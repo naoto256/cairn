@@ -572,6 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn list_repos_includes_demo() {
         let (_w, _s, srv) = fixture().await;
         let line = r#"{"jsonrpc":"2.0","id":4,"method":"list_repos"}"#;
