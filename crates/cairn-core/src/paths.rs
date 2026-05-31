@@ -1,14 +1,20 @@
 //! Storage layout on disk.
 //!
+//! Two layouts share the same root during the CAS rewrite: the
+//! legacy per-snapshot tree
+//! (`registry.db` + `indexes/<repo_hash>/<worktree_hash>/<branch>.db`)
+//! served by [`DataDir`], and the content-addressed layout
+//! (`repos/<repo_hash>/store.db`) served by [`CasDataDir`]. The
+//! legacy layout is unused at runtime once everything flips; deleting
+//! its files is safe and reclaims the space.
+//!
 //! ```text
 //! <data_dir>/
-//! ├── registry.db                  central inventory (always open)
-//! └── indexes/
-//!     └── <repo_hash>/
-//!         └── <worktree_hash>/
-//!             ├── main.db          one DB per (worktree, branch)
-//!             ├── feature-x.db
-//!             └── detached-a3f9c1d.db
+//! ├── registry.db                  legacy
+//! ├── indexes/                     legacy
+//! │   └── <repo_hash>/<worktree_hash>/<branch>.db
+//! └── repos/                       CAS
+//!     └── <repo_hash>/store.db
 //! ```
 //!
 //! The chosen `<data_dir>` follows the platform convention:
@@ -99,6 +105,65 @@ impl DataDir {
     }
 }
 
+/// Resolved storage root for the CAS layout (sibling of [`DataDir`];
+/// they share the same root, so a single `cairn-ng` directory holds
+/// both schemas).
+#[derive(Debug, Clone)]
+pub struct CasDataDir {
+    root: PathBuf,
+}
+
+impl CasDataDir {
+    /// Construct from the platform default location.
+    ///
+    /// # Errors
+    /// Fails if the platform does not expose a user data directory.
+    pub fn from_platform_default() -> Result<Self> {
+        let base = dirs::data_dir()
+            .ok_or_else(|| Error::InvalidArgument("platform has no user data directory".into()))?;
+        Ok(Self {
+            root: base.join(APP_NAME),
+        })
+    }
+
+    /// Construct with an explicit root (useful for tests and overrides).
+    #[must_use]
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Ensure the `repos/` subdirectory exists.
+    ///
+    /// # Errors
+    /// Propagates filesystem errors.
+    pub fn ensure(&self) -> Result<()> {
+        std::fs::create_dir_all(self.repos_dir())?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn repos_dir(&self) -> PathBuf {
+        self.root.join("repos")
+    }
+
+    /// Per-repo directory under `repos/`.
+    #[must_use]
+    pub fn repo_dir(&self, repo_hash: &str) -> PathBuf {
+        self.repos_dir().join(repo_hash)
+    }
+
+    /// Per-repo CAS store DB.
+    #[must_use]
+    pub fn store_db_path(&self, repo_hash: &str) -> PathBuf {
+        self.repo_dir(repo_hash).join("store.db")
+    }
+}
+
 /// Stable hash of an absolute, canonicalized path. The function is
 /// deliberately not cryptographic — it just needs to be consistent across
 /// runs and unlikely to collide for the ~hundreds of repositories one
@@ -174,5 +239,32 @@ mod tests {
         let dir = DataDir::with_root(tmp.path().join("cairn"));
         dir.ensure().unwrap();
         assert!(dir.indexes_dir().is_dir());
+    }
+
+    #[test]
+    fn cas_paths_compose_under_root() {
+        let dir = CasDataDir::with_root(PathBuf::from("/tmp/c"));
+        assert_eq!(dir.repos_dir(), PathBuf::from("/tmp/c/repos"));
+        assert_eq!(dir.repo_dir("abc"), PathBuf::from("/tmp/c/repos/abc"));
+        assert_eq!(
+            dir.store_db_path("abc"),
+            PathBuf::from("/tmp/c/repos/abc/store.db")
+        );
+    }
+
+    #[test]
+    fn cas_ensure_creates_repos_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = CasDataDir::with_root(tmp.path().join("cas"));
+        dir.ensure().unwrap();
+        assert!(dir.repos_dir().is_dir());
+    }
+
+    #[test]
+    fn cas_and_legacy_share_root() {
+        let root = PathBuf::from("/tmp/shared");
+        let legacy = DataDir::with_root(root.clone());
+        let cas = CasDataDir::with_root(root);
+        assert_eq!(legacy.root(), cas.root());
     }
 }
