@@ -304,58 +304,12 @@ mod tests {
     use super::*;
     use crate::cas::store;
     use std::fs;
-    use std::process::Command;
+    use crate::testutil::init_repo;
 
     fn fresh_db() -> (tempfile::TempDir, Connection) {
         let tmp = tempfile::tempdir().unwrap();
         let conn = store::open(&tmp.path().join("store.db")).unwrap();
         (tmp, conn)
-    }
-
-    fn run_git(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            // Isolate from any developer-side global git config — in
-            // particular any `core.hooksPath` pre-commit hook that
-            // would block the test commit.
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn init_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        run_git(repo, &["init", "-q", "-b", "main"]);
-        for (rel, content) in files {
-            let p = repo.join(rel);
-            fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(p, content).unwrap();
-        }
-        run_git(repo, &["add", "-A"]);
-        run_git(repo, &["commit", "-q", "-m", "init"]);
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
-        (tmp, sha)
     }
 
     #[test]

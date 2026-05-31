@@ -264,39 +264,11 @@ fn git_cat_file(repo_root: &Path, blob_sha: &str) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::cas::store;
+    use crate::testutil::init_repo;
     use std::fs;
 
-    fn run_git(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
     fn init_rust_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        run_git(repo, &["init", "-q", "-b", "main"]);
-        for (rel, content) in files {
-            let p = repo.join(rel);
-            fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(p, content).unwrap();
-        }
-        run_git(repo, &["add", "-A"]);
-        run_git(repo, &["commit", "-q", "-m", "init"]);
+        let (tmp, _sha) = init_repo(files);
         tmp
     }
 

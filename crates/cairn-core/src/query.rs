@@ -160,46 +160,11 @@ mod tests {
     use super::*;
     use crate::cas::store;
     use crate::register::register_repo;
+    use crate::testutil::init_repo;
     use std::fs;
-    use std::path::Path;
-    use std::process::Command;
-
-    fn run_git(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn init_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        run_git(repo, &["init", "-q", "-b", "main"]);
-        for (rel, content) in files {
-            let p = repo.join(rel);
-            fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(p, content).unwrap();
-        }
-        run_git(repo, &["add", "-A"]);
-        run_git(repo, &["commit", "-q", "-m", "init"]);
-        tmp
-    }
 
     fn registered() -> (tempfile::TempDir, tempfile::TempDir, Connection) {
-        let repo = init_repo(&[
+        let (repo, _sha) = init_repo(&[
             (
                 "src/lib.rs",
                 "pub fn alpha() -> i32 { 1 }\n\
@@ -331,7 +296,7 @@ mod tests {
 
     #[test]
     fn tentative_sees_uncommitted_file() {
-        let repo = init_repo(&[("src/lib.rs", "pub fn committed() {}\n")]);
+        let (repo, _sha) = init_repo(&[("src/lib.rs", "pub fn committed() {}\n")]);
         // Add an extra unstaged file.
         fs::write(
             repo.path().join("src/staged.rs"),

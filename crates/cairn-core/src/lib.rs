@@ -33,6 +33,8 @@ pub mod registry_db;
 pub mod snapshot_stats;
 pub mod sockets;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod watcher;
 
 pub use paths::DataDir;
