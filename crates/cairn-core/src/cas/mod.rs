@@ -7,8 +7,10 @@
 
 pub mod blob;
 pub mod hash;
+pub mod parse;
 pub mod schema;
 pub mod store;
 
 pub use blob::{BlobMeta, ParsedData};
 pub use hash::git_blob_sha;
+pub use parse::parse;
