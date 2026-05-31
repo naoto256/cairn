@@ -42,7 +42,9 @@ fn register_cairn_ng_and_find_git_blob_sha() {
         "expected to parse many blobs, got {}",
         outcome.blobs_parsed
     );
-    assert_eq!(outcome.branch.as_deref(), Some("feat/cas-skeleton"));
+    // Don't pin the branch name; tests must pass from any branch that
+    // is descended from the one that introduced cas/hash.rs.
+    assert!(outcome.branch.is_some(), "detached HEAD not supported");
 
     // `git_blob_sha` was defined in S3 at cas/hash.rs and is
     // re-exported via `cas::git_blob_sha`. find_symbols against
