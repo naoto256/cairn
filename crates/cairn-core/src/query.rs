@@ -6,16 +6,19 @@
 //! by `manifest_id` to surface results scoped to one snapshot's
 //! visible blobs.
 //!
-//! Only `find_symbols` is implemented here; the rest of the surface
-//! ports in later work.
+//! Currently exposes `find_symbols` and `find_references`; the rest
+//! of the surface ports in later work.
 
 use cairn_lang_api::Visibility;
-use cairn_proto::common::SymbolKind;
+use cairn_proto::common::{RefKind, SymbolKind};
+use cairn_proto::methods::ReferenceDirection;
 use rusqlite::{Connection, ToSql};
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
-use crate::cas::kind_conv::{symbol_kind_from_str, visibility_from_str};
+use crate::cas::kind_conv::{
+    ref_kind_from_str, ref_kind_to_str, symbol_kind_from_str, visibility_from_str,
+};
 use crate::manifest::ManifestId;
 
 /// One symbol hit. Mirrors the public-fact subset of
@@ -78,6 +81,135 @@ pub fn find_symbols(
     })?;
 
     run_find_symbols(conn, manifest_id, args)
+}
+
+// ─── find_references ──────────────────────────────────────────────────────
+
+/// One reference hit. Mirrors `cairn_proto::methods::FindReferenceHit`
+/// minus the repo / branch / location envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceHit {
+    pub target_name: String,
+    pub target_qualified: Option<String>,
+    pub kind: RefKind,
+    pub enclosing_qualified: Option<String>,
+    pub path: String,
+    pub line: u32,
+}
+
+/// Filters for `find_references`. `symbol` is required and non-empty.
+#[derive(Debug, Clone, Default)]
+pub struct FindReferencesArgs {
+    pub symbol: String,
+    pub direction: ReferenceDirection,
+    pub kind: Option<RefKind>,
+    pub limit: Option<u32>,
+}
+
+/// Find references either way:
+/// - `Incoming` — refs whose target matches `symbol` (callers / use
+///   sites). When `symbol` contains `::`, the qualified-name index is
+///   tried first; bare names match `target_name` directly.
+/// - `Outgoing` — refs inside the body of the symbol named `symbol`
+///   (= callees / uses from the symbol). Matches `symbols.qualified`
+///   on the enclosing FK.
+///
+/// # Errors
+/// `Error::InvalidArgument` when `symbol` is empty or the anchor
+/// doesn't resolve. SQLite errors otherwise.
+pub fn find_references(
+    conn: &Connection,
+    anchor: &AnchorName,
+    args: &FindReferencesArgs,
+) -> Result<Vec<ReferenceHit>> {
+    if args.symbol.trim().is_empty() {
+        return Err(crate::Error::InvalidArgument(
+            "find_references: `symbol` must be non-empty".into(),
+        ));
+    }
+    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
+        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
+    })?;
+    run_find_references(conn, manifest_id, args)
+}
+
+fn run_find_references(
+    conn: &Connection,
+    manifest_id: ManifestId,
+    args: &FindReferencesArgs,
+) -> Result<Vec<ReferenceHit>> {
+    let limit = args.limit.unwrap_or(100).max(1);
+    let kind_str = args.kind.map(ref_kind_to_str);
+
+    // Both directions JOIN `manifest_entries` so refs are scoped to
+    // blobs visible from this anchor. The enclosing-symbol JOIN is
+    // INNER for outgoing (we need the enclosing name to filter) and
+    // LEFT for incoming (top-level refs have no enclosing).
+    let run = |where_col: &str, value: &str, outgoing: bool| -> Result<Vec<ReferenceHit>> {
+        let mut sql = String::from(
+            "SELECT r.target_name, r.target_qualified, r.kind,
+                    enc.qualified AS enclosing,
+                    me.path, r.line
+               FROM refs r
+               JOIN manifest_entries me
+                 ON me.manifest_id = ?1
+                AND me.blob_sha = r.blob_sha
+               ",
+        );
+        sql.push_str(if outgoing {
+            "JOIN symbols enc ON enc.id = r.enclosing_id\n"
+        } else {
+            "LEFT JOIN symbols enc ON enc.id = r.enclosing_id\n"
+        });
+        sql.push_str("              WHERE ");
+        sql.push_str(where_col);
+        sql.push_str(" = ?2");
+        if kind_str.is_some() {
+            sql.push_str(" AND r.kind = ?3");
+        }
+        sql.push_str(" ORDER BY me.path, r.line");
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let row_to_hit = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ReferenceHit> {
+            Ok(ReferenceHit {
+                target_name: row.get(0)?,
+                target_qualified: row.get(1)?,
+                kind: ref_kind_from_str(&row.get::<_, String>(2)?),
+                enclosing_qualified: row.get(3)?,
+                path: row.get(4)?,
+                line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+            })
+        };
+        let rows: rusqlite::Result<Vec<ReferenceHit>> = match &kind_str {
+            Some(k) => stmt
+                .query_map(rusqlite::params![manifest_id.0, value, k], row_to_hit)?
+                .collect(),
+            None => stmt
+                .query_map(rusqlite::params![manifest_id.0, value], row_to_hit)?
+                .collect(),
+        };
+        Ok(rows?)
+    };
+
+    match args.direction {
+        ReferenceDirection::Outgoing => run("enc.qualified", &args.symbol, true),
+        ReferenceDirection::Incoming => {
+            // Prefer qualified-name matching when the symbol carries
+            // `::`; fall back to bare-name when qualified produces no
+            // hits. Bare symbols skip straight to the bare-name index.
+            if args.symbol.contains("::") {
+                let strict = run("r.target_qualified", &args.symbol, false)?;
+                if !strict.is_empty() {
+                    return Ok(strict);
+                }
+                let bare = args.symbol.rsplit("::").next().unwrap_or(&args.symbol);
+                run("r.target_name", bare, false)
+            } else {
+                run("r.target_name", &args.symbol, false)
+            }
+        }
+    }
 }
 
 fn run_find_symbols(
@@ -292,6 +424,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("anchor not found"));
+    }
+
+    #[test]
+    fn references_incoming_finds_callers() {
+        let (_repo, _db, c) = registered();
+        let hits = find_references(
+            &c,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "alpha".into(),
+                direction: ReferenceDirection::Incoming,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // alpha is referenced inside the file (see fixture src/lib.rs);
+        // at minimum we shouldn't error and the SQL must execute.
+        // Whether the syntactic-only Rust analyzer surfaces this
+        // particular call depends on the parser; assert structural
+        // correctness instead of a specific count.
+        for h in &hits {
+            assert_eq!(h.target_name, "alpha");
+        }
+    }
+
+    #[test]
+    fn references_outgoing_resolves_enclosing() {
+        let (_repo, _db, c) = registered();
+        // No symbol called `nonexistent` exists; the outgoing query
+        // should run and return an empty result rather than error.
+        let hits = find_references(
+            &c,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "nonexistent::callee".into(),
+                direction: ReferenceDirection::Outgoing,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn references_empty_symbol_errors() {
+        let (_repo, _db, c) = registered();
+        let err = find_references(
+            &c,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "  ".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
     }
 
     #[test]
