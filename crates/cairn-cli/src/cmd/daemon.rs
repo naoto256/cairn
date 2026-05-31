@@ -11,7 +11,7 @@ use cairn_core::ctl::CtlHandler;
 use cairn_core::daemon::Daemon;
 use cairn_core::data_rpc::DataRpc;
 use cairn_core::indexer::Indexer;
-use cairn_core::paths::DataDir;
+use cairn_core::paths::{CasDataDir, DataDir};
 use cairn_core::sockets::SocketPaths;
 use cairn_core::storage::Storage;
 use cairn_core::watcher::WatcherOrchestrator;
@@ -37,10 +37,14 @@ pub async fn run(args: Args) -> Result<()> {
         Some(p) => SocketPaths::with_runtime_dir(p),
         None => SocketPaths::from_platform_default()?,
     };
-    let data_dir = match args.data_dir {
+    let data_dir = match args.data_dir.clone() {
         Some(p) => DataDir::with_root(p),
         None => DataDir::from_platform_default()?,
     };
+    let cas_data_dir = Arc::new(match args.data_dir {
+        Some(p) => CasDataDir::with_root(p),
+        None => CasDataDir::from_platform_default()?,
+    });
 
     let storage = Arc::new(Storage::open(data_dir)?);
     info!(root = %storage.data_dir.root().display(), "storage open");
@@ -60,6 +64,7 @@ pub async fn run(args: Args) -> Result<()> {
             indexer,
             storage.clone(),
             watcher.clone(),
+            cas_data_dir,
             shutdown.clone(),
             env!("CARGO_PKG_VERSION"),
         )),

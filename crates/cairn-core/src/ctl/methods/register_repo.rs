@@ -1,13 +1,19 @@
-//! `register_repo` — add a repository, do the initial full index,
-//! and attach the live watcher.
+//! `register_repo` — open the CAS store for a worktree, build its
+//! initial committed + tentative manifests, parse any new blobs, and
+//! seed the HEAD / branch / tentative anchors.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_proto::control::Ack;
 use cairn_proto::methods::RegisterRepoArgs;
 use linkme::distributed_slice;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
+use crate::cas::store as cas_store;
+use crate::paths::path_hash;
+use crate::register::register_repo as cas_register;
 use crate::{Error, Result};
 
 struct RegisterRepo;
@@ -21,22 +27,40 @@ impl ControlMethod for RegisterRepo {
     async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
         let args: RegisterRepoArgs = parse_params(params)?;
         let path = std::path::PathBuf::from(&args.path);
-        let registered = ctx
-            .indexer
-            .register_repo(&args.alias, &path)
-            .await
-            .map_err(|e| Error::InvalidArgument(format!("register_repo: {e}")))?;
-        ctx.indexer
-            .full_index(&args.alias)
-            .await
-            .map_err(|e| Error::InvalidArgument(format!("full_index: {e}")))?;
-        if let Err(e) = ctx.watcher.start(&args.alias, &registered.root).await {
-            // Indexing already succeeded; report watcher failure as
-            // a warning rather than rolling back, because subsequent
-            // explicit `reindex_repo` calls still work.
-            warn!(alias = %args.alias, error = %e, "watcher failed to start");
-        }
-        info!(alias = %args.alias, "register_repo complete");
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|e| Error::InvalidArgument(format!("canonicalize {}: {e}", args.path)))?;
+        let repo_hash = path_hash(&canonical);
+
+        let cas_data_dir = ctx.cas_data_dir.clone();
+        cas_data_dir
+            .ensure()
+            .map_err(|e| Error::InvalidArgument(format!("cas data dir: {e}")))?;
+        let store_path = cas_data_dir.store_db_path(&repo_hash);
+
+        let now_ns = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| Error::InvalidArgument(format!("clock: {e}")))?
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+
+        let alias = args.alias.clone();
+        let worktree = canonical.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut conn = cas_store::open(&store_path)?;
+            cas_register(&mut conn, &worktree, now_ns)
+        })
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("register_repo task panicked: {e}")))??;
+
+        info!(
+            alias = %alias,
+            head = %outcome.head_commit,
+            branch = ?outcome.branch,
+            blobs_parsed = outcome.blobs_parsed,
+            "register_repo complete"
+        );
         Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
     }
 }
