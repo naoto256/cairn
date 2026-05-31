@@ -74,10 +74,10 @@ pub fn register_repo(
     // already exists for this commit.
     let committed = match manifest::lookup_by_commit_sha(&tx, &head_commit)? {
         Some(id) => id,
-        None => manifest::build_from_git_tree(&tx, worktree_path, &head_commit, now_ns, &include)?,
+        None => manifest::build_from_git_tree(&tx, worktree_path, &head_commit, now_ns, include)?,
     };
 
-    let tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, &include)?;
+    let tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, include)?;
 
     // Anchors.
     anchor::set(&tx, &AnchorName::head(), committed, now_ns)?;
