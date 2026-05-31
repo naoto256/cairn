@@ -92,17 +92,21 @@ CREATE INDEX idx_imports_blob ON imports(blob_sha, parser_id);
 CREATE INDEX idx_imports_module ON imports(to_module);
 
 CREATE TABLE implementations (
-    id             INTEGER PRIMARY KEY,
-    blob_sha       TEXT NOT NULL,
-    parser_id      TEXT NOT NULL,
-    type_id        INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-    interface_name TEXT NOT NULL,
-    kind           TEXT NOT NULL,
+    id                  INTEGER PRIMARY KEY,
+    blob_sha            TEXT NOT NULL,
+    parser_id           TEXT NOT NULL,
+    type_qualified      TEXT NOT NULL,
+    interface_qualified TEXT,
+    kind                TEXT NOT NULL,
+    line                INTEGER NOT NULL,
     FOREIGN KEY (blob_sha, parser_id) REFERENCES blobs(blob_sha, parser_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_impls_blob ON implementations(blob_sha, parser_id);
-CREATE INDEX idx_impls_interface ON implementations(interface_name);
+CREATE INDEX idx_impls_type ON implementations(type_qualified);
+CREATE INDEX idx_impls_interface
+    ON implementations(interface_qualified)
+    WHERE interface_qualified IS NOT NULL;
 
 -- Manifest layer
 CREATE TABLE manifests (

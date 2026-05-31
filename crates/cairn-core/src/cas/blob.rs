@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use cairn_lang_api::{ImportFact, RefFact, SemanticFacts, SymbolFact, SyntacticFacts};
+use cairn_lang_api::{ImplFact, ImportFact, RefFact, SemanticFacts, SymbolFact, SyntacticFacts};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::Result;
@@ -105,6 +105,14 @@ pub fn insert(
     if let Some(sem) = &data.semantic {
         for im in &sem.imports {
             insert_import(tx, blob_sha, parser_id, im)?;
+        }
+    }
+
+    // impls (semantic only — syntactic-only backends don't emit
+    // impl edges).
+    if let Some(sem) = &data.semantic {
+        for imp in &sem.impls {
+            insert_impl(tx, blob_sha, parser_id, imp)?;
         }
     }
 
@@ -265,6 +273,29 @@ fn insert_ref(
             byte_end,
             line,
             source,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_impl(
+    tx: &Transaction<'_>,
+    blob_sha: &str,
+    parser_id: &str,
+    imp: &ImplFact,
+) -> Result<()> {
+    let line = i64::from(imp.line);
+    tx.execute(
+        "INSERT INTO implementations
+           (blob_sha, parser_id, type_qualified, interface_qualified, kind, line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            blob_sha,
+            parser_id,
+            imp.type_qualified,
+            imp.interface_qualified,
+            imp.kind,
+            line,
         ],
     )?;
     Ok(())
