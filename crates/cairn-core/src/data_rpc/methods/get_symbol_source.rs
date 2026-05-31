@@ -13,7 +13,6 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::anchor::AnchorName;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, SymbolSourceRow};
 use crate::register::git_cat_file;
@@ -39,10 +38,7 @@ impl DataMethod for GetSymbolSource {
         let qualified = args.qualified.clone();
         let file_filter = args.file.clone();
         let signature_only = args.signature_only;
-        let anchor = args
-            .branch
-            .as_deref()
-            .map_or_else(AnchorName::head, AnchorName::branch);
+        let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let repo_alias = args.repo.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {

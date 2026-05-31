@@ -105,6 +105,11 @@ pub struct FindSymbolArgs {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SymbolKind>,
     /// Qualified-prefix scope. `container = "Foo"` returns symbols
@@ -186,6 +191,11 @@ pub struct ImplsArgs {
     pub type_: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -225,6 +235,11 @@ pub struct ImportsArgs {
     pub file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -298,6 +313,11 @@ pub struct FindReferencesArgs {
     pub direction: ReferenceDirection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -348,6 +368,11 @@ pub struct GetSymbolSourceArgs {
     pub qualified: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
     /// Path (relative to repo root) the symbol lives in. Optional
     /// disambiguator when the same qualified name exists in multiple
     /// files (rare; useful for cross-module test fixtures).

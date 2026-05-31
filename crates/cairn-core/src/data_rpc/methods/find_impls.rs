@@ -8,7 +8,6 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::anchor::AnchorName;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, FindImplsArgs as QueryArgs};
 use crate::{Error, Result};
@@ -35,10 +34,7 @@ impl DataMethod for FindImpls {
             type_qualified: args.type_.clone(),
             limit: args.limit,
         };
-        let anchor = args
-            .branch
-            .as_deref()
-            .map_or_else(AnchorName::head, AnchorName::branch);
+        let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let repo_alias = args.repo.clone();
 
         let items = tokio::task::spawn_blocking(move || -> Result<Vec<ImplHit>> {

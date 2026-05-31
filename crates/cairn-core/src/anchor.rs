@@ -75,6 +75,17 @@ impl From<String> for AnchorName {
     }
 }
 
+/// Pick an anchor from the wire-side `(anchor, branch)` pair the read
+/// methods take: a raw anchor name wins; otherwise wrap a bare branch
+/// name; otherwise fall back to `HEAD`.
+#[must_use]
+pub fn resolve_wire(anchor: Option<&str>, branch: Option<&str>) -> AnchorName {
+    match anchor {
+        Some(a) => AnchorName::from(a.to_string()),
+        None => branch.map_or_else(AnchorName::head, AnchorName::branch),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorKind {
     Branch(String),
