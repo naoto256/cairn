@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::info;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
-use crate::cas::store as cas_store;
+use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::paths::path_hash;
 use crate::register::register_repo as cas_register;
 use crate::{Error, Result};
@@ -47,15 +47,33 @@ impl ControlMethod for RegisterRepo {
 
         let alias = args.alias.clone();
         let worktree = canonical.clone();
+        let canonical_str = canonical.to_string_lossy().to_string();
+        let repo_hash_for_index = repo_hash.clone();
+        let index_path = cas_data_dir.index_db_path();
+
         let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut conn = cas_store::open(&store_path)?;
-            cas_register(&mut conn, &worktree, now_ns)
+            let outcome = cas_register(&mut conn, &worktree, now_ns)?;
+
+            // Update the top-level alias → repo index so queries can
+            // resolve `repo=<alias>`.
+            let mut idx = cas_registry::open(&index_path)?;
+            let tx = idx.transaction()?;
+            cas_registry::upsert(
+                &tx,
+                &alias,
+                &canonical_str,
+                &repo_hash_for_index,
+                now_ns,
+            )?;
+            tx.commit()?;
+            Ok(outcome)
         })
         .await
         .map_err(|e| Error::InvalidArgument(format!("register_repo task panicked: {e}")))??;
 
         info!(
-            alias = %alias,
+            alias = %args.alias,
             head = %outcome.head_commit,
             branch = ?outcome.branch,
             blobs_parsed = outcome.blobs_parsed,

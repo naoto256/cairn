@@ -162,6 +162,13 @@ impl CasDataDir {
     pub fn store_db_path(&self, repo_hash: &str) -> PathBuf {
         self.repo_dir(repo_hash).join("store.db")
     }
+
+    /// Top-level alias → repo index DB (sits next to `repos/`, not
+    /// under it).
+    #[must_use]
+    pub fn index_db_path(&self) -> PathBuf {
+        self.root.join("index.db")
+    }
 }
 
 /// Stable hash of an absolute, canonicalized path. The function is
