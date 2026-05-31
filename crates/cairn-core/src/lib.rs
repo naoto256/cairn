@@ -23,6 +23,7 @@ pub mod daemon;
 pub mod data_db;
 pub mod data_rpc;
 pub mod indexer;
+pub mod manifest;
 pub mod migration;
 pub mod paths;
 pub mod registry_db;
