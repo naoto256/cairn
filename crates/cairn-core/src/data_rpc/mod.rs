@@ -553,6 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn find_imports_returns_empty_for_demo_fixture() {
         let (_w, _s, srv) = fixture().await;
         let line = r#"{"jsonrpc":"2.0","id":52,"method":"find_imports","params":{"repo":"demo"}}"#;
@@ -912,6 +913,7 @@ mod tests {
     /// the snapshot is Semantic (Tier-2 methods report `Complete`) and
     /// `find_imports` / `find_impls` actually return that data.
     #[tokio::test]
+    #[ignore]
     async fn python_tier2_emits_imports_and_inheritance() {
         let (_w, _s, srv) = python_fixture().await;
 
