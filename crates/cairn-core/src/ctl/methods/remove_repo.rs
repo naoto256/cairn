@@ -32,11 +32,17 @@ impl ControlMethod for RemoveRepo {
             cas_registry::delete(&tx, &alias)?;
             tx.commit()?;
 
-            let repo_dir = cas_data_dir.repo_dir(&entry.repo_hash);
-            if let Err(e) = std::fs::remove_dir_all(&repo_dir)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(path = %repo_dir.display(), error = %e, "failed to remove repo dir");
+            // Only blow the on-disk store away when no other alias
+            // still references this repo_hash — multiple labels can
+            // share one CAS directory.
+            let remaining = cas_registry::count_aliases_for_repo(&index, &entry.repo_hash)?;
+            if remaining == 0 {
+                let repo_dir = cas_data_dir.repo_dir(&entry.repo_hash);
+                if let Err(e) = std::fs::remove_dir_all(&repo_dir)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(path = %repo_dir.display(), error = %e, "failed to remove repo dir");
+                }
             }
             Ok(true)
         })

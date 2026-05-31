@@ -10,9 +10,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use crate::Result;
 use crate::migration::{Migration, open_with_migrations};
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: r#"
 CREATE TABLE aliases (
     alias            TEXT PRIMARY KEY,
     root_path        TEXT NOT NULL UNIQUE,
@@ -20,7 +21,26 @@ CREATE TABLE aliases (
     registered_at_ns INTEGER NOT NULL
 );
 "#,
-}];
+    },
+    Migration {
+        // Drop the UNIQUE on root_path so multiple aliases can label
+        // the same on-disk repo. Recreated via the rename-shuffle since
+        // SQLite has no `DROP CONSTRAINT`.
+        version: 2,
+        sql: r#"
+CREATE TABLE aliases_v2 (
+    alias            TEXT PRIMARY KEY,
+    root_path        TEXT NOT NULL,
+    repo_hash        TEXT NOT NULL,
+    registered_at_ns INTEGER NOT NULL
+);
+INSERT INTO aliases_v2 SELECT alias, root_path, repo_hash, registered_at_ns FROM aliases;
+DROP TABLE aliases;
+ALTER TABLE aliases_v2 RENAME TO aliases;
+CREATE INDEX idx_aliases_repo_hash ON aliases(repo_hash);
+"#,
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasEntry {
@@ -38,9 +58,9 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
     open_with_migrations(path, MIGRATIONS)
 }
 
-/// Insert or replace an alias mapping. Replaces on conflict by `alias`
-/// (= same alias re-registered with possibly different path) and by
-/// `root_path` (= same path re-registered under a different alias).
+/// Insert or replace an alias mapping. Replaces only on conflict by
+/// `alias`; other aliases pointing at the same `root_path` are left
+/// alone so two labels can share one on-disk repo.
 ///
 /// # Errors
 /// SQLite failures.
@@ -51,12 +71,6 @@ pub fn upsert(
     repo_hash: &str,
     registered_at_ns: i64,
 ) -> Result<()> {
-    // Drop any prior row keyed by root_path that uses a different
-    // alias; the alias is the user-visible name and the latest wins.
-    tx.execute(
-        "DELETE FROM aliases WHERE root_path = ?1 AND alias <> ?2",
-        params![root_path, alias],
-    )?;
     tx.execute(
         "INSERT INTO aliases (alias, root_path, repo_hash, registered_at_ns)
          VALUES (?1, ?2, ?3, ?4)
@@ -67,6 +81,20 @@ pub fn upsert(
         params![alias, root_path, repo_hash, registered_at_ns],
     )?;
     Ok(())
+}
+
+/// Count how many aliases reference `repo_hash`. Used by
+/// `remove_repo` to decide whether the per-repo store directory is
+/// still in use by another label.
+///
+/// # Errors
+/// SQLite failures.
+pub fn count_aliases_for_repo(conn: &Connection, repo_hash: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM aliases WHERE repo_hash = ?1",
+        params![repo_hash],
+        |r| r.get(0),
+    )?)
 }
 
 /// Look up one alias. Returns `Ok(None)` if absent.
@@ -159,17 +187,28 @@ mod tests {
     }
 
     #[test]
-    fn upsert_rebinds_root_path_to_new_alias() {
+    fn upsert_allows_multiple_aliases_for_same_path() {
         let (_t, mut c) = fresh();
         let tx = c.transaction().unwrap();
-        upsert(&tx, "old", "/p", "h", 1).unwrap();
-        upsert(&tx, "new", "/p", "h", 2).unwrap();
+        upsert(&tx, "first", "/p", "h", 1).unwrap();
+        upsert(&tx, "second", "/p", "h", 2).unwrap();
         tx.commit().unwrap();
-        assert!(lookup_by_alias(&c, "old").unwrap().is_none());
+        // Both aliases survive; neither is silently dropped.
         assert_eq!(
-            lookup_by_alias(&c, "new").unwrap().unwrap().root_path,
+            lookup_by_alias(&c, "first").unwrap().unwrap().root_path,
             "/p"
         );
+        assert_eq!(
+            lookup_by_alias(&c, "second").unwrap().unwrap().root_path,
+            "/p"
+        );
+        assert_eq!(count_aliases_for_repo(&c, "h").unwrap(), 2);
+    }
+
+    #[test]
+    fn count_aliases_for_repo_is_zero_for_unknown() {
+        let (_t, c) = fresh();
+        assert_eq!(count_aliases_for_repo(&c, "ghost").unwrap(), 0);
     }
 
     #[test]

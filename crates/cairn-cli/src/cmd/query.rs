@@ -61,6 +61,10 @@ enum QueryCommand {
         repo: String,
         #[arg(long)]
         branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
         /// Restrict to symbols of this kind.
         #[arg(long)]
         kind: Option<String>,
@@ -79,6 +83,10 @@ enum QueryCommand {
         repo: String,
         #[arg(long)]
         branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
         /// File path (relative to repo root) to disambiguate the
         /// qualified name when it exists in multiple files.
         #[arg(long)]
@@ -97,6 +105,10 @@ enum QueryCommand {
         type_: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -110,6 +122,10 @@ enum QueryCommand {
         file: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -123,6 +139,10 @@ enum QueryCommand {
         kind: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -143,6 +163,7 @@ pub async fn run(args: Args) -> Result<()> {
             query,
             repo,
             branch,
+            anchor,
             kind,
             fuzzy,
             limit,
@@ -152,6 +173,9 @@ pub async fn run(args: Args) -> Result<()> {
             p.insert("repo".into(), Value::String(repo.clone()));
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
+            }
+            if let Some(a) = anchor {
+                p.insert("anchor".into(), Value::String(a.clone()));
             }
             if let Some(k) = kind {
                 p.insert("kind".into(), Value::String(k.clone()));
@@ -168,6 +192,7 @@ pub async fn run(args: Args) -> Result<()> {
             qualified,
             repo,
             branch,
+            anchor,
             file,
         } => {
             let mut p = serde_json::Map::new();
@@ -175,6 +200,9 @@ pub async fn run(args: Args) -> Result<()> {
             p.insert("qualified".into(), Value::String(qualified.clone()));
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
+            }
+            if let Some(a) = anchor {
+                p.insert("anchor".into(), Value::String(a.clone()));
             }
             if let Some(f) = file {
                 p.insert("file".into(), Value::String(f.clone()));
@@ -186,6 +214,7 @@ pub async fn run(args: Args) -> Result<()> {
             trait_,
             type_,
             branch,
+            anchor,
             limit,
         } => {
             let mut p = serde_json::Map::new();
@@ -199,6 +228,9 @@ pub async fn run(args: Args) -> Result<()> {
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
             }
+            if let Some(a) = anchor {
+                p.insert("anchor".into(), Value::String(a.clone()));
+            }
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
             }
@@ -208,6 +240,7 @@ pub async fn run(args: Args) -> Result<()> {
             repo,
             file,
             branch,
+            anchor,
             limit,
         } => {
             let mut p = serde_json::Map::new();
@@ -217,6 +250,9 @@ pub async fn run(args: Args) -> Result<()> {
             }
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
+            }
+            if let Some(a) = anchor {
+                p.insert("anchor".into(), Value::String(a.clone()));
             }
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
@@ -228,6 +264,7 @@ pub async fn run(args: Args) -> Result<()> {
             repo,
             kind,
             branch,
+            anchor,
             limit,
         } => {
             let mut p = serde_json::Map::new();
@@ -238,6 +275,9 @@ pub async fn run(args: Args) -> Result<()> {
             }
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
+            }
+            if let Some(a) = anchor {
+                p.insert("anchor".into(), Value::String(a.clone()));
             }
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
