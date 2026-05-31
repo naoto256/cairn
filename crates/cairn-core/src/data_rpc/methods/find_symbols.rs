@@ -7,13 +7,14 @@
 //! come back in later iterations.
 
 use cairn_proto::Completeness;
-use cairn_proto::common::{SourceTier, SymbolKind};
+use cairn_proto::common::SourceTier;
 use cairn_proto::methods::{FindSymbolArgs, FindSymbolHit, FindSymbolResult};
 use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::anchor::AnchorName;
+use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
@@ -33,7 +34,7 @@ impl DataMethod for FindSymbols {
         let cas_data_dir = ctx.cas_data_dir.clone();
         let q = FindSymbolsArgs {
             query: args.query.clone(),
-            kind: args.kind.as_ref().map(symbol_kind_to_db),
+            kind: args.kind.as_ref().map(symbol_kind_to_str),
             container: args.container.clone(),
             path_prefix: args.path.clone(),
             limit: args.limit,
@@ -124,32 +125,3 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit) -> FindSymbolHit {
     }
 }
 
-fn symbol_kind_to_db(kind: &SymbolKind) -> String {
-    match kind {
-        SymbolKind::Function => "function".into(),
-        SymbolKind::Method => "method".into(),
-        SymbolKind::Constructor => "constructor".into(),
-        SymbolKind::Getter => "getter".into(),
-        SymbolKind::Setter => "setter".into(),
-        SymbolKind::Class => "class".into(),
-        SymbolKind::Struct => "struct".into(),
-        SymbolKind::Enum => "enum".into(),
-        SymbolKind::Union => "union".into(),
-        SymbolKind::Trait => "trait".into(),
-        SymbolKind::Impl => "impl".into(),
-        SymbolKind::Interface => "interface".into(),
-        SymbolKind::TypeAlias => "type_alias".into(),
-        SymbolKind::Field => "field".into(),
-        SymbolKind::Property => "property".into(),
-        SymbolKind::Constant => "constant".into(),
-        SymbolKind::Variable => "variable".into(),
-        SymbolKind::Parameter => "parameter".into(),
-        SymbolKind::Module => "module".into(),
-        SymbolKind::Namespace => "namespace".into(),
-        SymbolKind::Package => "package".into(),
-        SymbolKind::Macro => "macro".into(),
-        SymbolKind::Test => "test".into(),
-        SymbolKind::Section => "section".into(),
-        SymbolKind::Other(s) => s.clone(),
-    }
-}
