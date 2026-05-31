@@ -64,10 +64,7 @@ pub fn find_symbols(
     let any_filter = args.query.as_deref().is_some_and(|q| !q.is_empty())
         || args.kind.as_deref().is_some_and(|k| !k.is_empty())
         || args.container.as_deref().is_some_and(|c| !c.is_empty())
-        || args
-            .path_prefix
-            .as_deref()
-            .is_some_and(|p| !p.is_empty());
+        || args.path_prefix.as_deref().is_some_and(|p| !p.is_empty());
     if !any_filter {
         return Err(crate::Error::InvalidArgument(
             "find_symbols: at least one of `query`, `kind`, `container`, or `path_prefix` \
@@ -260,7 +257,8 @@ pub fn get_symbol_source_row(
             AND me.blob_sha = s.blob_sha
           WHERE s.qualified = ?2",
     );
-    let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0), Box::new(qualified.to_string())];
+    let mut bound: Vec<Box<dyn ToSql>> =
+        vec![Box::new(manifest_id.0), Box::new(qualified.to_string())];
     if let Some(f) = file_filter {
         sql.push_str(" AND me.path = ?");
         bound.push(Box::new(f.to_string()));
@@ -578,9 +576,8 @@ fn run_find_symbols(
 
     let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: rusqlite::Result<Vec<SymbolHit>> = stmt
-        .query_map(param_refs.as_slice(), row_to_hit)?
-        .collect();
+    let rows: rusqlite::Result<Vec<SymbolHit>> =
+        stmt.query_map(param_refs.as_slice(), row_to_hit)?.collect();
     Ok(rows?)
 }
 

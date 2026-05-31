@@ -292,10 +292,7 @@ mod tests {
         set(&tx, &AnchorName::tentative(42), mid, 0).unwrap();
         tx.commit().unwrap();
 
-        assert_eq!(
-            resolve(&c, &AnchorName::tentative(42)).unwrap(),
-            Some(mid)
-        );
+        assert_eq!(resolve(&c, &AnchorName::tentative(42)).unwrap(), Some(mid));
     }
 
     #[test]

@@ -50,17 +50,13 @@ impl DataMethod for GetSymbolSource {
             let conn = cas_store::open(&store_path)?;
             let worktree_root = PathBuf::from(&entry.root_path);
 
-            let row = query::get_symbol_source_row(
-                &conn,
-                &anchor,
-                &qualified,
-                file_filter.as_deref(),
-            )?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "no symbol matches qualified=`{qualified}` in repo=`{repo_alias}`"
-                ))
-            })?;
+            let row =
+                query::get_symbol_source_row(&conn, &anchor, &qualified, file_filter.as_deref())?
+                    .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "no symbol matches qualified=`{qualified}` in repo=`{repo_alias}`"
+                    ))
+                })?;
 
             let source = if signature_only {
                 String::new()

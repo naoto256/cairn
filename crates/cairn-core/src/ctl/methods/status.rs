@@ -30,9 +30,7 @@ impl ControlMethod for Status {
             let mut out = Vec::with_capacity(entries.len());
             for entry in entries {
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                let store_bytes = std::fs::metadata(&store_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let store_bytes = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
                 let conn = cas_store::open(&store_path)?;
                 let snapshots = collect_anchor_snapshots(&conn, store_bytes)?;
                 let languages = collect_languages(&conn)?;
@@ -65,9 +63,8 @@ fn collect_anchor_snapshots(
     conn: &rusqlite::Connection,
     store_bytes: u64,
 ) -> Result<Vec<ProtoSnapshotStatus>> {
-    let mut stmt = conn.prepare(
-        "SELECT anchor_name, manifest_id FROM anchors ORDER BY anchor_name",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT anchor_name, manifest_id FROM anchors ORDER BY anchor_name")?;
     let rows = stmt
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))

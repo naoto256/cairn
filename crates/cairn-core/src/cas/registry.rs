@@ -121,8 +121,7 @@ pub fn list_all(conn: &Connection) -> Result<Vec<AliasEntry>> {
         "SELECT alias, root_path, repo_hash, registered_at_ns
          FROM aliases ORDER BY alias",
     )?;
-    let rows: rusqlite::Result<Vec<AliasEntry>> =
-        stmt.query_map([], row_to_entry)?.collect();
+    let rows: rusqlite::Result<Vec<AliasEntry>> = stmt.query_map([], row_to_entry)?.collect();
     Ok(rows?)
 }
 

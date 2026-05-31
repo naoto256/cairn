@@ -194,6 +194,3 @@ fn serialize(resp: &Response) -> String {
             .to_string()
     })
 }
-
-
-

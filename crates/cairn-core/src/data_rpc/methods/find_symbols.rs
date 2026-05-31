@@ -120,4 +120,3 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit) -> FindSymbolHit {
         source: SourceTier::Syntactic,
     }
 }
-

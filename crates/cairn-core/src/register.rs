@@ -74,29 +74,17 @@ pub fn register_repo(
     // already exists for this commit.
     let committed = match manifest::lookup_by_commit_sha(&tx, &head_commit)? {
         Some(id) => id,
-        None => manifest::build_from_git_tree(
-            &tx,
-            worktree_path,
-            &head_commit,
-            now_ns,
-            &include,
-        )?,
+        None => manifest::build_from_git_tree(&tx, worktree_path, &head_commit, now_ns, &include)?,
     };
 
-    let tentative =
-        manifest::build_from_worktree(&tx, worktree_path, now_ns, &include)?;
+    let tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, &include)?;
 
     // Anchors.
     anchor::set(&tx, &AnchorName::head(), committed, now_ns)?;
     if let Some(name) = &branch {
         anchor::set(&tx, &AnchorName::branch(name), committed, now_ns)?;
     }
-    anchor::set(
-        &tx,
-        &AnchorName::tentative(worktree_id),
-        tentative,
-        now_ns,
-    )?;
+    anchor::set(&tx, &AnchorName::tentative(worktree_id), tentative, now_ns)?;
 
     // Collect every (blob_sha, source) pair we need to ensure is
     // parsed. Source tells us where to fetch the content from:
@@ -183,9 +171,8 @@ fn parse_pending_blobs(
                     ContentSource::Worktree(p) => std::fs::read(p)?,
                     ContentSource::Git(sha) => git_cat_file(worktree_path, sha)?,
                 };
-                cas::parse::parse(backend, &content).map_err(|e| {
-                    crate::Error::InvalidArgument(format!("parse failed: {e}"))
-                })
+                cas::parse::parse(backend, &content)
+                    .map_err(|e| crate::Error::InvalidArgument(format!("parse failed: {e}")))
             },
         )?;
         if was_fresh {
@@ -288,15 +275,18 @@ mod tests {
 
         // HEAD and branch/main anchors both point at the committed
         // manifest.
-        let head = anchor::resolve(&conn, &AnchorName::head()).unwrap().unwrap();
-        let br = anchor::resolve(&conn, &AnchorName::branch("main")).unwrap().unwrap();
+        let head = anchor::resolve(&conn, &AnchorName::head())
+            .unwrap()
+            .unwrap();
+        let br = anchor::resolve(&conn, &AnchorName::branch("main"))
+            .unwrap()
+            .unwrap();
         assert_eq!(head, outcome.committed_manifest);
         assert_eq!(br, outcome.committed_manifest);
 
-        let tent =
-            anchor::resolve(&conn, &AnchorName::tentative(outcome.worktree_id))
-                .unwrap()
-                .unwrap();
+        let tent = anchor::resolve(&conn, &AnchorName::tentative(outcome.worktree_id))
+            .unwrap()
+            .unwrap();
         assert_eq!(tent, outcome.tentative_manifest);
 
         // A symbol named `greet` was indexed against some blob in the
@@ -350,11 +340,9 @@ mod tests {
 
         // The extra file's content was parsed too (= fresh blob).
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE name = 'g'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM symbols WHERE name = 'g'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(count >= 1);
     }

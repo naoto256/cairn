@@ -38,9 +38,7 @@ impl DataMethod for GetOutline {
 
             let raw = match query::get_outline(&conn, &anchor, &file, None) {
                 Ok(r) => r,
-                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => {
-                    Vec::new()
-                }
+                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => Vec::new(),
                 Err(other) => return Err(other),
             };
             Ok(raw.into_iter().map(into_wire_item).collect())
