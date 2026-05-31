@@ -59,7 +59,11 @@ pub async fn run(args: Args) -> Result<()> {
 
     let daemon = Daemon {
         paths,
-        data_handler: Arc::new(DataRpc::new(storage.clone(), indexer.clone())),
+        data_handler: Arc::new(DataRpc::new(
+            storage.clone(),
+            indexer.clone(),
+            cas_data_dir.clone(),
+        )),
         control_handler: Arc::new(CtlHandler::new(
             indexer,
             storage.clone(),
