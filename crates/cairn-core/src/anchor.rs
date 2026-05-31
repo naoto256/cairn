@@ -49,20 +49,22 @@ impl AnchorName {
         &self.0
     }
 
-    /// Parsed view of what the name represents.
+    /// Parsed view of what the name represents. Returns `None` for
+    /// names that don't match one of the four standard prefixes —
+    /// future anchor kinds get explicit variants rather than a
+    /// catch-all.
     #[must_use]
-    pub fn kind(&self) -> AnchorKind {
+    pub fn kind(&self) -> Option<AnchorKind> {
         if self.0 == "HEAD" {
-            AnchorKind::Head
+            Some(AnchorKind::Head)
         } else if let Some(name) = self.0.strip_prefix("branch/") {
-            AnchorKind::Branch(name.to_string())
+            Some(AnchorKind::Branch(name.to_string()))
         } else if let Some(name) = self.0.strip_prefix("tag/") {
-            AnchorKind::Tag(name.to_string())
+            Some(AnchorKind::Tag(name.to_string()))
         } else if let Some(rest) = self.0.strip_prefix("tentative/") {
-            rest.parse::<i64>()
-                .map_or(AnchorKind::Other(self.0.clone()), AnchorKind::Tentative)
+            rest.parse::<i64>().ok().map(AnchorKind::Tentative)
         } else {
-            AnchorKind::Other(self.0.clone())
+            None
         }
     }
 }
@@ -79,9 +81,6 @@ pub enum AnchorKind {
     Tag(String),
     Head,
     Tentative(i64),
-    /// Names that don't fit the standard prefixes — preserved so the
-    /// loader doesn't silently lose data on schema evolution.
-    Other(String),
 }
 
 /// One row from the `anchors` table.
@@ -210,35 +209,31 @@ mod tests {
 
     #[test]
     fn name_constructors_roundtrip_to_kind() {
-        assert_eq!(AnchorName::head().kind(), AnchorKind::Head);
+        assert_eq!(AnchorName::head().kind(), Some(AnchorKind::Head));
         assert_eq!(
             AnchorName::branch("main").kind(),
-            AnchorKind::Branch("main".into())
+            Some(AnchorKind::Branch("main".into()))
         );
         assert_eq!(
             AnchorName::tag("v1.0").kind(),
-            AnchorKind::Tag("v1.0".into())
+            Some(AnchorKind::Tag("v1.0".into()))
         );
         assert_eq!(
             AnchorName::tentative(7).kind(),
-            AnchorKind::Tentative(7)
+            Some(AnchorKind::Tentative(7))
         );
-        // Names that don't fit the prefixes preserve themselves.
-        let nameless = AnchorName::from("weird-anchor".to_string());
-        assert_eq!(
-            nameless.kind(),
-            AnchorKind::Other("weird-anchor".to_string())
-        );
-        // Tentative with non-numeric id falls back to Other (defensive).
-        let bad = AnchorName::from("tentative/oops".to_string());
-        assert_eq!(bad.kind(), AnchorKind::Other("tentative/oops".to_string()));
+        // Names that don't fit the prefixes report None — future
+        // anchor kinds add explicit variants instead of being silently
+        // absorbed.
+        assert_eq!(AnchorName::from("weird-anchor".to_string()).kind(), None);
+        assert_eq!(AnchorName::from("tentative/oops".to_string()).kind(), None);
     }
 
     #[test]
     fn branch_name_with_slashes_roundtrips() {
         let n = AnchorName::branch("release/0.1.0");
         assert_eq!(n.as_str(), "branch/release/0.1.0");
-        assert_eq!(n.kind(), AnchorKind::Branch("release/0.1.0".into()));
+        assert_eq!(n.kind(), Some(AnchorKind::Branch("release/0.1.0".into())));
     }
 
     #[test]
