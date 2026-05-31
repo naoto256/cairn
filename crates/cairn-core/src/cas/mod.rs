@@ -5,5 +5,10 @@
 //! modules) build on the same connection to map paths and refs onto
 //! blob_shas.
 
+pub mod blob;
+pub mod hash;
 pub mod schema;
 pub mod store;
+
+pub use blob::{BlobMeta, ParsedData};
+pub use hash::git_blob_sha;
