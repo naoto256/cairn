@@ -12,7 +12,7 @@
 use cairn_lang_api::Visibility;
 use cairn_proto::common::{RefKind, SymbolKind};
 use cairn_proto::methods::ReferenceDirection;
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
@@ -210,6 +210,77 @@ fn run_find_references(
             }
         }
     }
+}
+
+// ─── get_outline ──────────────────────────────────────────────────────────
+
+/// One outline entry for a single file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineItem {
+    pub name: String,
+    pub qualified: String,
+    pub kind: SymbolKind,
+    pub signature: Option<String>,
+    pub doc: Option<String>,
+    pub line: u32,
+}
+
+/// Return every symbol in `file` from the manifest at `anchor`, in
+/// line order. `parser_id` filters to one backend's output — typically
+/// the daemon picks it from the file extension and passes it in.
+///
+/// # Errors
+/// `Error::InvalidArgument` when the anchor doesn't resolve; SQLite
+/// errors otherwise.
+pub fn get_outline(
+    conn: &Connection,
+    anchor: &AnchorName,
+    file: &str,
+    parser_id: Option<&str>,
+) -> Result<Vec<OutlineItem>> {
+    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
+        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
+    })?;
+
+    let blob_sha: Option<String> = conn
+        .query_row(
+            "SELECT blob_sha FROM manifest_entries
+             WHERE manifest_id = ?1 AND path = ?2",
+            rusqlite::params![manifest_id.0, file],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(blob_sha) = blob_sha else {
+        return Ok(Vec::new());
+    };
+
+    let mut sql = String::from(
+        "SELECT name, qualified, kind, signature, doc, line_start
+           FROM symbols
+          WHERE blob_sha = ?1",
+    );
+    let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(blob_sha)];
+    if let Some(pid) = parser_id {
+        sql.push_str(" AND parser_id = ?");
+        bound.push(Box::new(pid.to_string()));
+    }
+    sql.push_str(" ORDER BY line_start");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+    let rows: rusqlite::Result<Vec<OutlineItem>> = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(OutlineItem {
+                name: row.get(0)?,
+                qualified: row.get(1)?,
+                kind: symbol_kind_from_str(&row.get::<_, String>(2)?),
+                signature: row.get(3)?,
+                doc: row.get(4)?,
+                line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+            })
+        })?
+        .collect();
+    Ok(rows?)
 }
 
 // ─── find_imports ─────────────────────────────────────────────────────────
