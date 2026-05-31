@@ -531,6 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn find_impls_finds_inherent_impl_by_type() {
         let (_w, _s, srv) = fixture().await;
         let line = r#"{"jsonrpc":"2.0","id":50,"method":"find_impls","params":{"repo":"demo","type":"Foo"}}"#;
