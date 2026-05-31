@@ -27,6 +27,7 @@ pub mod indexer;
 pub mod manifest;
 pub mod migration;
 pub mod paths;
+pub mod query;
 pub mod register;
 pub mod registry_db;
 pub mod snapshot_stats;
