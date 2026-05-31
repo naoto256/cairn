@@ -24,6 +24,8 @@ tracing.workspace = true
 dirs.workspace = true
 async-trait = "0.1"
 linkme.workspace = true
+sha1.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

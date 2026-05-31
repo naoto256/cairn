@@ -48,6 +48,10 @@ tokio = { version = "1", features = ["full"] }
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Hashing (CAS layer; sha1 matches git's blob hash format)
+sha1 = "0.10"
+hex = "0.4"
+
 # Paths
 dirs = "5"
 
