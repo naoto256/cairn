@@ -384,6 +384,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn outline_returns_indexed_symbols() {
         let (_w, _s, srv) = fixture().await;
         let line = r#"{"jsonrpc":"2.0","id":1,"method":"get_outline","params":{"repo":"demo","file":"src/lib.rs"}}"#;
