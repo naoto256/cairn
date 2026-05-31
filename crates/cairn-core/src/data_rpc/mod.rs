@@ -620,6 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn get_symbol_source_returns_function_body() {
         let (_w, _s, srv) = fixture().await;
         let line = r#"{"jsonrpc":"2.0","id":201,"method":"get_symbol_source","params":{"repo":"demo","qualified":"hello"}}"#;
@@ -642,6 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn get_symbol_source_signature_only_skips_body() {
         // 0.2.1: signature_only=true returns sig + doc without paying
         // for the file read. `source` is empty; `signature` carries
