@@ -245,7 +245,7 @@ fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_cat_file(repo_root: &Path, blob_sha: &str) -> std::io::Result<Vec<u8>> {
+pub(crate) fn git_cat_file(repo_root: &Path, blob_sha: &str) -> std::io::Result<Vec<u8>> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo_root)
