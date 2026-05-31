@@ -10,13 +10,13 @@
 
 use std::collections::HashMap;
 
-use cairn_lang_api::{
-    ImportFact, RefFact, RefKind, SemanticFacts, SymbolFact, SymbolKind, SyntacticFacts, TypeRole,
-    Visibility,
-};
+use cairn_lang_api::{ImportFact, RefFact, SemanticFacts, SymbolFact, SyntacticFacts};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::Result;
+use crate::cas::kind_conv::{
+    ref_kind_to_str, symbol_kind_to_str, type_role_to_str, visibility_to_str,
+};
 
 /// Everything one parser produces for one blob.
 #[derive(Debug, Clone, Default)]
@@ -309,76 +309,12 @@ fn resolve_enclosing(
         })
 }
 
-fn symbol_kind_to_str(kind: &SymbolKind) -> String {
-    match kind {
-        SymbolKind::Function => "function".into(),
-        SymbolKind::Method => "method".into(),
-        SymbolKind::Constructor => "constructor".into(),
-        SymbolKind::Getter => "getter".into(),
-        SymbolKind::Setter => "setter".into(),
-        SymbolKind::Class => "class".into(),
-        SymbolKind::Struct => "struct".into(),
-        SymbolKind::Enum => "enum".into(),
-        SymbolKind::Union => "union".into(),
-        SymbolKind::Trait => "trait".into(),
-        SymbolKind::Impl => "impl".into(),
-        SymbolKind::Interface => "interface".into(),
-        SymbolKind::TypeAlias => "type_alias".into(),
-        SymbolKind::Field => "field".into(),
-        SymbolKind::Property => "property".into(),
-        SymbolKind::Constant => "constant".into(),
-        SymbolKind::Variable => "variable".into(),
-        SymbolKind::Parameter => "parameter".into(),
-        SymbolKind::Module => "module".into(),
-        SymbolKind::Namespace => "namespace".into(),
-        SymbolKind::Package => "package".into(),
-        SymbolKind::Macro => "macro".into(),
-        SymbolKind::Test => "test".into(),
-        SymbolKind::Section => "section".into(),
-        SymbolKind::Other(s) => s.clone(),
-    }
-}
-
-fn visibility_to_str(v: Visibility) -> &'static str {
-    match v {
-        Visibility::Public => "public",
-        Visibility::Crate => "crate",
-        Visibility::Private => "private",
-    }
-}
-
-fn ref_kind_to_str(k: RefKind) -> &'static str {
-    match k {
-        RefKind::Call => "call",
-        RefKind::Type => "type",
-        RefKind::Import => "import",
-        RefKind::Instantiate => "instantiate",
-        RefKind::Read => "read",
-        RefKind::Write => "write",
-        RefKind::Override => "override",
-        RefKind::MacroInvoke => "macro_invoke",
-        RefKind::Annotation => "annotation",
-    }
-}
-
-fn type_role_to_str(r: TypeRole) -> &'static str {
-    match r {
-        TypeRole::Param => "param",
-        TypeRole::Return => "return",
-        TypeRole::Field => "field",
-        TypeRole::Local => "local",
-        TypeRole::Bound => "bound",
-        TypeRole::GenericArg => "generic_arg",
-        TypeRole::Alias => "alias",
-        TypeRole::Cast => "cast",
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cas::store;
-    use cairn_lang_api::{DocOverride, ImportFact, RefFact, SymbolFact};
+    use cairn_lang_api::{DocOverride, ImportFact, RefFact, RefKind, SymbolFact, SymbolKind};
 
     fn fresh() -> (tempfile::TempDir, Connection) {
         let tmp = tempfile::tempdir().unwrap();

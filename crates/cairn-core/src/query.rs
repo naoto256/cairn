@@ -15,6 +15,7 @@ use rusqlite::{Connection, ToSql};
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
+use crate::cas::kind_conv::{symbol_kind_from_str, visibility_from_str};
 use crate::manifest::ManifestId;
 
 /// One symbol hit. Mirrors the public-fact subset of
@@ -152,44 +153,6 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
         line: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
         blob_sha: row.get(8)?,
     })
-}
-
-fn symbol_kind_from_str(s: &str) -> SymbolKind {
-    match s {
-        "function" => SymbolKind::Function,
-        "method" => SymbolKind::Method,
-        "constructor" => SymbolKind::Constructor,
-        "getter" => SymbolKind::Getter,
-        "setter" => SymbolKind::Setter,
-        "class" => SymbolKind::Class,
-        "struct" => SymbolKind::Struct,
-        "enum" => SymbolKind::Enum,
-        "union" => SymbolKind::Union,
-        "trait" => SymbolKind::Trait,
-        "impl" => SymbolKind::Impl,
-        "interface" => SymbolKind::Interface,
-        "type_alias" => SymbolKind::TypeAlias,
-        "field" => SymbolKind::Field,
-        "property" => SymbolKind::Property,
-        "constant" => SymbolKind::Constant,
-        "variable" => SymbolKind::Variable,
-        "parameter" => SymbolKind::Parameter,
-        "module" => SymbolKind::Module,
-        "namespace" => SymbolKind::Namespace,
-        "package" => SymbolKind::Package,
-        "macro" => SymbolKind::Macro,
-        "test" => SymbolKind::Test,
-        "section" => SymbolKind::Section,
-        other => SymbolKind::Other(other.to_string()),
-    }
-}
-
-fn visibility_from_str(s: &str) -> Visibility {
-    match s {
-        "public" => Visibility::Public,
-        "crate" => Visibility::Crate,
-        _ => Visibility::Private,
-    }
 }
 
 #[cfg(test)]

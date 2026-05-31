@@ -7,6 +7,7 @@
 
 pub mod blob;
 pub mod hash;
+pub mod kind_conv;
 pub mod parse;
 pub mod registry;
 pub mod schema;
