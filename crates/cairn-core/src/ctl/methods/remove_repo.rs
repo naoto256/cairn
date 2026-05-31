@@ -1,7 +1,5 @@
-//! `remove_repo` — stop the watcher, drop the registry rows, delete
-//! the on-disk snapshot files.
-
-use std::path::PathBuf;
+//! `remove_repo` — drop the alias entry and delete the per-repo
+//! CAS store on disk.
 
 use cairn_proto::control::{Ack, RemoveRepoArgs};
 use linkme::distributed_slice;
@@ -9,7 +7,8 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
-use crate::{Error, Result, registry_db};
+use crate::cas::registry as cas_registry;
+use crate::{Error, Result};
 
 struct RemoveRepo;
 
@@ -21,42 +20,34 @@ impl ControlMethod for RemoveRepo {
 
     async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
         let args: RemoveRepoArgs = parse_params(params)?;
-        // Stop the live watcher first — inflight events would
-        // otherwise race the registry teardown.
-        ctx.watcher.stop(&args.alias).await;
+        let cas_data_dir = ctx.cas_data_dir.clone();
+        let alias = args.alias.clone();
 
-        let alias_owned = args.alias.clone();
-        let data_dir = ctx.storage.data_dir.clone();
-        let result = ctx
-            .storage
-            .with_registry(move |conn| {
-                let Some(repo) = registry_db::find_repo_by_alias(conn, &alias_owned)? else {
-                    return Ok::<_, Error>(None);
-                };
-                let mut snap_paths: Vec<PathBuf> = Vec::new();
-                for wt in registry_db::list_worktrees(conn, repo.id)? {
-                    for snap in registry_db::list_snapshots(conn, wt.id)? {
-                        snap_paths.push(data_dir.snapshot_db_path(
-                            &repo.repo_hash,
-                            &wt.worktree_hash,
-                            &snap.branch,
-                        ));
-                    }
-                }
-                registry_db::delete_repo(conn, &alias_owned)?;
-                Ok(Some(snap_paths))
-            })
-            .await?;
+        let removed = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let Some(entry) = cas_registry::lookup_by_alias(&index, &alias)? else {
+                return Ok(false);
+            };
+            let tx = index.transaction()?;
+            cas_registry::delete(&tx, &alias)?;
+            tx.commit()?;
 
-        let Some(paths) = result else {
-            return Err(Error::InvalidArgument(format!("no repo `{}`", args.alias)));
-        };
-        for p in paths {
-            if let Err(e) = std::fs::remove_file(&p)
+            let repo_dir = cas_data_dir.repo_dir(&entry.repo_hash);
+            if let Err(e) = std::fs::remove_dir_all(&repo_dir)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                warn!(path = %p.display(), error = %e, "failed to remove snapshot file");
+                warn!(path = %repo_dir.display(), error = %e, "failed to remove repo dir");
             }
+            Ok(true)
+        })
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("remove_repo task panicked: {e}")))??;
+
+        if !removed {
+            return Err(Error::InvalidArgument(format!(
+                "no repo `{}`",
+                args.alias
+            )));
         }
         Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
     }
