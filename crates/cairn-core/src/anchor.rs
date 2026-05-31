@@ -1,0 +1,351 @@
+//! Anchor layer: named pointers to manifests.
+//!
+//! An anchor names a git-shaped reference (`branch/<name>`,
+//! `tag/<name>`, `HEAD`, `tentative/<worktree_id>`) and binds it to
+//! one `manifest_id`. The query layer resolves an anchor to a
+//! manifest, then resolves the manifest's `(path, blob_sha)` pairs
+//! to blob-keyed parsed data.
+
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+
+use crate::Result;
+use crate::manifest::ManifestId;
+
+/// Anchor naming convention. The string form is what the `anchors`
+/// table stores in `anchor_name`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnchorName(String);
+
+impl AnchorName {
+    /// `branch/<name>` — moves with the branch tip.
+    #[must_use]
+    pub fn branch(name: &str) -> Self {
+        Self(format!("branch/{name}"))
+    }
+
+    /// `tag/<name>` — immutable in practice.
+    #[must_use]
+    pub fn tag(name: &str) -> Self {
+        Self(format!("tag/{name}"))
+    }
+
+    /// The repo's current HEAD. Always present once a repo is
+    /// registered.
+    #[must_use]
+    pub fn head() -> Self {
+        Self("HEAD".to_string())
+    }
+
+    /// `tentative/<worktree_id>` — reflects worktree state. One per
+    /// registered worktree.
+    #[must_use]
+    pub fn tentative(worktree_id: i64) -> Self {
+        Self(format!("tentative/{worktree_id}"))
+    }
+
+    /// Raw stored form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parsed view of what the name represents.
+    #[must_use]
+    pub fn kind(&self) -> AnchorKind {
+        if self.0 == "HEAD" {
+            AnchorKind::Head
+        } else if let Some(name) = self.0.strip_prefix("branch/") {
+            AnchorKind::Branch(name.to_string())
+        } else if let Some(name) = self.0.strip_prefix("tag/") {
+            AnchorKind::Tag(name.to_string())
+        } else if let Some(rest) = self.0.strip_prefix("tentative/") {
+            rest.parse::<i64>()
+                .map_or(AnchorKind::Other(self.0.clone()), AnchorKind::Tentative)
+        } else {
+            AnchorKind::Other(self.0.clone())
+        }
+    }
+}
+
+impl From<String> for AnchorName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorKind {
+    Branch(String),
+    Tag(String),
+    Head,
+    Tentative(i64),
+    /// Names that don't fit the standard prefixes — preserved so the
+    /// loader doesn't silently lose data on schema evolution.
+    Other(String),
+}
+
+/// One row from the `anchors` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub name: AnchorName,
+    pub manifest_id: ManifestId,
+    pub last_updated_ns: i64,
+}
+
+/// Upsert an anchor. If `name` already exists, its `manifest_id` and
+/// `last_updated_ns` are replaced.
+///
+/// # Errors
+/// SQLite failure (including FK violation if `manifest_id` doesn't
+/// exist).
+pub fn set(
+    tx: &Transaction<'_>,
+    name: &AnchorName,
+    manifest_id: ManifestId,
+    last_updated_ns: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(anchor_name) DO UPDATE SET
+             manifest_id = excluded.manifest_id,
+             last_updated_ns = excluded.last_updated_ns",
+        params![name.as_str(), manifest_id.0, last_updated_ns],
+    )?;
+    Ok(())
+}
+
+/// Look up one anchor by name. Returns `Ok(None)` if absent.
+///
+/// # Errors
+/// SQLite failure.
+pub fn get(conn: &Connection, name: &AnchorName) -> Result<Option<Anchor>> {
+    Ok(conn
+        .query_row(
+            "SELECT anchor_name, manifest_id, last_updated_ns
+             FROM anchors WHERE anchor_name = ?1",
+            params![name.as_str()],
+            row_to_anchor,
+        )
+        .optional()?)
+}
+
+/// Convenience: resolve an anchor straight to its `manifest_id`.
+///
+/// # Errors
+/// SQLite failure.
+pub fn resolve(conn: &Connection, name: &AnchorName) -> Result<Option<ManifestId>> {
+    Ok(get(conn, name)?.map(|a| a.manifest_id))
+}
+
+/// All anchors in storage, ordered by name.
+///
+/// # Errors
+/// SQLite failure.
+pub fn list_all(conn: &Connection) -> Result<Vec<Anchor>> {
+    let mut stmt = conn.prepare(
+        "SELECT anchor_name, manifest_id, last_updated_ns
+         FROM anchors ORDER BY anchor_name",
+    )?;
+    let rows: rusqlite::Result<Vec<Anchor>> = stmt.query_map([], row_to_anchor)?.collect();
+    Ok(rows?)
+}
+
+/// All anchors whose name starts with `prefix` (e.g. `"branch/"` to
+/// enumerate every branch anchor).
+///
+/// # Errors
+/// SQLite failure.
+pub fn list_prefix(conn: &Connection, prefix: &str) -> Result<Vec<Anchor>> {
+    let mut stmt = conn.prepare(
+        "SELECT anchor_name, manifest_id, last_updated_ns
+         FROM anchors WHERE anchor_name LIKE ?1 || '%' ORDER BY anchor_name",
+    )?;
+    let rows: rusqlite::Result<Vec<Anchor>> = stmt.query_map([prefix], row_to_anchor)?.collect();
+    Ok(rows?)
+}
+
+/// Remove an anchor. Returns `true` if a row was deleted.
+///
+/// # Errors
+/// SQLite failure.
+pub fn delete(tx: &Transaction<'_>, name: &AnchorName) -> Result<bool> {
+    let n = tx.execute(
+        "DELETE FROM anchors WHERE anchor_name = ?1",
+        params![name.as_str()],
+    )?;
+    Ok(n > 0)
+}
+
+fn row_to_anchor(r: &rusqlite::Row<'_>) -> rusqlite::Result<Anchor> {
+    Ok(Anchor {
+        name: AnchorName(r.get::<_, String>(0)?),
+        manifest_id: ManifestId(r.get::<_, i64>(1)?),
+        last_updated_ns: r.get::<_, i64>(2)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cas::store;
+    use rusqlite::params;
+
+    fn fresh() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = store::open(&tmp.path().join("store.db")).unwrap();
+        (tmp, conn)
+    }
+
+    /// Insert a placeholder manifest row so anchors have something to
+    /// point at. Returns its id.
+    fn placeholder_manifest(tx: &Transaction<'_>, kind: &str) -> ManifestId {
+        tx.execute(
+            "INSERT INTO manifests (kind, built_at_ns) VALUES (?1, 0)",
+            params![kind],
+        )
+        .unwrap();
+        ManifestId(tx.last_insert_rowid())
+    }
+
+    #[test]
+    fn name_constructors_roundtrip_to_kind() {
+        assert_eq!(AnchorName::head().kind(), AnchorKind::Head);
+        assert_eq!(
+            AnchorName::branch("main").kind(),
+            AnchorKind::Branch("main".into())
+        );
+        assert_eq!(
+            AnchorName::tag("v1.0").kind(),
+            AnchorKind::Tag("v1.0".into())
+        );
+        assert_eq!(
+            AnchorName::tentative(7).kind(),
+            AnchorKind::Tentative(7)
+        );
+        // Names that don't fit the prefixes preserve themselves.
+        let nameless = AnchorName::from("weird-anchor".to_string());
+        assert_eq!(
+            nameless.kind(),
+            AnchorKind::Other("weird-anchor".to_string())
+        );
+        // Tentative with non-numeric id falls back to Other (defensive).
+        let bad = AnchorName::from("tentative/oops".to_string());
+        assert_eq!(bad.kind(), AnchorKind::Other("tentative/oops".to_string()));
+    }
+
+    #[test]
+    fn branch_name_with_slashes_roundtrips() {
+        let n = AnchorName::branch("release/0.1.0");
+        assert_eq!(n.as_str(), "branch/release/0.1.0");
+        assert_eq!(n.kind(), AnchorKind::Branch("release/0.1.0".into()));
+    }
+
+    #[test]
+    fn set_then_get_returns_anchor() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let mid = placeholder_manifest(&tx, "committed");
+        let name = AnchorName::head();
+        set(&tx, &name, mid, 1234).unwrap();
+        tx.commit().unwrap();
+
+        let got = get(&c, &name).unwrap().unwrap();
+        assert_eq!(got.name, name);
+        assert_eq!(got.manifest_id, mid);
+        assert_eq!(got.last_updated_ns, 1234);
+    }
+
+    #[test]
+    fn get_returns_none_for_missing() {
+        let (_tmp, c) = fresh();
+        assert!(get(&c, &AnchorName::branch("nope")).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_upserts_existing_anchor() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m1 = placeholder_manifest(&tx, "committed");
+        let m2 = placeholder_manifest(&tx, "committed");
+        let name = AnchorName::branch("main");
+        set(&tx, &name, m1, 100).unwrap();
+        set(&tx, &name, m2, 200).unwrap();
+        tx.commit().unwrap();
+
+        let got = get(&c, &name).unwrap().unwrap();
+        assert_eq!(got.manifest_id, m2);
+        assert_eq!(got.last_updated_ns, 200);
+    }
+
+    #[test]
+    fn resolve_returns_manifest_id_directly() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let mid = placeholder_manifest(&tx, "tentative");
+        set(&tx, &AnchorName::tentative(42), mid, 0).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            resolve(&c, &AnchorName::tentative(42)).unwrap(),
+            Some(mid)
+        );
+    }
+
+    #[test]
+    fn list_all_returns_sorted() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "committed");
+        set(&tx, &AnchorName::head(), m, 0).unwrap();
+        set(&tx, &AnchorName::branch("main"), m, 0).unwrap();
+        set(&tx, &AnchorName::branch("dev"), m, 0).unwrap();
+        set(&tx, &AnchorName::tag("v0"), m, 0).unwrap();
+        tx.commit().unwrap();
+
+        let names: Vec<String> = list_all(&c)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name.as_str().to_string())
+            .collect();
+        assert_eq!(names, vec!["HEAD", "branch/dev", "branch/main", "tag/v0"]);
+    }
+
+    #[test]
+    fn list_prefix_filters_by_kind() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "committed");
+        set(&tx, &AnchorName::head(), m, 0).unwrap();
+        set(&tx, &AnchorName::branch("main"), m, 0).unwrap();
+        set(&tx, &AnchorName::branch("dev"), m, 0).unwrap();
+        set(&tx, &AnchorName::tag("v0"), m, 0).unwrap();
+        tx.commit().unwrap();
+
+        let branches = list_prefix(&c, "branch/").unwrap();
+        assert_eq!(branches.len(), 2);
+        let tags = list_prefix(&c, "tag/").unwrap();
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[test]
+    fn delete_removes_one_and_reports() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "tentative");
+        set(&tx, &AnchorName::head(), m, 0).unwrap();
+        let dropped = delete(&tx, &AnchorName::head()).unwrap();
+        assert!(dropped);
+        let again = delete(&tx, &AnchorName::head()).unwrap();
+        assert!(!again);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn set_rejects_missing_manifest_via_fk() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let err = set(&tx, &AnchorName::head(), ManifestId(9999), 0).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("foreign"));
+    }
+}

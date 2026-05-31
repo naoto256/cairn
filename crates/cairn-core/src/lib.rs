@@ -17,6 +17,7 @@
 // crates with the ENTRIES (this one) cannot.
 #![deny(unsafe_code)]
 
+pub mod anchor;
 pub mod cas;
 pub mod ctl;
 pub mod daemon;
