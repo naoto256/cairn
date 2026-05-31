@@ -1,0 +1,20 @@
+[package]
+name = "cairn-lang-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Trait surface and registry for Cairn language backends."
+
+[dependencies]
+cairn-proto.workspace = true
+linkme.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

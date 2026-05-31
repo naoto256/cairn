@@ -1,0 +1,18 @@
+[package]
+name = "cairn-lang-treesitter-generic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Generic tree-sitter floor: syntactic extraction shared across all languages."
+
+[dependencies]
+cairn-lang-api.workspace = true
+tree-sitter.workspace = true
+
+[lints]
+workspace = true

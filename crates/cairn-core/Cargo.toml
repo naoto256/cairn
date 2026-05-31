@@ -1,0 +1,37 @@
+[package]
+name = "cairn-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Core daemon: SQLite indexes, parser pool, query engine, MCP/control dispatch."
+
+[dependencies]
+cairn-proto.workspace = true
+cairn-lang-api.workspace = true
+cairn-watch.workspace = true
+tokio.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+async-trait = "0.1"
+linkme.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+cairn-lang-rust.workspace = true
+cairn-lang-python.workspace = true
+# markdown is a genuinely syntactic-only backend (no analyzer); used in
+# tests to exercise the Syntactic → Completeness::Partial wiring.
+cairn-lang-markdown.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,35 @@
+/target/
+
+# Local-only working memos (TODO / DESIGN drafts / handoff notes).
+# Per the global convention these are prefixed with `_` and stay
+# off-disk. Global gitignore already handles `_uchgs-*` artifacts.
+_*.md
+
+# Audit receipts written by the code-audit skill (local-only).
+.audit/
+
+# Sub-agent isolated worktrees created by the Claude harness.
+.claude/worktrees/
+**/.claude/settings.local.json
+
+# Local development scaffolding (scratch experiments, ad-hoc
+# benchmarks). Release-candidate fixtures go under tests/fixtures/.
+.scratch/
+
+# Local SQLite stores used during development. CodeCairn writes
+# real indexes under the OS data dir, but devs may keep throwaway
+# DBs in the tree for iteration.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets — never commit. `.env.example` is the documented escape
+# hatch for example files.
+.env
+.env.*
+!.env.example
+*.pem
+*.key

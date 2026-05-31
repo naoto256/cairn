@@ -1,0 +1,94 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cairn-cli",
+    "crates/cairn-core",
+    "crates/cairn-proto",
+    "crates/cairn-lang-api",
+    "crates/cairn-lang-treesitter-generic",
+    "crates/cairn-lang-rust",
+    "crates/cairn-lang-python",
+    "crates/cairn-lang-markdown",
+    "crates/cairn-watch",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Naoto Morishima"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naoto256/cairn"
+homepage = "https://github.com/naoto256/cairn"
+readme = "README.md"
+
+[workspace.lints.rust]
+# `deny` (not `forbid`) at workspace scope so a crate that has a
+# legitimate need for `#[allow(unsafe_code)]` (e.g. the linker-
+# section attribute `linkme::distributed_slice` expands to on its
+# entries) can opt in locally. Crates that write no unsafe code of
+# their own still set `#![forbid(unsafe_code)]` at their crate root
+# for the absolute guarantee.
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Default clippy ("all" group: correctness + suspicious + complexity
+# + perf + style) is what CI denies on. We do NOT opt into `pedantic`
+# at the workspace level — pedantic mixes useful warnings (e.g.
+# `missing_errors_doc`) with noisy style preferences (e.g.
+# `doc_markdown`, `useless_format`) at a frequency that makes
+# `-D warnings` unworkable mid-development. Crates may opt in
+# individually if they want stricter enforcement.
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Paths
+dirs = "5"
+
+# Filesystem & git
+notify = "7"
+notify-debouncer-full = "0.4"
+ignore = "0.4"
+
+# Parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-md = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors & logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linker-time plugin registry (static linking only)
+linkme = "0.3"
+
+# Argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+cairn-core = { path = "crates/cairn-core" }
+cairn-proto = { path = "crates/cairn-proto" }
+cairn-lang-api = { path = "crates/cairn-lang-api" }
+cairn-lang-treesitter-generic = { path = "crates/cairn-lang-treesitter-generic" }
+cairn-lang-rust = { path = "crates/cairn-lang-rust" }
+cairn-lang-python = { path = "crates/cairn-lang-python" }
+cairn-lang-markdown = { path = "crates/cairn-lang-markdown" }
+cairn-watch = { path = "crates/cairn-watch" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

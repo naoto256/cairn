@@ -1,0 +1,41 @@
+[package]
+name = "cairn-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Cairn: daemon, serve relay, and management CLI."
+
+[[bin]]
+name = "cairn"
+path = "src/main.rs"
+
+[dependencies]
+cairn-core.workspace = true
+cairn-lang-api.workspace = true
+cairn-proto.workspace = true
+# Pull language backends into the link line so linkme's distributed
+# slice picks up their registration constructors. The crates themselves
+# do not need to be referenced from Rust code.
+cairn-lang-rust.workspace = true
+cairn-lang-python.workspace = true
+cairn-lang-markdown.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"
+linkme.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "cairn-lang-markdown"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Markdown backend: extracts H1-H6 headings as section symbols so outline / find_symbol can navigate docs alongside code."
+
+[dependencies]
+cairn-lang-api.workspace = true
+cairn-lang-treesitter-generic.workspace = true
+tree-sitter.workspace = true
+tree-sitter-md.workspace = true
+linkme.workspace = true
+
+[lints]
+workspace = true

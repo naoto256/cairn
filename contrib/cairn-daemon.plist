@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent unit for the Cairn daemon.
+
+  Install:
+    cp contrib/cairn-daemon.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/cairn-daemon.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/cairn-daemon.plist
+
+  Edit `/usr/local/bin/cairn` below if you installed the binary somewhere
+  else (e.g. ~/.cargo/bin/cairn). LaunchAgents do not expand $HOME / ~ in
+  paths, so an absolute path is required.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.cairn.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/cairn</string>
+        <string>daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cairn-daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cairn-daemon.err.log</string>
+</dict>
+</plist>

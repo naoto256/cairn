@@ -1,0 +1,438 @@
+//! `cairn mcp` — stdio MCP front-end.
+//!
+//! Spawned by an MCP client (typically Claude Code) per session. Speaks
+//! the full MCP protocol on stdin/stdout, and translates each tool
+//! invocation into the appropriate underlying request on the daemon:
+//!
+//! - data-plane tools (`get_outline`, `find_symbols`, `find_impls`,
+//!   `find_imports`, `list_repos`) → plain JSON-RPC on `cairn.sock`.
+//! - admin tools (`register_repo`, `reindex_repo`) → control
+//!   protocol on `control.sock`.
+//!
+//! This separation lets out-of-tree consumers (cairn-graph,
+//! cairn-audit, IDE plugins, a future `cairn-lsp` binary) talk to the
+//! daemon over plain JSON-RPC without dragging along MCP types they
+//! have no use for; MCP framing lives entirely in this module.
+//!
+//! Each MCP tool is its own module under [`tools`] and registers
+//! itself into the [`MCP_TOOLS`] distributed slice. Adding a new tool
+//! is a one-file change: write a `struct Foo; impl McpTool for Foo`,
+//! drop a `#[distributed_slice]` entry, and the front-end picks it up.
+
+mod tools;
+mod types;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use self::types::{
+    ContentBlock, InitializeResult, ServerCapabilities, ServerInfo, ToolSpec, ToolsCallParams,
+    ToolsCallResult, ToolsCapability, ToolsListResult,
+};
+use anyhow::Result;
+use cairn_core::sockets::SocketPaths;
+use cairn_proto::jsonrpc::{
+    JsonRpcVersion, Request as RpcRequest, RequestId, Response as RpcResponse, ResponseError,
+    error_code,
+};
+use clap::Args as ClapArgs;
+use linkme::distributed_slice;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const SERVER_NAME: &str = "cairn";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ─── tool trait + registry ─────────────────────────────────────────────────
+
+/// One MCP tool. Each implementer lives in [`tools`] and contributes
+/// a constructor to [`MCP_TOOLS`] via `#[distributed_slice]`. Tools
+/// declare both their MCP-facing schema ([`McpTool::spec`]) and the
+/// runtime route their arguments turn into ([`McpTool::route`]); the
+/// shared dispatcher in this module handles the wire IO and wraps the
+/// daemon's response back into an MCP `ToolsCallResult`.
+pub trait McpTool: Send + Sync {
+    /// MCP-facing schema: tool name, description, and JSON schema for
+    /// arguments. Used in the `tools/list` response.
+    fn spec(&self) -> ToolSpec;
+
+    /// Decide where this tool's call goes. Returns either a data-plane
+    /// JSON-RPC request to send to `cairn.sock` or a control-protocol
+    /// message for `control.sock`. Returning an `Err` surfaces as
+    /// `INVALID_PARAMS` to the MCP caller.
+    fn route(&self, args: Value) -> std::result::Result<ToolRoute, String>;
+
+    /// Display order in the tool list. Lower comes first. Used so the
+    /// most-useful tools appear at the top of `tools/list` (which is
+    /// what an LLM scrolls through first).
+    fn sort_key(&self) -> i32 {
+        50
+    }
+}
+
+/// Where a tool's call goes after the front-end resolves its
+/// arguments. Both planes now speak the same JSON-RPC envelope; the
+/// only thing that differs is which socket the request lands on
+/// (and that admin responses to mutating verbs may be a generic Ack
+/// rather than a structured payload).
+pub enum ToolRoute {
+    /// Send `params` as a JSON-RPC `method` call to `cairn.sock`.
+    DataPlane { method: String, params: Value },
+    /// Send `params` as a JSON-RPC `method` call to `control.sock`.
+    Control { method: String, params: Value },
+}
+
+#[allow(unsafe_code)]
+#[distributed_slice]
+pub static MCP_TOOLS: [fn() -> Box<dyn McpTool>] = [..];
+
+/// Server-wide guidance returned in `initialize.instructions`. Sets
+/// the default tool-selection policy for the session — individual
+/// tool descriptions reinforce the same nudges at the point of use,
+/// but a model that has already started reaching for `grep` rarely
+/// re-reads a single tool's description, so the policy belongs here
+/// too.
+const SERVER_INSTRUCTIONS: &str = "\
+Cairn is a local, symbol-aware code index over the repos you've \
+registered. Reach for it before `grep` / `Read` when navigating \
+code: cairn returns the exact location, signature, and structure \
+you actually need, while `grep` / `Read` drag whole files (or \
+whole match lists) into this conversation and burn your context \
+window for content you'll mostly discard. The index is \
+always-current — the daemon's file watcher keeps it in lockstep \
+with the working tree, including branch switches and new \
+worktrees.\n\
+\n\
+1. Call `list_repos` once per session. If the repo you're in is \
+   listed, default to cairn's tools below. If it isn't, call \
+   `register_repo` once and you're set for the rest of the \
+   session (and beyond — registration persists).\n\
+\n\
+2. Replace your habitual moves:\n\
+   - `grep` for a definition → `find_symbols`\n\
+   - `Read <file>` to scan structure → `get_outline`\n\
+   - `Read <file>` to view one fn / struct → `get_symbol_source`\n\
+   - `grep \"impl X for\"` → `find_impls`\n\
+   - `grep <fn>(` for callers → `find_references`\n\
+   - `grep \"^use \"` → `find_imports`\n\
+\n\
+3. `grep` / `Read` still belong in your toolbox — for free-form \
+   text inside symbol bodies, README prose, or files cairn \
+   doesn't understand. The point is to make them the second \
+   reach, not the first.";
+
+// ─── run loop ──────────────────────────────────────────────────────────────
+
+#[derive(ClapArgs, Debug)]
+pub struct Args {
+    /// Override the runtime directory (otherwise picked from
+    /// $XDG_RUNTIME_DIR / ~/Library/Caches).
+    #[arg(long)]
+    pub runtime_dir: Option<PathBuf>,
+}
+
+pub async fn run(args: Args) -> Result<()> {
+    let paths = match args.runtime_dir {
+        Some(p) => SocketPaths::with_runtime_dir(p),
+        None => SocketPaths::from_platform_default()?,
+    };
+    let dispatcher = Dispatcher::new(paths);
+
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut lines = BufReader::new(stdin).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(reply) = dispatcher.handle_line(&line).await {
+            stdout.write_all(reply.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+/// Per-session state: the resolved socket paths plus the tool
+/// registry materialised from [`MCP_TOOLS`].
+struct Dispatcher {
+    paths: SocketPaths,
+    tools: HashMap<String, Box<dyn McpTool>>,
+    /// Sorted tool list for `tools/list` responses (display order).
+    ordered: Vec<&'static str>,
+}
+
+impl Dispatcher {
+    fn new(paths: SocketPaths) -> Self {
+        let mut entries: Vec<Box<dyn McpTool>> = MCP_TOOLS.iter().map(|c| c()).collect();
+        entries.sort_by_key(|t| (t.sort_key(), t.spec().name));
+        let mut tools: HashMap<String, Box<dyn McpTool>> = HashMap::new();
+        let mut ordered: Vec<&'static str> = Vec::with_capacity(entries.len());
+        for t in entries {
+            let name = leak_name(t.spec().name);
+            ordered.push(name);
+            tools.insert(name.to_string(), t);
+        }
+        Self {
+            paths,
+            tools,
+            ordered,
+        }
+    }
+
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.ordered
+            .iter()
+            .filter_map(|name| self.tools.get(*name).map(|t| t.spec()))
+            .collect()
+    }
+
+    /// Dispatch one MCP line. Returns `None` for notifications (no
+    /// id, no reply expected).
+    async fn handle_line(&self, line: &str) -> Option<String> {
+        let req: RpcRequest = match serde_json::from_str::<RpcRequest>(line) {
+            Ok(r) => r,
+            Err(_) => {
+                // Could be a notification (no id). Detect that shape
+                // so we don't spam an error response.
+                let parsed = serde_json::from_str::<Value>(line).ok();
+                let has_id = parsed.as_ref().and_then(|v| v.get("id")).is_some();
+                if !has_id {
+                    return None;
+                }
+                return Some(serialize(&error_resp(
+                    RequestId::Number(0),
+                    error_code::PARSE_ERROR,
+                    "invalid JSON-RPC envelope".into(),
+                )));
+            }
+        };
+
+        let id = req.id.clone();
+        let resp = match req.method.as_str() {
+            "initialize" => RpcResponse {
+                jsonrpc: JsonRpcVersion::V2,
+                id,
+                result: Some(serde_json::to_value(initialize_result()).unwrap()),
+                error: None,
+            },
+            "notifications/initialized" => return None,
+            "tools/list" => RpcResponse {
+                jsonrpc: JsonRpcVersion::V2,
+                id,
+                result: Some(
+                    serde_json::to_value(ToolsListResult {
+                        tools: self.tool_specs(),
+                    })
+                    .unwrap(),
+                ),
+                error: None,
+            },
+            "tools/call" => {
+                let params: ToolsCallParams = match req
+                    .params
+                    .clone()
+                    .ok_or_else(|| "missing params".to_string())
+                    .and_then(|v| {
+                        serde_json::from_value(v).map_err(|e| format!("invalid params: {e}"))
+                    }) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Some(serialize(&error_resp(id, error_code::INVALID_PARAMS, e)));
+                    }
+                };
+                self.handle_tools_call(id, params).await
+            }
+            other => error_resp(
+                id,
+                error_code::METHOD_NOT_FOUND,
+                format!("unknown method: {other}"),
+            ),
+        };
+        Some(serialize(&resp))
+    }
+
+    /// Resolve the tool, ask it for a [`ToolRoute`], run the route,
+    /// and wrap the response back into an MCP `ToolsCallResult`.
+    async fn handle_tools_call(&self, id: RequestId, params: ToolsCallParams) -> RpcResponse {
+        let Some(tool) = self.tools.get(&params.name) else {
+            return error_resp(
+                id,
+                error_code::METHOD_NOT_FOUND,
+                format!("unknown tool: {}", params.name),
+            );
+        };
+        let route = match tool.route(params.arguments) {
+            Ok(r) => r,
+            Err(e) => return error_resp(id, error_code::INVALID_PARAMS, e),
+        };
+        match route {
+            ToolRoute::DataPlane { method, params } => {
+                let req = RpcRequest {
+                    jsonrpc: JsonRpcVersion::V2,
+                    id: RequestId::Number(1),
+                    method,
+                    params: Some(params),
+                };
+                match send_json_rpc(&self.paths.cairn, &req).await {
+                    Ok(resp) => mcp_wrap_rpc_response(id, resp),
+                    Err(e) => {
+                        error_resp(id, error_code::INTERNAL_ERROR, format!("data socket: {e}"))
+                    }
+                }
+            }
+            ToolRoute::Control { method, params } => {
+                let req = RpcRequest {
+                    jsonrpc: JsonRpcVersion::V2,
+                    id: RequestId::Number(1),
+                    method,
+                    params: Some(params),
+                };
+                match send_json_rpc(&self.paths.control, &req).await {
+                    Ok(resp) => mcp_wrap_rpc_response(id, resp),
+                    Err(e) => error_resp(
+                        id,
+                        error_code::INTERNAL_ERROR,
+                        format!("control socket: {e}"),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+// ─── wire IO ───────────────────────────────────────────────────────────────
+
+async fn send_json_rpc(socket: &std::path::Path, req: &RpcRequest) -> std::io::Result<RpcResponse> {
+    let stream = UnixStream::connect(socket).await?;
+    let (read, mut write) = stream.into_split();
+    let body = serde_json::to_string(req)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write.write_all(body.as_bytes()).await?;
+    write.write_all(b"\n").await?;
+    write.flush().await?;
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// ─── response wrapping ────────────────────────────────────────────────────
+
+fn mcp_wrap_rpc_response(id: RequestId, resp: RpcResponse) -> RpcResponse {
+    if let Some(err) = resp.error {
+        return RpcResponse {
+            jsonrpc: JsonRpcVersion::V2,
+            id,
+            result: None,
+            error: Some(err),
+        };
+    }
+    let value = resp.result.unwrap_or(Value::Null);
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
+    let result = ToolsCallResult {
+        content: vec![ContentBlock::Text { text }],
+        is_error: false,
+    };
+    let mut wrapped = serde_json::to_value(result).unwrap();
+    if let Value::Object(ref mut map) = wrapped {
+        map.insert("structuredContent".into(), value);
+    }
+    RpcResponse {
+        jsonrpc: JsonRpcVersion::V2,
+        id,
+        result: Some(wrapped),
+        error: None,
+    }
+}
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn initialize_result() -> InitializeResult {
+    InitializeResult {
+        protocol_version: MCP_PROTOCOL_VERSION.into(),
+        capabilities: ServerCapabilities {
+            tools: ToolsCapability {
+                list_changed: false,
+            },
+        },
+        server_info: ServerInfo {
+            name: SERVER_NAME.into(),
+            version: SERVER_VERSION.into(),
+        },
+        instructions: Some(SERVER_INSTRUCTIONS.into()),
+    }
+}
+
+fn error_resp(id: RequestId, code: i32, message: String) -> RpcResponse {
+    RpcResponse {
+        jsonrpc: JsonRpcVersion::V2,
+        id,
+        result: None,
+        error: Some(ResponseError {
+            code,
+            message,
+            data: None,
+        }),
+    }
+}
+
+fn serialize(resp: &RpcResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#
+            .into()
+    })
+}
+
+/// Tool specs come from per-tool [`McpTool::spec`] calls and own
+/// their name `String`. The dispatcher's lookup uses `&'static str`
+/// keys for cheap matching against the wire `method` field; we leak
+/// the names at startup. The number of tools is tiny and the leak is
+/// bounded by `MCP_TOOLS.len()`.
+fn leak_name(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dispatcher() -> Dispatcher {
+        let tmp = tempfile::tempdir().unwrap();
+        Dispatcher::new(SocketPaths::with_runtime_dir(tmp.path().to_path_buf()))
+    }
+
+    #[test]
+    fn tool_specs_in_advertised_order() {
+        let names: Vec<String> = dispatcher()
+            .tool_specs()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_repos",
+                "get_outline",
+                "get_symbol_source",
+                "find_symbols",
+                "find_impls",
+                "find_references",
+                "find_imports",
+                "register_repo",
+                "reindex_repo",
+            ]
+        );
+    }
+
+    #[test]
+    fn initialize_carries_instructions() {
+        let r = initialize_result();
+        assert_eq!(r.protocol_version, MCP_PROTOCOL_VERSION);
+        assert!(r.instructions.unwrap().contains("find_symbols"));
+    }
+}

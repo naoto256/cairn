@@ -1,0 +1,28 @@
+[package]
+name = "cairn-lang-rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Rust language backend (tree-sitter floor; analyzer slot reserved for syn / rust-analyzer)."
+
+[dependencies]
+cairn-lang-api.workspace = true
+cairn-lang-treesitter-generic.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+linkme.workspace = true
+# `syn` provides the semantic enrichment layer (impl edges / imports
+# / richer docs). Tree-sitter stays the syntactic floor; `syn` runs
+# afterwards as the in-process analyzer. proc-macro2's
+# `span-locations` feature is what makes `Span::start()` (used to
+# pull the source line of each impl / use item) available on stable.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[lints]
+workspace = true

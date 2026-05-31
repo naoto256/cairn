@@ -1,0 +1,35 @@
+# cargo-deny configuration for cairn.
+#
+# License allowlist covers the licenses cairn's own LICENSE-APACHE /
+# LICENSE-MIT dual-licensing model trades on, plus the permissive
+# licenses present in the current transitive dependency graph.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[advisories]
+ignore = [
+    # `instant` is unmaintained. Transitive via notify-types -> notify /
+    # notify-debouncer-full -> cairn-watch (filesystem watcher). No safe
+    # upgrade path at the moment; revisit when notify drops it.
+    "RUSTSEC-2024-0384",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,30 @@
+# Linux user systemd unit for the Cairn daemon.
+#
+# Install:
+#   cp contrib/cairn-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cairn-daemon.service
+#
+# Tail logs:
+#   journalctl --user -u cairn-daemon -f
+#
+# Edit ExecStart below if you installed the binary somewhere other than
+# ~/.cargo/bin (e.g. /usr/local/bin).
+
+[Unit]
+Description=Cairn code-intelligence index daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/cairn daemon
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+# The daemon only touches per-user paths under XDG_DATA_HOME and
+# XDG_RUNTIME_DIR; nothing system-wide. Run with no extra privileges.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
