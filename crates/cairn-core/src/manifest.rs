@@ -129,7 +129,7 @@ where
             })
         })
         .collect();
-    insert_entries(tx, id, entries.into_iter())?;
+    insert_entries(tx, id, entries)?;
     Ok(id)
 }
 
