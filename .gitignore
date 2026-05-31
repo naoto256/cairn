@@ -1,8 +1,7 @@
 /target/
 
-# Local-only working memos (TODO / DESIGN drafts / handoff notes).
-# Per the global convention these are prefixed with `_` and stay
-# off-disk. Global gitignore already handles `_uchgs-*` artifacts.
+# Local-only working memos (drafts / notes). Convention: prefix the
+# filename with `_` and the file stays off-disk.
 _*.md
 
 # Audit receipts written by the code-audit skill (local-only).
@@ -16,9 +15,9 @@ _*.md
 # benchmarks). Release-candidate fixtures go under tests/fixtures/.
 .scratch/
 
-# Local SQLite stores used during development. CodeCairn writes
-# real indexes under the OS data dir, but devs may keep throwaway
-# DBs in the tree for iteration.
+# Local SQLite stores used during development. The daemon writes
+# real indexes under the OS data dir; devs may keep throwaway DBs
+# in the tree for iteration.
 *.db
 *.db-journal
 *.db-wal
