@@ -5,7 +5,8 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx};
-use crate::{Result, registry_db};
+use crate::Result;
+use crate::cas::registry as cas_registry;
 
 struct Doctor;
 
@@ -36,8 +37,8 @@ impl ControlMethod for Doctor {
             )),
         });
 
-        let data_root = ctx.storage.data_dir.root().to_path_buf();
-        let writable = std::fs::metadata(&data_root)
+        let cas_root = ctx.cas_data_dir.root().to_path_buf();
+        let writable = std::fs::metadata(&cas_root)
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false);
         checks.push(DoctorCheck {
@@ -47,38 +48,40 @@ impl ControlMethod for Doctor {
             } else {
                 DoctorStatus::Fail
             },
-            detail: Some(data_root.to_string_lossy().to_string()),
+            detail: Some(cas_root.to_string_lossy().to_string()),
         });
 
-        let repos_result = ctx
-            .storage
-            .with_registry(|conn| registry_db::list_repos(conn))
-            .await;
-        match repos_result {
-            Ok(repos) => {
-                if repos.is_empty() {
+        let cas_data_dir = ctx.cas_data_dir.clone();
+        let aliases_result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<cas_registry::AliasEntry>> {
+                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+                cas_registry::list_all(&index)
+            })
+            .await
+            .map_err(|e| crate::Error::InvalidArgument(format!("doctor task panicked: {e}")))?;
+
+        match aliases_result {
+            Ok(entries) if entries.is_empty() => checks.push(DoctorCheck {
+                name: "registered repositories".into(),
+                status: DoctorStatus::Warn,
+                detail: Some("no repos registered yet".into()),
+            }),
+            Ok(entries) => {
+                for entry in entries {
+                    let exists = std::path::Path::new(&entry.root_path).is_dir();
                     checks.push(DoctorCheck {
-                        name: "registered repositories".into(),
-                        status: DoctorStatus::Warn,
-                        detail: Some("no repos registered yet".into()),
+                        name: format!("repo `{}` root present", entry.alias),
+                        status: if exists {
+                            DoctorStatus::Pass
+                        } else {
+                            DoctorStatus::Fail
+                        },
+                        detail: Some(entry.root_path),
                     });
-                } else {
-                    for repo in repos {
-                        let exists = std::path::Path::new(&repo.root_path).is_dir();
-                        checks.push(DoctorCheck {
-                            name: format!("repo `{}` root present", repo.alias),
-                            status: if exists {
-                                DoctorStatus::Pass
-                            } else {
-                                DoctorStatus::Fail
-                            },
-                            detail: Some(repo.root_path),
-                        });
-                    }
                 }
             }
             Err(e) => checks.push(DoctorCheck {
-                name: "registry readable".into(),
+                name: "alias index readable".into(),
                 status: DoctorStatus::Fail,
                 detail: Some(e.to_string()),
             }),
