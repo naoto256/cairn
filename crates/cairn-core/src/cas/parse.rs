@@ -13,10 +13,7 @@ use crate::cas::ParsedData;
 ///
 /// # Errors
 /// [`ExtractError`] from either pass, propagated as-is.
-pub fn parse(
-    backend: &dyn LanguageBackend,
-    content: &[u8],
-) -> Result<ParsedData, ExtractError> {
+pub fn parse(backend: &dyn LanguageBackend, content: &[u8]) -> Result<ParsedData, ExtractError> {
     let syntactic = backend.extract_syntactic(content)?;
     let semantic = backend
         .analyzer()
@@ -38,12 +35,13 @@ mod tests {
         let src = b"pub fn hello() -> u32 { 42 }\n";
         let data = parse(&RustBackend, src).unwrap();
         assert!(
+            data.syntactic.symbols.iter().any(|s| s.name == "hello"),
+            "no `hello` symbol in {:?}",
             data.syntactic
                 .symbols
                 .iter()
-                .any(|s| s.name == "hello"),
-            "no `hello` symbol in {:?}",
-            data.syntactic.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                .map(|s| &s.name)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -53,8 +51,8 @@ mod tests {
         // semantic pass; the bundle must contain at least one.
         let src = b"use std::io::Read;\npub fn f() {}\n";
         let data = parse(&RustBackend, src).unwrap();
-        let import_total = data.syntactic.imports.len()
-            + data.semantic.as_ref().map_or(0, |s| s.imports.len());
+        let import_total =
+            data.syntactic.imports.len() + data.semantic.as_ref().map_or(0, |s| s.imports.len());
         assert!(import_total >= 1, "no imports surfaced");
     }
 

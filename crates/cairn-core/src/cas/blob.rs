@@ -124,11 +124,7 @@ pub fn insert(
 ///
 /// # Errors
 /// SQLite errors other than `QueryReturnedNoRows`.
-pub fn lookup(
-    conn: &Connection,
-    blob_sha: &str,
-    parser_id: &str,
-) -> Result<Option<BlobMeta>> {
+pub fn lookup(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result<Option<BlobMeta>> {
     let row = conn
         .query_row(
             "SELECT parser_revision, parsed_at_ns FROM blobs
@@ -193,7 +189,14 @@ where
     let tx = conn.transaction()?;
     // If a stale row exists (different revision), drop it first.
     delete(&tx, blob_sha, parser_id)?;
-    insert(&tx, blob_sha, parser_id, expected_revision, parsed_at_ns, &data)?;
+    insert(
+        &tx,
+        blob_sha,
+        parser_id,
+        expected_revision,
+        parsed_at_ns,
+        &data,
+    )?;
     tx.commit()?;
     Ok(true)
 }
@@ -339,7 +342,6 @@ fn resolve_enclosing(
                 .and_then(|q| by_qualified.get(q).copied())
         })
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -157,11 +157,7 @@ pub fn get_entries(conn: &Connection, id: ManifestId) -> Result<Vec<ManifestEntr
 ///
 /// # Errors
 /// SQLite failure.
-pub fn get_blob_for_path(
-    conn: &Connection,
-    id: ManifestId,
-    path: &str,
-) -> Result<Option<String>> {
+pub fn get_blob_for_path(conn: &Connection, id: ManifestId, path: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT blob_sha FROM manifest_entries
@@ -177,12 +173,7 @@ pub fn get_blob_for_path(
 ///
 /// # Errors
 /// SQLite failure.
-pub fn upsert_path(
-    tx: &Transaction<'_>,
-    id: ManifestId,
-    path: &str,
-    blob_sha: &str,
-) -> Result<()> {
+pub fn upsert_path(tx: &Transaction<'_>, id: ManifestId, path: &str, blob_sha: &str) -> Result<()> {
     tx.execute(
         "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
          VALUES (?1, ?2, ?3)
@@ -276,15 +267,16 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<ManifestEntry>> {
         if record.is_empty() {
             continue;
         }
-        let record = std::str::from_utf8(record).map_err(|e| {
-            crate::Error::InvalidArgument(format!("non-utf8 ls-tree output: {e}"))
-        })?;
+        let record = std::str::from_utf8(record)
+            .map_err(|e| crate::Error::InvalidArgument(format!("non-utf8 ls-tree output: {e}")))?;
         let Some((meta, path)) = record.split_once('\t') else {
             continue;
         };
         let mut parts = meta.split_whitespace();
         let Some(_mode) = parts.next() else { continue };
-        let Some(obj_type) = parts.next() else { continue };
+        let Some(obj_type) = parts.next() else {
+            continue;
+        };
         let Some(sha) = parts.next() else { continue };
         if obj_type != "blob" {
             // Skip submodules (type=commit). Tree entries don't
@@ -303,8 +295,8 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<ManifestEntry>> {
 mod tests {
     use super::*;
     use crate::cas::store;
-    use std::fs;
     use crate::testutil::init_repo;
+    use std::fs;
 
     fn fresh_db() -> (tempfile::TempDir, Connection) {
         let tmp = tempfile::tempdir().unwrap();
@@ -349,13 +341,9 @@ mod tests {
         let (_db_tmp, mut c) = fresh_db();
 
         let tx = c.transaction().unwrap();
-        let id = build_from_git_tree(
-            &tx,
-            _repo_tmp.path(),
-            &commit,
-            100,
-            |p| p.ends_with(".rs") || p.ends_with(".md"),
-        )
+        let id = build_from_git_tree(&tx, _repo_tmp.path(), &commit, 100, |p| {
+            p.ends_with(".rs") || p.ends_with(".md")
+        })
         .unwrap();
         tx.commit().unwrap();
 

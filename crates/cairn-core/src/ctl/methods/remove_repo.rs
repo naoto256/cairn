@@ -50,10 +50,7 @@ impl ControlMethod for RemoveRepo {
         .map_err(|e| Error::InvalidArgument(format!("remove_repo task panicked: {e}")))??;
 
         if !removed {
-            return Err(Error::InvalidArgument(format!(
-                "no repo `{}`",
-                args.alias
-            )));
+            return Err(Error::InvalidArgument(format!("no repo `{}`", args.alias)));
         }
         Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
     }

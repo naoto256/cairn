@@ -41,9 +41,7 @@ impl DataMethod for FindImports {
 
             let hits = match query::find_imports(&conn, &anchor, &q) {
                 Ok(h) => h,
-                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => {
-                    Vec::new()
-                }
+                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => Vec::new(),
                 Err(other) => return Err(other),
             };
 
