@@ -140,9 +140,16 @@ pub struct ImplFact {
 /// Upgrade the doc string of an already-emitted symbol. Used when the
 /// analyzer can extract richer doc than the syntactic pass — e.g.
 /// `#[doc = "..."]` attribute clusters.
+///
+/// In Rust the same qualified name can map to multiple symbol rows
+/// (a `struct Foo`, plus any `impl Foo` and `impl SomeTrait for Foo`
+/// blocks). The override carries `target_kind` and the writer scopes
+/// its UPDATE by `(qualified, kind)` so the struct's doc doesn't
+/// bleed onto the impl rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocOverride {
     pub target_qualified: String,
+    pub target_kind: SymbolKind,
     pub doc: String,
 }
 
