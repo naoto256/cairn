@@ -28,7 +28,7 @@
 
 use cairn_lang_api::{
     Analyzer, DocOverride, ExtractError, ImplFact, ImportFact, RefFact, RefKind, SemanticFacts,
-    TypeRole,
+    SymbolKind, TypeRole,
 };
 use syn::spanned::Spanned;
 use syn::visit::Visit;
@@ -81,21 +81,21 @@ impl<'a> Walker<'a> {
             // ... at the module level) get a one-line handler each.
             // Fn additionally has its body walked for call refs.
             syn::Item::Fn(it) => {
-                self.collect_doc(it.sig.ident.to_string(), &it.attrs);
+                self.collect_doc(it.sig.ident.to_string(), SymbolKind::Function, &it.attrs);
                 let enclosing = self.qualify(it.sig.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 emit_fn_signature_type_refs(&it.sig, &enclosing, self.facts);
                 self.walk_fn_body(&enclosing, &it.block);
             }
             syn::Item::Struct(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::Struct, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 emit_generic_param_bounds(&it.generics, &enclosing, self.facts);
                 emit_fields_type_refs(&it.fields, &enclosing, self.facts);
             }
             syn::Item::Enum(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::Enum, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 emit_generic_param_bounds(&it.generics, &enclosing, self.facts);
@@ -104,7 +104,7 @@ impl<'a> Walker<'a> {
                 }
             }
             syn::Item::Trait(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::Trait, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 emit_generic_param_bounds(&it.generics, &enclosing, self.facts);
@@ -124,7 +124,7 @@ impl<'a> Walker<'a> {
                 }
             }
             syn::Item::Union(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::Union, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 emit_generic_param_bounds(&it.generics, &enclosing, self.facts);
@@ -133,19 +133,19 @@ impl<'a> Walker<'a> {
                 }
             }
             syn::Item::Const(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::Constant, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 walk_type_for_refs(&it.ty, TypeRole::Alias, &enclosing, self.facts);
             }
             syn::Item::Static(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::Variable, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 walk_type_for_refs(&it.ty, TypeRole::Alias, &enclosing, self.facts);
             }
             syn::Item::Type(it) => {
-                self.collect_doc(it.ident.to_string(), &it.attrs);
+                self.collect_doc(it.ident.to_string(), SymbolKind::TypeAlias, &it.attrs);
                 let enclosing = self.qualify(it.ident.to_string());
                 emit_attribute_refs(&it.attrs, &enclosing, self.facts);
                 emit_generic_param_bounds(&it.generics, &enclosing, self.facts);
@@ -153,7 +153,7 @@ impl<'a> Walker<'a> {
             }
             syn::Item::Macro(it) => {
                 if let Some(name) = it.ident.as_ref() {
-                    self.collect_doc(name.to_string(), &it.attrs);
+                    self.collect_doc(name.to_string(), SymbolKind::Macro, &it.attrs);
                 }
                 // Item-position macro invocation (`lazy_static! { ... }`,
                 // `define_table! { ... }` etc.). The enclosing is the
@@ -228,7 +228,7 @@ impl<'a> Walker<'a> {
     }
 
     fn visit_mod(&mut self, it: &syn::ItemMod) {
-        self.collect_doc(it.ident.to_string(), &it.attrs);
+        self.collect_doc(it.ident.to_string(), SymbolKind::Module, &it.attrs);
         if let Some((_, items)) = &it.content {
             self.module_path.push(it.ident.to_string());
             for item in items {
@@ -243,7 +243,13 @@ impl<'a> Walker<'a> {
     /// tree-sitter pass already handles `///` / `//!` clusters; this
     /// path is what catches codegen-emitted docs (`include_str!`,
     /// macro expansions, cfg-gated docs).
-    fn collect_doc(&mut self, name: String, attrs: &[syn::Attribute]) {
+    ///
+    /// `target_kind` scopes the eventual UPDATE so the doc only
+    /// patches the symbol row of the kind we actually read it from
+    /// (a `struct Foo` doc must not bleed onto sibling
+    /// `impl Foo` / `impl Trait for Foo` rows that share the same
+    /// qualified name).
+    fn collect_doc(&mut self, name: String, kind: SymbolKind, attrs: &[syn::Attribute]) {
         let mut lines: Vec<String> = Vec::new();
         for attr in attrs {
             if !attr.path().is_ident("doc") {
@@ -268,6 +274,7 @@ impl<'a> Walker<'a> {
         let target_qualified = self.qualify(name);
         self.facts.doc_overrides.push(DocOverride {
             target_qualified,
+            target_kind: kind,
             doc,
         });
     }
