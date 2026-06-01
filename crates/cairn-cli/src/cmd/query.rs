@@ -73,6 +73,11 @@ enum QueryCommand {
         fuzzy: bool,
         #[arg(long)]
         limit: Option<u32>,
+        /// Drop the `signature` field from each hit. Use for broad
+        /// enumerations where the signature dominates wire / context
+        /// cost.
+        #[arg(long)]
+        signature_only: bool,
     },
     /// Print the source of one symbol by qualified name.
     Source {
@@ -167,6 +172,7 @@ pub async fn run(args: Args) -> Result<()> {
             kind,
             fuzzy,
             limit,
+            signature_only,
         } => {
             let mut p = serde_json::Map::new();
             p.insert("query".into(), Value::String(query.clone()));
@@ -185,6 +191,9 @@ pub async fn run(args: Args) -> Result<()> {
             }
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
+            }
+            if *signature_only {
+                p.insert("signature_only".into(), Value::Bool(true));
             }
             ("find_symbols", Value::Object(p))
         }
