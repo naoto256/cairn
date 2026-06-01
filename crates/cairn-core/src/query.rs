@@ -92,6 +92,11 @@ pub struct ReferenceHit {
     pub enclosing_qualified: Option<String>,
     pub path: String,
     pub line: u32,
+    /// SHA of the blob that owns this ref. The wire layer uses it to
+    /// pull a one-line snippet via `git cat-file` (= the same content
+    /// the indexer parsed), with the worktree as a fallback for
+    /// uncommitted state.
+    pub blob_sha: String,
 }
 
 /// Filters for `find_references`. `symbol` is required and non-empty.
@@ -146,7 +151,7 @@ fn run_find_references(
         let mut sql = String::from(
             "SELECT r.target_name, r.target_qualified, r.kind,
                     enc.qualified AS enclosing,
-                    me.path, r.line
+                    me.path, r.line, r.blob_sha
                FROM refs r
                JOIN manifest_entries me
                  ON me.manifest_id = ?1
@@ -176,6 +181,7 @@ fn run_find_references(
                 enclosing_qualified: row.get(3)?,
                 path: row.get(4)?,
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                blob_sha: row.get(6)?,
             })
         };
         let rows: rusqlite::Result<Vec<ReferenceHit>> = match &kind_str {
