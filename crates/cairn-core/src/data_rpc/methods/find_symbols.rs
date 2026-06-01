@@ -40,6 +40,7 @@ impl DataMethod for FindSymbols {
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let requested_repo = args.repo.clone();
+        let signature_only = args.signature_only;
 
         let items = tokio::task::spawn_blocking(move || -> Result<Vec<FindSymbolHit>> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
@@ -68,7 +69,12 @@ impl DataMethod for FindSymbols {
                     Err(other) => return Err(other),
                 };
                 for h in hits {
-                    out.push(into_wire_hit(&entry.alias, anchor.as_str(), h));
+                    out.push(into_wire_hit(
+                        &entry.alias,
+                        anchor.as_str(),
+                        h,
+                        signature_only,
+                    ));
                 }
             }
             Ok(out)
@@ -104,7 +110,7 @@ fn validate(args: &FindSymbolArgs) -> Result<()> {
     }
 }
 
-fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit) -> FindSymbolHit {
+fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit, signature_only: bool) -> FindSymbolHit {
     let location = format!("{repo}:{anchor}:{}:{}", h.path, h.line);
     FindSymbolHit {
         id: h.id,
@@ -114,7 +120,11 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit) -> FindSymbolHit {
         repo: repo.to_string(),
         branch: anchor.to_string(),
         location,
-        signature: h.signature,
+        // `signature_only=true` drops the heaviest field. The naming
+        // mirrors `GetSymbolSourceArgs.signature_only`; here the
+        // analogous "minimal navigation payload" is everything *but*
+        // the signature.
+        signature: if signature_only { None } else { h.signature },
         // The CAS query layer doesn't yet round-trip the per-fact
         // source-tier tag; default to Syntactic until it does.
         source: SourceTier::Syntactic,

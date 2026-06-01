@@ -135,6 +135,14 @@ pub struct FindSymbolArgs {
     pub fuzzy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// When true, hits omit the `signature` field. Use for broad
+    /// enumerations (e.g. `kind = "function"` over a directory) where
+    /// the signature dominates wire/context cost. Named for
+    /// consistency with `GetSymbolSourceArgs.signature_only`; the
+    /// other navigation fields (`id`, `qualified`, `name`, `kind`,
+    /// `repo`, `branch`, `location`) are always returned.
+    #[serde(default)]
+    pub signature_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
