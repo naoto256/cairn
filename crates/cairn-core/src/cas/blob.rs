@@ -72,13 +72,19 @@ pub fn insert(
     }
 
     // doc_overrides: the syntactic pass often misses richer doc forms
-    // (attribute clusters etc.); the analyzer patches them in.
+    // (attribute clusters etc.); the analyzer patches them in. We
+    // scope the UPDATE by `(qualified, kind)` because Rust admits
+    // multiple symbol rows for the same qualified name (a `struct
+    // Foo` next to `impl Foo` and `impl Trait for Foo`), and the
+    // analyzer only sourced the doc from one of them.
     if let Some(sem) = &data.semantic {
         for d in &sem.doc_overrides {
+            let kind = crate::cas::kind_conv::symbol_kind_to_str(&d.target_kind);
             tx.execute(
                 "UPDATE symbols SET doc = ?1
-                 WHERE blob_sha = ?2 AND parser_id = ?3 AND qualified = ?4",
-                params![d.doc, blob_sha, parser_id, d.target_qualified],
+                 WHERE blob_sha = ?2 AND parser_id = ?3
+                   AND qualified = ?4 AND kind = ?5",
+                params![d.doc, blob_sha, parser_id, d.target_qualified, kind],
             )?;
         }
     }
@@ -510,6 +516,7 @@ mod tests {
             semantic: Some(SemanticFacts {
                 doc_overrides: vec![DocOverride {
                     target_qualified: "m::foo".into(),
+                    target_kind: SymbolKind::Function,
                     doc: "new richer doc".into(),
                 }],
                 ..Default::default()
@@ -527,6 +534,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(doc, "new richer doc");
+    }
+
+    #[test]
+    fn doc_override_does_not_leak_to_sibling_kinds() {
+        // Regression: a `struct Foo` and its sibling `impl Foo` /
+        // `impl Trait for Foo` share `qualified="Foo"`. The
+        // analyzer's doc_override (sourced from the struct) used to
+        // UPDATE every row matching qualified, leaking the struct
+        // doc onto the impl rows. The fix scopes UPDATE by kind.
+        let (_tmp, mut c) = fresh();
+        let data = ParsedData {
+            syntactic: SyntacticFacts {
+                symbols: vec![
+                    SymbolFact {
+                        name: "Foo".into(),
+                        qualified: "Foo".into(),
+                        kind: SymbolKind::Struct,
+                        signature: Some("pub struct Foo".into()),
+                        doc: None,
+                        visibility: None,
+                        byte_range: 0..1,
+                        line_range: 1..1,
+                        body_start: None,
+                        parent_idx: None,
+                    },
+                    SymbolFact {
+                        name: "Foo".into(),
+                        qualified: "Foo".into(),
+                        kind: SymbolKind::Impl,
+                        signature: Some("impl Foo".into()),
+                        doc: None,
+                        visibility: None,
+                        byte_range: 2..3,
+                        line_range: 5..5,
+                        body_start: None,
+                        parent_idx: None,
+                    },
+                    SymbolFact {
+                        name: "Foo".into(),
+                        qualified: "Foo".into(),
+                        kind: SymbolKind::Impl,
+                        signature: Some("impl Display for Foo".into()),
+                        doc: None,
+                        visibility: None,
+                        byte_range: 4..5,
+                        line_range: 10..10,
+                        body_start: None,
+                        parent_idx: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            semantic: Some(SemanticFacts {
+                doc_overrides: vec![DocOverride {
+                    target_qualified: "Foo".into(),
+                    target_kind: SymbolKind::Struct,
+                    doc: "Struct-only doc".into(),
+                }],
+                ..Default::default()
+            }),
+        };
+        let tx = c.transaction().unwrap();
+        insert(&tx, "shaG", "rust", 1, 0, &data).unwrap();
+        tx.commit().unwrap();
+
+        let mut stmt = c
+            .prepare("SELECT kind, doc FROM symbols WHERE qualified = 'Foo' ORDER BY line_start")
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("struct".into(), Some("Struct-only doc".into())),
+                ("impl".into(), None),
+                ("impl".into(), None),
+            ],
+            "doc override must patch the struct only, not its sibling impl rows"
+        );
     }
 
     #[test]
