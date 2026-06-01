@@ -27,6 +27,7 @@ pub mod register;
 pub mod sockets;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod timefmt;
 
 pub use sockets::SocketPaths;
 

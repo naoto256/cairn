@@ -98,7 +98,7 @@ fn collect_snapshots(conn: &rusqlite::Connection) -> Result<Vec<SnapshotEntry>> 
             // can derive Semantic when every blob has a semantic
             // analyzer entry.
             enrichment: SourceTier::Syntactic,
-            last_accessed: Some(last_ns.to_string()),
+            last_accessed: Some(crate::timefmt::ns_to_rfc3339_utc(last_ns)),
             file_count: u64::try_from(file_count).unwrap_or(0),
             symbol_count: u64::try_from(symbol_count).unwrap_or(0),
         });
