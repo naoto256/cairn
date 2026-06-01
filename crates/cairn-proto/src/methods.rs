@@ -348,6 +348,15 @@ pub struct FindReferenceHit {
     /// `repo:branch:file:line` string, clickable in editors that
     /// recognise the format.
     pub location: String,
+    /// Single source line at `line` (trailing newline stripped). The
+    /// caller would otherwise round-trip to `get_symbol_source` just
+    /// to see what each reference looks like; carrying the line here
+    /// is cheap (~80 chars per hit) and gives `find_references` the
+    /// "what does this call site look like" answer in one call.
+    /// `None` when the indexed blob can't be materialised (e.g. a
+    /// worktree file that disappeared under a tentative anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 // ─── get_symbol_source ─────────────────────────────────────────────────────
