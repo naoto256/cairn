@@ -126,9 +126,20 @@ pub struct FindSymbolArgs {
     /// snapshot the response is reported as `partial`.
     #[serde(default)]
     pub include_inherited: bool,
-    /// File-path prefix (relative to the repo root). Only symbols
-    /// whose `file.path` starts with this prefix are returned. Useful
-    /// for "show me the classes in `crates/foo/`".
+    /// File-path **string** prefix (relative to the repo root). Only
+    /// symbols whose `file.path` starts with this string are returned;
+    /// the match is byte-level, not directory-aware.
+    ///
+    /// To scope to a directory, include the trailing `/`:
+    ///
+    /// - `path = "crates/foo/"` → only files under `crates/foo/`.
+    /// - `path = "crates/foo"` → also matches `crates/foo_bar/...`
+    ///   (sibling directories with a shared prefix).
+    ///
+    /// To match a single file or a file-name prefix, omit the slash:
+    ///
+    /// - `path = "crates/foo/src/lib"` → matches `lib.rs` and
+    ///   `lib_helper.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default)]
