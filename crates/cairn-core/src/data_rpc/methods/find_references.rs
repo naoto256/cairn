@@ -2,14 +2,19 @@
 //! (incoming, default) or refs inside a symbol's body (outgoing).
 //! Reads the CAS `refs` table scoped by the resolved anchor.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use cairn_proto::Completeness;
 use cairn_proto::methods::{FindReferenceHit, FindReferencesArgs, FindReferencesResult};
 use linkme::distributed_slice;
 use serde_json::Value;
+use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
+use crate::register::git_cat_file;
 use crate::{Error, Result};
 
 pub struct FindReferences;
@@ -45,6 +50,7 @@ impl DataMethod for FindReferences {
             })?;
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let conn = cas_store::open(&store_path)?;
+            let worktree_root = PathBuf::from(&entry.root_path);
 
             let hits = match query::find_references(&conn, &anchor, &q) {
                 Ok(h) => h,
@@ -57,9 +63,10 @@ impl DataMethod for FindReferences {
                 Err(other) => return Err(other),
             };
 
+            let mut snippets = SnippetCache::new(worktree_root);
             Ok(hits
                 .into_iter()
-                .map(|h| into_wire_hit(&entry.alias, anchor.as_str(), h))
+                .map(|h| into_wire_hit(&entry.alias, anchor.as_str(), h, &mut snippets))
                 .collect())
         })
         .await
@@ -77,8 +84,14 @@ impl DataMethod for FindReferences {
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(FindReferences);
 
-fn into_wire_hit(repo: &str, anchor: &str, h: ReferenceHit) -> FindReferenceHit {
+fn into_wire_hit(
+    repo: &str,
+    anchor: &str,
+    h: ReferenceHit,
+    snippets: &mut SnippetCache,
+) -> FindReferenceHit {
     let location = format!("{repo}:{anchor}:{}:{}", h.path, h.line);
+    let snippet = snippets.line_for(&h.blob_sha, &h.path, h.line);
     FindReferenceHit {
         target_name: h.target_name,
         target_qualified: h.target_qualified,
@@ -86,5 +99,112 @@ fn into_wire_hit(repo: &str, anchor: &str, h: ReferenceHit) -> FindReferenceHit 
         enclosing_qualified: h.enclosing_qualified,
         branch: anchor.to_string(),
         location,
+        snippet,
+    }
+}
+
+/// Lazily reads each touched blob at most once. Most `find_references`
+/// result sets cluster hits onto a small number of files (one impl
+/// block, one trait method), so the cache turns N hits into K blob
+/// reads with K ≪ N.
+struct SnippetCache {
+    worktree_root: PathBuf,
+    /// `blob_sha → file contents` once materialised. `None` means we
+    /// already tried and the blob couldn't be loaded; we won't retry.
+    blobs: HashMap<String, Option<Vec<u8>>>,
+}
+
+impl SnippetCache {
+    fn new(worktree_root: PathBuf) -> Self {
+        Self {
+            worktree_root,
+            blobs: HashMap::new(),
+        }
+    }
+
+    fn line_for(&mut self, blob_sha: &str, path: &str, line: u32) -> Option<String> {
+        let bytes = self.load(blob_sha, path);
+        bytes
+            .and_then(|b| extract_line(b, line))
+            .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    fn load(&mut self, blob_sha: &str, path: &str) -> Option<&[u8]> {
+        if !self.blobs.contains_key(blob_sha) {
+            let loaded = load_blob_or_worktree(&self.worktree_root, blob_sha, path);
+            self.blobs.insert(blob_sha.to_string(), loaded);
+        }
+        self.blobs.get(blob_sha).and_then(Option::as_deref)
+    }
+}
+
+fn load_blob_or_worktree(worktree_root: &Path, blob_sha: &str, path: &str) -> Option<Vec<u8>> {
+    if let Ok(b) = git_cat_file(worktree_root, blob_sha) {
+        return Some(b);
+    }
+    // Fallback to the worktree file. Tentative anchors point at the
+    // current worktree state, so a freshly-added file lives there but
+    // not in the object DB yet.
+    match std::fs::read(worktree_root.join(path)) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            debug!(blob_sha, path, error = %e, "snippet: blob not in git and worktree unreadable");
+            None
+        }
+    }
+}
+
+/// Returns the requested 1-indexed line as a UTF-8 lossy slice.
+/// `None` when the file is shorter than the requested line.
+fn extract_line(bytes: &[u8], line: u32) -> Option<String> {
+    if line == 0 {
+        return None;
+    }
+    let target = line as usize - 1;
+    let mut current = 0;
+    let mut start = 0;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if current == target {
+            // walk to the end of this line
+            let end = bytes[idx..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(bytes.len(), |n| idx + n);
+            return Some(String::from_utf8_lossy(&bytes[start..end]).into_owned());
+        }
+        if b == b'\n' {
+            current += 1;
+            start = idx + 1;
+        }
+    }
+    if current == target && start <= bytes.len() {
+        return Some(String::from_utf8_lossy(&bytes[start..]).into_owned());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_line_returns_target_line_text() {
+        let src = b"alpha\nbeta\ngamma\n";
+        assert_eq!(extract_line(src, 1).as_deref(), Some("alpha"));
+        assert_eq!(extract_line(src, 2).as_deref(), Some("beta"));
+        assert_eq!(extract_line(src, 3).as_deref(), Some("gamma"));
+    }
+
+    #[test]
+    fn extract_line_handles_trailing_no_newline() {
+        let src = b"alpha\nbeta";
+        assert_eq!(extract_line(src, 2).as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn extract_line_returns_none_past_end() {
+        let src = b"alpha\nbeta\n";
+        assert_eq!(extract_line(src, 5), None);
+        assert_eq!(extract_line(src, 0), None);
     }
 }
