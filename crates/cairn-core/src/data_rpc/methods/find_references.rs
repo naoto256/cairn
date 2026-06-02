@@ -3,7 +3,7 @@
 //! Reads the CAS `refs` table scoped by the resolved anchor.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cairn_proto::Completeness;
 use cairn_proto::methods::{FindReferenceHit, FindReferencesArgs, FindReferencesResult};
@@ -14,7 +14,7 @@ use tracing::debug;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
-use crate::register::git_cat_file;
+use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
 
 pub struct FindReferences;
@@ -131,26 +131,19 @@ impl SnippetCache {
 
     fn load(&mut self, blob_sha: &str, path: &str) -> Option<&[u8]> {
         if !self.blobs.contains_key(blob_sha) {
-            let loaded = load_blob_or_worktree(&self.worktree_root, blob_sha, path);
+            let loaded = load_blob_or_worktree(&self.worktree_root, blob_sha, path)
+                .inspect_err(|e| {
+                    debug!(
+                        blob_sha,
+                        path,
+                        error = %e,
+                        "snippet: blob not in git and worktree unreadable"
+                    );
+                })
+                .ok();
             self.blobs.insert(blob_sha.to_string(), loaded);
         }
         self.blobs.get(blob_sha).and_then(Option::as_deref)
-    }
-}
-
-fn load_blob_or_worktree(worktree_root: &Path, blob_sha: &str, path: &str) -> Option<Vec<u8>> {
-    if let Ok(b) = git_cat_file(worktree_root, blob_sha) {
-        return Some(b);
-    }
-    // Fallback to the worktree file. Tentative anchors point at the
-    // current worktree state, so a freshly-added file lives there but
-    // not in the object DB yet.
-    match std::fs::read(worktree_root.join(path)) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            debug!(blob_sha, path, error = %e, "snippet: blob not in git and worktree unreadable");
-            None
-        }
     }
 }
 

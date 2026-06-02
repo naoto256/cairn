@@ -247,6 +247,24 @@ pub(crate) fn git_cat_file(repo_root: &Path, blob_sha: &str) -> std::io::Result<
     Ok(out.stdout)
 }
 
+/// Load the bytes the indexer parsed for `(blob_sha, path)`.
+///
+/// Tries `git cat-file <blob_sha>` first (= the authoritative blob the
+/// index was built from). If that fails — typically because the blob
+/// only exists in the worktree under a tentative anchor — falls back
+/// to reading `worktree_root.join(path)` straight off disk.
+///
+/// Wire methods that need source-line context (`get_symbol_source`,
+/// `find_references` snippets) share this lookup; keeping it in one
+/// place avoids the two callers' fallbacks drifting apart.
+pub(crate) fn load_blob_or_worktree(
+    worktree_root: &Path,
+    blob_sha: &str,
+    path: &str,
+) -> std::io::Result<Vec<u8>> {
+    git_cat_file(worktree_root, blob_sha).or_else(|_| std::fs::read(worktree_root.join(path)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
