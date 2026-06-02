@@ -8,9 +8,11 @@
 //! and a plain `{"method":"get_outline"}` JSON-RPC both deserialize into
 //! [`OutlineArgs`] and return [`OutlineResult`].
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
-use crate::common::{Completeness, RefKind, SourceTier, SymbolKind};
+use crate::common::{Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind};
 
 // ─── list_repos ─────────────────────────────────────────────────────────────
 
@@ -24,18 +26,97 @@ pub struct ListReposResult {
 pub struct RepoEntry {
     pub alias: String,
     pub root: String,
-    pub languages: Vec<String>,
     pub snapshots: Vec<SnapshotEntry>,
+}
+
+impl RepoEntry {
+    #[must_use]
+    pub fn languages(&self) -> BTreeSet<&str> {
+        self.snapshots
+            .iter()
+            .flat_map(|s| s.enrichment.iter().map(|e| e.language.as_str()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub branch: String,
     pub status: String,
-    pub enrichment: SourceTier,
+    pub enrichment: Vec<LanguageEnrichment>,
     pub last_accessed: Option<String>,
     pub file_count: u64,
     pub symbol_count: u64,
+}
+
+#[cfg(test)]
+mod list_repos_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_entry_serializes_enrichment_matrix() {
+        let entry = SnapshotEntry {
+            branch: "main".into(),
+            status: "ready".into(),
+            enrichment: vec![LanguageEnrichment {
+                language: "rust".into(),
+                tier: SourceTier::Semantic,
+                has_analyzer: true,
+            }],
+            last_accessed: Some("2026-06-03T00:00:00Z".into()),
+            file_count: 1,
+            symbol_count: 2,
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "branch": "main",
+                "status": "ready",
+                "enrichment": [{
+                    "language": "rust",
+                    "tier": "semantic",
+                    "has_analyzer": true
+                }],
+                "last_accessed": "2026-06-03T00:00:00Z",
+                "file_count": 1,
+                "symbol_count": 2
+            })
+        );
+        let back: SnapshotEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.enrichment[0].language, "rust");
+    }
+
+    #[test]
+    fn repo_entry_derives_languages_from_snapshots() {
+        let repo = RepoEntry {
+            alias: "cairn".into(),
+            root: "/tmp/cairn".into(),
+            snapshots: vec![SnapshotEntry {
+                branch: "main".into(),
+                status: "ready".into(),
+                enrichment: vec![
+                    LanguageEnrichment {
+                        language: "rust".into(),
+                        tier: SourceTier::Semantic,
+                        has_analyzer: true,
+                    },
+                    LanguageEnrichment {
+                        language: "markdown".into(),
+                        tier: SourceTier::Syntactic,
+                        has_analyzer: false,
+                    },
+                ],
+                last_accessed: None,
+                file_count: 2,
+                symbol_count: 3,
+            }],
+        };
+        assert_eq!(
+            repo.languages().into_iter().collect::<Vec<_>>(),
+            vec!["markdown", "rust"]
+        );
+    }
 }
 
 // ─── get_outline ────────────────────────────────────────────────────────────

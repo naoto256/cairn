@@ -30,6 +30,22 @@ pub enum SourceTier {
     Semantic,
 }
 
+/// Per-language enrichment status within one snapshot.
+///
+/// `tier=Syntactic && has_analyzer=true` indicates Tier-2 capability
+/// exists but the snapshot's blobs carry no semantic facts (either the
+/// analyzer hasn't run for this blob set, or it ran and produced no
+/// resolvable facts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageEnrichment {
+    /// Short language tag, e.g. `"rust"`, `"python"`, `"markdown"`.
+    pub language: String,
+    /// Realized tier for this `(snapshot, language)` slice.
+    pub tier: SourceTier,
+    /// Whether the language's backend declares an analyzer at compile time.
+    pub has_analyzer: bool,
+}
+
 /// Open-ended kind tag for a defined symbol. Backends are free to add
 /// their own values; the strings below are the canonical names cairn
 /// reasons about. This enum is the single source of truth — both wire
@@ -234,5 +250,25 @@ mod tests {
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v, serde_json::json!({ "status": "partial" }));
+    }
+
+    #[test]
+    fn language_enrichment_round_trips() {
+        let e = LanguageEnrichment {
+            language: "rust".into(),
+            tier: SourceTier::Semantic,
+            has_analyzer: true,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "language": "rust",
+                "tier": "semantic",
+                "has_analyzer": true,
+            })
+        );
+        let back: LanguageEnrichment = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
     }
 }

@@ -1,7 +1,7 @@
 //! `list_repos` — enumerate every registered repo with the anchors
 //! its CAS store knows about.
 
-use cairn_proto::common::SourceTier;
+use cairn_lang_api::{LanguageBackend, all_backends};
 use cairn_proto::methods::{ListReposResult, RepoEntry, SnapshotEntry};
 use linkme::distributed_slice;
 use rusqlite::params;
@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod};
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::enrichment::collect_enrichment;
 use crate::{Error, Result};
 
 pub struct ListRepos;
@@ -23,18 +24,17 @@ impl DataMethod for ListRepos {
         let cas_data_dir = ctx.cas_data_dir.clone();
 
         let repos = tokio::task::spawn_blocking(move || -> Result<Vec<RepoEntry>> {
+            let backends = all_backends();
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
             let entries = cas_registry::list_all(&index)?;
             let mut out = Vec::with_capacity(entries.len());
             for entry in entries {
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
                 let conn = cas_store::open(&store_path)?;
-                let snapshots = collect_snapshots(&conn)?;
-                let languages = collect_languages(&conn)?;
+                let snapshots = collect_snapshots(&conn, &backends)?;
                 out.push(RepoEntry {
                     alias: entry.alias,
                     root: entry.root_path,
-                    languages,
                     snapshots,
                 });
             }
@@ -55,7 +55,10 @@ static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(ListRepos);
 /// tentative manifest. Branch-style names lose the `branch/` prefix to
 /// match the old wire format (`branch: "main"`); `HEAD` and
 /// `tentative/<id>` come through verbatim.
-fn collect_snapshots(conn: &rusqlite::Connection) -> Result<Vec<SnapshotEntry>> {
+fn collect_snapshots(
+    conn: &rusqlite::Connection,
+    backends: &[Box<dyn LanguageBackend>],
+) -> Result<Vec<SnapshotEntry>> {
     let mut stmt = conn.prepare(
         "SELECT anchor_name, manifest_id, last_updated_ns
            FROM anchors ORDER BY anchor_name",
@@ -93,11 +96,7 @@ fn collect_snapshots(conn: &rusqlite::Connection) -> Result<Vec<SnapshotEntry>> 
         out.push(SnapshotEntry {
             branch,
             status: "ready".into(),
-            // The CAS path doesn't yet record per-blob source-tier;
-            // surface Syntactic as the safe default. A later sweep
-            // can derive Semantic when every blob has a semantic
-            // analyzer entry.
-            enrichment: SourceTier::Syntactic,
+            enrichment: collect_enrichment(conn, manifest_id, backends)?,
             last_accessed: Some(crate::timefmt::ns_to_rfc3339_utc(last_ns)),
             file_count: u64::try_from(file_count).unwrap_or(0),
             symbol_count: u64::try_from(symbol_count).unwrap_or(0),
@@ -106,23 +105,64 @@ fn collect_snapshots(conn: &rusqlite::Connection) -> Result<Vec<SnapshotEntry>> 
     Ok(out)
 }
 
-/// Distinct languages from the blob parsers, stripped to their
-/// short name (`tree-sitter-rust@0.23` → `rust`). Anything that
-/// doesn't follow the `tree-sitter-<lang>@` shape comes through
-/// verbatim.
-fn collect_languages(conn: &rusqlite::Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT parser_id FROM blobs ORDER BY parser_id")?;
-    let parser_ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(parser_ids
-        .into_iter()
-        .map(|p| {
-            p.strip_prefix("tree-sitter-")
-                .and_then(|rest| rest.split('@').next())
-                .map_or(p.clone(), str::to_string)
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_lang_api::all_backends;
+    use cairn_lang_markdown as _;
+    use cairn_lang_python as _;
+    use cairn_lang_rust as _;
+    use cairn_proto::SourceTier;
+
+    use crate::cas::store;
+    use crate::register::register_repo;
+    use crate::testutil::init_repo;
+
+    #[test]
+    fn list_repos_emits_per_language_enrichment_matrix() {
+        let (repo, _sha) = init_repo(&[
+            (
+                "src/lib.rs",
+                "pub trait T {}\npub struct S;\nimpl T for S {}\n",
+            ),
+            ("script.py", "def greet():\n    return 'hi'\n"),
+            ("README.md", "# Hi\n"),
+        ]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, repo.path(), 1000).unwrap();
+
+        let backends = all_backends();
+        let snapshots = collect_snapshots(&conn, &backends).unwrap();
+        let snapshot = snapshots.iter().find(|s| s.branch == "HEAD").unwrap();
+        let languages: Vec<&str> = snapshot
+            .enrichment
+            .iter()
+            .map(|e| e.language.as_str())
+            .collect();
+        assert_eq!(languages, vec!["markdown", "python", "rust"]);
+
+        let rust = snapshot
+            .enrichment
+            .iter()
+            .find(|e| e.language == "rust")
+            .unwrap();
+        assert!(rust.has_analyzer);
+        assert_eq!(rust.tier, SourceTier::Semantic);
+
+        let python = snapshot
+            .enrichment
+            .iter()
+            .find(|e| e.language == "python")
+            .unwrap();
+        assert!(python.has_analyzer);
+
+        let markdown = snapshot
+            .enrichment
+            .iter()
+            .find(|e| e.language == "markdown")
+            .unwrap();
+        assert!(!markdown.has_analyzer);
+        assert_eq!(markdown.tier, SourceTier::Syntactic);
+    }
 }
