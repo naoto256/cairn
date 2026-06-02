@@ -10,9 +10,11 @@
 //! `reindex_repo` are in [`crate::methods`]. Verbs with no args
 //! (`status`, `doctor`, `shutdown`) accept either `null` or `{}`.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
-use crate::common::SourceTier;
+use crate::common::LanguageEnrichment;
 
 // ─── status ────────────────────────────────────────────────────────────────
 
@@ -27,18 +29,91 @@ pub struct StatusReport {
 pub struct RepoStatus {
     pub alias: String,
     pub root: String,
-    pub languages: Vec<String>,
     pub snapshots: Vec<SnapshotStatus>,
+}
+
+impl RepoStatus {
+    #[must_use]
+    pub fn languages(&self) -> BTreeSet<&str> {
+        self.snapshots
+            .iter()
+            .flat_map(|s| s.enrichment.iter().map(|e| e.language.as_str()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatus {
     pub branch: String,
     pub status: String,
-    pub enrichment: SourceTier,
+    pub enrichment: Vec<LanguageEnrichment>,
     pub file_count: u64,
     pub symbol_count: u64,
     pub size_bytes: u64,
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::common::SourceTier;
+
+    #[test]
+    fn snapshot_status_serializes_enrichment_matrix() {
+        let status = SnapshotStatus {
+            branch: "HEAD".into(),
+            status: "ready".into(),
+            enrichment: vec![LanguageEnrichment {
+                language: "python".into(),
+                tier: SourceTier::Syntactic,
+                has_analyzer: true,
+            }],
+            file_count: 1,
+            symbol_count: 2,
+            size_bytes: 3,
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "branch": "HEAD",
+                "status": "ready",
+                "enrichment": [{
+                    "language": "python",
+                    "tier": "syntactic",
+                    "has_analyzer": true
+                }],
+                "file_count": 1,
+                "symbol_count": 2,
+                "size_bytes": 3
+            })
+        );
+        let back: SnapshotStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back.enrichment[0].language, "python");
+    }
+
+    #[test]
+    fn repo_status_derives_languages_from_snapshots() {
+        let repo = RepoStatus {
+            alias: "cairn".into(),
+            root: "/tmp/cairn".into(),
+            snapshots: vec![SnapshotStatus {
+                branch: "HEAD".into(),
+                status: "ready".into(),
+                enrichment: vec![LanguageEnrichment {
+                    language: "rust".into(),
+                    tier: SourceTier::Semantic,
+                    has_analyzer: true,
+                }],
+                file_count: 1,
+                symbol_count: 1,
+                size_bytes: 1,
+            }],
+        };
+        assert_eq!(
+            repo.languages().into_iter().collect::<Vec<_>>(),
+            vec!["rust"]
+        );
+    }
 }
 
 // ─── doctor ────────────────────────────────────────────────────────────────

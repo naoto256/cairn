@@ -387,11 +387,12 @@ fn render(method: &str, value: &Value) {
         "list_repos" => {
             if let Ok(r) = serde_json::from_value::<ListReposResult>(value.clone()) {
                 for repo in &r.repos {
+                    let languages = repo.languages();
                     println!(
                         "{}\t{}\t[{}]",
                         repo.alias,
                         repo.root,
-                        repo.languages.join(",")
+                        languages.iter().copied().collect::<Vec<_>>().join(",")
                     );
                     for snap in &repo.snapshots {
                         println!(
