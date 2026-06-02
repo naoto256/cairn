@@ -19,7 +19,7 @@ impl McpTool for FindImpls {
                     "repo":   {"type": "string"},
                     "trait":  {"type": "string", "description": "Match impl blocks implementing this trait. e.g. `Display`."},
                     "type":   {"type": "string", "description": "Match impl blocks targeting this type. e.g. `Foo` or `crate::module::Foo`."},
-                    "branch": {"type": "string", "description": "Restrict to a single snapshot. Omit to search every indexed branch."},
+                    "branch": {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 500},
                 },
                 "required": ["repo"],

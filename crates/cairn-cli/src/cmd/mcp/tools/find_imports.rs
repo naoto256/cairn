@@ -18,7 +18,7 @@ impl McpTool for FindImports {
                 "properties": {
                     "repo":   {"type": "string"},
                     "file":   {"type": "string", "description": "Path relative to repo root."},
-                    "branch": {"type": "string"},
+                    "branch": {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 1000},
                 },
                 "required": ["repo"],
