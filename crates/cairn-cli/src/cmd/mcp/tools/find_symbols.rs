@@ -25,6 +25,7 @@ impl McpTool for FindSymbols {
                     "path":   {"type": "string", "description": "File-path prefix relative to repo root. e.g. `crates/foo/` to scope by directory."},
                     "fuzzy":  {"type": "boolean", "description": "When `query` is set, run an FTS5 search over name + qualified + doc instead of exact match."},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 500, "description": "Cap on hits. Truncation is surfaced via `completeness: partial` so silent caps don't bite."},
+                    "signature_only": {"type": "boolean", "description": "Drop the `signature` field from each hit. Use for broad enumerations (e.g. `kind=\"function\"` over a directory) where the signature dominates wire / context cost."},
                 },
                 "additionalProperties": false,
             }),
