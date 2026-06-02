@@ -51,6 +51,18 @@ pub struct ManifestEntry {
     pub blob_sha: String,
 }
 
+/// Transient path metadata used by manifest inclusion predicates.
+pub struct PathHint<'a> {
+    pub path: &'a str,
+    pub is_executable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    manifest: ManifestEntry,
+    is_executable: bool,
+}
+
 /// Look up an existing committed manifest for `commit_sha`. Returns
 /// `Ok(None)` if none exists.
 ///
@@ -85,11 +97,21 @@ pub fn build_from_git_tree<F>(
     include: F,
 ) -> Result<ManifestId>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(&PathHint<'_>) -> bool,
 {
     let entries = list_git_tree(repo_root, commit_sha)?;
     let id = create_empty(tx, ManifestKind::Committed, Some(commit_sha), built_at_ns)?;
-    insert_entries(tx, id, entries.into_iter().filter(|e| include(&e.path)))?;
+    insert_entries(
+        tx,
+        id,
+        entries.into_iter().filter_map(|e| {
+            include(&PathHint {
+                path: &e.manifest.path,
+                is_executable: e.is_executable,
+            })
+            .then_some(e.manifest)
+        }),
+    )?;
     Ok(id)
 }
 
@@ -108,7 +130,7 @@ pub fn build_from_worktree<F>(
     include: F,
 ) -> Result<ManifestId>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(&PathHint<'_>) -> bool,
 {
     let id = create_empty(tx, ManifestKind::Tentative, None, built_at_ns)?;
 
@@ -116,7 +138,10 @@ where
         .filter_map(|sf| {
             let rel = sf.path.strip_prefix(worktree_path).ok()?.to_owned();
             let rel_str = rel.to_string_lossy().into_owned();
-            if !include(&rel_str) {
+            if !include(&PathHint {
+                path: &rel_str,
+                is_executable: sf.is_executable,
+            }) {
                 return None;
             }
             // Slow path: read + hash. Worktree-only files (= not in
@@ -240,7 +265,7 @@ fn insert_entries<I: IntoIterator<Item = ManifestEntry>>(
     Ok(())
 }
 
-fn list_git_tree(repo_root: &Path, commit_sha: &str) -> Result<Vec<ManifestEntry>> {
+fn list_git_tree(repo_root: &Path, commit_sha: &str) -> Result<Vec<TreeEntry>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -260,7 +285,7 @@ fn list_git_tree(repo_root: &Path, commit_sha: &str) -> Result<Vec<ManifestEntry
     parse_ls_tree(&output.stdout)
 }
 
-fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<ManifestEntry>> {
+fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<TreeEntry>> {
     let mut out = Vec::new();
     // Each record is `<mode> <type> <sha>\t<path>\0`.
     for record in stdout.split(|b| *b == 0) {
@@ -273,7 +298,7 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<ManifestEntry>> {
             continue;
         };
         let mut parts = meta.split_whitespace();
-        let Some(_mode) = parts.next() else { continue };
+        let Some(mode) = parts.next() else { continue };
         let Some(obj_type) = parts.next() else {
             continue;
         };
@@ -283,9 +308,12 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<ManifestEntry>> {
             // appear with -r.
             continue;
         }
-        out.push(ManifestEntry {
-            path: path.to_string(),
-            blob_sha: sha.to_string(),
+        out.push(TreeEntry {
+            manifest: ManifestEntry {
+                path: path.to_string(),
+                blob_sha: sha.to_string(),
+            },
+            is_executable: mode == "100755",
         });
     }
     Ok(out)
@@ -311,13 +339,19 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                ManifestEntry {
-                    path: "src/lib.rs".into(),
-                    blob_sha: "abc123".into()
+                TreeEntry {
+                    manifest: ManifestEntry {
+                        path: "src/lib.rs".into(),
+                        blob_sha: "abc123".into()
+                    },
+                    is_executable: false
                 },
-                ManifestEntry {
-                    path: "bin/run".into(),
-                    blob_sha: "def456".into()
+                TreeEntry {
+                    manifest: ManifestEntry {
+                        path: "bin/run".into(),
+                        blob_sha: "def456".into()
+                    },
+                    is_executable: true
                 },
             ]
         );
@@ -328,7 +362,7 @@ mod tests {
         let stdout = b"160000 commit aaaa\tvendor/sub\x00100644 blob bbbb\tREADME\x00";
         let parsed = parse_ls_tree(stdout).unwrap();
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].path, "README");
+        assert_eq!(parsed[0].manifest.path, "README");
     }
 
     #[test]
@@ -341,8 +375,8 @@ mod tests {
         let (_db_tmp, mut c) = fresh_db();
 
         let tx = c.transaction().unwrap();
-        let id = build_from_git_tree(&tx, _repo_tmp.path(), &commit, 100, |p| {
-            p.ends_with(".rs") || p.ends_with(".md")
+        let id = build_from_git_tree(&tx, _repo_tmp.path(), &commit, 100, |hint| {
+            hint.path.ends_with(".rs") || hint.path.ends_with(".md")
         })
         .unwrap();
         tx.commit().unwrap();
@@ -389,7 +423,7 @@ mod tests {
 
         let (_db_tmp, mut c) = fresh_db();
         let tx = c.transaction().unwrap();
-        let id = build_from_worktree(&tx, wt, 0, |p| p.ends_with(".rs")).unwrap();
+        let id = build_from_worktree(&tx, wt, 0, |hint| hint.path.ends_with(".rs")).unwrap();
         tx.commit().unwrap();
 
         let entries = get_entries(&c, id).unwrap();

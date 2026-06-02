@@ -17,6 +17,7 @@ pub struct ScannedFile {
     pub path: PathBuf,
     pub mtime_ns: i128,
     pub size_bytes: u64,
+    pub is_executable: bool,
 }
 
 /// Directory names that cairn always prunes from the working-tree
@@ -74,7 +75,21 @@ fn scanned_from_entry(entry: DirEntry) -> Option<ScannedFile> {
         path: entry.into_path(),
         mtime_ns,
         size_bytes: meta.len(),
+        is_executable: is_executable(&meta),
     })
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    // TODO: Decide how Windows should surface executable script candidates.
+    false
 }
 
 #[cfg(test)]

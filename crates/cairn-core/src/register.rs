@@ -19,14 +19,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cairn_lang_api::{LanguageBackend, all_backends, pick_backend_for_path};
+use cairn_lang_api::{
+    LanguageBackend, all_backends, pick_backend_for_path, pick_backend_for_shebang,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, warn};
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas;
-use crate::manifest::{self, ManifestEntry, ManifestId};
+use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
 
 /// Per-parser revision baseline. Bumped when a backend's output for
 /// the same input changes in a way that should invalidate already-
@@ -61,7 +63,12 @@ pub fn register_repo(
     now_ns: i64,
 ) -> Result<RegisterOutcome> {
     let backends = all_backends();
-    let include = |path: &str| pick_backend_for_path(&backends, path).is_some();
+    let include = |hint: &PathHint<'_>| {
+        if pick_backend_for_path(&backends, hint.path).is_some() {
+            return true;
+        }
+        hint.is_executable
+    };
 
     let head_commit = run_git_capture(worktree_path, &["rev-parse", "HEAD"])?;
     let branch = detect_branch(worktree_path);
@@ -136,25 +143,48 @@ fn parse_pending_blobs(
             .or_insert_with(|| Path::new(e.path.as_str()));
     }
 
-    let mut work_units: Vec<(String, String, ContentSource)> = Vec::new();
+    let mut work_units: Vec<(String, String, WorkContent)> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for entry in committed.iter().chain(tentative.iter()) {
-        let Some(backend) = pick_backend_for_path(backends, &entry.path) else {
+        if let Some(backend) = pick_backend_for_path(backends, &entry.path) {
+            let parser_id = backend.parser_id().to_string();
+            if !seen.insert((entry.blob_sha.clone(), parser_id.clone())) {
+                continue;
+            }
+            let source = source_for(entry, &tentative_path_by_blob, worktree_path);
+            work_units.push((
+                entry.blob_sha.clone(),
+                parser_id,
+                WorkContent::Source(source),
+            ));
+            continue;
+        }
+
+        let source = match tentative_path_by_blob.get(entry.blob_sha.as_str()) {
+            Some(rel) => ContentSource::Worktree(worktree_path.join(rel)),
+            None => ContentSource::Git(entry.blob_sha.clone()),
+        };
+        let content = match &source {
+            ContentSource::Worktree(p) => std::fs::read(p)?,
+            ContentSource::Git(sha) => git_cat_file(worktree_path, sha)?,
+        };
+        let Some(backend) = pick_backend_with_shebang_fallback(backends, &entry.path, &content)
+        else {
             continue;
         };
         let parser_id = backend.parser_id().to_string();
         if !seen.insert((entry.blob_sha.clone(), parser_id.clone())) {
             continue;
         }
-        let source = match tentative_path_by_blob.get(entry.blob_sha.as_str()) {
-            Some(rel) => ContentSource::Worktree(worktree_path.join(rel)),
-            None => ContentSource::Git(entry.blob_sha.clone()),
-        };
-        work_units.push((entry.blob_sha.clone(), parser_id, source));
+        work_units.push((
+            entry.blob_sha.clone(),
+            parser_id,
+            WorkContent::Preread(content),
+        ));
     }
 
     let mut fresh = 0;
-    for (blob_sha, parser_id, source) in work_units {
+    for (blob_sha, parser_id, content) in work_units {
         let backend = backends
             .iter()
             .find(|b| b.parser_id() == parser_id)
@@ -167,11 +197,14 @@ fn parse_pending_blobs(
             PARSER_REVISION,
             now_ns,
             || {
-                let content = match &source {
-                    ContentSource::Worktree(p) => std::fs::read(p)?,
-                    ContentSource::Git(sha) => git_cat_file(worktree_path, sha)?,
+                let bytes = match &content {
+                    WorkContent::Source(ContentSource::Worktree(p)) => std::fs::read(p)?,
+                    WorkContent::Source(ContentSource::Git(sha)) => {
+                        git_cat_file(worktree_path, sha)?
+                    }
+                    WorkContent::Preread(bytes) => bytes.clone(),
                 };
-                cas::parse::parse(backend, &content)
+                cas::parse::parse(backend, &bytes)
                     .map_err(|e| crate::Error::InvalidArgument(format!("parse failed: {e}")))
             },
         )?;
@@ -184,9 +217,49 @@ fn parse_pending_blobs(
     Ok(fresh)
 }
 
+fn source_for(
+    entry: &ManifestEntry,
+    tentative_path_by_blob: &std::collections::HashMap<&str, &Path>,
+    worktree_path: &Path,
+) -> ContentSource {
+    match tentative_path_by_blob.get(entry.blob_sha.as_str()) {
+        Some(rel) => ContentSource::Worktree(worktree_path.join(rel)),
+        None => ContentSource::Git(entry.blob_sha.clone()),
+    }
+}
+
+fn pick_backend_with_shebang_fallback<'a>(
+    backends: &'a [Box<dyn LanguageBackend>],
+    path: &str,
+    content: &[u8],
+) -> Option<&'a dyn LanguageBackend> {
+    if let Some(backend) = pick_backend_for_path(backends, path) {
+        return Some(backend);
+    }
+    let first_line = read_first_line(content)?;
+    if !first_line.starts_with("#!") {
+        return None;
+    }
+    pick_backend_for_shebang(backends, first_line)
+}
+
+fn read_first_line(content: &[u8]) -> Option<&str> {
+    let window = &content[..content.len().min(256)];
+    let end = window
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(window.len());
+    std::str::from_utf8(&window[..end]).ok()
+}
+
 enum ContentSource {
     Worktree(PathBuf),
     Git(String),
+}
+
+enum WorkContent {
+    Source(ContentSource),
+    Preread(Vec<u8>),
 }
 
 fn upsert_worktree(tx: &rusqlite::Transaction<'_>, path: &Path, now_ns: i64) -> Result<i64> {
@@ -270,7 +343,13 @@ mod tests {
     use super::*;
     use crate::cas::store;
     use crate::testutil::init_repo;
+    use cairn_lang_python::PythonBackend;
+    use cairn_lang_rust as _;
     use std::fs;
+
+    fn python_backends() -> Vec<Box<dyn LanguageBackend>> {
+        vec![Box::new(PythonBackend)]
+    }
 
     fn init_rust_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
         let (tmp, _sha) = init_repo(files);
@@ -361,6 +440,135 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols WHERE name = 'g'", [], |r| {
                 r.get(0)
             })
+            .unwrap();
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn shebang_fallback_picks_python_env_script() {
+        let backends = python_backends();
+        let backend = pick_backend_with_shebang_fallback(
+            &backends,
+            "bin/foo",
+            b"#!/usr/bin/env python3\nprint('hi')\n",
+        )
+        .unwrap();
+        assert!(backend.parser_id().starts_with("tree-sitter-python@"));
+    }
+
+    #[test]
+    fn shebang_fallback_picks_uv_inline_script() {
+        let backends = python_backends();
+        let backend = pick_backend_with_shebang_fallback(
+            &backends,
+            "bin/foo",
+            b"#!/usr/bin/env -S uv run --script\nprint('hi')\n",
+        )
+        .unwrap();
+        assert!(backend.parser_id().starts_with("tree-sitter-python@"));
+    }
+
+    #[test]
+    fn shebang_fallback_rejects_shell_script() {
+        let backends = python_backends();
+        assert!(
+            pick_backend_with_shebang_fallback(&backends, "bin/foo", b"#!/bin/bash\necho hi\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shebang_fallback_rejects_extensionless_without_shebang() {
+        let backends = python_backends();
+        assert!(pick_backend_with_shebang_fallback(&backends, "bin/foo", b"\x7fELF").is_none());
+    }
+
+    #[test]
+    fn shebang_fallback_keeps_path_based_match() {
+        let backends = python_backends();
+        let backend =
+            pick_backend_with_shebang_fallback(&backends, "foo.py", b"print('hi')\n").unwrap();
+        assert!(backend.parser_id().starts_with("tree-sitter-python@"));
+    }
+
+    #[test]
+    fn read_first_line_handles_empty_and_short_files() {
+        assert_eq!(read_first_line(b""), Some(""));
+        assert_eq!(read_first_line(b"abc"), Some("abc"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn end_to_end_indexes_uv_inline_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _sha) = init_repo(&[(
+            "bin/myscript",
+            "#!/usr/bin/env -S uv run --script\n# /// script\n# requires-python = '>=3.11'\n# ///\ndef greet():\n    return 'hi'\n",
+        )]);
+        let path = repo.path().join("bin/myscript");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let outcome = register_repo(&mut conn, repo.path(), 1000).unwrap();
+
+        assert!(outcome.blobs_parsed >= 1);
+        let entries = manifest::get_entries(&conn, outcome.tentative_manifest).unwrap();
+        assert!(
+            entries.iter().any(|e| e.path == "bin/myscript"),
+            "bin/myscript missing from tentative manifest: {entries:#?}"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name = 'greet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(count >= 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn end_to_end_skips_non_shebang_extensionless() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _sha) = init_repo(&[("bin/data", "not a script\n")]);
+        let path = repo.path().join("bin/data");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let outcome = register_repo(&mut conn, repo.path(), 1000).unwrap();
+
+        assert_eq!(outcome.blobs_parsed, 0);
+        let entries = manifest::get_entries(&conn, outcome.tentative_manifest).unwrap();
+        assert!(entries.iter().any(|e| e.path == "bin/data"));
+    }
+
+    #[test]
+    fn end_to_end_does_not_regress_python_py_files() {
+        let (repo, _sha) = init_repo(&[("foo.py", "def greet():\n    return 'hi'\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let outcome = register_repo(&mut conn, repo.path(), 1000).unwrap();
+
+        assert!(outcome.blobs_parsed >= 1);
+        let entries = manifest::get_entries(&conn, outcome.committed_manifest).unwrap();
+        assert!(entries.iter().any(|e| e.path == "foo.py"));
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name = 'greet'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(count >= 1);
     }
