@@ -147,8 +147,12 @@ fn render_status(r: &StatusReport) {
     }
     for repo in &r.repos {
         println!("  - {} ({})", repo.alias, repo.root);
-        if !repo.languages.is_empty() {
-            println!("      languages: {}", repo.languages.join(", "));
+        let languages = repo.languages();
+        if !languages.is_empty() {
+            println!(
+                "      languages: {}",
+                languages.iter().copied().collect::<Vec<_>>().join(", ")
+            );
         }
         for snap in &repo.snapshots {
             println!(

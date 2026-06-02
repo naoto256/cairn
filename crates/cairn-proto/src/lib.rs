@@ -29,5 +29,6 @@ pub mod jsonrpc;
 pub mod methods;
 
 pub use common::{
-    Completeness, MissingTier, Position, Range, RefKind, SourceTier, SymbolKind, TypeRole,
+    Completeness, LanguageEnrichment, MissingTier, Position, Range, RefKind, SourceTier,
+    SymbolKind, TypeRole,
 };

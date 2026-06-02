@@ -19,6 +19,7 @@ pub mod cas;
 pub mod ctl;
 pub mod daemon;
 pub mod data_rpc;
+pub(crate) mod enrichment;
 pub mod manifest;
 pub mod migration;
 pub mod paths;
