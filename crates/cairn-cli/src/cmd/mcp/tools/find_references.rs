@@ -28,7 +28,7 @@ impl McpTool for FindReferences {
                         "description": "Restrict to one RefKind. Omit for every kind.",
                         "enum": ["call", "type", "import", "instantiate", "read", "write", "override", "macro_invoke", "annotation"],
                     },
-                    "branch": {"type": "string", "description": "Restrict to a single snapshot. Omit to search every indexed branch."},
+                    "branch": {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. Truncation is surfaced via `completeness: partial`."},
                 },
                 "required": ["repo", "symbol"],

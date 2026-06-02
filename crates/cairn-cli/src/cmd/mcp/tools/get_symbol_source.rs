@@ -18,7 +18,7 @@ impl McpTool for GetSymbolSource {
                 "properties": {
                     "repo":      {"type": "string"},
                     "qualified": {"type": "string", "description": "Fully-qualified name, e.g. `crate::cli::parse_args` or `MyStruct::new`. Use `find_symbols` first if you only have a bare name."},
-                    "branch":    {"type": "string", "description": "Restrict to a single snapshot. Omit to use the first matching branch."},
+                    "branch":    {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
                     "file":      {"type": "string", "description": "Path relative to repo root. Optional; only needed when the same qualified name exists in multiple files."},
                     "signature_only": {"type": "boolean", "description": "Return only the signature + doc string (no body bytes). Cheap API-surface peek; the `source` field is empty when this is set, `signature` and `doc` carry everything."},
                 },
