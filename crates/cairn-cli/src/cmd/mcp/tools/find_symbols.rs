@@ -22,7 +22,7 @@ impl McpTool for FindSymbols {
                     "kind":   {"type": "string", "description": "Restrict to one SymbolKind (e.g. `class`, `function`, `method`, `struct`, `trait`, `enum`)."},
                     "container": {"type": "string", "description": "Qualified-prefix scope. `Widget` returns members of Widget (Widget::* / Widget.*)."},
                     "include_inherited": {"type": "boolean", "description": "When `container` is set, walk the implementations table and include members inherited from base types. Tier-2 dependent — `partial{semantic}` on syntactic-only snapshots."},
-                    "path":   {"type": "string", "description": "File-path prefix relative to repo root. e.g. `crates/foo/` to scope by directory."},
+                    "path":   {"type": "string", "description": "File-path **string** prefix relative to repo root — byte-level, not directory-aware. Include the trailing `/` to scope to a directory (`crates/foo/` matches only files under `crates/foo/`); `crates/foo` (no slash) also matches sibling `crates/foo_bar/...`. Omit the slash when you want a filename prefix (`crates/foo/src/lib` matches `lib.rs` and `lib_helper.rs`)."},
                     "fuzzy":  {"type": "boolean", "description": "When `query` is set, run an FTS5 search over name + qualified + doc instead of exact match."},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 500, "description": "Cap on hits. Truncation is surfaced via `completeness: partial` so silent caps don't bite."},
                     "signature_only": {"type": "boolean", "description": "Drop the `signature` field from each hit. Use for broad enumerations (e.g. `kind=\"function\"` over a directory) where the signature dominates wire / context cost."},
