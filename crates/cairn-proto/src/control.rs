@@ -44,12 +44,26 @@ impl RepoStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatus {
-    pub branch: String,
+    pub branches: Vec<String>,
     pub status: String,
     pub enrichment: Vec<LanguageEnrichment>,
     pub file_count: u64,
     pub symbol_count: u64,
     pub size_bytes: u64,
+}
+
+impl SnapshotStatus {
+    /// First branch label in `branches` ordering (`HEAD` if present).
+    #[must_use]
+    pub fn primary_label(&self) -> Option<&str> {
+        self.branches.first().map(String::as_str)
+    }
+
+    /// Whether `HEAD` points at this snapshot's manifest.
+    #[must_use]
+    pub fn has_head(&self) -> bool {
+        self.branches.iter().any(|b| b == "HEAD")
+    }
 }
 
 #[cfg(test)]
@@ -60,7 +74,7 @@ mod status_tests {
     #[test]
     fn snapshot_status_serializes_enrichment_matrix() {
         let status = SnapshotStatus {
-            branch: "HEAD".into(),
+            branches: vec!["HEAD".into(), "main".into()],
             status: "ready".into(),
             enrichment: vec![LanguageEnrichment {
                 language: "python".into(),
@@ -75,7 +89,7 @@ mod status_tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "branch": "HEAD",
+                "branches": ["HEAD", "main"],
                 "status": "ready",
                 "enrichment": [{
                     "language": "python",
@@ -89,6 +103,8 @@ mod status_tests {
         );
         let back: SnapshotStatus = serde_json::from_value(v).unwrap();
         assert_eq!(back.enrichment[0].language, "python");
+        assert_eq!(back.primary_label(), Some("HEAD"));
+        assert!(back.has_head());
     }
 
     #[test]
@@ -97,7 +113,7 @@ mod status_tests {
             alias: "cairn".into(),
             root: "/tmp/cairn".into(),
             snapshots: vec![SnapshotStatus {
-                branch: "HEAD".into(),
+                branches: vec!["HEAD".into()],
                 status: "ready".into(),
                 enrichment: vec![LanguageEnrichment {
                     language: "rust".into(),

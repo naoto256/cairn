@@ -86,6 +86,31 @@ pub fn resolve_wire(anchor: Option<&str>, branch: Option<&str>) -> AnchorName {
     }
 }
 
+/// Sort key for anchor names in wire output. Used to order:
+/// 1. The labels within a single `branches: Vec<String>` group.
+/// 2. The snapshot groups themselves in `list_repos` / `status`.
+///
+/// Order: `HEAD` first, then bare branches (`branch/<n>` shape)
+/// alphabetically by `<n>`, then prefix-tagged anchors (`tag/`,
+/// `tentative/`, other) alphabetically by full internal name.
+///
+/// Operates on the internal anchor name (not the wire label), i.e.
+/// `branch/main`, not `main`.
+#[must_use]
+pub(crate) fn order_key(internal: &str) -> (u8, String) {
+    if internal == "HEAD" {
+        (0, String::new())
+    } else if let Some(rest) = internal.strip_prefix("branch/") {
+        (1, rest.to_string())
+    } else if internal.starts_with("tag/") {
+        (2, internal.to_string())
+    } else if internal.starts_with("tentative/") {
+        (3, internal.to_string())
+    } else {
+        (4, internal.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorKind {
     Branch(String),
@@ -245,6 +270,28 @@ mod tests {
         let n = AnchorName::branch("release/0.1.0");
         assert_eq!(n.as_str(), "branch/release/0.1.0");
         assert_eq!(n.kind(), Some(AnchorKind::Branch("release/0.1.0".into())));
+    }
+
+    #[test]
+    fn order_key_ranks_head_first_then_branches_then_kinded() {
+        let mut names = vec![
+            "tag/v1",
+            "branch/zebra",
+            "HEAD",
+            "branch/main",
+            "tentative/1",
+        ];
+        names.sort_by_key(|a| order_key(a));
+        assert_eq!(
+            names,
+            vec![
+                "HEAD",
+                "branch/main",
+                "branch/zebra",
+                "tag/v1",
+                "tentative/1"
+            ]
+        );
     }
 
     #[test]
