@@ -5,7 +5,59 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [0.1.0-alpha.1] — Unreleased
+## [0.1.0-alpha.2] — Unreleased
+
+Follow-up pass on the 0.1.0-alpha.1 wire surface, driven by dogfooding
+feedback from a peer code-review session that used cairn live.
+
+### Added
+
+- **`FindReferenceHit.snippet`**: every `find_references` hit now
+  carries the one-line source text at its `line`, so callers can see
+  what each call site looks like without a separate
+  `get_symbol_source` round-trip. The line is materialised via
+  `git cat-file` (worktree fallback for tentative anchors) and a
+  per-call cache deduplicates blob reads.
+- **`FindSymbolArgs.signature_only`** (wire + CLI `--signature-only` +
+  MCP `find_symbols` tool `input_schema`): drops the `signature`
+  field per hit so broad enumerations (e.g. `kind="function"` over a
+  directory) stay cheap in wire / context cost. Navigation fields
+  (`id`, `qualified`, `name`, `kind`, `repo`, `branch`, `location`)
+  always come through.
+
+### Changed (wire breaking)
+
+- **`SnapshotEntry.last_accessed`** is now an RFC 3339 UTC string
+  (`"2026-06-01T18:00:00.123456789Z"`) instead of the raw nanosecond
+  epoch (`"1780243103595899000"`). Inline formatter (Hinnant's
+  `civil_from_days`); no new time-crate dependency.
+
+### Fixed
+
+- **`get_outline` doc duplication**: the syn-emitted `doc_override`
+  used to `UPDATE symbols SET doc = ?` scoped by `qualified` alone,
+  which fanned the struct's doc onto every sibling `impl Foo` and
+  `impl Trait for Foo` row in the table (Rust admits multiple symbol
+  rows for one qualified name). `DocOverride` now carries
+  `target_kind` and the UPDATE filters by `(qualified, kind)`, so
+  outline responses no longer repeat the same doc 3–5× per type.
+
+### Docs
+
+- **`FindSymbolArgs.path`** docstring (proto + MCP tool description)
+  now spells out the byte-level string-prefix semantics — `path =
+  "crates/foo/"` for a directory scope, `path = "crates/foo"` also
+  matches sibling `crates/foo_bar/...`. Behavior unchanged.
+
+### Internal
+
+- `register::load_blob_or_worktree(root, blob_sha, path)` extracted
+  from the inlined `git cat-file` + worktree fallback that both
+  `find_references` (snippet load) and `get_symbol_source` already
+  needed. Rule-of-Three prep work — keeps the lookup canonical when a
+  third wire method needs source-line context.
+
+## [0.1.0-alpha.1] — 2026-05-31
 
 Initial line under the content-addressed architecture. The previous
 0.x line on the same name is discarded; this is a fresh start with no
@@ -63,4 +115,5 @@ upgrade path. Re-register your repos.
   deleted?"). The branch anchors retain past manifests, so the
   substrate is in place; the query method is unwired.
 
-[0.1.0-alpha.1]: https://github.com/naoto256/cairn
+[0.1.0-alpha.2]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.1...HEAD
+[0.1.0-alpha.1]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.1
