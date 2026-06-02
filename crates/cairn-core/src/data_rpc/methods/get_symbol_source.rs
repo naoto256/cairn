@@ -15,7 +15,7 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, SymbolSourceRow};
-use crate::register::git_cat_file;
+use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
 
 pub struct GetSymbolSource;
@@ -95,22 +95,17 @@ impl DataMethod for GetSymbolSource {
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(GetSymbolSource);
 
-/// Slice `row.byte_start..row.byte_end` out of the blob's content.
-/// Tries git first (= the indexed blob is the authoritative source);
-/// if the blob is not in the object store (e.g. an uncommitted file
-/// under a tentative anchor) falls back to reading the file from the
-/// worktree.
+/// Slice `row.byte_start..row.byte_end` out of the blob's content,
+/// loaded via the shared `register::load_blob_or_worktree` helper (git
+/// cat-file first, worktree fallback for tentative-anchor blobs).
 fn materialise(worktree_root: &std::path::Path, row: &SymbolSourceRow) -> Result<String> {
-    let bytes = match git_cat_file(worktree_root, &row.blob_sha) {
-        Ok(b) => b,
-        Err(_) => std::fs::read(worktree_root.join(&row.path)).map_err(|e| {
-            Error::InvalidArgument(format!(
-                "get_symbol_source: blob {} not in git and {} unreadable: {e}",
-                row.blob_sha,
-                worktree_root.join(&row.path).display()
-            ))
-        })?,
-    };
+    let bytes = load_blob_or_worktree(worktree_root, &row.blob_sha, &row.path).map_err(|e| {
+        Error::InvalidArgument(format!(
+            "get_symbol_source: blob {} not in git and {} unreadable: {e}",
+            row.blob_sha,
+            worktree_root.join(&row.path).display()
+        ))
+    })?;
     if row.byte_end > bytes.len() || row.byte_start > row.byte_end {
         return Err(Error::InvalidArgument(format!(
             "get_symbol_source: blob {} shorter than indexed byte range ({}..{} vs {} bytes); reindex needed",
