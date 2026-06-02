@@ -40,13 +40,16 @@ impl LanguageBackend for PythonBackend {
     }
 
     fn shebang_patterns(&self) -> &'static [&'static str] {
-        // Substrings searched in the trimmed first line. Covers both
-        // direct interpreter shebangs (`#!/usr/bin/python3`) and
-        // `env`-based ones (`#!/usr/bin/env python3`). "python3" is
-        // listed first so it wins on environments where both python2
-        // and python3 are installed and a backend "python2" might
-        // later claim the bare `python` substring.
-        &["python3", "python"]
+        // Substrings searched in the trimmed first line. Covers:
+        // - direct interpreter shebangs: `#!/usr/bin/python3`
+        // - env-based shebangs: `#!/usr/bin/env python3`
+        // - uv inline scripts: `#!/usr/bin/env -S uv run --script`
+        //
+        // "python3" comes before bare "python" so a future Python 2
+        // backend could still claim the narrower interpreter name.
+        // "uv run --script" includes `--script` to avoid claiming
+        // `uv run foo.py`, which path matching handles separately.
+        &["python3", "python", "uv run --script"]
     }
 
     fn parser_id(&self) -> &'static str {
