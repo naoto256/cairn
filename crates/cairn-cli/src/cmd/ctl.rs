@@ -157,7 +157,7 @@ fn render_status(r: &StatusReport) {
         for snap in &repo.snapshots {
             println!(
                 "      [{}] status={} enrichment={:?} files={} symbols={} bytes={}",
-                snap.branch,
+                snap.branches.join("/"),
                 snap.status,
                 snap.enrichment,
                 snap.file_count,
