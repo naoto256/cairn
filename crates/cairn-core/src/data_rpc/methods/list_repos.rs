@@ -1,6 +1,8 @@
 //! `list_repos` — enumerate every registered repo with the anchors
 //! its CAS store knows about.
 
+use std::collections::BTreeMap;
+
 use cairn_lang_api::{LanguageBackend, all_backends};
 use cairn_proto::methods::{ListReposResult, RepoEntry, SnapshotEntry};
 use linkme::distributed_slice;
@@ -8,6 +10,7 @@ use rusqlite::params;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod};
+use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::enrichment::collect_enrichment;
 use crate::{Error, Result};
@@ -51,10 +54,14 @@ impl DataMethod for ListRepos {
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(ListRepos);
 
-/// Build one `SnapshotEntry` per anchor that points at a committed or
-/// tentative manifest. Branch-style names lose the `branch/` prefix to
-/// match the old wire format (`branch: "main"`); `HEAD` and
-/// `tentative/<id>` come through verbatim.
+struct SnapshotAcc {
+    internal_names: Vec<String>,
+    last_updated_ns: i64,
+}
+
+/// Build one `SnapshotEntry` per manifest. Anchor names become labels
+/// in `branches`; branch-style names lose the `branch/` prefix while
+/// `HEAD` and `tentative/<id>` come through verbatim.
 fn collect_snapshots(
     conn: &rusqlite::Connection,
     backends: &[Box<dyn LanguageBackend>],
@@ -72,8 +79,28 @@ fn collect_snapshots(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut out = Vec::with_capacity(rows.len());
+
+    let mut groups: BTreeMap<i64, SnapshotAcc> = BTreeMap::new();
     for (name, manifest_id, last_ns) in rows {
+        let acc = groups.entry(manifest_id).or_insert(SnapshotAcc {
+            internal_names: Vec::new(),
+            last_updated_ns: last_ns,
+        });
+        acc.internal_names.push(name);
+        if last_ns > acc.last_updated_ns {
+            acc.last_updated_ns = last_ns;
+        }
+    }
+
+    let mut entries: Vec<(String, SnapshotEntry)> = Vec::with_capacity(groups.len());
+    for (manifest_id, mut acc) in groups {
+        acc.internal_names.sort_by_key(|a| anchor::order_key(a));
+        let sort_internal = acc.internal_names.first().cloned().unwrap_or_default();
+        let branches = acc
+            .internal_names
+            .iter()
+            .map(|n| n.strip_prefix("branch/").unwrap_or(n).to_string())
+            .collect();
         let file_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM manifest_entries WHERE manifest_id = ?1",
@@ -90,19 +117,20 @@ fn collect_snapshots(
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        let branch = name
-            .strip_prefix("branch/")
-            .map_or_else(|| name.clone(), str::to_string);
-        out.push(SnapshotEntry {
-            branch,
-            status: "ready".into(),
-            enrichment: collect_enrichment(conn, manifest_id, backends)?,
-            last_accessed: Some(crate::timefmt::ns_to_rfc3339_utc(last_ns)),
-            file_count: u64::try_from(file_count).unwrap_or(0),
-            symbol_count: u64::try_from(symbol_count).unwrap_or(0),
-        });
+        entries.push((
+            sort_internal,
+            SnapshotEntry {
+                branches,
+                status: "ready".into(),
+                enrichment: collect_enrichment(conn, manifest_id, backends)?,
+                last_accessed: Some(crate::timefmt::ns_to_rfc3339_utc(acc.last_updated_ns)),
+                file_count: u64::try_from(file_count).unwrap_or(0),
+                symbol_count: u64::try_from(symbol_count).unwrap_or(0),
+            },
+        ));
     }
-    Ok(out)
+    entries.sort_by_key(|(a, _)| anchor::order_key(a));
+    Ok(entries.into_iter().map(|(_, e)| e).collect())
 }
 
 #[cfg(test)]
@@ -134,7 +162,7 @@ mod tests {
 
         let backends = all_backends();
         let snapshots = collect_snapshots(&conn, &backends).unwrap();
-        let snapshot = snapshots.iter().find(|s| s.branch == "HEAD").unwrap();
+        let snapshot = snapshots.iter().find(|s| s.has_head()).unwrap();
         let languages: Vec<&str> = snapshot
             .enrichment
             .iter()
@@ -164,5 +192,27 @@ mod tests {
             .unwrap();
         assert!(!markdown.has_analyzer);
         assert_eq!(markdown.tier, SourceTier::Syntactic);
+    }
+
+    #[test]
+    fn list_repos_dedups_anchors_by_manifest_id() {
+        let (repo, _sha) = init_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, repo.path(), 1000).unwrap();
+
+        let backends = all_backends();
+        let snapshots = collect_snapshots(&conn, &backends).unwrap();
+
+        let head_main = snapshots.iter().find(|s| s.has_head()).unwrap();
+        assert_eq!(head_main.branches, vec!["HEAD", "main"]);
+
+        let tentative = snapshots
+            .iter()
+            .find(|s| s.branches.iter().any(|b| b.starts_with("tentative/")))
+            .unwrap();
+        assert_eq!(tentative.branches.len(), 1);
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots[0].has_head());
     }
 }

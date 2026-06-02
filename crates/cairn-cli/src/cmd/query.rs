@@ -397,7 +397,10 @@ fn render(method: &str, value: &Value) {
                     for snap in &repo.snapshots {
                         println!(
                             "    {}\t{}\tfiles={}\tsymbols={}",
-                            snap.branch, snap.status, snap.file_count, snap.symbol_count
+                            snap.branches.join("/"),
+                            snap.status,
+                            snap.file_count,
+                            snap.symbol_count
                         );
                     }
                 }

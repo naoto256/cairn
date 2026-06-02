@@ -41,12 +41,26 @@ impl RepoEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEntry {
-    pub branch: String,
+    pub branches: Vec<String>,
     pub status: String,
     pub enrichment: Vec<LanguageEnrichment>,
     pub last_accessed: Option<String>,
     pub file_count: u64,
     pub symbol_count: u64,
+}
+
+impl SnapshotEntry {
+    /// First branch label in `branches` ordering (`HEAD` if present).
+    #[must_use]
+    pub fn primary_label(&self) -> Option<&str> {
+        self.branches.first().map(String::as_str)
+    }
+
+    /// Whether `HEAD` points at this snapshot's manifest.
+    #[must_use]
+    pub fn has_head(&self) -> bool {
+        self.branches.iter().any(|b| b == "HEAD")
+    }
 }
 
 #[cfg(test)]
@@ -56,7 +70,7 @@ mod list_repos_tests {
     #[test]
     fn snapshot_entry_serializes_enrichment_matrix() {
         let entry = SnapshotEntry {
-            branch: "main".into(),
+            branches: vec!["HEAD".into(), "main".into()],
             status: "ready".into(),
             enrichment: vec![LanguageEnrichment {
                 language: "rust".into(),
@@ -71,7 +85,7 @@ mod list_repos_tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "branch": "main",
+                "branches": ["HEAD", "main"],
                 "status": "ready",
                 "enrichment": [{
                     "language": "rust",
@@ -85,6 +99,8 @@ mod list_repos_tests {
         );
         let back: SnapshotEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back.enrichment[0].language, "rust");
+        assert_eq!(back.primary_label(), Some("HEAD"));
+        assert!(back.has_head());
     }
 
     #[test]
@@ -93,7 +109,7 @@ mod list_repos_tests {
             alias: "cairn".into(),
             root: "/tmp/cairn".into(),
             snapshots: vec![SnapshotEntry {
-                branch: "main".into(),
+                branches: vec!["main".into()],
                 status: "ready".into(),
                 enrichment: vec![
                     LanguageEnrichment {
