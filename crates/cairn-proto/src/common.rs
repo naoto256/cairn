@@ -32,10 +32,13 @@ pub enum SourceTier {
 
 /// Per-language enrichment status within one snapshot.
 ///
-/// `tier=Syntactic && has_analyzer=true` indicates Tier-2 capability
-/// exists but the snapshot's blobs carry no semantic facts (either the
-/// analyzer hasn't run for this blob set, or it ran and produced no
-/// resolvable facts).
+/// `tier` reports whether a matching analyzer run is recorded for any
+/// blob in this `(snapshot, language)` slice; freshness against the
+/// current analyzer revision is enforced separately on the next parse.
+/// `tier=Syntactic && has_analyzer=true` therefore means Tier-2
+/// capability exists but no matching analyzer run is recorded for this
+/// snapshot's blob set — analyzer-ran-with-zero-facts already counts
+/// as `Semantic`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageEnrichment {
     /// Short language tag, e.g. `"rust"`, `"python"`, `"markdown"`.
