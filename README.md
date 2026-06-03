@@ -4,8 +4,9 @@ Local, symbol-aware code index. A daemon-backed index for fast,
 structural code search across the repos you've registered — definitions,
 references, impls, imports, source bodies — with no external service.
 
-Status: **0.1.0-alpha.2**. The on-disk format is current-state-of-the-day;
-do not depend on it staying stable until 1.0.
+Status: **0.1.0-alpha.2**. Wire schemas (JSON-RPC + MCP), on-disk
+format, and CLI flags are current-state-of-the-day; do not depend on
+them staying stable until 1.0.
 
 ## Why
 
