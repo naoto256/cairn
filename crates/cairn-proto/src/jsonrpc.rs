@@ -68,7 +68,6 @@ pub mod error_code {
     // Cairn-specific (-32000 .. -32099 is the implementation-defined range).
     pub const REPO_NOT_FOUND: i32 = -32001;
     pub const FILE_NOT_INDEXED: i32 = -32002;
-    pub const SNAPSHOT_NOT_READY: i32 = -32003;
 }
 
 /// Construct a successful JSON-RPC response.

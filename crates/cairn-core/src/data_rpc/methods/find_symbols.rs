@@ -47,7 +47,9 @@ impl DataMethod for FindSymbols {
             let aliases = match requested_repo.as_deref() {
                 Some(name) => {
                     let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
-                        Error::InvalidArgument(format!("unknown repo alias: `{name}`"))
+                        Error::RepoNotFound {
+                            alias: name.to_string(),
+                        }
                     })?;
                     vec![entry]
                 }
@@ -60,7 +62,7 @@ impl DataMethod for FindSymbols {
                 let conn = cas_store::open(&store_path)?;
                 let hits = match query::find_symbols(&conn, &anchor, &q) {
                     Ok(h) => h,
-                    Err(Error::InvalidArgument(_)) => {
+                    Err(Error::AnchorNotFound { .. }) => {
                         // The requested anchor doesn't exist in this
                         // store — skip rather than fail the whole
                         // query (= other repos may still have it).
