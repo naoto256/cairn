@@ -1,0 +1,21 @@
+[package]
+name = "cairn-lang-go"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Go language backend (tree-sitter floor; analyzer slot reserved for gopls)."
+
+[dependencies]
+cairn-lang-api.workspace = true
+cairn-lang-treesitter-generic.workspace = true
+tree-sitter.workspace = true
+tree-sitter-go.workspace = true
+linkme.workspace = true
+
+[lints]
+workspace = true

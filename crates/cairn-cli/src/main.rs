@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 // (under `_`, so the binding is unusable) and that suffices to keep
 // the rlib in the final link line. Adding a new language backend
 // means adding one more `use ... as _;` line here.
+use cairn_lang_go as _;
 use cairn_lang_markdown as _;
 use cairn_lang_python as _;
 use cairn_lang_rust as _;

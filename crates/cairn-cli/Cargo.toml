@@ -25,6 +25,7 @@ cairn-lang-rust.workspace = true
 cairn-lang-python.workspace = true
 cairn-lang-markdown.workspace = true
 cairn-lang-typescript.workspace = true
+cairn-lang-go.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

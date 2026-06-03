@@ -103,18 +103,23 @@ above.
 ## Languages
 
 Tier-1 (syntactic, tree-sitter) for Rust / Python / Markdown /
-TypeScript plus a generic tree-sitter fallback. Python additionally
-carries a Tier-2 analyzer (imports, inheritance, refs). Rust Tier-2
-(via `syn`) is shipped as the analyzer in `cairn-lang-rust`; Tier-3
-(LSP-grade, `rust-analyzer`-driven) is roadmapped for the 1.0 line.
-TypeScript covers `*.ts`, `*.mts`, `*.cts`; `.tsx` lives in a
-separate upstream grammar and is intentionally a follow-up backend.
+TypeScript / Go plus a generic tree-sitter fallback. Python
+additionally carries a Tier-2 analyzer (imports, inheritance,
+refs). Rust Tier-2 (via `syn`) is shipped as the analyzer in
+`cairn-lang-rust`; Tier-3 (LSP-grade, `rust-analyzer`-driven) is
+roadmapped for the 1.0 line. TypeScript covers `*.ts`, `*.mts`,
+`*.cts`; `.tsx` lives in a separate upstream grammar and is
+intentionally a follow-up backend. Go covers `*.go` (functions,
+methods with receiver-qualified names, named types, top-level
+constants and variables, imports); Tier-2 via `gopls` is reserved
+as future work, and exported-vs-unexported visibility (Go's
+first-letter convention) is currently uniformly `Public`.
 
 Files are picked by extension first (`*.py`, `*.rs`, `*.md`, `*.ts`,
-...); extensionless executables (`bin/foo` with mode `0755+`) are
-sniffed by shebang, such as `#!/usr/bin/env python3` or
-`#!/usr/bin/env -S uv run --script` (PEP 723 inline scripts), and
-indexed as the matching language.
+`*.go`, ...); extensionless executables (`bin/foo` with mode
+`0755+`) are sniffed by shebang, such as `#!/usr/bin/env python3`
+or `#!/usr/bin/env -S uv run --script` (PEP 723 inline scripts),
+and indexed as the matching language.
 
 ## License
 
