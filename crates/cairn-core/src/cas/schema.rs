@@ -1,4 +1,4 @@
-//! Per-repo store schema (v1).
+//! Per-repo store schema.
 //!
 //! One SQLite file per registered repo holds:
 //!
@@ -18,9 +18,10 @@
 
 use crate::migration::Migration;
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: r#"
 -- CAS metadata
 CREATE TABLE blobs (
     blob_sha        TEXT NOT NULL,
@@ -169,4 +170,12 @@ CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
     VALUES (new.id, new.name, new.qualified, new.doc);
 END;
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        sql: r#"
+ALTER TABLE blobs ADD COLUMN analyzer_id TEXT;
+ALTER TABLE blobs ADD COLUMN analyzer_revision INTEGER;
+"#,
+    },
+];
