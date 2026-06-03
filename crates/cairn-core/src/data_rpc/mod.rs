@@ -43,6 +43,8 @@ use crate::{Error, Result};
 
 pub mod methods;
 
+mod helpers;
+
 // ─── trait + registry ──────────────────────────────────────────────────────
 
 /// One JSON-RPC method exposed on the data socket. Each implementer
@@ -157,9 +159,10 @@ fn error_from(id: RequestId, err: &Error) -> Response {
     let msg = err.to_string();
     let code = match err {
         Error::InvalidArgument(s) if s.starts_with("invalid params") => error_code::INVALID_PARAMS,
-        Error::InvalidArgument(s) if s.starts_with("no repo ") => error_code::REPO_NOT_FOUND,
-        Error::InvalidArgument(s) if s.contains("has no snapshot") => {
-            error_code::SNAPSHOT_NOT_READY
+        Error::InvalidArgument(s)
+            if s.starts_with("no repo ") || s.starts_with("unknown repo alias:") =>
+        {
+            error_code::REPO_NOT_FOUND
         }
         _ => error_code::INTERNAL_ERROR,
     };

@@ -13,7 +13,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::data_rpc::helpers::with_repo_conn;
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -34,27 +34,21 @@ impl DataMethod for GetSymbolSource {
             ));
         }
 
-        let cas_data_dir = ctx.cas_data_dir.clone();
         let qualified = args.qualified.clone();
         let file_filter = args.file.clone();
         let signature_only = args.signature_only;
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let repo_alias = args.repo.clone();
+        let repo_alias_for_error = repo_alias.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entry = cas_registry::lookup_by_alias(&index, &repo_alias)?.ok_or_else(|| {
-                Error::InvalidArgument(format!("unknown repo alias: `{repo_alias}`"))
-            })?;
-            let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+        let result = with_repo_conn(ctx, &repo_alias, "get_symbol_source", move |entry, conn| {
             let worktree_root = PathBuf::from(&entry.root_path);
 
             let row =
                 query::get_symbol_source_row(&conn, &anchor, &qualified, file_filter.as_deref())?
                     .ok_or_else(|| {
                     Error::InvalidArgument(format!(
-                        "no symbol matches qualified=`{qualified}` in repo=`{repo_alias}`"
+                        "no symbol matches qualified=`{qualified}` in repo=`{repo_alias_for_error}`"
                     ))
                 })?;
 
@@ -84,8 +78,7 @@ impl DataMethod for GetSymbolSource {
                 source_tier: SourceTier::Syntactic,
             })
         })
-        .await
-        .map_err(|e| Error::InvalidArgument(format!("get_symbol_source task panicked: {e}")))??;
+        .await?;
 
         Ok(serde_json::to_value(result).unwrap())
     }

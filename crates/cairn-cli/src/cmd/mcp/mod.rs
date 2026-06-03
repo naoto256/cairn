@@ -38,12 +38,13 @@ use cairn_proto::jsonrpc::{
 use clap::Args as ClapArgs;
 use linkme::distributed_slice;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "cairn";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 // ─── tool trait + registry ─────────────────────────────────────────────────
 
@@ -142,16 +143,31 @@ pub async fn run(args: Args) -> Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(reply) = dispatcher.handle_line(&line).await {
-            stdout.write_all(reply.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+    loop {
+        match read_mcp_line_capped(&mut reader, MCP_MAX_LINE_BYTES).await? {
+            McpLine::Eof => break,
+            McpLine::TooLong => {
+                let resp = error_resp(
+                    RequestId::Null,
+                    error_code::INVALID_REQUEST,
+                    format!("JSON-RPC line exceeds {MCP_MAX_LINE_BYTES} bytes"),
+                );
+                stdout.write_all(serialize(&resp).as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            McpLine::Line(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(reply) = dispatcher.handle_line(&line).await {
+                    stdout.write_all(reply.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
+            }
         }
     }
     Ok(())
@@ -307,6 +323,60 @@ impl Dispatcher {
 
 // ─── wire IO ───────────────────────────────────────────────────────────────
 
+enum McpLine {
+    Eof,
+    Line(String),
+    TooLong,
+}
+
+async fn read_mcp_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<McpLine> {
+    let mut buf = Vec::new();
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if too_long {
+                return Ok(McpLine::TooLong);
+            }
+            if buf.is_empty() {
+                return Ok(McpLine::Eof);
+            }
+            return line_from_bytes(buf);
+        }
+        let (done, n) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (true, i + 1),
+            None => (false, available.len()),
+        };
+        if !too_long {
+            if buf.len() + n > max {
+                too_long = true;
+            } else {
+                buf.extend_from_slice(&available[..n]);
+            }
+        }
+        reader.consume(n);
+        if done {
+            return if too_long {
+                Ok(McpLine::TooLong)
+            } else {
+                line_from_bytes(buf)
+            };
+        }
+    }
+}
+
+fn line_from_bytes(mut buf: Vec<u8>) -> std::io::Result<McpLine> {
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    String::from_utf8(buf)
+        .map(McpLine::Line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 async fn send_json_rpc(socket: &std::path::Path, req: &RpcRequest) -> std::io::Result<RpcResponse> {
     let stream = UnixStream::connect(socket).await?;
     let (read, mut write) = stream.into_split();
@@ -414,5 +484,23 @@ mod tests {
         let r = initialize_result();
         assert_eq!(r.protocol_version, MCP_PROTOCOL_VERSION);
         assert!(r.instructions.unwrap().contains("find_symbols"));
+    }
+
+    #[tokio::test]
+    async fn read_mcp_line_capped_accepts_line_at_limit() {
+        let mut reader = BufReader::new(&b"abc\nnext\n"[..]);
+        let line = read_mcp_line_capped(&mut reader, 4).await.unwrap();
+        assert!(matches!(line, McpLine::Line(s) if s == "abc"));
+        let line = read_mcp_line_capped(&mut reader, 5).await.unwrap();
+        assert!(matches!(line, McpLine::Line(s) if s == "next"));
+    }
+
+    #[tokio::test]
+    async fn read_mcp_line_capped_drains_oversized_line() {
+        let mut reader = BufReader::new(&b"abcdef\nok\n"[..]);
+        let line = read_mcp_line_capped(&mut reader, 4).await.unwrap();
+        assert!(matches!(line, McpLine::TooLong));
+        let line = read_mcp_line_capped(&mut reader, 3).await.unwrap();
+        assert!(matches!(line, McpLine::Line(s) if s == "ok"));
     }
 }

@@ -54,6 +54,7 @@ pub enum JsonRpcVersion {
 pub enum RequestId {
     Number(i64),
     String(String),
+    Null,
 }
 
 /// Standard JSON-RPC error codes plus cairn extensions.
@@ -130,6 +131,8 @@ mod tests {
         assert!(matches!(s, RequestId::String(_)));
         let n: RequestId = serde_json::from_str("42").unwrap();
         assert!(matches!(n, RequestId::Number(42)));
+        let null: RequestId = serde_json::from_str("null").unwrap();
+        assert!(matches!(null, RequestId::Null));
     }
 
     #[test]
