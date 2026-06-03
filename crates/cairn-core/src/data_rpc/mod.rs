@@ -14,8 +14,8 @@
 //! module.
 //!
 //! Admin verbs (`register_repo`, `reindex_repo`, `status`, `doctor`,
-//! `shutdown`) live on a separate control socket so the data plane
-//! stays read-only by construction. The MCP front-end translates
+//! `prune`, `shutdown`) live on a separate control socket so the data
+//! plane stays read-only by construction. The MCP front-end translates
 //! `register_repo` / `reindex_repo` tools into [`cairn_proto::control`]
 //! messages on that other socket; the daemon never speaks MCP itself.
 //!

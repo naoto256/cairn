@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
-use cairn_proto::control::{DoctorReport, DoctorStatus, StatusReport};
+use cairn_proto::control::{DoctorReport, DoctorStatus, PruneResult, StatusReport};
 use cairn_proto::jsonrpc::{JsonRpcVersion, Request, RequestId, Response};
 use clap::{Args as ClapArgs, Subcommand};
 use serde_json::{Value, json};
@@ -40,6 +40,12 @@ enum CtlCommand {
     Status,
     /// Force a full re-index of `alias`.
     ReindexRepo { alias: String },
+    /// Delete cached blobs whose parser IDs no current backend owns.
+    Prune {
+        /// Restrict pruning to one registered repo alias.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Diagnose dependencies, paths, and reachability.
     Doctor,
     /// Ask the daemon to shut down.
@@ -65,6 +71,7 @@ pub async fn run(args: Args) -> Result<()> {
         CtlCommand::RemoveRepo { alias } => ("remove_repo", json!({"alias": alias})),
         CtlCommand::Status => ("status", Value::Null),
         CtlCommand::ReindexRepo { alias } => ("reindex_repo", json!({"alias": alias})),
+        CtlCommand::Prune { repo } => ("prune", json!({"repo": repo})),
         CtlCommand::Doctor => ("doctor", Value::Null),
         CtlCommand::Shutdown => ("shutdown", Value::Null),
     };
@@ -134,9 +141,22 @@ fn render(method: &str, resp: &Response) {
                 return;
             }
         }
+        "prune" => {
+            if let Ok(report) = serde_json::from_value::<PruneResult>(value.clone()) {
+                render_prune(&report);
+                return;
+            }
+        }
         _ => {}
     }
     println!("ok");
+}
+
+fn render_prune(r: &PruneResult) {
+    println!("deleted {} blob(s)", r.total_deleted);
+    for repo in &r.repos {
+        println!("  - {}: {}", repo.alias, repo.deleted_blob_count);
+    }
 }
 
 fn render_status(r: &StatusReport) {

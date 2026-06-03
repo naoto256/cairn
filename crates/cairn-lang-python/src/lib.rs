@@ -53,7 +53,7 @@ impl LanguageBackend for PythonBackend {
     }
 
     fn parser_id(&self) -> &'static str {
-        concat!("tree-sitter-python@", env!("CARGO_PKG_VERSION"))
+        "tree-sitter-python"
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {

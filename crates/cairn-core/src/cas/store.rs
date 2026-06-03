@@ -27,12 +27,12 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_to_version_2() {
+    fn migrations_run_to_version_3() {
         let (_tmp, c) = fresh();
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
@@ -111,6 +111,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (None, None));
+    }
+
+    #[test]
+    fn v3_deletes_versioned_parser_ids_only() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::migration::apply(&mut c, &crate::cas::schema::MIGRATIONS[..2]).unwrap();
+        c.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('stable', 'tree-sitter-rust', 1, 0),
+                    ('versioned', 'tree-sitter-rust@0.1.0-alpha.2', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        crate::migration::apply(&mut c, crate::cas::schema::MIGRATIONS).unwrap();
+        let rows: Vec<(String, String)> = c
+            .prepare("SELECT blob_sha, parser_id FROM blobs ORDER BY blob_sha")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("stable".to_string(), "tree-sitter-rust".to_string())]
+        );
     }
 
     #[test]

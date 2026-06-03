@@ -6,7 +6,7 @@
 //! newline-terminated JSON-RPC reply.
 //!
 //! Verbs (`register_repo`, `remove_repo`, `status`, `doctor`,
-//! `reindex_repo`, `shutdown`) live in [`methods`] and register
+//! `reindex_repo`, `prune`, `shutdown`) live in [`methods`] and register
 //! themselves into [`CONTROL_METHODS`] via `#[distributed_slice]`.
 //! Adding a new verb is a one-file change — same pattern the data
 //! RPC and MCP front-end already use.

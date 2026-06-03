@@ -16,6 +16,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::LanguageEnrichment;
 
+// ─── prune ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneResult {
+    pub repos: Vec<PruneRepoEntry>,
+    pub total_deleted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneRepoEntry {
+    pub alias: String,
+    pub deleted_blob_count: u64,
+}
+
 // ─── status ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
