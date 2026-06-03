@@ -230,6 +230,12 @@ pub trait LanguageBackend: Send + Sync {
 pub trait Analyzer: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Monotonic revision for this analyzer's semantic output. Bump
+    /// when the same input would produce different semantic facts.
+    fn revision(&self) -> u32 {
+        1
+    }
+
     /// Extract semantic facts from `source`. The same buffer was
     /// already handed to [`LanguageBackend::extract_syntactic`]; the
     /// analyzer re-parses it (or uses a different parser, like

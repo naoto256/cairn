@@ -29,7 +29,8 @@ pub(crate) fn collect_enrichment(
             .map(|b| b.as_ref());
         let language = backend.map_or_else(|| short_lang_name(&parser_id), |b| b.name().into());
         let has_analyzer = backend.is_some_and(|b| b.analyzer().is_some());
-        let tier = if manifest_has_semantic_facts(conn, manifest_id, &parser_id)? {
+        let analyzer_id = backend.and_then(|b| b.analyzer().map(|a| a.name()));
+        let tier = if manifest_has_analyzer_run(conn, manifest_id, &parser_id, analyzer_id)? {
             SourceTier::Semantic
         } else {
             SourceTier::Syntactic
@@ -59,46 +60,147 @@ fn short_lang_name(parser_id: &str) -> String {
         .map_or_else(|| parser_id.to_string(), str::to_string)
 }
 
-fn manifest_has_semantic_facts(
+fn manifest_has_analyzer_run(
     conn: &Connection,
     manifest_id: i64,
     parser_id: &str,
+    analyzer_id: Option<&str>,
 ) -> Result<bool> {
-    let semantic_refs: bool = conn.query_row(
+    let Some(analyzer_id) = analyzer_id else {
+        return Ok(false);
+    };
+    let ran: bool = conn.query_row(
         "SELECT EXISTS(
-           SELECT 1 FROM refs r
-             JOIN manifest_entries me ON me.blob_sha = r.blob_sha
+           SELECT 1 FROM blobs b
+             JOIN manifest_entries me ON me.blob_sha = b.blob_sha
             WHERE me.manifest_id = ?1
-              AND r.parser_id = ?2
-              AND r.source = 'semantic'
+              AND b.parser_id = ?2
+              AND b.analyzer_id = ?3
          )",
-        params![manifest_id, parser_id],
+        params![manifest_id, parser_id, analyzer_id],
         |r| r.get(0),
     )?;
-    if semantic_refs {
-        return Ok(true);
-    }
-
-    let implementations: bool = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM implementations i
-             JOIN manifest_entries me ON me.blob_sha = i.blob_sha
-            WHERE me.manifest_id = ?1
-              AND i.parser_id = ?2
-         )",
-        params![manifest_id, parser_id],
-        |r| r.get(0),
-    )?;
-    Ok(implementations)
+    Ok(ran)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use cairn_lang_api::{Analyzer, ExtractError, SemanticFacts, SyntacticFacts};
 
     #[test]
     fn short_lang_name_strips_tree_sitter_prefix_and_version() {
         assert_eq!(short_lang_name("tree-sitter-rust@1.2.3"), "rust");
         assert_eq!(short_lang_name("custom-parser"), "custom-parser");
+    }
+
+    #[test]
+    fn analyzer_run_marks_manifest_semantic_even_without_facts() {
+        let (_tmp, conn) = fresh_store();
+        seed_manifest_blob(
+            &conn,
+            "sha-sem",
+            "tree-sitter-empty@1",
+            Some("empty-analyzer"),
+            Some(1),
+        );
+        let backends: Vec<Box<dyn LanguageBackend>> = vec![Box::new(EmptyBackend)];
+
+        let enrichment = collect_enrichment(&conn, 1, &backends).unwrap();
+        assert_eq!(enrichment.len(), 1);
+        assert_eq!(enrichment[0].language, "empty");
+        assert_eq!(enrichment[0].tier, SourceTier::Semantic);
+        assert!(enrichment[0].has_analyzer);
+    }
+
+    #[test]
+    fn missing_analyzer_run_keeps_manifest_syntactic() {
+        let (_tmp, conn) = fresh_store();
+        seed_manifest_blob(&conn, "sha-syn", "tree-sitter-empty@1", None, None);
+        let backends: Vec<Box<dyn LanguageBackend>> = vec![Box::new(EmptyBackend)];
+
+        let enrichment = collect_enrichment(&conn, 1, &backends).unwrap();
+        assert_eq!(enrichment.len(), 1);
+        assert_eq!(enrichment[0].language, "empty");
+        assert_eq!(enrichment[0].tier, SourceTier::Syntactic);
+        assert!(enrichment[0].has_analyzer);
+    }
+
+    fn fresh_store() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        (tmp, conn)
+    }
+
+    fn seed_manifest_blob(
+        conn: &Connection,
+        blob_sha: &str,
+        parser_id: &str,
+        analyzer_id: Option<&str>,
+        analyzer_revision: Option<u32>,
+    ) {
+        conn.execute(
+            "INSERT INTO blobs
+               (blob_sha, parser_id, parser_revision, parsed_at_ns, analyzer_id, analyzer_revision)
+             VALUES (?1, ?2, 1, 0, ?3, ?4)",
+            params![blob_sha, parser_id, analyzer_id, analyzer_revision],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, commit_sha, built_at_ns)
+             VALUES (1, 'committed', 'abc', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'x.empty', ?1)",
+            params![blob_sha],
+        )
+        .unwrap();
+    }
+
+    struct EmptyBackend;
+
+    impl LanguageBackend for EmptyBackend {
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+
+        fn file_patterns(&self) -> &'static [&'static str] {
+            &["*.empty"]
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-empty@1"
+        }
+
+        fn extract_syntactic(
+            &self,
+            _source: &[u8],
+        ) -> std::result::Result<SyntacticFacts, ExtractError> {
+            Ok(SyntacticFacts::default())
+        }
+
+        fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
+            Some(Arc::new(EmptyAnalyzer))
+        }
+    }
+
+    struct EmptyAnalyzer;
+
+    impl Analyzer for EmptyAnalyzer {
+        fn name(&self) -> &'static str {
+            "empty-analyzer"
+        }
+
+        fn extract_semantic(
+            &self,
+            _source: &[u8],
+        ) -> std::result::Result<SemanticFacts, ExtractError> {
+            Ok(SemanticFacts::default())
+        }
     }
 }
