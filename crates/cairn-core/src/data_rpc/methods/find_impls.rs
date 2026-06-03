@@ -39,7 +39,7 @@ impl DataMethod for FindImpls {
         let items = with_repo_conn(ctx, &repo_alias, "find_impls", move |entry, conn| {
             let hits = match query::find_impls(&conn, &anchor, &q) {
                 Ok(h) => h,
-                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => Vec::new(),
+                Err(Error::AnchorNotFound { .. }) => Vec::new(),
                 Err(other) => return Err(other),
             };
 

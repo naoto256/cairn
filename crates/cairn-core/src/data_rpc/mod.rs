@@ -38,6 +38,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::daemon::LineHandler;
+use crate::jsonrpc_errors;
 use crate::paths::CasDataDir;
 use crate::{Error, Result};
 
@@ -147,24 +148,13 @@ impl DataRpc {
 // ─── helpers shared by method modules ─────────────────────────────────────
 
 /// Decode `params` (the raw `Value` from the JSON-RPC envelope) into a
-/// concrete args struct. Returns an `Error::InvalidArgument` (which
+/// concrete args struct. Returns an `Error::InvalidParams` (which
 /// [`error_from`] maps to `error_code::INVALID_PARAMS`) on shape
 /// mismatch.
 pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T> {
-    serde_json::from_value(params)
-        .map_err(|e| Error::InvalidArgument(format!("invalid params: {e}")))
+    serde_json::from_value(params).map_err(|e| Error::InvalidParams(e.to_string()))
 }
 
 fn error_from(id: RequestId, err: &Error) -> Response {
-    let msg = err.to_string();
-    let code = match err {
-        Error::InvalidArgument(s) if s.starts_with("invalid params") => error_code::INVALID_PARAMS,
-        Error::InvalidArgument(s)
-            if s.starts_with("no repo ") || s.starts_with("unknown repo alias:") =>
-        {
-            error_code::REPO_NOT_FOUND
-        }
-        _ => error_code::INTERNAL_ERROR,
-    };
-    error_resp(id, code, msg)
+    jsonrpc_errors::error_from(id, err)
 }

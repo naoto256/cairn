@@ -47,7 +47,7 @@ impl DataMethod for FindReferences {
 
             let hits = match query::find_references(&conn, &anchor, &q) {
                 Ok(h) => h,
-                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => {
+                Err(Error::AnchorNotFound { .. }) => {
                     // The requested branch doesn't exist as an anchor
                     // in this repo — return an empty result rather
                     // than failing the whole request.
