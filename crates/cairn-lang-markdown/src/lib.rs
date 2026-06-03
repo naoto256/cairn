@@ -34,7 +34,7 @@ impl LanguageBackend for MarkdownBackend {
     }
 
     fn parser_id(&self) -> &'static str {
-        concat!("tree-sitter-md@", env!("CARGO_PKG_VERSION"))
+        "tree-sitter-md"
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -301,8 +301,8 @@ mod tests {
     }
 
     #[test]
-    fn parser_id_includes_version() {
+    fn parser_id_is_stable() {
         let id = MarkdownBackend.parser_id();
-        assert!(id.starts_with("tree-sitter-md@"), "got: {id}");
+        assert_eq!(id, "tree-sitter-md");
     }
 }
