@@ -31,6 +31,8 @@ pub struct ParsedData {
 pub struct BlobMeta {
     pub parser_revision: u32,
     pub parsed_at_ns: i64,
+    pub analyzer_id: Option<String>,
+    pub analyzer_revision: Option<u32>,
 }
 
 /// Insert `data` for the given `(blob_sha, parser_id)`. Writes the
@@ -47,12 +49,25 @@ pub fn insert(
     parser_id: &str,
     parser_revision: u32,
     parsed_at_ns: i64,
+    analyzer: Option<(&str, u32)>,
     data: &ParsedData,
 ) -> Result<()> {
+    let (analyzer_id, analyzer_revision) = match analyzer {
+        Some((id, revision)) => (Some(id), Some(revision)),
+        None => (None, None),
+    };
     tx.execute(
-        "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![blob_sha, parser_id, parser_revision, parsed_at_ns],
+        "INSERT INTO blobs
+           (blob_sha, parser_id, parser_revision, parsed_at_ns, analyzer_id, analyzer_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            blob_sha,
+            parser_id,
+            parser_revision,
+            parsed_at_ns,
+            analyzer_id,
+            analyzer_revision,
+        ],
     )?;
 
     // Symbols first — refs/imports rely on the within-blob symbol IDs
@@ -133,13 +148,15 @@ pub fn insert(
 pub fn lookup(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result<Option<BlobMeta>> {
     let row = conn
         .query_row(
-            "SELECT parser_revision, parsed_at_ns FROM blobs
+            "SELECT parser_revision, parsed_at_ns, analyzer_id, analyzer_revision FROM blobs
              WHERE blob_sha = ?1 AND parser_id = ?2",
             params![blob_sha, parser_id],
             |r| {
                 Ok(BlobMeta {
                     parser_revision: r.get::<_, u32>(0)?,
                     parsed_at_ns: r.get::<_, i64>(1)?,
+                    analyzer_id: r.get::<_, Option<String>>(2)?,
+                    analyzer_revision: r.get::<_, Option<u32>>(3)?,
                 })
             },
         )
@@ -179,6 +196,7 @@ pub fn reuse_or_compute<F>(
     blob_sha: &str,
     parser_id: &str,
     expected_revision: u32,
+    expected_analyzer: Option<(&str, u32)>,
     parsed_at_ns: i64,
     compute: F,
 ) -> Result<bool>
@@ -187,6 +205,7 @@ where
 {
     if let Some(meta) = lookup(conn, blob_sha, parser_id)?
         && meta.parser_revision == expected_revision
+        && analyzer_matches(&meta, expected_analyzer)
     {
         return Ok(false);
     }
@@ -201,10 +220,20 @@ where
         parser_id,
         expected_revision,
         parsed_at_ns,
+        expected_analyzer,
         &data,
     )?;
     tx.commit()?;
     Ok(true)
+}
+
+fn analyzer_matches(meta: &BlobMeta, expected: Option<(&str, u32)>) -> bool {
+    match expected {
+        Some((id, revision)) => {
+            meta.analyzer_id.as_deref() == Some(id) && meta.analyzer_revision == Some(revision)
+        }
+        None => meta.analyzer_id.is_none() && meta.analyzer_revision.is_none(),
+    }
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -381,7 +410,7 @@ mod tests {
         let (_tmp, mut c) = fresh();
         let data = ParsedData::default();
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaA", "rust", 7, 1234, &data).unwrap();
+        insert(&tx, "shaA", "rust", 7, 1234, None, &data).unwrap();
         tx.commit().unwrap();
 
         let meta = lookup(&c, "shaA", "rust").unwrap().unwrap();
@@ -410,7 +439,7 @@ mod tests {
             semantic: None,
         };
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaB", "rust", 1, 0, &data).unwrap();
+        insert(&tx, "shaB", "rust", 1, 0, None, &data).unwrap();
         tx.commit().unwrap();
 
         let count: i64 = c
@@ -473,7 +502,7 @@ mod tests {
             }),
         };
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaC", "rust", 1, 0, &data).unwrap();
+        insert(&tx, "shaC", "rust", 1, 0, None, &data).unwrap();
         tx.commit().unwrap();
 
         let resolved: i64 = c
@@ -523,7 +552,7 @@ mod tests {
             }),
         };
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaD", "rust", 1, 0, &data).unwrap();
+        insert(&tx, "shaD", "rust", 1, 0, None, &data).unwrap();
         tx.commit().unwrap();
 
         let doc: String = c
@@ -596,7 +625,7 @@ mod tests {
             }),
         };
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaG", "rust", 1, 0, &data).unwrap();
+        insert(&tx, "shaG", "rust", 1, 0, None, &data).unwrap();
         tx.commit().unwrap();
 
         let mut stmt = c
@@ -644,7 +673,7 @@ mod tests {
             }),
         };
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaE", "rust", 1, 0, &data).unwrap();
+        insert(&tx, "shaE", "rust", 1, 0, None, &data).unwrap();
         tx.commit().unwrap();
 
         let count: i64 = c
@@ -688,7 +717,7 @@ mod tests {
             semantic: None,
         };
         let tx = c.transaction().unwrap();
-        insert(&tx, "shaF", "rust", 1, 0, &data).unwrap();
+        insert(&tx, "shaF", "rust", 1, 0, None, &data).unwrap();
         let removed = delete(&tx, "shaF", "rust").unwrap();
         tx.commit().unwrap();
         assert_eq!(removed, 1);
@@ -710,11 +739,11 @@ mod tests {
             Ok(ParsedData::default())
         };
 
-        let fresh1 = reuse_or_compute(&mut c, "shaG", "rust", 3, 0, bump).unwrap();
+        let fresh1 = reuse_or_compute(&mut c, "shaG", "rust", 3, None, 0, bump).unwrap();
         assert!(fresh1);
         assert_eq!(*counter.borrow(), 1);
 
-        let fresh2 = reuse_or_compute(&mut c, "shaG", "rust", 3, 0, bump).unwrap();
+        let fresh2 = reuse_or_compute(&mut c, "shaG", "rust", 3, None, 0, bump).unwrap();
         assert!(!fresh2);
         assert_eq!(*counter.borrow(), 1, "compute should not run on hit");
     }
@@ -728,12 +757,52 @@ mod tests {
             Ok(ParsedData::default())
         };
 
-        reuse_or_compute(&mut c, "shaH", "rust", 1, 0, bump).unwrap();
-        let fresh = reuse_or_compute(&mut c, "shaH", "rust", 2, 0, bump).unwrap();
+        reuse_or_compute(&mut c, "shaH", "rust", 1, None, 0, bump).unwrap();
+        let fresh = reuse_or_compute(&mut c, "shaH", "rust", 2, None, 0, bump).unwrap();
         assert!(fresh);
         assert_eq!(*counter.borrow(), 2);
 
         let meta = lookup(&c, "shaH", "rust").unwrap().unwrap();
         assert_eq!(meta.parser_revision, 2);
+    }
+
+    #[test]
+    fn reuse_or_compute_reparses_on_analyzer_revision_bump() {
+        let (_tmp, mut c) = fresh();
+        let counter = std::cell::RefCell::new(0u32);
+        let bump = || {
+            *counter.borrow_mut() += 1;
+            Ok(ParsedData::default())
+        };
+
+        reuse_or_compute(&mut c, "shaI", "rust", 1, Some(("rust-syn", 1)), 0, bump).unwrap();
+        let fresh =
+            reuse_or_compute(&mut c, "shaI", "rust", 1, Some(("rust-syn", 2)), 0, bump).unwrap();
+        assert!(fresh);
+        assert_eq!(*counter.borrow(), 2);
+
+        let meta = lookup(&c, "shaI", "rust").unwrap().unwrap();
+        assert_eq!(meta.parser_revision, 1);
+        assert_eq!(meta.analyzer_id.as_deref(), Some("rust-syn"));
+        assert_eq!(meta.analyzer_revision, Some(2));
+    }
+
+    #[test]
+    fn reuse_or_compute_reparses_when_analyzer_disappears() {
+        let (_tmp, mut c) = fresh();
+        let counter = std::cell::RefCell::new(0u32);
+        let bump = || {
+            *counter.borrow_mut() += 1;
+            Ok(ParsedData::default())
+        };
+
+        reuse_or_compute(&mut c, "shaJ", "rust", 1, Some(("rust-syn", 1)), 0, bump).unwrap();
+        let fresh = reuse_or_compute(&mut c, "shaJ", "rust", 1, None, 0, bump).unwrap();
+        assert!(fresh);
+        assert_eq!(*counter.borrow(), 2);
+
+        let meta = lookup(&c, "shaJ", "rust").unwrap().unwrap();
+        assert_eq!(meta.analyzer_id, None);
+        assert_eq!(meta.analyzer_revision, None);
     }
 }

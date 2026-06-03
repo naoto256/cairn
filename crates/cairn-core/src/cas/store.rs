@@ -27,12 +27,12 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_to_version_1() {
+    fn migrations_run_to_version_2() {
         let (_tmp, c) = fresh();
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
@@ -88,6 +88,29 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn v2_adds_nullable_analyzer_columns() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::migration::apply(&mut c, &crate::cas::schema::MIGRATIONS[..1]).unwrap();
+        c.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('sha1', 'rust', 1, 100)",
+            [],
+        )
+        .unwrap();
+
+        crate::migration::apply(&mut c, crate::cas::schema::MIGRATIONS).unwrap();
+        let row: (Option<String>, Option<u32>) = c
+            .query_row(
+                "SELECT analyzer_id, analyzer_revision FROM blobs
+                 WHERE blob_sha = 'sha1' AND parser_id = 'rust'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None));
     }
 
     #[test]

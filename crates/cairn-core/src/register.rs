@@ -190,11 +190,14 @@ fn parse_pending_blobs(
             .find(|b| b.parser_id() == parser_id)
             .expect("parser_id was just produced by a registered backend")
             .as_ref();
+        let analyzer = backend.analyzer();
+        let expected_analyzer = analyzer.as_deref().map(|a| (a.name(), a.revision()));
         let was_fresh = cas::blob::reuse_or_compute(
             conn,
             &blob_sha,
             &parser_id,
             PARSER_REVISION,
+            expected_analyzer,
             now_ns,
             || {
                 let bytes = match &content {
