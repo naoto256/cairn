@@ -189,4 +189,25 @@ ALTER TABLE blobs ADD COLUMN analyzer_revision INTEGER;
 DELETE FROM blobs WHERE parser_id LIKE '%@%';
 "#,
     },
+    Migration {
+        version: 4,
+        sql: r#"
+CREATE TABLE workspace_analysis_runs (
+    manifest_id       INTEGER NOT NULL REFERENCES manifests(manifest_id) ON DELETE CASCADE,
+    analyzer_id       TEXT NOT NULL,
+    analyzer_revision INTEGER NOT NULL,
+    config_hash       TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (
+        status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')
+    ),
+    started_at_ns     INTEGER NOT NULL,
+    finished_at_ns    INTEGER,
+    error             TEXT,
+    PRIMARY KEY (manifest_id, analyzer_id)
+);
+
+CREATE INDEX idx_workspace_analysis_runs_status
+    ON workspace_analysis_runs(status);
+"#,
+    },
 ];

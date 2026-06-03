@@ -30,6 +30,7 @@ pub mod sockets;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod timefmt;
+pub mod workspace_analyzer;
 
 pub use sockets::SocketPaths;
 
