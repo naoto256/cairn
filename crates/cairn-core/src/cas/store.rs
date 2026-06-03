@@ -27,12 +27,12 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_to_version_3() {
+    fn migrations_run_to_version_4() {
         let (_tmp, c) = fresh();
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
@@ -57,6 +57,7 @@ mod tests {
             "manifest_entries",
             "anchors",
             "worktrees",
+            "workspace_analysis_runs",
             "symbols_fts",
         ] {
             assert!(table_exists(&c, t), "missing table: {t}");
@@ -137,6 +138,113 @@ mod tests {
             rows,
             vec![("stable".to_string(), "tree-sitter-rust".to_string())]
         );
+    }
+
+    #[test]
+    fn v4_adds_workspace_analysis_runs_from_v3() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::migration::apply(&mut c, &crate::cas::schema::MIGRATIONS[..2]).unwrap();
+        c.execute_batch("PRAGMA user_version = 3").unwrap();
+
+        crate::migration::apply(&mut c, crate::cas::schema::MIGRATIONS).unwrap();
+
+        let v: u32 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+        assert!(table_exists(&c, "workspace_analysis_runs"));
+    }
+
+    #[test]
+    fn workspace_analysis_runs_track_one_current_run_per_manifest_analyzer() {
+        let (_tmp, c) = fresh();
+        c.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns)
+             VALUES (1, 'rust-analyzer-lsp', 1, 'cfg-a', 'pending', 10)",
+            [],
+        )
+        .unwrap();
+
+        let err = c
+            .execute(
+                "INSERT INTO workspace_analysis_runs
+                   (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                    status, started_at_ns)
+                 VALUES (1, 'rust-analyzer-lsp', 2, 'cfg-b', 'pending', 20)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE") || err.to_string().contains("PRIMARY"));
+    }
+
+    #[test]
+    fn workspace_analysis_run_status_constraint_enforced() {
+        let (_tmp, c) = fresh();
+        c.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+
+        for status in ["pending", "running", "succeeded", "failed", "skipped"] {
+            c.execute(
+                "INSERT INTO workspace_analysis_runs
+                   (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                    status, started_at_ns)
+                 VALUES (1, ?1, 1, 'cfg', ?2, 0)",
+                [format!("analyzer-{status}"), status.to_string()],
+            )
+            .unwrap();
+        }
+
+        let err = c
+            .execute(
+                "INSERT INTO workspace_analysis_runs
+                   (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                    status, started_at_ns)
+                 VALUES (1, 'bad-analyzer', 1, 'cfg', 'unknown', 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("check"));
+    }
+
+    #[test]
+    fn workspace_analysis_runs_cascade_on_manifest_delete() {
+        let (_tmp, c) = fresh();
+        c.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns)
+             VALUES (1, 'rust-analyzer-lsp', 1, 'cfg', 'succeeded', 10)",
+            [],
+        )
+        .unwrap();
+
+        c.execute("DELETE FROM manifests WHERE manifest_id = 1", [])
+            .unwrap();
+
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM workspace_analysis_runs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
