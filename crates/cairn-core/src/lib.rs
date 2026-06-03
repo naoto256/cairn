@@ -20,6 +20,7 @@ pub mod ctl;
 pub mod daemon;
 pub mod data_rpc;
 pub(crate) mod enrichment;
+pub(crate) mod jsonrpc_errors;
 pub mod manifest;
 pub mod migration;
 pub mod paths;
@@ -39,6 +40,15 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// JSON-RPC parameter parse / validation failure.
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+    /// User-facing repo alias is not registered.
+    #[error("unknown repo alias: `{alias}`")]
+    RepoNotFound { alias: String },
+    /// Requested snapshot anchor is not present in the store.
+    #[error("anchor not found: `{name}`")]
+    AnchorNotFound { name: String },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("schema corruption: {0}")]
@@ -46,3 +56,30 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn typed_error_display_formats_wire_messages() {
+        assert_eq!(
+            Error::InvalidParams("missing field `repo`".into()).to_string(),
+            "invalid params: missing field `repo`"
+        );
+        assert_eq!(
+            Error::RepoNotFound {
+                alias: "demo".into()
+            }
+            .to_string(),
+            "unknown repo alias: `demo`"
+        );
+        assert_eq!(
+            Error::AnchorNotFound {
+                name: "HEAD".into()
+            }
+            .to_string(),
+            "anchor not found: `HEAD`"
+        );
+    }
+}

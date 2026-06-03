@@ -73,9 +73,10 @@ pub fn find_symbols(
         ));
     }
 
-    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
-    })?;
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
 
     run_find_symbols(conn, manifest_id, args)
 }
@@ -117,7 +118,7 @@ pub struct FindReferencesArgs {
 ///   on the enclosing FK.
 ///
 /// # Errors
-/// `Error::InvalidArgument` when `symbol` is empty or the anchor
+/// `Error::InvalidArgument` when `symbol` is empty, `Error::AnchorNotFound` when the anchor
 /// doesn't resolve. SQLite errors otherwise.
 pub fn find_references(
     conn: &Connection,
@@ -129,9 +130,10 @@ pub fn find_references(
             "find_references: `symbol` must be non-empty".into(),
         ));
     }
-    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
-    })?;
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
     run_find_references(conn, manifest_id, args)
 }
 
@@ -241,7 +243,7 @@ pub struct SymbolSourceRow {
 /// when nothing matches.
 ///
 /// # Errors
-/// `Error::InvalidArgument` when the anchor doesn't resolve; SQLite
+/// `Error::AnchorNotFound` when the anchor doesn't resolve; SQLite
 /// errors otherwise.
 pub fn get_symbol_source_row(
     conn: &Connection,
@@ -249,9 +251,10 @@ pub fn get_symbol_source_row(
     qualified: &str,
     file_filter: Option<&str>,
 ) -> Result<Option<SymbolSourceRow>> {
-    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
-    })?;
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
 
     let mut sql = String::from(
         "SELECT s.name, s.kind, s.signature, s.doc,
@@ -311,7 +314,7 @@ pub struct OutlineItem {
 /// the daemon picks it from the file extension and passes it in.
 ///
 /// # Errors
-/// `Error::InvalidArgument` when the anchor doesn't resolve; SQLite
+/// `Error::AnchorNotFound` when the anchor doesn't resolve; SQLite
 /// errors otherwise.
 pub fn get_outline(
     conn: &Connection,
@@ -319,9 +322,10 @@ pub fn get_outline(
     file: &str,
     parser_id: Option<&str>,
 ) -> Result<Vec<OutlineItem>> {
-    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
-    })?;
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
 
     let blob_sha: Option<String> = conn
         .query_row(
@@ -412,9 +416,10 @@ pub fn find_impls(
             "find_impls: one of `trait` / `type` must be supplied".into(),
         ));
     }
-    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
-    })?;
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
     let limit = args.limit.unwrap_or(100).max(1);
 
     let mut sql = String::from(
@@ -490,9 +495,10 @@ pub fn find_imports(
     anchor: &AnchorName,
     args: &FindImportsArgs,
 ) -> Result<Vec<ImportHit>> {
-    let manifest_id = anchor::resolve(conn, anchor)?.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("anchor not found: {}", anchor.as_str()))
-    })?;
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
     let limit = args.limit.unwrap_or(200).max(1);
 
     let mut sql = String::from(

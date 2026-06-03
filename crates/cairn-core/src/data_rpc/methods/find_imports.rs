@@ -33,7 +33,7 @@ impl DataMethod for FindImports {
         let items = with_repo_conn(ctx, &repo_alias, "find_imports", move |_entry, conn| {
             let hits = match query::find_imports(&conn, &anchor, &q) {
                 Ok(h) => h,
-                Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => Vec::new(),
+                Err(Error::AnchorNotFound { .. }) => Vec::new(),
                 Err(other) => return Err(other),
             };
 

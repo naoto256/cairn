@@ -37,8 +37,11 @@ impl ControlMethod for ReindexRepo {
 
         let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entry = cas_registry::lookup_by_alias(&index, &alias)?
-                .ok_or_else(|| Error::InvalidArgument(format!("no repo `{alias}`")))?;
+            let entry = cas_registry::lookup_by_alias(&index, &alias)?.ok_or_else(|| {
+                Error::RepoNotFound {
+                    alias: alias.clone(),
+                }
+            })?;
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let mut conn = cas_store::open(&store_path)?;
             cas_register(&mut conn, &PathBuf::from(&entry.root_path), now_ns)
