@@ -351,6 +351,78 @@ mod tests {
         }
     }
 
+    async fn wait_for_touched(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+        file_name: &OsStr,
+    ) -> Option<WatchEvent> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(ev) = rx.recv().await {
+                if let WatchEvent::File {
+                    path,
+                    change: FileChange::Touched,
+                } = &ev
+                {
+                    if path.file_name() == Some(file_name) {
+                        return Some(ev);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Variant of `wait_for_touched` for the *first* event of a session
+    /// where the FSEvents stream may still be settling. The probe file
+    /// is re-written on a fixed interval so that even if the very first
+    /// few writes land inside the stream's initial dead zone (observed
+    /// on /private/tmp under sandboxed runners), a later write still
+    /// triggers a delivered event. The total wait budget is `total`;
+    /// each retry write happens every `retry_every`.
+    async fn wait_for_probe_with_retries(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+        probe: &std::path::Path,
+        total: Duration,
+        retry_every: Duration,
+    ) -> Option<WatchEvent> {
+        let probe_name = probe.file_name()?.to_os_string();
+        let deadline = tokio::time::Instant::now() + total;
+        let mut attempt: u32 = 0;
+        // Initial write — content varies per attempt so the debouncer
+        // cannot dedupe a later retry against the first one.
+        std::fs::write(probe, format!("probe-{attempt}")).ok()?;
+        let mut last_write = tokio::time::Instant::now();
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let until_retry = (last_write + retry_every).saturating_duration_since(now);
+            let until_deadline = deadline.saturating_duration_since(now);
+            let wait = until_retry.min(until_deadline);
+            match tokio::time::timeout(wait, rx.recv()).await {
+                Ok(Some(WatchEvent::File {
+                    path,
+                    change: FileChange::Touched,
+                })) if path.file_name() == Some(probe_name.as_os_str()) => {
+                    return Some(WatchEvent::File {
+                        path,
+                        change: FileChange::Touched,
+                    });
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => return None,
+                Err(_) => {
+                    attempt += 1;
+                    std::fs::write(probe, format!("probe-{attempt}")).ok()?;
+                    last_write = tokio::time::Instant::now();
+                }
+            }
+        }
+    }
+
     #[test]
     fn classifier_skips_always_pruned_subtrees() {
         let tmp = tempfile::tempdir().unwrap();
@@ -410,31 +482,29 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _handle = watch_repo(&root, Duration::from_millis(150), tx).unwrap();
 
-        // Give the watcher a moment to settle before we trigger events.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let probe = root.join(".probe");
+        // The first few writes after `watch_repo` returns can land
+        // inside the FSEvents stream's initial settle window and be
+        // silently dropped. Retry the probe write every 500 ms up to a
+        // 10 s budget so the test only fails when the watcher is truly
+        // unable to deliver *any* event — not because the very first
+        // write happened to race the stream attach.
+        let probe_event = wait_for_probe_with_retries(
+            &mut rx,
+            &probe,
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(
+            probe_event.is_some(),
+            "watcher delivered no Touched event for .probe within 10s of retries"
+        );
 
         let target = root.join("hello.rs");
         std::fs::write(&target, "fn main() {}").unwrap();
 
-        // Wait up to 3 seconds for a debounced event to surface.
-        let timeout = Duration::from_secs(3);
-        let event = tokio::time::timeout(timeout, async {
-            while let Some(ev) = rx.recv().await {
-                if let WatchEvent::File {
-                    path,
-                    change: FileChange::Touched,
-                } = &ev
-                {
-                    if path.file_name() == Some(OsStr::new("hello.rs")) {
-                        return Some(ev);
-                    }
-                }
-            }
-            None
-        })
-        .await
-        .ok()
-        .flatten();
+        let event = wait_for_touched(&mut rx, OsStr::new("hello.rs")).await;
 
         assert!(
             event.is_some(),
