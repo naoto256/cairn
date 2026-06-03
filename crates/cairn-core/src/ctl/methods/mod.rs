@@ -6,6 +6,7 @@
 //! distributed slice.
 
 mod doctor;
+mod prune;
 mod register_repo;
 mod reindex_repo;
 mod remove_repo;

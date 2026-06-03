@@ -178,4 +178,15 @@ ALTER TABLE blobs ADD COLUMN analyzer_id TEXT;
 ALTER TABLE blobs ADD COLUMN analyzer_revision INTEGER;
 "#,
     },
+    Migration {
+        version: 3,
+        sql: r#"
+-- Drop parser IDs that encoded the crate version
+-- (`tree-sitter-X@<version>`). Stable parser IDs plus
+-- LanguageBackend::parser_revision() now drive invalidation, so these
+-- rows are guaranteed orphans after upgrade. Dependent rows cascade
+-- through the blobs foreign key.
+DELETE FROM blobs WHERE parser_id LIKE '%@%';
+"#,
+    },
 ];

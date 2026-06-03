@@ -203,6 +203,12 @@ pub trait LanguageBackend: Send + Sync {
     /// recorded in `files.parser` so a stale snapshot is detectable.
     fn parser_id(&self) -> &'static str;
 
+    /// Monotonic revision for this backend's syntactic output. Bump
+    /// when the same input would produce different facts.
+    fn parser_revision(&self) -> u32 {
+        1
+    }
+
     /// Extract syntactic facts from one source buffer. Synchronous; the
     /// daemon offloads to a parser pool / spawn_blocking as needed.
     ///

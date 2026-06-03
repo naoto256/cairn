@@ -41,7 +41,7 @@ impl LanguageBackend for RustBackend {
     }
 
     fn parser_id(&self) -> &'static str {
-        concat!("tree-sitter-rust@", env!("CARGO_PKG_VERSION"))
+        "tree-sitter-rust"
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -482,8 +482,8 @@ mod outer {
     }
 
     #[test]
-    fn parser_id_includes_version() {
+    fn parser_id_is_stable() {
         let id = RustBackend.parser_id();
-        assert!(id.starts_with("tree-sitter-rust@"));
+        assert_eq!(id, "tree-sitter-rust");
     }
 }

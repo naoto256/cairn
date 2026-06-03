@@ -30,12 +30,6 @@ use crate::anchor::{self, AnchorName};
 use crate::cas;
 use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
 
-/// Per-parser revision baseline. Bumped when a backend's output for
-/// the same input changes in a way that should invalidate already-
-/// stored blob entries. Per-`parser_id` so a Rust-parser bump does
-/// not invalidate Python blobs.
-pub const PARSER_REVISION: u32 = 1;
-
 /// Outcome of a successful `register_repo` call.
 #[derive(Debug, Clone)]
 pub struct RegisterOutcome {
@@ -196,7 +190,7 @@ fn parse_pending_blobs(
             conn,
             &blob_sha,
             &parser_id,
-            PARSER_REVISION,
+            backend.parser_revision(),
             expected_analyzer,
             now_ns,
             || {
@@ -394,7 +388,7 @@ mod tests {
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM symbols
-                 WHERE name = 'greet' AND parser_id LIKE 'tree-sitter-rust@%'",
+                 WHERE name = 'greet' AND parser_id = 'tree-sitter-rust'",
                 [],
                 |r| r.get(0),
             )
@@ -456,7 +450,7 @@ mod tests {
             b"#!/usr/bin/env python3\nprint('hi')\n",
         )
         .unwrap();
-        assert!(backend.parser_id().starts_with("tree-sitter-python@"));
+        assert_eq!(backend.parser_id(), "tree-sitter-python");
     }
 
     #[test]
@@ -468,7 +462,7 @@ mod tests {
             b"#!/usr/bin/env -S uv run --script\nprint('hi')\n",
         )
         .unwrap();
-        assert!(backend.parser_id().starts_with("tree-sitter-python@"));
+        assert_eq!(backend.parser_id(), "tree-sitter-python");
     }
 
     #[test]
@@ -491,7 +485,7 @@ mod tests {
         let backends = python_backends();
         let backend =
             pick_backend_with_shebang_fallback(&backends, "foo.py", b"print('hi')\n").unwrap();
-        assert!(backend.parser_id().starts_with("tree-sitter-python@"));
+        assert_eq!(backend.parser_id(), "tree-sitter-python");
     }
 
     #[test]
