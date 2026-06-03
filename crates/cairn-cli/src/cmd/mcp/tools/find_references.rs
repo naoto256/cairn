@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
+use super::BRANCH_PARAM_DESC;
 
 struct FindReferences;
 
@@ -28,7 +29,7 @@ impl McpTool for FindReferences {
                         "description": "Restrict to one RefKind. Omit for every kind.",
                         "enum": ["call", "type", "import", "instantiate", "read", "write", "override", "macro_invoke", "annotation"],
                     },
-                    "branch": {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
+                    "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. Truncation is surfaced via `completeness: partial`."},
                 },
                 "required": ["repo", "symbol"],

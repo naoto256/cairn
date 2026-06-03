@@ -21,12 +21,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cairn_proto::jsonrpc::{
-    JsonRpcVersion, Request, RequestId, Response, ResponseError, error_code,
+    Request, RequestId, Response, error_code, error_response as error_resp, ok_response as ok_resp,
+    serialize_response as serialize,
 };
 use linkme::distributed_slice;
 use serde_json::Value;
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::daemon::LineHandler;
 use crate::paths::CasDataDir;
@@ -148,28 +149,6 @@ pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Res
         .map_err(|e| Error::InvalidArgument(format!("invalid params: {e}")))
 }
 
-fn ok_resp(id: RequestId, result: Value) -> Response {
-    Response {
-        jsonrpc: JsonRpcVersion::V2,
-        id,
-        result: Some(result),
-        error: None,
-    }
-}
-
-fn error_resp(id: RequestId, code: i32, message: impl Into<String>) -> Response {
-    Response {
-        jsonrpc: JsonRpcVersion::V2,
-        id,
-        result: None,
-        error: Some(ResponseError {
-            code,
-            message: message.into(),
-            data: None,
-        }),
-    }
-}
-
 fn error_from(id: RequestId, err: &Error) -> Response {
     let msg = err.to_string();
     let code = match err {
@@ -178,12 +157,4 @@ fn error_from(id: RequestId, err: &Error) -> Response {
         _ => error_code::INTERNAL_ERROR,
     };
     error_resp(id, code, msg)
-}
-
-fn serialize(resp: &Response) -> String {
-    serde_json::to_string(resp).unwrap_or_else(|e| {
-        warn!(error = %e, "control response serialization failed");
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#
-            .to_string()
-    })
 }

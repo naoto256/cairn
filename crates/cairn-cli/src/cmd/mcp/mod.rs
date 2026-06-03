@@ -32,8 +32,8 @@ use self::types::{
 use anyhow::Result;
 use cairn_core::sockets::SocketPaths;
 use cairn_proto::jsonrpc::{
-    JsonRpcVersion, Request as RpcRequest, RequestId, Response as RpcResponse, ResponseError,
-    error_code,
+    JsonRpcVersion, Request as RpcRequest, RequestId, Response as RpcResponse, error_code,
+    error_response as error_resp, serialize_response as serialize,
 };
 use clap::Args as ClapArgs;
 use linkme::distributed_slice;
@@ -207,7 +207,7 @@ impl Dispatcher {
                 return Some(serialize(&error_resp(
                     RequestId::Number(0),
                     error_code::PARSE_ERROR,
-                    "invalid JSON-RPC envelope".into(),
+                    "invalid JSON-RPC envelope",
                 )));
             }
         };
@@ -366,26 +366,6 @@ fn initialize_result() -> InitializeResult {
         },
         instructions: Some(SERVER_INSTRUCTIONS.into()),
     }
-}
-
-fn error_resp(id: RequestId, code: i32, message: String) -> RpcResponse {
-    RpcResponse {
-        jsonrpc: JsonRpcVersion::V2,
-        id,
-        result: None,
-        error: Some(ResponseError {
-            code,
-            message,
-            data: None,
-        }),
-    }
-}
-
-fn serialize(resp: &RpcResponse) -> String {
-    serde_json::to_string(resp).unwrap_or_else(|_| {
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#
-            .into()
-    })
 }
 
 /// Tool specs come from per-tool [`McpTool::spec`] calls and own

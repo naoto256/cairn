@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
+use super::BRANCH_PARAM_DESC;
 
 struct FindImports;
 
@@ -18,7 +19,7 @@ impl McpTool for FindImports {
                 "properties": {
                     "repo":   {"type": "string"},
                     "file":   {"type": "string", "description": "Path relative to repo root."},
-                    "branch": {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
+                    "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 1000},
                 },
                 "required": ["repo"],
