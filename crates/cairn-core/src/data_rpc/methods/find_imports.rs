@@ -8,7 +8,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::data_rpc::helpers::with_repo_conn;
 use crate::query::{self, FindImportsArgs as QueryArgs};
 use crate::{Error, Result};
 
@@ -23,7 +23,6 @@ impl DataMethod for FindImports {
     async fn dispatch(&self, ctx: &DataCtx, params: Value) -> Result<Value> {
         let args: ImportsArgs = parse_params(params)?;
 
-        let cas_data_dir = ctx.cas_data_dir.clone();
         let q = QueryArgs {
             file: args.file.clone(),
             limit: args.limit,
@@ -31,14 +30,7 @@ impl DataMethod for FindImports {
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let repo_alias = args.repo.clone();
 
-        let items = tokio::task::spawn_blocking(move || -> Result<Vec<ImportHit>> {
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entry = cas_registry::lookup_by_alias(&index, &repo_alias)?.ok_or_else(|| {
-                Error::InvalidArgument(format!("unknown repo alias: `{repo_alias}`"))
-            })?;
-            let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
-
+        let items = with_repo_conn(ctx, &repo_alias, "find_imports", move |_entry, conn| {
             let hits = match query::find_imports(&conn, &anchor, &q) {
                 Ok(h) => h,
                 Err(Error::InvalidArgument(msg)) if msg.contains("anchor not found") => Vec::new(),
@@ -58,8 +50,7 @@ impl DataMethod for FindImports {
                 })
                 .collect())
         })
-        .await
-        .map_err(|e| Error::InvalidArgument(format!("find_imports task panicked: {e}")))??;
+        .await?;
 
         Ok(serde_json::to_value(ImportsResult {
             items,

@@ -12,7 +12,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::data_rpc::helpers::with_repo_conn;
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -33,7 +33,6 @@ impl DataMethod for FindReferences {
             ));
         }
 
-        let cas_data_dir = ctx.cas_data_dir.clone();
         let q = QueryArgs {
             symbol: args.symbol.clone(),
             direction: args.direction,
@@ -43,13 +42,7 @@ impl DataMethod for FindReferences {
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let repo_alias = args.repo.clone();
 
-        let items = tokio::task::spawn_blocking(move || -> Result<Vec<FindReferenceHit>> {
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entry = cas_registry::lookup_by_alias(&index, &repo_alias)?.ok_or_else(|| {
-                Error::InvalidArgument(format!("unknown repo alias: `{repo_alias}`"))
-            })?;
-            let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+        let items = with_repo_conn(ctx, &repo_alias, "find_references", move |entry, conn| {
             let worktree_root = PathBuf::from(&entry.root_path);
 
             let hits = match query::find_references(&conn, &anchor, &q) {
@@ -69,8 +62,7 @@ impl DataMethod for FindReferences {
                 .map(|h| into_wire_hit(&entry.alias, anchor.as_str(), h, &mut snippets))
                 .collect())
         })
-        .await
-        .map_err(|e| Error::InvalidArgument(format!("find_references task panicked: {e}")))??;
+        .await?;
 
         Ok(serde_json::to_value(FindReferencesResult {
             items,
