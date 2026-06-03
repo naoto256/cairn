@@ -70,6 +70,42 @@ pub mod error_code {
     pub const SNAPSHOT_NOT_READY: i32 = -32003;
 }
 
+/// Construct a successful JSON-RPC response.
+#[must_use]
+pub fn ok_response(id: RequestId, result: Value) -> Response {
+    Response {
+        jsonrpc: JsonRpcVersion::V2,
+        id,
+        result: Some(result),
+        error: None,
+    }
+}
+
+/// Construct an error JSON-RPC response with no `data` payload.
+#[must_use]
+pub fn error_response(id: RequestId, code: i32, message: impl Into<String>) -> Response {
+    Response {
+        jsonrpc: JsonRpcVersion::V2,
+        id,
+        result: None,
+        error: Some(ResponseError {
+            code,
+            message: message.into(),
+            data: None,
+        }),
+    }
+}
+
+/// Serialize a JSON-RPC response, falling back to a minimal internal-error
+/// envelope if serialization itself fails.
+#[must_use]
+pub fn serialize_response(resp: &Response) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +136,22 @@ mod tests {
     fn jsonrpc_version_rejects_non_two() {
         let result: Result<JsonRpcVersion, _> = serde_json::from_str("\"1.0\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn response_helpers_build_success_and_error_envelopes() {
+        let ok = ok_response(RequestId::Number(1), json!({"ok": true}));
+        assert_eq!(ok.jsonrpc, JsonRpcVersion::V2);
+        assert!(ok.result.is_some());
+        assert!(ok.error.is_none());
+
+        let err = error_response(
+            RequestId::String("x".into()),
+            error_code::INVALID_PARAMS,
+            "bad",
+        );
+        assert_eq!(err.jsonrpc, JsonRpcVersion::V2);
+        assert!(err.result.is_none());
+        assert_eq!(err.error.unwrap().code, error_code::INVALID_PARAMS);
     }
 }

@@ -108,6 +108,12 @@ analyzer (imports, inheritance, refs). Rust Tier-2 (via `syn`) is
 shipped as the analyzer in `cairn-lang-rust`; Tier-3 (LSP-grade,
 `rust-analyzer`-driven) is roadmapped for the 1.0 line.
 
+Files are picked by extension first (`*.py`, `*.rs`, `*.md`, ...);
+extensionless executables (`bin/foo` with mode `0755+`) are sniffed
+by shebang, such as `#!/usr/bin/env python3` or
+`#!/usr/bin/env -S uv run --script` (PEP 723 inline scripts), and
+indexed as the matching language.
+
 ## License
 
 Dual-licensed under either [MIT](LICENSE-MIT) or

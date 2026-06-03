@@ -16,3 +16,5 @@ mod get_symbol_source;
 mod list_repos;
 mod register_repo;
 mod reindex_repo;
+
+pub(super) const BRANCH_PARAM_DESC: &str = "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`.";

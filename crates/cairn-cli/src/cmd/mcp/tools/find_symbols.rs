@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
+use super::BRANCH_PARAM_DESC;
 
 struct FindSymbols;
 
@@ -18,7 +19,7 @@ impl McpTool for FindSymbols {
                 "properties": {
                     "query":  {"type": "string", "description": "Name / qualified text. Optional; pair with `kind` / `container` / `path` for structural enumeration."},
                     "repo":   {"type": "string", "description": "Repository alias. Omit to search every registered repo."},
-                    "branch": {"type": "string", "description": "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`."},
+                    "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
                     "kind":   {"type": "string", "description": "Restrict to one SymbolKind (e.g. `class`, `function`, `method`, `struct`, `trait`, `enum`)."},
                     "container": {"type": "string", "description": "Qualified-prefix scope. `Widget` returns members of Widget (Widget::* / Widget.*)."},
                     "include_inherited": {"type": "boolean", "description": "When `container` is set, walk the implementations table and include members inherited from base types. Tier-2 dependent — `partial{semantic}` on syntactic-only snapshots."},
