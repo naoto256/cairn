@@ -56,9 +56,9 @@ enum QueryCommand {
     Find {
         /// Symbol query — exact name unless `--fuzzy`.
         query: String,
-        /// Repository alias.
+        /// Repository alias. Omit to search every registered repo.
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -177,7 +177,9 @@ pub async fn run(args: Args) -> Result<()> {
         } => {
             let mut p = serde_json::Map::new();
             p.insert("query".into(), Value::String(query.clone()));
-            p.insert("repo".into(), Value::String(repo.clone()));
+            if let Some(repo) = repo {
+                p.insert("repo".into(), Value::String(repo.clone()));
+            }
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
             }
