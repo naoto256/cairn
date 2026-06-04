@@ -490,6 +490,25 @@ mod tests {
                 .contains("language enrichment matrix")
         );
 
+        let get_outline = specs
+            .iter()
+            .find(|spec| spec.name == "get_outline")
+            .unwrap();
+        assert!(get_outline.description.contains("Pass `file`"));
+        assert!(get_outline.description.contains("pass `path`"));
+        assert!(get_outline.description.contains("file → line order"));
+        assert!(get_outline.description.contains("Default limit is 200"));
+        assert!(get_outline.description.contains("`cap`"));
+        assert_eq!(
+            get_outline.input_schema["required"],
+            serde_json::json!(["repo"])
+        );
+        assert!(get_outline.input_schema["properties"]["path"].is_object());
+        assert_eq!(
+            get_outline.input_schema["properties"]["limit"]["maximum"],
+            1000
+        );
+
         let find_symbols = specs
             .iter()
             .find(|spec| spec.name == "find_symbols")
