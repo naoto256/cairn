@@ -44,6 +44,20 @@ cached parse on the next pass.
   `ctl`, `mcp`) now import them under their previous local aliases.
 - **`RequestId::Null`** in the JSON-RPC types so an error envelope
   whose request `id` is unparseable can be emitted as `id: null`.
+- **Rust Tier-3 analyzer** (`cairn-lang-rust-tier3`) backed by
+  `rust-analyzer` LSP. `register_repo` / `reindex_repo` runs the
+  workspace analyzer once per snapshot, waits for the LSP server to
+  reach progress-quiescence, walks tree-sitter-rust to find method-
+  call sites, and writes resolved targets into `refs` under
+  `source = "tier3-rust-analyzer"`. `find_references` picks them up
+  through the existing read path. `WorkspaceAnalyzer` trait +
+  `WORKSPACE_ANALYZERS` distributed slice + `workspace_analysis_runs`
+  table (schema v4) provide the boundary; `cairn-core::lsp::LspClient`
+  provides a minimal self-typed LSP subprocess client (initialize /
+  initialized handshake, `$/progress` reader, `did_open`, `did_change`,
+  `did_close`, `textDocument/definition`, graceful shutdown). Missing
+  `rust-analyzer` binary surfaces as `Skipped`; Tier-1 / Tier-2 facts
+  are unaffected on degrade.
 
 ### Changed (wire breaking)
 
@@ -225,8 +239,6 @@ upgrade path. Re-register your repos.
 - Live worktree-change watcher → tentative-manifest update is
   roadmapped; for now, `cairn ctl reindex-repo <alias>` is how the
   index catches up after worktree edits.
-- Tier-3 (LSP-grade, `rust-analyzer`-driven) analyzers; current
-  Tier-2 for Rust uses `syn` only.
 - Cross-repo blob deduplication: each registered repo gets its own
   CAS store. Two repos with byte-identical files do not share blobs.
 - `find_history` (= "where did this symbol exist before it got
