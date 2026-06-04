@@ -1,0 +1,17 @@
+{
+  "description": "Cairn PreToolUse hook: when the agent reaches for grep / rg / ag / ack in a cairn-registered cwd, append a reminder pointing at the closest cairn tool (find_symbols / find_impls / find_imports / find_references) so the next-turn decision starts from the index instead of from raw text.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/tools/cairn-nudge.sh\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -77,6 +77,18 @@ cached parse on the next pass.
   `find_references` MCP tool descriptions so consumers know which
   remediation each reason implies (raise `limit`, wait, fall back to
   a lower tier, or check `cairn ctl status`).
+- **`plugin/`** — in-tree plugin for Claude Code and Codex. Bundles
+  the cairn MCP server registration (`plugin/.mcp.json`) and a
+  `PreToolUse` hook (`plugin/tools/cairn-nudge.sh`) that, when the
+  cwd belongs to a cairn-registered repo, blocks `grep` / `rg` /
+  `ag` / `ack` / `egrep` / `fgrep` calls with a short reason
+  pointing at the closest cairn tool (`find_imports` for `^use`,
+  `find_impls` for `impl X for`, `find_references` for `name(`,
+  `find_symbols` otherwise). The block is non-destructive: any
+  dependency / runtime failure is a no-op, and the agent can rerun
+  the original command after deciding. `.claude-plugin/` and
+  `.codex-plugin/` manifests are sibling directories so the same
+  bundle installs on both hosts.
 
 ### Changed (wire breaking)
 
