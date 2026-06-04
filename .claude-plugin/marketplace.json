@@ -12,12 +12,7 @@
       "author": {
         "name": "Naoto Morishima"
       },
-      "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/naoto256/cairn.git",
-        "path": "plugin",
-        "ref": "main"
-      }
+      "source": "./plugin"
     }
   ]
 }
