@@ -139,6 +139,7 @@ dependencies = [
  "cairn-lang-markdown",
  "cairn-lang-python",
  "cairn-lang-rust",
+ "cairn-lang-rust-tier3",
  "cairn-lang-typescript",
  "cairn-proto",
  "clap",
@@ -227,6 +228,17 @@ dependencies = [
  "linkme",
  "proc-macro2",
  "syn",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
+name = "cairn-lang-rust-tier3"
+version = "0.1.0-alpha.3"
+dependencies = [
+ "cairn-core",
+ "linkme",
+ "tokio",
  "tree-sitter",
  "tree-sitter-rust",
 ]

@@ -106,8 +106,14 @@ Tier-1 (syntactic, tree-sitter) for Rust / Python / Markdown /
 TypeScript / Go plus a generic tree-sitter fallback. Python
 additionally carries a Tier-2 analyzer (imports, inheritance,
 refs). Rust Tier-2 (via `syn`) is shipped as the analyzer in
-`cairn-lang-rust`; Tier-3 (LSP-grade, `rust-analyzer`-driven) is
-roadmapped for the 1.0 line. TypeScript covers `*.ts`, `*.mts`,
+`cairn-lang-rust`. Rust Tier-3 (LSP-grade) is now wired in
+`cairn-lang-rust-tier3`: when a `rust-analyzer` binary is
+discoverable, `register_repo` runs it once per snapshot and emits
+resolved method-call refs back into `refs` under
+`source = tier3-rust-analyzer`; consumers see them through
+`find_references` automatically. If `rust-analyzer` is not on
+`PATH` the analyzer logs the run as `Skipped` and leaves Tier-1 /
+Tier-2 facts untouched. TypeScript covers `*.ts`, `*.mts`,
 `*.cts`; `.tsx` lives in a separate upstream grammar and is
 intentionally a follow-up backend. Go covers `*.go` (functions,
 methods with receiver-qualified names, named types, top-level
