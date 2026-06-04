@@ -102,7 +102,7 @@ enum QueryCommand {
     /// `--type` for "what does Y implement?", or both.
     Impls {
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         /// Trait name to match the impl's trait side.
         #[arg(long = "trait", value_name = "TRAIT")]
         trait_: Option<String>,
@@ -121,7 +121,7 @@ enum QueryCommand {
     /// Import edges (`use` statements).
     Imports {
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         /// File to list imports for. Omit to list every import in
         /// the (filtered) snapshot.
         #[arg(long)]
@@ -140,7 +140,7 @@ enum QueryCommand {
         /// Symbol name or qualified path.
         symbol: String,
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(long)]
         kind: Option<String>,
         #[arg(long)]
@@ -228,7 +228,9 @@ pub async fn run(args: Args) -> Result<()> {
             limit,
         } => {
             let mut p = serde_json::Map::new();
-            p.insert("repo".into(), Value::String(repo.clone()));
+            if let Some(repo) = repo {
+                p.insert("repo".into(), Value::String(repo.clone()));
+            }
             if let Some(t) = trait_ {
                 p.insert("trait".into(), Value::String(t.clone()));
             }
@@ -254,7 +256,9 @@ pub async fn run(args: Args) -> Result<()> {
             limit,
         } => {
             let mut p = serde_json::Map::new();
-            p.insert("repo".into(), Value::String(repo.clone()));
+            if let Some(repo) = repo {
+                p.insert("repo".into(), Value::String(repo.clone()));
+            }
             if let Some(f) = file {
                 p.insert("file".into(), Value::String(f.clone()));
             }
@@ -278,7 +282,9 @@ pub async fn run(args: Args) -> Result<()> {
             limit,
         } => {
             let mut p = serde_json::Map::new();
-            p.insert("repo".into(), Value::String(repo.clone()));
+            if let Some(repo) = repo {
+                p.insert("repo".into(), Value::String(repo.clone()));
+            }
             p.insert("symbol".into(), Value::String(symbol.clone()));
             if let Some(k) = kind {
                 p.insert("kind".into(), Value::String(k.clone()));
@@ -451,10 +457,7 @@ fn render(method: &str, value: &Value) {
                         .map(|a| format!(" as {a}"))
                         .unwrap_or_default();
                     let reex = if h.is_reexport { " [pub]" } else { "" };
-                    println!(
-                        "{}:{}\t{}::{}{}{}",
-                        h.file, h.line, h.to_module, imp, alias, reex
-                    );
+                    println!("{}\t{}::{}{}{}", h.location, h.to_module, imp, alias, reex);
                 }
                 note_partial(&r.completeness);
                 return;

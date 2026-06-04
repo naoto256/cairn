@@ -12,8 +12,7 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
-use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, trim_to_requested_limit};
+use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
 
@@ -29,7 +28,6 @@ impl DataMethod for FindSymbols {
         let args: FindSymbolArgs = parse_params(params)?;
         validate(&args)?;
 
-        let cas_data_dir = ctx.cas_data_dir.clone();
         let effective_limit = args.limit.unwrap_or(50).max(1);
         let q = FindSymbolsArgs {
             query: args.query.clone(),
@@ -40,45 +38,23 @@ impl DataMethod for FindSymbols {
             limit: Some(limit_with_probe(effective_limit)),
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
+        let anchor_label = anchor.as_str().to_string();
         let requested_repo = args.repo.clone();
         let signature_only = args.signature_only;
 
-        let (items, capped) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<FindSymbolHit>, bool)> {
-                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-                let aliases = match requested_repo.as_deref() {
-                    Some(name) => {
-                        let entry =
-                            cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
-                                Error::RepoNotFound {
-                                    alias: name.to_string(),
-                                }
-                            })?;
-                        vec![entry]
-                    }
-                    None => cas_registry::list_all(&index)?,
-                };
-
-                let mut out: Vec<(String, SymbolHit)> = Vec::new();
-                let mut capped = false;
-                for entry in aliases {
-                    let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                    let conn = cas_store::open(&store_path)?;
-                    let mut hits = match query::find_symbols(&conn, &anchor, &q) {
-                        Ok(h) => h,
-                        Err(Error::AnchorNotFound { .. }) => {
-                            // The requested anchor doesn't exist in this
-                            // store — skip rather than fail the whole
-                            // query (= other repos may still have it).
-                            continue;
-                        }
-                        Err(other) => return Err(other),
-                    };
-                    capped |= trim_to_requested_limit(&mut hits, effective_limit);
-                    for h in hits {
-                        out.push((entry.alias.clone(), h));
-                    }
-                }
+        let (hits, capped) = with_one_or_all_stores(
+            ctx,
+            requested_repo,
+            "find_symbols",
+            effective_limit,
+            move |entry, conn| {
+                let hits = query::find_symbols(conn, &anchor, &q)?;
+                Ok(hits
+                    .into_iter()
+                    .map(|hit| (entry.alias.clone(), hit))
+                    .collect())
+            },
+            |out: &mut Vec<(String, SymbolHit)>| {
                 out.sort_by(|(repo_a, a), (repo_b, b)| {
                     language_sort_key(a.language.as_deref())
                         .cmp(&language_sort_key(b.language.as_deref()))
@@ -87,15 +63,13 @@ impl DataMethod for FindSymbols {
                         .then_with(|| repo_a.cmp(repo_b))
                         .then_with(|| a.qualified.cmp(&b.qualified))
                 });
-                capped |= trim_to_requested_limit(&mut out, effective_limit);
-                let items = out
-                    .into_iter()
-                    .map(|(repo, h)| into_wire_hit(&repo, anchor.as_str(), h, signature_only))
-                    .collect();
-                Ok((items, capped))
-            })
-            .await
-            .map_err(|e| Error::InvalidArgument(format!("find_symbols task panicked: {e}")))??;
+            },
+        )
+        .await?;
+        let items = hits
+            .into_iter()
+            .map(|(repo, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
+            .collect();
 
         Ok(serde_json::to_value(FindSymbolResult {
             items,

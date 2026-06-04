@@ -11,9 +11,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, trim_to_requested_limit, with_repo_conn,
-};
+use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -43,32 +41,26 @@ impl DataMethod for FindReferences {
             limit: Some(limit_with_probe(effective_limit)),
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
-        let repo_alias = args.repo.clone();
+        let anchor_label = anchor.as_str().to_string();
+        let requested_repo = args.repo.clone();
 
-        let (items, capped) =
-            with_repo_conn(ctx, &repo_alias, "find_references", move |entry, conn| {
+        let (items, capped) = with_one_or_all_stores(
+            ctx,
+            requested_repo,
+            "find_references",
+            effective_limit,
+            move |entry, conn| {
                 let worktree_root = PathBuf::from(&entry.root_path);
-
-                let mut hits = match query::find_references(&conn, &anchor, &q) {
-                    Ok(h) => h,
-                    Err(Error::AnchorNotFound { .. }) => {
-                        // The requested branch doesn't exist as an anchor
-                        // in this repo — return an empty result rather
-                        // than failing the whole request.
-                        Vec::new()
-                    }
-                    Err(other) => return Err(other),
-                };
-                let capped = trim_to_requested_limit(&mut hits, effective_limit);
-
+                let hits = query::find_references(conn, &anchor, &q)?;
                 let mut snippets = SnippetCache::new(worktree_root);
-                let items = hits
+                Ok(hits
                     .into_iter()
-                    .map(|h| into_wire_hit(&entry.alias, anchor.as_str(), h, &mut snippets))
-                    .collect();
-                Ok((items, capped))
-            })
-            .await?;
+                    .map(|h| into_wire_hit(&entry.alias, &anchor_label, h, &mut snippets))
+                    .collect())
+            },
+            |_out: &mut Vec<FindReferenceHit>| {},
+        )
+        .await?;
 
         Ok(serde_json::to_value(FindReferencesResult {
             items,
@@ -176,10 +168,18 @@ fn extract_line(bytes: &[u8], line: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use cairn_proto::Completeness;
     use serde_json::json;
 
     use super::*;
+    use crate::cas::{registry as cas_registry, store as cas_store};
     use crate::data_rpc::helpers::test_support::assert_limit_probe;
+    use crate::paths::{CasDataDir, path_hash};
+    use crate::register::register_repo;
+    use crate::testutil::init_repo;
 
     #[tokio::test]
     async fn exact_limit_is_complete_and_over_limit_is_partial() {
@@ -189,6 +189,48 @@ mod tests {
             json!({"repo": "demo", "symbol": "target", "kind": "call", "include_noise": true, "limit": 2}),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn repo_none_searches_all_registered_repos_and_caps_accumulated_total() {
+        let fixture = cross_repo_fixture();
+
+        let all = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({"symbol": "target", "kind": "call", "include_noise": true, "limit": 10}),
+            )
+            .await
+            .unwrap();
+        let items = all["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(
+            items
+                .iter()
+                .any(|h| h["location"].as_str().unwrap().starts_with("alpha:HEAD:"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|h| h["location"].as_str().unwrap().starts_with("beta:HEAD:"))
+        );
+        assert_eq!(
+            serde_json::from_value::<Completeness>(all["completeness"].clone()).unwrap(),
+            Completeness::Complete
+        );
+
+        let capped = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({"symbol": "target", "kind": "call", "include_noise": true, "limit": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capped["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            serde_json::from_value::<Completeness>(capped["completeness"].clone()).unwrap(),
+            Completeness::partial_truncated("cap")
+        );
     }
 
     #[test]
@@ -210,5 +252,60 @@ mod tests {
         let src = b"alpha\nbeta\n";
         assert_eq!(extract_line(src, 5), None);
         assert_eq!(extract_line(src, 0), None);
+    }
+
+    struct CrossRepoFixture {
+        _repos: Vec<tempfile::TempDir>,
+        _data: tempfile::TempDir,
+        ctx: DataCtx,
+    }
+
+    fn cross_repo_fixture() -> CrossRepoFixture {
+        let alpha = init_repo(&[(
+            "src/alpha.rs",
+            "pub fn target() {}\n\
+             pub fn caller_a() { target(); }\n\
+             pub fn caller_b() { target(); }\n",
+        )])
+        .0;
+        let beta = init_repo(&[(
+            "src/beta.rs",
+            "pub fn target() {}\n\
+             pub fn caller_c() { target(); }\n",
+        )])
+        .0;
+        let data = tempfile::tempdir().unwrap();
+        let cas = CasDataDir::with_root(data.path().to_path_buf());
+        cas.ensure().unwrap();
+        register_alias(&cas, "alpha", alpha.path());
+        register_alias(&cas, "beta", beta.path());
+
+        CrossRepoFixture {
+            _repos: vec![alpha, beta],
+            _data: data,
+            ctx: DataCtx {
+                cas_data_dir: Arc::new(cas),
+            },
+        }
+    }
+
+    fn register_alias(cas: &CasDataDir, alias: &str, repo_path: &std::path::Path) {
+        let canonical = std::fs::canonicalize(repo_path).unwrap();
+        let repo_hash = path_hash(&canonical);
+        let store_path = cas.store_db_path(&repo_hash);
+        let mut store = cas_store::open(&store_path).unwrap();
+        let now_ns = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        register_repo(&mut store, &canonical, now_ns).unwrap();
+
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(&tx, alias, &canonical.to_string_lossy(), &repo_hash, now_ns).unwrap();
+        tx.commit().unwrap();
     }
 }

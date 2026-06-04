@@ -7,8 +7,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, trim_to_requested_limit};
+use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
 use crate::query::{self, FindImplsArgs as QueryArgs, ImplHit as QueryHit};
 use crate::{Error, Result};
 
@@ -35,45 +34,24 @@ impl DataMethod for FindImpls {
             limit: Some(limit_with_probe(effective_limit)),
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
+        let anchor_label = anchor.as_str().to_string();
         let requested_repo = args.repo.clone();
 
-        let cas_data_dir = ctx.cas_data_dir.clone();
-        let (items, capped) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<ImplHit>, bool)> {
-                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-                let aliases = match requested_repo.as_deref() {
-                    Some(name) => {
-                        let entry =
-                            cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
-                                Error::RepoNotFound {
-                                    alias: name.to_string(),
-                                }
-                            })?;
-                        vec![entry]
-                    }
-                    None => cas_registry::list_all(&index)?,
-                };
-
-                let mut out = Vec::new();
-                let mut capped = false;
-                for entry in aliases {
-                    let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                    let conn = cas_store::open(&store_path)?;
-                    let mut hits = match query::find_impls(&conn, &anchor, &q) {
-                        Ok(h) => h,
-                        Err(Error::AnchorNotFound { .. }) => continue,
-                        Err(other) => return Err(other),
-                    };
-                    capped |= trim_to_requested_limit(&mut hits, effective_limit);
-                    for h in hits {
-                        out.push(into_wire_hit(&entry.alias, anchor.as_str(), h));
-                    }
-                    capped |= trim_to_requested_limit(&mut out, effective_limit);
-                }
-                Ok((out, capped))
-            })
-            .await
-            .map_err(|e| Error::InvalidArgument(format!("find_impls task panicked: {e}")))??;
+        let (items, capped) = with_one_or_all_stores(
+            ctx,
+            requested_repo,
+            "find_impls",
+            effective_limit,
+            move |entry, conn| {
+                let hits = query::find_impls(conn, &anchor, &q)?;
+                Ok(hits
+                    .into_iter()
+                    .map(|hit| into_wire_hit(&entry.alias, &anchor_label, hit))
+                    .collect())
+            },
+            |_out: &mut Vec<ImplHit>| {},
+        )
+        .await?;
 
         Ok(serde_json::to_value(ImplsResult {
             items,
