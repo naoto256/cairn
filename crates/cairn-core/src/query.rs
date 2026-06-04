@@ -153,13 +153,35 @@ fn run_find_references(
     // LEFT for incoming (top-level refs have no enclosing).
     let run = |where_col: &str, value: &str, outgoing: bool| -> Result<Vec<ReferenceHit>> {
         let mut sql = String::from(
-            "SELECT r.target_name, r.target_qualified, r.kind,
-                    enc.qualified AS enclosing,
-                    me.path, r.line, r.blob_sha
-               FROM refs r
-               JOIN manifest_entries me
-                 ON me.manifest_id = ?1
-                AND me.blob_sha = r.blob_sha
+            "SELECT target_name, target_qualified, kind, enclosing, path, line, blob_sha
+               FROM (
+                 SELECT r.target_name, r.target_qualified, r.kind,
+                        enc.qualified AS enclosing,
+                        me.path, r.line, r.blob_sha, r.byte_start,
+                        CASE
+                          WHEN r.source LIKE 'tier3-%' THEN 0
+                          WHEN r.source = 'rust-syn' THEN 1
+                          ELSE 2
+                        END AS source_rank,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
+                          ORDER BY
+                            CASE
+                              WHEN r.source LIKE 'tier3-%' THEN 0
+                              WHEN r.source = 'rust-syn' THEN 1
+                              ELSE 2
+                            END,
+                            CASE
+                              WHEN r.target_qualified IS NOT NULL
+                               AND r.target_qualified <> '' THEN 0
+                              ELSE 1
+                            END,
+                            r.source
+                        ) AS dedup_rank
+                   FROM refs r
+                   JOIN manifest_entries me
+                     ON me.manifest_id = ?1
+                    AND me.blob_sha = r.blob_sha
                ",
         );
         sql.push_str(if outgoing {
@@ -178,7 +200,11 @@ fn run_find_references(
             sql.push_str(" AND r.target_qualified IS NOT NULL");
             sql.push_str(" AND r.target_qualified <> ''");
         }
-        sql.push_str(" ORDER BY me.path, r.line");
+        sql.push(')');
+        if !args.include_noise {
+            sql.push_str(" WHERE dedup_rank = 1");
+        }
+        sql.push_str(" ORDER BY path, line, byte_start, source_rank");
         sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -656,6 +682,82 @@ mod tests {
         (repo, db_tmp, conn)
     }
 
+    fn refs_dedup_fixture(
+        tier3: bool,
+        analyzer_status: Option<&str>,
+    ) -> (tempfile::TempDir, Connection) {
+        let db_tmp = tempfile::tempdir().unwrap();
+        let conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('HEAD', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/lib.rs', 'sha-ref')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('sha-ref', 'tree-sitter-rust', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (id, blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (1, 'sha-ref', 'tree-sitter-rust', 'caller', 'caller', 'function',
+                0, 100, 1, 8, 'rust-syn')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO refs
+               (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES
+               ('sha-ref', 'tree-sitter-rust', 1, 'render', NULL, 'call',
+                42, 48, 5, 'rust-syn')",
+            [],
+        )
+        .unwrap();
+        if tier3 {
+            conn.execute(
+                "INSERT INTO refs
+                   (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                    byte_start, byte_end, line, source)
+                 VALUES
+                   ('sha-ref', 'tree-sitter-rust', 1, 'render', 'crate::Widget::render', 'call',
+                    42, 48, 5, 'tier3-rust-analyzer')",
+                [],
+            )
+            .unwrap();
+        }
+        if let Some(status) = analyzer_status {
+            conn.execute(
+                "INSERT INTO workspace_analysis_runs
+                   (manifest_id, analyzer_id, analyzer_revision, config_hash, status,
+                    started_at_ns, finished_at_ns, error)
+                 VALUES
+                   (1, 'rust-analyzer-lsp', 1, 'config', ?1, 0, 1, 'rust-analyzer unavailable')",
+                rusqlite::params![status],
+            )
+            .unwrap();
+        }
+        (db_tmp, conn)
+    }
+
     #[test]
     fn find_by_name_returns_matching_symbol() {
         let (_repo, _db, c) = registered();
@@ -960,6 +1062,118 @@ mod tests {
             hits.iter()
                 .any(|h| h.target_name == "Widget" && h.kind == RefKind::Type),
             "type refs missing from include_noise refs: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn references_tier2_only_falls_back_to_bare_name_refs() {
+        let (_db, conn) = refs_dedup_fixture(false, None);
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "render".into(),
+                direction: ReferenceDirection::Incoming,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].target_name, "render");
+        assert_eq!(hits[0].target_qualified, None);
+    }
+
+    #[test]
+    fn references_tier3_suppresses_tier2_same_call_site() {
+        let (_db, conn) = refs_dedup_fixture(true, None);
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "render".into(),
+                direction: ReferenceDirection::Incoming,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].target_qualified.as_deref(),
+            Some("crate::Widget::render")
+        );
+    }
+
+    #[test]
+    fn references_tier3_failed_run_falls_back_to_tier2_refs() {
+        let (_db, conn) = refs_dedup_fixture(false, Some("failed"));
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "render".into(),
+                direction: ReferenceDirection::Incoming,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].target_name, "render");
+        assert_eq!(hits[0].target_qualified, None);
+    }
+
+    #[test]
+    fn references_outgoing_prefers_tier3_for_same_call_site() {
+        let (_db, conn) = refs_dedup_fixture(true, None);
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "caller".into(),
+                direction: ReferenceDirection::Outgoing,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].target_qualified.as_deref(),
+            Some("crate::Widget::render")
+        );
+    }
+
+    #[test]
+    fn references_include_noise_keeps_tier2_and_tier3_duplicates() {
+        let (_db, conn) = refs_dedup_fixture(true, None);
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "render".into(),
+                direction: ReferenceDirection::Incoming,
+                include_noise: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(
+            hits.iter().any(|h| h.target_qualified.is_none()),
+            "Tier-2 fallback row missing from noisy refs: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h.target_qualified.as_deref() == Some("crate::Widget::render")),
+            "Tier-3 row missing from noisy refs: {hits:?}"
         );
     }
 
