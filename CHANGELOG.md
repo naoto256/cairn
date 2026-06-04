@@ -20,11 +20,15 @@ versions follow [SemVer](https://semver.org/).
   `FindReferenceHit` / `FindSymbolHit`. The field carries the same
   `repo:branch:file:line` prefix the other three discovery hits
   already used; older clients ignore unknown fields.
-- **CLI** `cairn query impls / imports / refs` `--repo` becomes
-  optional (was required). The CLI delegate omits the `repo` key
-  from the JSON-RPC params when the flag is absent. The `imports`
-  renderer now prints `h.location` instead of `{file}:{line}` so
-  cross-repo runs show their origin.
+- **CLI** `cairn query find / impls / imports / refs` `--repo`
+  becomes optional (was required). The CLI delegate omits the
+  `repo` key from the JSON-RPC params when the flag is absent.
+  `find` already had a cross-repo-aware renderer (it prints
+  `h.location` which carries `repo:branch:file:line`); the
+  `imports` renderer is updated the same way. (`find` itself was
+  missed by PR #38; this PR brings it to parity with the other
+  three commands so the four CLI discovery surfaces match the
+  MCP authority.)
 - **MCP** tool descriptions for `find_imports` and `find_references`
   lead with "Omit `repo` to search every registered repo; each hit
   carries its repo in the `location` prefix" (mirroring the
