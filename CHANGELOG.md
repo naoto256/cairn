@@ -7,7 +7,49 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.1.0-alpha.4] — Unreleased
 
-(Nothing yet — see the roadmap in the README.)
+### Changed (wire additive)
+
+- **`cairn-proto::ImportsArgs.repo`** and **`FindReferencesArgs.repo`**
+  become `Option<String>` so `find_imports` and `find_references`
+  accept `repo=None` for workspace-wide search, matching
+  `find_symbols` and `find_impls`. All four data-plane discovery
+  tools are now symmetric. Existing clients that pass a `String`
+  payload keep working unchanged.
+- **`cairn-proto::ImportHit.location`** is added as a `String` with
+  `serde(default)` so the wire shape matches `ImplHit` /
+  `FindReferenceHit` / `FindSymbolHit`. The field carries the same
+  `repo:branch:file:line` prefix the other three discovery hits
+  already used; older clients ignore unknown fields.
+- **CLI** `cairn query impls / imports / refs` `--repo` becomes
+  optional (was required). The CLI delegate omits the `repo` key
+  from the JSON-RPC params when the flag is absent. The `imports`
+  renderer now prints `h.location` instead of `{file}:{line}` so
+  cross-repo runs show their origin.
+- **MCP** tool descriptions for `find_imports` and `find_references`
+  lead with "Omit `repo` to search every registered repo; each hit
+  carries its repo in the `location` prefix" (mirroring the
+  `find_impls` wording introduced in alpha.3). `repo` is removed
+  from `input_schema.required[]`.
+
+### Internal
+
+- **`data_rpc::helpers::with_one_or_all_stores<T, F, S>`** extracts
+  the previously-duplicated cross-repo dispatch shape (spawn_blocking
+  + registry lookup / list_all + `AnchorNotFound continue-skip` +
+  per-store probe + accumulated trim). `FindSymbols::dispatch` and
+  `FindImpls::dispatch` migrate to it; `FindImports::dispatch` and
+  `FindReferences::dispatch` use it for their newly-added cross-repo
+  paths. A `finalize: FnMut(&mut Vec<T>)` callback slots between
+  accumulation and the final trim so callers needing a global sort
+  (`find_symbols`' language / path / line / repo / qualified ordering)
+  apply it where the cap has been told the right truth. Double trim
+  is intentional: per-store probe detects per-repo overflow,
+  accumulated trim enforces the union cap.
+- **`query::get_outline_under_path`** `LIMIT` is now parameter-bound
+  (`LIMIT ?` plus `bound.push(Box::new(i64::from(limit)))`), matching
+  the rest of `query.rs`. Style fix; the previous `format!`-built
+  clause was non-exploitable because the dispatch clamps `limit` to
+  `[1, 1000]` before reaching the query layer.
 
 ## [0.1.0-alpha.3] — 2026-06-05
 
