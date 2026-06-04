@@ -369,7 +369,8 @@ pub struct ImplHit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportsArgs {
-    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// File whose imports to list (path relative to repo root). When
     /// omitted, every import in the (filtered) snapshot is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +410,9 @@ pub struct ImportHit {
     /// True when this is a `pub use` re-export.
     pub is_reexport: bool,
     pub branch: String,
+    /// `repo:branch:file:line` pointing at the import statement.
+    #[serde(default)]
+    pub location: String,
     pub line: u32,
 }
 
@@ -436,7 +440,8 @@ pub enum ReferenceDirection {
 /// Arguments to `find_references`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindReferencesArgs {
-    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Name or qualified path of the **anchor** symbol. In the default
     /// `direction = Incoming` this is the *target* (who calls X);
     /// with `Outgoing` it is the *enclosing* container (what does X

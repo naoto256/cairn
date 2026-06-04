@@ -440,7 +440,8 @@ pub fn get_outline_under_path(
         bound.push(Box::new(pid.to_string()));
     }
     sql.push_str(" ORDER BY me.path, s.line_start");
-    sql.push_str(&format!(" LIMIT {limit}"));
+    sql.push_str(" LIMIT ?");
+    bound.push(Box::new(i64::from(limit)));
 
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();

@@ -35,6 +35,58 @@ where
     .map_err(|e| Error::InvalidArgument(format!("{method_name} task panicked: {e}")))?
 }
 
+/// Open one requested repo store or every registered store, run the
+/// per-store query, and apply the shared limit-probe semantics.
+pub(crate) async fn with_one_or_all_stores<T, F, S>(
+    ctx: &DataCtx,
+    requested_repo: Option<String>,
+    method_name: &'static str,
+    effective_limit: u32,
+    mut query_store: F,
+    mut finalize: S,
+) -> Result<(Vec<T>, bool)>
+where
+    T: Send + 'static,
+    F: FnMut(&cas_registry::AliasEntry, &rusqlite::Connection) -> Result<Vec<T>> + Send + 'static,
+    S: FnMut(&mut Vec<T>) + Send + 'static,
+{
+    let cas_data_dir = ctx.cas_data_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<(Vec<T>, bool)> {
+        let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+        let aliases = match requested_repo.as_deref() {
+            Some(name) => {
+                let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
+                    Error::RepoNotFound {
+                        alias: name.to_string(),
+                    }
+                })?;
+                vec![entry]
+            }
+            None => cas_registry::list_all(&index)?,
+        };
+
+        let mut out = Vec::new();
+        let mut capped = false;
+        for entry in aliases {
+            let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
+            let conn = cas_store::open(&store_path)?;
+            let mut hits = match query_store(&entry, &conn) {
+                Ok(h) => h,
+                Err(Error::AnchorNotFound { .. }) => continue,
+                Err(other) => return Err(other),
+            };
+            capped |= trim_to_requested_limit(&mut hits, effective_limit);
+            out.extend(hits);
+        }
+
+        finalize(&mut out);
+        capped |= trim_to_requested_limit(&mut out, effective_limit);
+        Ok((out, capped))
+    })
+    .await
+    .map_err(|e| Error::InvalidArgument(format!("{method_name} task panicked: {e}")))?
+}
+
 pub(crate) fn limit_with_probe(effective_limit: u32) -> u32 {
     effective_limit.saturating_add(1)
 }

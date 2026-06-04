@@ -555,10 +555,34 @@ mod tests {
         assert!(find_impls.description.contains("`repo:branch:file:line`"));
         assert!(find_impls.input_schema["required"].is_null());
 
+        let find_imports = specs
+            .iter()
+            .find(|spec| spec.name == "find_imports")
+            .unwrap();
+        assert!(find_imports.description.contains("Omit `repo`"));
+        assert!(find_imports.description.contains("every registered repo"));
+        assert!(find_imports.description.contains("`repo:branch:file:line`"));
+        assert!(find_imports.input_schema["required"].is_null());
+
         let find_references = specs
             .iter()
             .find(|spec| spec.name == "find_references")
             .unwrap();
+        assert!(find_references.description.contains("Omit `repo`"));
+        assert!(
+            find_references
+                .description
+                .contains("every registered repo")
+        );
+        assert!(
+            find_references
+                .description
+                .contains("`repo:branch:file:line`")
+        );
+        assert_eq!(
+            find_references.input_schema["required"],
+            serde_json::json!(["symbol"])
+        );
         let ref_kind_desc = find_references.input_schema["properties"]["kind"]["description"]
             .as_str()
             .unwrap();
