@@ -1,0 +1,21 @@
+[package]
+name = "cairn-lang-rust-tier3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Rust Tier-3 workspace analyzer backed by rust-analyzer LSP."
+
+[dependencies]
+cairn-core.workspace = true
+linkme.workspace = true
+tokio.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+
+[lints]
+workspace = true
