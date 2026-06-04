@@ -5,7 +5,11 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [0.1.0-alpha.3] — Unreleased
+## [0.1.0-alpha.4] — Unreleased
+
+(Nothing yet — see the roadmap in the README.)
+
+## [0.1.0-alpha.3] — 2026-06-05
 
 Capabilities-and-correctness pass on top of alpha.2. The big lines:
 the dispatcher now sniffs shebangs so extensionless `bin/foo` scripts
@@ -288,6 +292,7 @@ upgrade path. Re-register your repos.
   deleted?"). The branch anchors retain past manifests, so the
   substrate is in place; the query method is unwired.
 
-[0.1.0-alpha.3]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.4]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...HEAD
+[0.1.0-alpha.3]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.1
