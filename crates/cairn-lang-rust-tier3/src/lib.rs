@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_core::lsp::{Location, LspClient, Position, Url};
+use cairn_core::lsp::pool::{self as lsp_pool, PoolKey, PooledRustAnalyzer, RustAnalyzerSpawnSpec};
+use cairn_core::lsp::{Location, Position, Url};
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     ResolvedRef, WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
@@ -21,6 +22,9 @@ use tree_sitter::Node;
 
 const ANALYZER_ID: &str = "rust-analyzer-lsp";
 const ANALYZER_REVISION: u32 = 1;
+const CONFIG_HASH: &str = "rust-analyzer-lsp-v1";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKSPACE_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct RustAnalyzerWorkspaceAnalyzer;
 
@@ -44,24 +48,28 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
         files: &[WorkspaceFile],
     ) -> Result<WorkspaceFacts> {
         let binary = rust_analyzer_binary();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| Error::InvalidArgument(format!("rust-analyzer runtime: {e}")))?;
-        runtime.block_on(async {
-            let client = LspClient::start(&binary, repo_root, "rust-analyzer-lsp-v1")
-                .await
-                .map_err(map_lsp_error)?;
-            client
-                .wait_for_workspace_load(Duration::from_secs(120))
-                .await
-                .map_err(map_lsp_error)?;
-            let mut facts = WorkspaceFacts::default();
-            let result = collect_resolved_refs(&client, repo_root, files, &mut facts).await;
-            let shutdown = client.shutdown().await.map_err(map_lsp_error);
-            result.and(shutdown)?;
-            Ok(facts)
+        let key = PoolKey::rust_analyzer(repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
+            .map_err(map_lsp_error)?;
+        let spawn_spec = RustAnalyzerSpawnSpec {
+            binary,
+            workspace_root: repo_root.to_path_buf(),
+            config_hash: CONFIG_HASH.to_string(),
+            request_timeout: REQUEST_TIMEOUT,
+            workspace_load_timeout: WORKSPACE_LOAD_TIMEOUT,
+        };
+        let repo_root = repo_root.to_path_buf();
+        let files = files.to_vec();
+        let pool = lsp_pool::global().map_err(map_lsp_error)?;
+        pool.with_rust_analyzer(key, spawn_spec, |client| {
+            Box::pin(async move {
+                let mut facts = WorkspaceFacts::default();
+                collect_resolved_refs(client, &repo_root, &files, &mut facts)
+                    .await
+                    .map_err(core_error_to_lsp)?;
+                Ok(facts)
+            })
         })
+        .map_err(map_lsp_error)
     }
 }
 
@@ -76,7 +84,7 @@ fn rust_analyzer_binary() -> PathBuf {
 }
 
 async fn collect_resolved_refs(
-    client: &LspClient,
+    client: &mut PooledRustAnalyzer<'_>,
     repo_root: &Path,
     files: &[WorkspaceFile],
     facts: &mut WorkspaceFacts,
@@ -92,7 +100,7 @@ async fn collect_resolved_refs(
         }
         let uri = Url::from_file_path(path).map_err(map_lsp_error)?;
         client
-            .did_open(&uri, "rust", 1, &source)
+            .sync_document(&uri, "rust", &source)
             .await
             .map_err(map_lsp_error)?;
         for call in calls {
@@ -113,7 +121,7 @@ async fn collect_resolved_refs(
 }
 
 async fn definition_with_retry(
-    client: &LspClient,
+    client: &PooledRustAnalyzer<'_>,
     uri: &Url,
     position: Position,
 ) -> Result<Vec<Location>> {
@@ -133,6 +141,10 @@ async fn definition_with_retry(
 
 fn is_file_not_found(err: &cairn_core::lsp::Error) -> bool {
     matches!(err, cairn_core::lsp::Error::Protocol(message) if message.contains("file not found"))
+}
+
+fn core_error_to_lsp(err: Error) -> cairn_core::lsp::Error {
+    cairn_core::lsp::Error::Protocol(err.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

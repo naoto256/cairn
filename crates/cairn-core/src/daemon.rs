@@ -73,6 +73,9 @@ impl Daemon {
         // Wait for either accept loop to complete (which happens when
         // shutdown fires) and then drop everything.
         let _ = tokio::join!(cairn_task, ctrl_task);
+        if let Err(err) = crate::lsp::pool::shutdown_global_if_initialized().await {
+            warn!(error = %err, "lsp pool shutdown failed");
+        }
         info!("daemon stopped");
 
         // Best-effort cleanup of socket files; the OS leaves them

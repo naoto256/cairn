@@ -5,6 +5,8 @@
 //! rust-analyzer integration planned in PR3, without pulling in the
 //! full `lsp-types` surface yet.
 
+pub mod pool;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
