@@ -13,7 +13,7 @@ impl McpTool for FindReferences {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "find_references".into(),
-            description: "Symmetric reference tool — both directions of the call/use graph in one primitive.\n\n  • `direction=incoming` (default) — \"who references `symbol`\". Each hit is a use site whose target is `symbol`; the hit carries the enclosing function's qualified name + `repo:branch:file:line`.\n  • `direction=outgoing` — \"what does `symbol` reference\" (callees + type uses inside symbol's body). Each hit is a reference whose enclosing container is `symbol`. Use this to map a function's outgoing call graph without `grep`.\n\nA `::`-bearing symbol matches the fully-qualified path first and falls back to the bare last segment if nothing matches; bare names skip straight to the name index. Pass `kind` to restrict to a single RefKind. Available wherever cairn has run its Tier-2 analyzer (Rust + Python today). Results may carry `completeness: partial` either because Tier-2 is still warming, because more matches exist than `limit`, or because method-call receiver types aren't resolved (Tier-3 territory).".into(),
+            description: "Symmetric reference tool — both directions of the call/use graph in one primitive.\n\n  • `direction=incoming` (default) — \"who references `symbol`\". Each hit is a use site whose target is `symbol`; the hit carries the enclosing function's qualified name + `repo:branch:file:line`.\n  • `direction=outgoing` — \"what does `symbol` reference\". By default this returns only resolved call refs (`kind=call` with non-empty `target_qualified`) so it can map a function's call graph without unresolved method-call, type-ref, or annotation noise. Set `include_noise=true` to return the full legacy ref set.\n\nA `::`-bearing symbol matches the fully-qualified path first and falls back to the bare last segment if nothing matches; bare names skip straight to the name index. Pass `kind` to restrict to a single RefKind; for outgoing type/unresolved refs also set `include_noise=true`. Available wherever cairn has run its Tier-2 analyzer (Rust + Python today). Results may carry `completeness: partial` either because Tier-2 is still warming, because more matches exist than `limit`, or because method-call receiver types aren't resolved (Tier-3 territory).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -21,8 +21,12 @@ impl McpTool for FindReferences {
                     "symbol": {"type": "string", "description": "Anchor symbol. Incoming: matched as the *target* (who calls X). Outgoing: matched as the *enclosing container* (what does X call). `crate::module::foo` form supported."},
                     "direction": {
                         "type": "string",
-                        "description": "`incoming` (default) lists references TO `symbol`; `outgoing` lists references FROM `symbol`'s body (its callees / type uses).",
+                        "description": "`incoming` (default) lists references TO `symbol`; `outgoing` lists references FROM `symbol`'s body. Outgoing defaults to resolved call refs only.",
                         "enum": ["incoming", "outgoing"],
+                    },
+                    "include_noise": {
+                        "type": "boolean",
+                        "description": "Outgoing only: when true, include unresolved method calls, type refs, annotations, and other non-default refs. Default false returns only resolved call refs.",
                     },
                     "kind":   {
                         "type": "string",

@@ -37,6 +37,7 @@ impl DataMethod for FindReferences {
             symbol: args.symbol.clone(),
             direction: args.direction,
             kind: args.kind,
+            include_noise: args.include_noise,
             limit: Some(args.limit.unwrap_or(100)),
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
