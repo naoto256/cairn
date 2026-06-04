@@ -4,10 +4,11 @@
 #
 # Fires before every Bash invocation. When the cwd belongs to a
 # cairn-registered repo AND the command starts with a code-search
-# binary (grep / rg / ag / ack), block the bash and steer the agent
-# toward the matching cairn tool. The block message names the
-# replacement so the agent's next turn starts from the index instead
-# of from raw text.
+# binary (grep / rg / ag / ack / egrep / fgrep), let the bash run
+# and emit a hookSpecificOutput.additionalContext advisory naming
+# the matching cairn tool. The advisory surfaces in the agent's
+# next-turn context so the *next* call defaults to the index; the
+# current grep is not interrupted.
 #
 # Non-grep commands and non-registered cwds pass through silently.
 # Any failure (jq missing, cairn missing, parse error) is a no-op —
