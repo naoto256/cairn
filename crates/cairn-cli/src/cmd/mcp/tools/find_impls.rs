@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC};
 
 struct FindImpls;
 
@@ -13,7 +13,9 @@ impl McpTool for FindImpls {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "find_impls".into(),
-            description: "Default tool for trait/impl questions. Given a `trait` name, returns every `impl Trait for Foo` block in the repo — answering \"what types implement Display?\". Given a `type` name, returns every trait that type implements, plus any inherent (`impl Foo {}`) blocks — answering \"what does Foo do?\". Returns location + branch + kind (`trait` or `inherent`). Uses the syn-based semantic layer, so results reflect the current source without rust-analyzer or rustc running. At least one of `trait` / `type` must be supplied; both may be combined. Results may carry `completeness: partial` while the Tier-2 analyzer is still running or when a probe detects more matches than `limit`; items already returned are valid.".into(),
+            description: format!(
+                "Default tool for trait/impl questions. Given a `trait` name, returns every `impl Trait for Foo` block in the repo — answering \"what types implement Display?\". Given a `type` name, returns every trait that type implements, plus any inherent (`impl Foo {{}}`) blocks — answering \"what does Foo do?\". Returns location + branch + kind (`trait` or `inherent`). Uses the syn-based semantic layer, so results reflect the current source without rust-analyzer or rustc running. At least one of `trait` / `type` must be supplied; both may be combined. {COMPLETENESS_REASON_DESC} Items already returned are valid."
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
