@@ -12,7 +12,7 @@ impl McpTool for ListRepos {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_repos".into(),
-            description: "Discover which repositories cairn is currently indexing. Call this at the start of a session before reaching for code-navigation tools: if the project you're working in is already listed, prefer `get_outline` / `find_symbols` over `grep` / `Read`; if it isn't, call `register_repo` once to add it. Cheap, no arguments.".into(),
+            description: "**Start here.** Returns the registered repository inventory plus, per snapshot, the language enrichment matrix (which Tier-1 / Tier-2 / Tier-3 facts the index has for each language). Use this to figure out which repos exist, which languages they cover, and which tiers are warm before sending narrower queries. If the project you're working in is already listed, prefer `get_outline` / `find_symbols` over `grep` / `Read`; if it isn't, call `register_repo` once to add it. Cheap, no arguments.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},

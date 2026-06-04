@@ -17,4 +17,6 @@ mod list_repos;
 mod register_repo;
 mod reindex_repo;
 
-pub(super) const BRANCH_PARAM_DESC: &str = "Restrict to a single snapshot (bare branch name, `HEAD`, `tag/<v>`, or `tentative/<id>`). Omit to use `HEAD`.";
+pub(super) const BRANCH_PARAM_DESC: &str = "Restrict to a single snapshot by bare branch name (for example `main` or `release/0.1.0`). Do not pass `HEAD`, `tag/<v>`, or `tentative/<id>` here; those are anchor names. Omit both `branch` and `anchor` to default to `HEAD`.";
+
+pub(super) const ANCHOR_PARAM_DESC: &str = "Raw anchor name: `HEAD` (default), `branch/<n>`, `tag/<n>`, or `tentative/<id>`. Takes priority over `branch`. Use this to target HEAD or a tag/tentative snapshot; use `branch` for a bare branch name.";
