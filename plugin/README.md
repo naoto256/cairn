@@ -46,20 +46,46 @@ understand.
 
 This plugin is shipped in-tree alongside the cairn binary so its
 version matches the daemon it talks to. Both Claude Code and Codex
-discover plugins under the standard plugin directories.
+discover plugins through marketplace catalogs (`marketplace.json`),
+not by scanning arbitrary directories — the repo root carries a
+`.claude-plugin/marketplace.json` that points at this `plugin/`
+subdir as the install source.
 
-- **Claude Code**: copy or symlink this directory to
-  `~/.claude/plugins/cairn/`, or install via your plugin marketplace
-  flow. Claude Code reads `.claude-plugin/plugin.json`,
-  `.mcp.json`, and `hooks/hooks.json`.
-- **Codex**: same directory works. Codex reads
-  `.codex-plugin/plugin.json`, `.mcp.json`, and `hooks/hooks.json`.
-  See https://developers.openai.com/codex/hooks for the host-specific
-  hook contract.
+### Claude Code
+
+From a published GitHub remote:
+
+```
+/plugin marketplace add naoto256/cairn
+/plugin install cairn@naoto256-cairn
+```
+
+From a local checkout (handy during development):
+
+```
+/plugin marketplace add /absolute/path/to/cairn
+/plugin install cairn@naoto256-cairn
+```
+
+After install, restart the Claude Code session so the MCP server
+registration and hook take effect.
+
+See https://code.claude.com/docs/en/discover-plugins for the full
+slash-command reference.
+
+### Codex
+
+Codex reads `.codex-plugin/plugin.json`, `.mcp.json`, and
+`hooks/hooks.json` from the same `plugin/` directory. See
+https://developers.openai.com/codex/hooks for the host-specific
+hook contract.
 
 The `${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}` expansion in
 `hooks/hooks.json` handles either host's plugin-path environment
-variable.
+variable, and `tools/cairn-nudge.sh` emits the appropriate
+host-shaped JSON (Claude Code's
+`{hookSpecificOutput.permissionDecision: "deny"}` vs Codex's
+`{decision: "block", reason}`) based on which env var is set.
 
 ## Configuration
 
