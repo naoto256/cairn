@@ -58,6 +58,13 @@ cached parse on the next pass.
   `did_close`, `textDocument/definition`, graceful shutdown). Missing
   `rust-analyzer` binary surfaces as `Skipped`; Tier-1 / Tier-2 facts
   are unaffected on degrade.
+- **Long-lived rust-analyzer pool** (`cairn-core::lsp::pool`) reuses
+  one warmed LSP client per canonical repo root / analyzer / binary /
+  config tuple across Rust Tier-3 workspace analysis runs. The pool
+  owns a dedicated Tokio runtime, lazily spawns clients, synchronizes
+  documents with full-text `didOpen` / `didChange`, and provides
+  daemon shutdown cleanup. The design note lives at
+  `crates/cairn-core/src/lsp/docs/long_lived_design.md`.
 
 ### Changed (wire breaking)
 
