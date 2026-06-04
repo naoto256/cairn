@@ -336,6 +336,7 @@ pub fn get_symbol_source_row(
 /// One outline entry for a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineItem {
+    pub file: Option<String>,
     pub name: String,
     pub qualified: String,
     pub kind: SymbolKind,
@@ -391,12 +392,68 @@ pub fn get_outline(
     let rows: rusqlite::Result<Vec<OutlineItem>> = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(OutlineItem {
+                file: None,
                 name: row.get(0)?,
                 qualified: row.get(1)?,
                 kind: symbol_kind_from_str(&row.get::<_, String>(2)?),
                 signature: row.get(3)?,
                 doc: row.get(4)?,
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+            })
+        })?
+        .collect();
+    Ok(rows?)
+}
+
+/// Return every symbol from files under `path_prefix`, sorted by
+/// file then line. The prefix is byte-level and repo-root-relative,
+/// matching `find_symbols.path` semantics.
+///
+/// # Errors
+/// `Error::AnchorNotFound` when the anchor doesn't resolve; SQLite
+/// errors otherwise.
+pub fn get_outline_under_path(
+    conn: &Connection,
+    anchor: &AnchorName,
+    path_prefix: &str,
+    parser_id: Option<&str>,
+    limit: u32,
+) -> Result<Vec<OutlineItem>> {
+    let manifest_id =
+        anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
+    let limit = limit.max(1);
+
+    let mut sql = String::from(
+        "SELECT me.path, s.name, s.qualified, s.kind, s.signature, s.doc, s.line_start
+          FROM manifest_entries me
+           JOIN symbols s
+             ON s.blob_sha = me.blob_sha
+          WHERE me.manifest_id = ?1
+            AND substr(me.path, 1, length(?2)) = ?2",
+    );
+    let mut bound: Vec<Box<dyn ToSql>> =
+        vec![Box::new(manifest_id.0), Box::new(path_prefix.to_string())];
+    if let Some(pid) = parser_id {
+        sql.push_str(" AND s.parser_id = ?");
+        bound.push(Box::new(pid.to_string()));
+    }
+    sql.push_str(" ORDER BY me.path, s.line_start");
+    sql.push_str(&format!(" LIMIT {limit}"));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+    let rows: rusqlite::Result<Vec<OutlineItem>> = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(OutlineItem {
+                file: Some(row.get(0)?),
+                name: row.get(1)?,
+                qualified: row.get(2)?,
+                kind: symbol_kind_from_str(&row.get::<_, String>(3)?),
+                signature: row.get(4)?,
+                doc: row.get(5)?,
+                line: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
             })
         })?
         .collect();
@@ -987,6 +1044,33 @@ mod tests {
                 ("py_user", Some("python"), "src/a.py"),
                 ("rust_user", Some("rust"), "src/b.rs"),
                 ("User", None, "src/z.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn directory_outline_returns_items_per_file_under_path_prefix_sorted() {
+        let (repo, _sha) = init_repo(&[
+            ("a/foo.rs", "pub fn foo_one() {}\npub fn foo_two() {}\n"),
+            ("a/bar.rs", "pub fn bar_one() {}\n"),
+            ("b/baz.rs", "pub fn baz_one() {}\n"),
+        ]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        let hits = get_outline_under_path(&conn, &AnchorName::head(), "a/", None, 10).unwrap();
+        let rows: Vec<(&str, &str, u32)> = hits
+            .iter()
+            .map(|h| (h.file.as_deref().unwrap(), h.name.as_str(), h.line))
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                ("a/bar.rs", "bar_one", 1),
+                ("a/foo.rs", "foo_one", 1),
+                ("a/foo.rs", "foo_two", 2),
             ]
         );
     }
