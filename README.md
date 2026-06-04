@@ -79,15 +79,20 @@ store alive while any other label still references it.
 ### Query
 
 ```sh
-cairn query find <name>             --repo <alias>   # symbol by name
-cairn query refs <name>             --repo <alias>   # callers / use sites
-cairn query source <qualified-name> --repo <alias>   # source body
-cairn query outline <alias> <file>                   # per-file outline
-cairn query impls --type <T>        --repo <alias>   # what T implements
-cairn query impls --trait <T>       --repo <alias>   # what implements T
-cairn query imports --file <path>   --repo <alias>   # use / import edges
-cairn query repos                                    # registered repos
+cairn query find <name>             [--repo <alias>]   # symbol by name
+cairn query refs <name>             [--repo <alias>]   # callers / use sites
+cairn query source <qualified-name> --repo <alias>     # source body
+cairn query outline <alias> <file>                     # per-file outline
+cairn query impls --type <T>        [--repo <alias>]   # what T implements
+cairn query impls --trait <T>       [--repo <alias>]   # what implements T
+cairn query imports --file <path>   [--repo <alias>]   # use / import edges
+cairn query repos                                      # registered repos
 ```
+
+Omitting `--repo` searches every registered repo for the four
+discovery commands (`find`, `refs`, `impls`, `imports`); each hit
+carries its origin in a `repo:branch:file:line` location prefix.
+`source` and `outline` still target a single repo.
 
 `--anchor <name>` selects a non-default state:
 `HEAD` (default), `branch/<n>`, `tag/<n>`, `tentative/<id>`.
