@@ -357,11 +357,10 @@ impl LspClient {
         Ok(())
     }
 
-    /// Notify the server that a document is open before issuing
-    /// per-position requests against it.
+    /// Open a text document in the server using full-text synchronization.
     ///
     /// # Errors
-    /// Returns protocol/server errors from the underlying transport.
+    /// Returns protocol/server errors from the underlying LSP transport.
     pub async fn did_open(
         &self,
         uri: &Url,
@@ -378,6 +377,46 @@ impl LspClient {
                     "languageId": language_id,
                     "version": version,
                     "text": text,
+                }
+            }),
+        )
+        .await
+    }
+
+    /// Replace a text document using full-text synchronization.
+    ///
+    /// # Errors
+    /// Returns protocol/server errors from the underlying LSP transport.
+    pub async fn did_change(&self, uri: &Url, version: i32, text: &str) -> Result<()> {
+        self.ensure_running().await?;
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {
+                    "uri": uri.as_str(),
+                    "version": version,
+                },
+                "contentChanges": [
+                    {
+                        "text": text,
+                    }
+                ],
+            }),
+        )
+        .await
+    }
+
+    /// Close a text document in the server.
+    ///
+    /// # Errors
+    /// Returns protocol/server errors from the underlying LSP transport.
+    pub async fn did_close(&self, uri: &Url) -> Result<()> {
+        self.ensure_running().await?;
+        self.notify(
+            "textDocument/didClose",
+            json!({
+                "textDocument": {
+                    "uri": uri.as_str(),
                 }
             }),
         )
@@ -902,6 +941,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_sync_notifications_use_full_text_payloads() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(fake_server(server_io, FakeMode::RecordDocumentSync(tx)));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let uri = Url::from("file:///tmp/cairn/src/lib.rs");
+
+        client
+            .did_open(&uri, "rust", 1, "fn main() {}\n")
+            .await
+            .unwrap();
+        client
+            .did_change(&uri, 2, "fn main() { println!(\"hi\"); }\n")
+            .await
+            .unwrap();
+        client.did_close(&uri).await.unwrap();
+
+        let open = rx.recv().await.unwrap();
+        assert_eq!(
+            open.get("method").and_then(Value::as_str),
+            Some("textDocument/didOpen")
+        );
+        let open_doc = &open["params"]["textDocument"];
+        assert_eq!(open_doc["uri"], uri.as_str());
+        assert_eq!(open_doc["languageId"], "rust");
+        assert_eq!(open_doc["version"], 1);
+        assert_eq!(open_doc["text"], "fn main() {}\n");
+
+        let change = rx.recv().await.unwrap();
+        assert_eq!(
+            change.get("method").and_then(Value::as_str),
+            Some("textDocument/didChange")
+        );
+        assert_eq!(change["params"]["textDocument"]["uri"], uri.as_str());
+        assert_eq!(change["params"]["textDocument"]["version"], 2);
+        assert_eq!(
+            change["params"]["contentChanges"][0]["text"],
+            "fn main() { println!(\"hi\"); }\n"
+        );
+
+        let close = rx.recv().await.unwrap();
+        assert_eq!(
+            close.get("method").and_then(Value::as_str),
+            Some("textDocument/didClose")
+        );
+        assert_eq!(close["params"]["textDocument"]["uri"], uri.as_str());
+
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn definition_times_out_when_server_never_replies() {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let _server = tokio::spawn(fake_server(server_io, FakeMode::DefinitionTimeout));
@@ -1222,6 +1322,7 @@ mod tests {
         ServerStatusQuiescent,
         RequireServerStatusOptIn,
         RequireDidOpen,
+        RecordDocumentSync(tokio::sync::mpsc::UnboundedSender<Value>),
     }
 
     async fn fake_server(stream: DuplexStream, mode: FakeMode) {
@@ -1340,8 +1441,18 @@ mod tests {
                         }
                     }
                 }
-                (Some("textDocument/didOpen"), None) => {
-                    did_open = true;
+                (
+                    Some(
+                        "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose",
+                    ),
+                    None,
+                ) => {
+                    if matches!(method, Some("textDocument/didOpen")) {
+                        did_open = true;
+                    }
+                    if let FakeMode::RecordDocumentSync(tx) = &mode {
+                        tx.send(message).unwrap();
+                    }
                 }
                 (Some("textDocument/definition"), Some(id)) => {
                     if matches!(mode, FakeMode::DefinitionTimeout) {
