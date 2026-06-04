@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::BRANCH_PARAM_DESC;
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
 
 struct GetSymbolSource;
 
@@ -20,6 +20,7 @@ impl McpTool for GetSymbolSource {
                     "repo":      {"type": "string"},
                     "qualified": {"type": "string", "description": "Fully-qualified name, e.g. `crate::cli::parse_args` or `MyStruct::new`. Use `find_symbols` first if you only have a bare name."},
                     "branch":    {"type": "string", "description": BRANCH_PARAM_DESC},
+                    "anchor":    {"type": "string", "description": ANCHOR_PARAM_DESC},
                     "file":      {"type": "string", "description": "Path relative to repo root. Optional; only needed when the same qualified name exists in multiple files."},
                     "signature_only": {"type": "boolean", "description": "Return only the signature + doc string (no body bytes). Cheap API-surface peek; the `source` field is empty when this is set, `signature` and `doc` carry everything."},
                 },

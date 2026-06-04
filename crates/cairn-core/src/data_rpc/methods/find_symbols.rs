@@ -6,7 +6,6 @@
 //! Tier-2 layer in the legacy implementation and comes back in a
 //! later iteration.
 
-use cairn_proto::common::SourceTier;
 use cairn_proto::methods::{FindSymbolArgs, FindSymbolHit, FindSymbolResult};
 use linkme::distributed_slice;
 use serde_json::Value;
@@ -134,14 +133,13 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit, signature_only: bool) -
         // analogous "minimal navigation payload" is everything *but*
         // the signature.
         signature: if signature_only { None } else { h.signature },
-        // The CAS query layer doesn't yet round-trip the per-fact
-        // source-tier tag; default to Syntactic until it does.
-        source: SourceTier::Syntactic,
+        source: h.source_tier,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use cairn_proto::common::{SourceTier, SymbolKind};
     use serde_json::json;
 
     use super::*;
@@ -155,5 +153,24 @@ mod tests {
             json!({"repo": "demo", "kind": "struct", "limit": 2}),
         )
         .await;
+    }
+
+    #[test]
+    fn wire_hit_preserves_query_source_tier() {
+        let hit = SymbolHit {
+            id: 1,
+            name: "semantic_fn".into(),
+            qualified: "semantic_fn".into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            visibility: None,
+            path: "src/lib.rs".into(),
+            line: 1,
+            blob_sha: "sha".into(),
+            source_tier: SourceTier::Semantic,
+        };
+
+        let wire = into_wire_hit("demo", "HEAD", hit, false);
+        assert_eq!(wire.source, SourceTier::Semantic);
     }
 }
