@@ -73,3 +73,31 @@ fn init_tracing() {
         )
         .init();
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_language_backend_registry_includes_cli_linked_backends() {
+        let mut backend_names = cairn_lang_api::all_backends()
+            .iter()
+            .map(|backend| backend.name())
+            .collect::<Vec<_>>();
+        backend_names.sort_unstable();
+
+        assert_eq!(
+            backend_names,
+            ["go", "markdown", "python", "rust", "typescript"]
+        );
+    }
+
+    #[test]
+    fn runtime_workspace_analyzer_registry_includes_cli_linked_analyzers() {
+        let mut analyzer_ids = cairn_core::workspace_analyzer::all_workspace_analyzers()
+            .iter()
+            .map(|analyzer| analyzer.id())
+            .collect::<Vec<_>>();
+        analyzer_ids.sort_unstable();
+
+        assert_eq!(analyzer_ids, ["rust-analyzer-lsp"]);
+    }
+}
