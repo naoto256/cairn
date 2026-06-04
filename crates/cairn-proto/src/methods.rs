@@ -418,8 +418,9 @@ pub struct FindReferencesArgs {
     /// call). A token containing `::` matches the qualified form
     /// first; a bare name falls back to the looser name index.
     pub symbol: String,
-    /// Restrict to a specific reference kind. When omitted every kind
-    /// is returned (calls, method calls, type uses, …).
+    /// Restrict to a specific reference kind. For outgoing queries,
+    /// the default still returns only resolved call refs unless
+    /// `include_noise` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<RefKind>,
     /// `Incoming` (default) = "who references `symbol`"; `Outgoing`
@@ -427,6 +428,13 @@ pub struct FindReferencesArgs {
     /// `symbol`'s body). 0.2.1 surface completion.
     #[serde(default)]
     pub direction: ReferenceDirection,
+    /// Outgoing queries default to resolved call refs only
+    /// (`kind = call` and non-empty `target_qualified`) so consumers
+    /// can map a function's call graph without type refs,
+    /// annotations, or unresolved receiver-method noise. Set this to
+    /// true to return the legacy full ref set for debugging.
+    #[serde(default)]
+    pub include_noise: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,

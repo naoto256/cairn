@@ -106,6 +106,7 @@ pub struct FindReferencesArgs {
     pub symbol: String,
     pub direction: ReferenceDirection,
     pub kind: Option<RefKind>,
+    pub include_noise: bool,
     pub limit: Option<u32>,
 }
 
@@ -170,6 +171,11 @@ fn run_find_references(
         sql.push_str(" = ?2");
         if kind_str.is_some() {
             sql.push_str(" AND r.kind = ?3");
+        }
+        if outgoing && !args.include_noise {
+            sql.push_str(" AND r.kind = 'call'");
+            sql.push_str(" AND r.target_qualified IS NOT NULL");
+            sql.push_str(" AND r.target_qualified <> ''");
         }
         sql.push_str(" ORDER BY me.path, r.line");
         sql.push_str(&format!(" LIMIT {limit}"));
@@ -788,6 +794,93 @@ mod tests {
         )
         .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn references_outgoing_defaults_to_resolved_calls() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n\
+             pub fn resolved() {}\n\
+             pub fn caller(arg: Widget) -> Widget {\n\
+                 resolved();\n\
+                 arg.render();\n\
+                 arg\n\
+             }\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, _repo.path(), 0).unwrap();
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "caller".into(),
+                direction: ReferenceDirection::Outgoing,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            hits.iter()
+                .map(|h| h.target_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["resolved"],
+            "outgoing default should hide unresolved method calls and type refs: {hits:?}"
+        );
+        assert!(hits.iter().all(|h| h.kind == RefKind::Call));
+        assert!(hits.iter().all(|h| h.target_qualified.is_some()));
+    }
+
+    #[test]
+    fn references_outgoing_include_noise_returns_legacy_refs() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n\
+             pub fn resolved() {}\n\
+             pub fn caller(arg: Widget) -> Widget {\n\
+                 resolved();\n\
+                 arg.render();\n\
+                 arg\n\
+             }\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, _repo.path(), 0).unwrap();
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "caller".into(),
+                direction: ReferenceDirection::Outgoing,
+                include_noise: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.target_name == "resolved"
+                && h.kind == RefKind::Call
+                && h.target_qualified.as_deref() == Some("resolved")),
+            "resolved call missing from noisy outgoing refs: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.target_name == "render"
+                && h.kind == RefKind::Call
+                && h.target_qualified.is_none()),
+            "unresolved method call missing from include_noise refs: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h.target_name == "Widget" && h.kind == RefKind::Type),
+            "type refs missing from include_noise refs: {hits:?}"
+        );
     }
 
     #[test]
