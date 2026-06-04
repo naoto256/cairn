@@ -59,7 +59,7 @@ impl DataMethod for FindSymbols {
                     None => cas_registry::list_all(&index)?,
                 };
 
-                let mut out = Vec::new();
+                let mut out: Vec<(String, SymbolHit)> = Vec::new();
                 let mut capped = false;
                 for entry in aliases {
                     let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
@@ -76,16 +76,23 @@ impl DataMethod for FindSymbols {
                     };
                     capped |= trim_to_requested_limit(&mut hits, effective_limit);
                     for h in hits {
-                        out.push(into_wire_hit(
-                            &entry.alias,
-                            anchor.as_str(),
-                            h,
-                            signature_only,
-                        ));
+                        out.push((entry.alias.clone(), h));
                     }
-                    capped |= trim_to_requested_limit(&mut out, effective_limit);
                 }
-                Ok((out, capped))
+                out.sort_by(|(repo_a, a), (repo_b, b)| {
+                    language_sort_key(a.language.as_deref())
+                        .cmp(&language_sort_key(b.language.as_deref()))
+                        .then_with(|| a.path.cmp(&b.path))
+                        .then_with(|| a.line.cmp(&b.line))
+                        .then_with(|| repo_a.cmp(repo_b))
+                        .then_with(|| a.qualified.cmp(&b.qualified))
+                });
+                capped |= trim_to_requested_limit(&mut out, effective_limit);
+                let items = out
+                    .into_iter()
+                    .map(|(repo, h)| into_wire_hit(&repo, anchor.as_str(), h, signature_only))
+                    .collect();
+                Ok((items, capped))
             })
             .await
             .map_err(|e| Error::InvalidArgument(format!("find_symbols task panicked: {e}")))??;
@@ -128,12 +135,20 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit, signature_only: bool) -
         repo: repo.to_string(),
         branch: anchor.to_string(),
         location,
+        language: h.language,
         // `signature_only=true` drops the heaviest field. The naming
         // mirrors `GetSymbolSourceArgs.signature_only`; here the
         // analogous "minimal navigation payload" is everything *but*
         // the signature.
         signature: if signature_only { None } else { h.signature },
         source: h.source_tier,
+    }
+}
+
+fn language_sort_key(language: Option<&str>) -> (bool, &str) {
+    match language {
+        Some(lang) => (false, lang),
+        None => (true, ""),
     }
 }
 
@@ -167,10 +182,12 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 1,
             blob_sha: "sha".into(),
+            language: Some("rust".into()),
             source_tier: SourceTier::Semantic,
         };
 
         let wire = into_wire_hit("demo", "HEAD", hit, false);
         assert_eq!(wire.source, SourceTier::Semantic);
+        assert_eq!(wire.language.as_deref(), Some("rust"));
     }
 }
