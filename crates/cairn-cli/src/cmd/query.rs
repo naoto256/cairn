@@ -376,8 +376,8 @@ fn note_partial(c: &Completeness) {
             format!(" missing={}", names.join(","))
         };
         let why = reason
-            .as_deref()
-            .map(|r| format!(" reason={r}"))
+            .as_ref()
+            .map(|r| format!(" reason={}", r.as_str()))
             .unwrap_or_default();
         eprintln!("# partial result{tiers}{why}");
     }

@@ -65,6 +65,18 @@ cached parse on the next pass.
   documents with full-text `didOpen` / `didChange`, and provides
   daemon shutdown cleanup. The design note lives at
   `crates/cairn-core/src/lsp/docs/long_lived_design.md`.
+- **`cairn-proto::PartialReason`** — canonical taxonomy for
+  `Completeness::Partial.reason`: `Cap` / `Tier2Warming` /
+  `Tier3Warming` / `Tier3Unavailable` / `AnalyzerFailed`, plus an
+  `Other(String)` backstop for forward-compatible strings from newer
+  producers. Wire format is unchanged (manual `Serialize`/`Deserialize`
+  emits a plain snake_case string), so existing payloads like
+  `{"reason": "cap"}` continue to round-trip. The shared
+  `COMPLETENESS_REASON_DESC` constant enumerates the five reasons in
+  the `find_symbols` / `find_impls` / `find_imports` /
+  `find_references` MCP tool descriptions so consumers know which
+  remediation each reason implies (raise `limit`, wait, fall back to
+  a lower tier, or check `cairn ctl status`).
 
 ### Changed (wire breaking)
 

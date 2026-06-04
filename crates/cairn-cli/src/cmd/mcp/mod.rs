@@ -520,6 +520,15 @@ mod tests {
         assert!(find_symbols.description.contains("Best practice"));
         assert!(find_symbols.description.contains("Auth*"));
         assert!(find_symbols.description.contains("exact match is faster"));
+        for reason in [
+            "`cap`",
+            "`tier2_warming`",
+            "`tier3_warming`",
+            "`tier3_unavailable`",
+            "`analyzer_failed`",
+        ] {
+            assert!(find_symbols.description.contains(reason));
+        }
 
         let find_references = specs
             .iter()
@@ -530,6 +539,11 @@ mod tests {
             .unwrap();
         assert!(ref_kind_desc.contains("snake_case"));
         assert!(ref_kind_desc.contains("`macro_invoke`"));
+        for name in ["find_impls", "find_references", "find_imports"] {
+            let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+            assert!(spec.description.contains("tier3_unavailable"));
+            assert!(spec.description.contains("analyzer crashed"));
+        }
     }
 
     #[test]

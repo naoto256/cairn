@@ -1,6 +1,6 @@
 //! Types shared between the MCP and control protocols.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A line:column position inside a file. Lines are 1-based (matching what
 /// editors and `file:line` strings show); columns are 0-based UTF-8 byte
@@ -133,10 +133,10 @@ pub enum Completeness {
         /// the tier (e.g. one file out of many timed out).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         missing_tiers: Vec<MissingTier>,
-        /// Machine-readable short tag for the cause. Kept open so
-        /// methods can extend without bumping the proto.
+        /// Machine-readable short tag for the cause. Serialized as a
+        /// snake_case string for wire compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
+        reason: Option<PartialReason>,
     },
 }
 
@@ -152,7 +152,7 @@ impl Completeness {
     /// is missing — we just stopped collecting), so `missing_tiers` is
     /// empty and the reason carries the cap.
     #[must_use]
-    pub fn partial_truncated(reason: impl Into<String>) -> Self {
+    pub fn partial_truncated(reason: impl Into<PartialReason>) -> Self {
         Self::Partial {
             missing_tiers: Vec::new(),
             reason: Some(reason.into()),
@@ -166,14 +166,84 @@ impl Completeness {
     /// (e.g. a language without a Tier-2 analyzer yet, or enrichment
     /// still pending) — as well as by `find_symbols` when
     /// `include_inherited` walks a syntactic-only snapshot.
-    /// `reason` carries a human-readable detail such as which branches
-    /// were syntactic-only.
+    /// `reason` carries the canonical machine-readable reason.
     #[must_use]
-    pub fn partial_semantic(reason: impl Into<String>) -> Self {
+    pub fn partial_semantic(reason: impl Into<PartialReason>) -> Self {
         Self::Partial {
             missing_tiers: vec![MissingTier::Semantic],
             reason: Some(reason.into()),
         }
+    }
+}
+
+/// Canonical machine-readable cause for a partial result.
+///
+/// The wire representation is intentionally a plain snake_case string
+/// so existing clients that expect `"reason": "cap"` keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialReason {
+    /// Caller `limit` was reached; raise `limit` to see more.
+    Cap,
+    /// Tier-2 semantic analyzer has not completed for this snapshot.
+    Tier2Warming,
+    /// Tier-3 workspace analyzer has not completed for this snapshot.
+    Tier3Warming,
+    /// Tier-3 binary or service was unavailable and the run was skipped.
+    Tier3Unavailable,
+    /// Analyzer execution failed for this snapshot.
+    AnalyzerFailed,
+    /// Forward-compatible backstop for reason strings from newer producers.
+    Other(String),
+}
+
+impl PartialReason {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Cap => "cap",
+            Self::Tier2Warming => "tier2_warming",
+            Self::Tier3Warming => "tier3_warming",
+            Self::Tier3Unavailable => "tier3_unavailable",
+            Self::AnalyzerFailed => "analyzer_failed",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl From<&str> for PartialReason {
+    fn from(value: &str) -> Self {
+        match value {
+            "cap" => Self::Cap,
+            "tier2_warming" => Self::Tier2Warming,
+            "tier3_warming" => Self::Tier3Warming,
+            "tier3_unavailable" => Self::Tier3Unavailable,
+            "analyzer_failed" => Self::AnalyzerFailed,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for PartialReason {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl Serialize for PartialReason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PartialReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
     }
 }
 
@@ -220,7 +290,7 @@ mod tests {
     fn completeness_partial_carries_tiers_and_reason() {
         let p = Completeness::Partial {
             missing_tiers: vec![MissingTier::Semantic],
-            reason: Some("tier2_warming".into()),
+            reason: Some(PartialReason::Tier2Warming),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -239,10 +309,37 @@ mod tests {
                 reason,
             } => {
                 assert_eq!(missing_tiers, vec![MissingTier::Semantic]);
-                assert_eq!(reason.as_deref(), Some("tier2_warming"));
+                assert_eq!(reason, Some(PartialReason::Tier2Warming));
             }
             Completeness::Complete => panic!("expected Partial"),
         }
+    }
+
+    #[test]
+    fn partial_reason_round_trips_canonical_strings() {
+        for reason in [
+            PartialReason::Cap,
+            PartialReason::Tier2Warming,
+            PartialReason::Tier3Warming,
+            PartialReason::Tier3Unavailable,
+            PartialReason::AnalyzerFailed,
+        ] {
+            let value = serde_json::to_value(&reason).unwrap();
+            assert_eq!(value, serde_json::json!(reason.as_str()));
+            let back: PartialReason = serde_json::from_value(value).unwrap();
+            assert_eq!(back, reason);
+        }
+    }
+
+    #[test]
+    fn partial_reason_preserves_unknown_strings() {
+        let reason: PartialReason =
+            serde_json::from_value(serde_json::json!("future_reason")).unwrap();
+        assert_eq!(reason, PartialReason::Other("future_reason".into()));
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!("future_reason")
+        );
     }
 
     #[test]
