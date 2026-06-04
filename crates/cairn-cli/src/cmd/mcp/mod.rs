@@ -480,6 +480,59 @@ mod tests {
     }
 
     #[test]
+    fn tool_specs_describe_snapshot_and_kind_filters_precisely() {
+        let specs = dispatcher().tool_specs();
+        let list_repos = specs.iter().find(|spec| spec.name == "list_repos").unwrap();
+        assert!(list_repos.description.contains("Start here"));
+        assert!(
+            list_repos
+                .description
+                .contains("language enrichment matrix")
+        );
+
+        let find_symbols = specs
+            .iter()
+            .find(|spec| spec.name == "find_symbols")
+            .unwrap();
+        let symbol_props = &find_symbols.input_schema["properties"];
+        let branch_desc = symbol_props["branch"]["description"].as_str().unwrap();
+        assert!(branch_desc.contains("bare branch name"));
+        assert!(branch_desc.contains("Do not pass `HEAD`"));
+        assert!(branch_desc.contains("Omit both `branch` and `anchor`"));
+        assert!(
+            symbol_props["anchor"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Raw anchor name")
+        );
+        assert!(
+            symbol_props["anchor"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Takes priority over `branch`")
+        );
+
+        let kind_desc = symbol_props["kind"]["description"].as_str().unwrap();
+        assert!(kind_desc.contains("snake_case"));
+        assert!(kind_desc.contains("`type_alias`"));
+        assert!(kind_desc.contains("`section`"));
+        assert!(kind_desc.contains("Aliases such as `fn`"));
+        assert!(find_symbols.description.contains("Best practice"));
+        assert!(find_symbols.description.contains("Auth*"));
+        assert!(find_symbols.description.contains("exact match is faster"));
+
+        let find_references = specs
+            .iter()
+            .find(|spec| spec.name == "find_references")
+            .unwrap();
+        let ref_kind_desc = find_references.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(ref_kind_desc.contains("snake_case"));
+        assert!(ref_kind_desc.contains("`macro_invoke`"));
+    }
+
+    #[test]
     fn initialize_carries_instructions() {
         let r = initialize_result();
         assert_eq!(r.protocol_version, MCP_PROTOCOL_VERSION);

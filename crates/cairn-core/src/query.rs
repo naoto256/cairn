@@ -10,7 +10,7 @@
 //! of the surface ports in later work.
 
 use cairn_lang_api::Visibility;
-use cairn_proto::common::{RefKind, SymbolKind};
+use cairn_proto::common::{RefKind, SourceTier, SymbolKind};
 use cairn_proto::methods::ReferenceDirection;
 use rusqlite::{Connection, OptionalExtension, ToSql};
 
@@ -35,6 +35,7 @@ pub struct SymbolHit {
     pub path: String,
     pub line: u32,
     pub blob_sha: String,
+    pub source_tier: SourceTier,
 }
 
 /// Filters for `find_symbols`. All optional; the caller must supply
@@ -581,11 +582,14 @@ fn run_find_symbols(
     // file path the blob was mounted at.
     let mut sql = String::from(
         "SELECT s.id, s.name, s.qualified, s.kind, s.signature, s.visibility,
-                 me.path, s.line_start, s.blob_sha
+                 me.path, s.line_start, s.blob_sha,
+                 b.analyzer_id IS NOT NULL
            FROM symbols s
            JOIN manifest_entries me
              ON me.manifest_id = ?1
             AND me.blob_sha = s.blob_sha
+           JOIN blobs b
+             ON b.blob_sha = s.blob_sha
           WHERE 1=1",
     );
     let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0)];
@@ -650,6 +654,11 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
         path: row.get(6)?,
         line: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
         blob_sha: row.get(8)?,
+        source_tier: if row.get::<_, bool>(9)? {
+            SourceTier::Semantic
+        } else {
+            SourceTier::Syntactic
+        },
     })
 }
 
@@ -758,6 +767,54 @@ mod tests {
         (db_tmp, conn)
     }
 
+    fn source_tier_fixture() -> (tempfile::TempDir, Connection) {
+        let db_tmp = tempfile::tempdir().unwrap();
+        let conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('HEAD', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs
+               (blob_sha, parser_id, parser_revision, analyzer_id,
+                analyzer_revision, parsed_at_ns)
+             VALUES
+               ('sha-syn', 'tree-sitter-rust', 1, NULL, NULL, 0),
+               ('sha-sem', 'tree-sitter-rust', 1, 'rust-syn', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES
+               (1, 'src/syntactic.rs', 'sha-syn'),
+               (1, 'src/semantic.rs', 'sha-sem')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               ('sha-syn', 'tree-sitter-rust', 'syntactic_fn', 'syntactic_fn',
+                'function', 0, 10, 1, 1, 'tree-sitter-rust'),
+               ('sha-sem', 'tree-sitter-rust', 'semantic_fn', 'semantic_fn',
+                'function', 0, 10, 1, 1, 'rust-syn')",
+            [],
+        )
+        .unwrap();
+        (db_tmp, conn)
+    }
+
     #[test]
     fn find_by_name_returns_matching_symbol() {
         let (_repo, _db, c) = registered();
@@ -856,6 +913,25 @@ mod tests {
             hits.iter().any(|h| h.name == "Widget"),
             "Widget not in {hits:?}"
         );
+    }
+
+    #[test]
+    fn find_symbols_reports_source_tier_from_blob_analyzer_id() {
+        let (_db, c) = source_tier_fixture();
+        let hits = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                kind: Some("function".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let syntactic = hits.iter().find(|h| h.name == "syntactic_fn").unwrap();
+        assert_eq!(syntactic.source_tier, SourceTier::Syntactic);
+        let semantic = hits.iter().find(|h| h.name == "semantic_fn").unwrap();
+        assert_eq!(semantic.source_tier, SourceTier::Semantic);
     }
 
     #[test]

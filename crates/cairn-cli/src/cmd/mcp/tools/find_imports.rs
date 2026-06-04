@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::BRANCH_PARAM_DESC;
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
 
 struct FindImports;
 
@@ -20,6 +20,7 @@ impl McpTool for FindImports {
                     "repo":   {"type": "string"},
                     "file":   {"type": "string", "description": "Path relative to repo root."},
                     "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
+                    "anchor": {"type": "string", "description": ANCHOR_PARAM_DESC},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
                 },
                 "required": ["repo"],

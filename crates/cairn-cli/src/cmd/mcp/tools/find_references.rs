@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::BRANCH_PARAM_DESC;
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
+
+const REF_KIND_DESC: &str = "Restrict to one RefKind. Use snake_case strings: `call`, `type`, `import`, `instantiate`, `read`, `write`, `override`, `macro_invoke`, or `annotation`. Omit for every kind.";
 
 struct FindReferences;
 
@@ -30,10 +32,11 @@ impl McpTool for FindReferences {
                     },
                     "kind":   {
                         "type": "string",
-                        "description": "Restrict to one RefKind. Omit for every kind.",
+                        "description": REF_KIND_DESC,
                         "enum": ["call", "type", "import", "instantiate", "read", "write", "override", "macro_invoke", "annotation"],
                     },
                     "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
+                    "anchor": {"type": "string", "description": ANCHOR_PARAM_DESC},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
                 },
                 "required": ["repo", "symbol"],

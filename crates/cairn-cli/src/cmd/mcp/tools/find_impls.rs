@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::BRANCH_PARAM_DESC;
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
 
 struct FindImpls;
 
@@ -21,6 +21,7 @@ impl McpTool for FindImpls {
                     "trait":  {"type": "string", "description": "Match impl blocks implementing this trait. e.g. `Display`."},
                     "type":   {"type": "string", "description": "Match impl blocks targeting this type. e.g. `Foo` or `crate::module::Foo`."},
                     "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
+                    "anchor": {"type": "string", "description": ANCHOR_PARAM_DESC},
                     "limit":  {"type": "integer", "minimum": 1, "maximum": 500, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
                 },
                 "required": ["repo"],
