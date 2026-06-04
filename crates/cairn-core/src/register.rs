@@ -29,6 +29,7 @@ use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas;
 use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
+use crate::workspace_analyzer::run_registered_workspace_analyzers;
 
 /// Outcome of a successful `register_repo` call.
 #[derive(Debug, Clone)]
@@ -100,6 +101,13 @@ pub fn register_repo(
         worktree_path,
         &backends,
         &committed_entries,
+        &tentative_entries,
+        now_ns,
+    )?;
+    let _workspace_refs = run_registered_workspace_analyzers(
+        conn,
+        worktree_path,
+        tentative,
         &tentative_entries,
         now_ns,
     )?;
