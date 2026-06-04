@@ -146,7 +146,10 @@ CREATE TABLE worktrees (
     registered_at_ns INTEGER NOT NULL
 );
 
--- FTS5 over symbols, content-synced via triggers
+-- FTS5 over symbols, content-synced via triggers. Query semantics are
+-- SQLite FTS5 defaults with unicode61: bare whitespace-separated tokens
+-- are AND-ed, quoted text is an exact-order phrase, and prefix matching
+-- requires an explicit trailing `*` in the MATCH query.
 CREATE VIRTUAL TABLE symbols_fts USING fts5(
     name, qualified, doc,
     content='symbols', content_rowid='id',

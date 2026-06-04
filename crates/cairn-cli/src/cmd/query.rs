@@ -68,7 +68,8 @@ enum QueryCommand {
         /// Restrict to symbols of this kind.
         #[arg(long)]
         kind: Option<String>,
-        /// Fuzzy / FTS5 match instead of exact.
+        /// FTS5 match over name, qualified, and doc instead of exact.
+        /// Spaces are AND, quotes are phrase, `*` enables prefix matching.
         #[arg(long)]
         fuzzy: bool,
         #[arg(long)]

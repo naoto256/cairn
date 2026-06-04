@@ -190,9 +190,12 @@ pub struct OutlineItem {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FindSymbolArgs {
     /// Text matched against `name` / `qualified` (exact when `fuzzy`
-    /// is false, FTS5 over name + qualified + doc when true). Optional
-    /// from 0.2.1; pair with `kind` / `container` / `path` instead
-    /// when you want a structural enumeration.
+    /// is false, FTS5 over name + qualified + doc when true). In
+    /// fuzzy mode, whitespace between bare tokens is FTS5 AND, quoted
+    /// text is an exact-order phrase, and prefix matching is only
+    /// applied when the caller writes `*` (for example `Authent*`).
+    /// Optional from 0.2.1; pair with `kind` / `container` / `path`
+    /// instead when you want a structural enumeration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     /// Repository alias. `None` searches every registered repo (the
@@ -239,6 +242,10 @@ pub struct FindSymbolArgs {
     ///   `lib_helper.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Use SQLite FTS5 over `name`, `qualified`, and `doc` instead of
+    /// exact `name` / `qualified` matching. Bare tokens separated by
+    /// spaces are AND-ed by FTS5, quoted strings require exact token
+    /// order, and prefix matching requires an explicit trailing `*`.
     #[serde(default)]
     pub fuzzy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
