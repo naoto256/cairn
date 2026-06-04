@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "naoto256-cairn",
+  "description": "Cairn — local symbol-aware code index.",
+  "owner": {
+    "name": "Naoto Morishima"
+  },
+  "plugins": [
+    {
+      "name": "cairn",
+      "description": "Wires the cairn MCP server and a PreToolUse Bash hook that blocks grep / rg / ag / ack / egrep / fgrep in cairn-registered cwds with a reason pointing at the closest cairn tool.",
+      "author": {
+        "name": "Naoto Morishima"
+      },
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/naoto256/cairn.git",
+        "path": "plugin",
+        "ref": "main"
+      }
+    }
+  ]
+}

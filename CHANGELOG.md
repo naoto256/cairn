@@ -88,7 +88,15 @@ cached parse on the next pass.
   dependency / runtime failure is a no-op, and the agent can rerun
   the original command after deciding. `.claude-plugin/` and
   `.codex-plugin/` manifests are sibling directories so the same
-  bundle installs on both hosts.
+  bundle installs on both hosts. The hook script detects the host
+  via `CLAUDE_PLUGIN_ROOT` and emits the matching JSON shape —
+  Claude Code's
+  `{hookSpecificOutput.permissionDecision: "deny", permissionDecisionReason}`
+  or Codex's `{decision: "block", reason}`. The repo root carries
+  `.claude-plugin/marketplace.json` so Claude Code can discover the
+  bundle via the standard `/plugin marketplace add` /
+  `/plugin install` flow (local checkout path or
+  `naoto256/cairn` remote both supported).
 
 ### Changed (wire breaking)
 
