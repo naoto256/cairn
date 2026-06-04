@@ -68,23 +68,17 @@ case "$cmd" in
     ;;
 esac
 
-reason="cwd is a cairn-registered repo. For this query, reach for \`${suggest}\` first — it ${hint}. \`grep\` is the right call only for free-form text inside symbol bodies or in files cairn does not understand. Re-run as-is if that's what you mean."
+reason="cwd is a cairn-registered repo. \`${suggest}\` is usually the better next call for this query — it ${hint}. \`grep\` is the right reach for free-form text inside symbol bodies or in files cairn does not understand."
 
-# Output format differs by host:
-#   - Claude Code reads hookSpecificOutput.permissionDecision (= "deny" /
-#     "allow" / "ask" / "defer") with permissionDecisionReason surfaced
-#     to the agent. The host env var CLAUDE_PLUGIN_ROOT is set in the
-#     hook's environment.
-#   - Codex reads the top-level {decision:"block", reason:"..."} shape.
-# We detect the host by CLAUDE_PLUGIN_ROOT and emit the matching shape.
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  jq -cn --arg reason "$reason" '{
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: $reason
-    }
-  }'
-else
-  jq -cn --arg reason "$reason" '{decision:"block", reason:$reason}'
-fi
+# Both Claude Code and Codex accept the same non-blocking advisory
+# shape on PreToolUse: hookSpecificOutput.additionalContext lets the
+# tool run normally and surfaces the text to the agent's next-turn
+# context. Returning no permissionDecision means "defer" (= use the
+# normal permission flow), so the grep / rg / ack call executes
+# unchanged.
+jq -cn --arg reason "$reason" '{
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    additionalContext: $reason
+  }
+}'

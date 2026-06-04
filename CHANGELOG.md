@@ -80,23 +80,27 @@ cached parse on the next pass.
 - **`plugin/`** — in-tree plugin for Claude Code and Codex. Bundles
   the cairn MCP server registration (`plugin/.mcp.json`) and a
   `PreToolUse` hook (`plugin/tools/cairn-nudge.sh`) that, when the
-  cwd belongs to a cairn-registered repo, blocks `grep` / `rg` /
-  `ag` / `ack` / `egrep` / `fgrep` calls with a short reason
-  pointing at the closest cairn tool (`find_imports` for `^use`,
-  `find_impls` for `impl X for`, `find_references` for `name(`,
-  `find_symbols` otherwise). The block is non-destructive: any
-  dependency / runtime failure is a no-op, and the agent can rerun
-  the original command after deciding. `.claude-plugin/` and
-  `.codex-plugin/` manifests are sibling directories so the same
-  bundle installs on both hosts. The hook script detects the host
-  via `CLAUDE_PLUGIN_ROOT` and emits the matching JSON shape —
-  Claude Code's
-  `{hookSpecificOutput.permissionDecision: "deny", permissionDecisionReason}`
-  or Codex's `{decision: "block", reason}`. The repo root carries
-  `.claude-plugin/marketplace.json` so Claude Code can discover the
-  bundle via the standard `/plugin marketplace add` /
-  `/plugin install` flow (local checkout path or
-  `naoto256/cairn` remote both supported).
+  cwd belongs to a cairn-registered repo, lets `grep` / `rg` / `ag`
+  / `ack` / `egrep` / `fgrep` calls execute as usual and emits a
+  `hookSpecificOutput.additionalContext` advisory pointing at the
+  closest cairn tool (`find_imports` for `^use`, `find_impls` for
+  `impl X for`, `find_references` for `name(`, `find_symbols`
+  otherwise). The advisory surfaces in the agent's next-turn
+  context so the *next* call defaults to the index, but the current
+  `grep` is not interrupted. Both Claude Code and Codex accept the
+  same `hookSpecificOutput.additionalContext` shape on `PreToolUse`,
+  so a single output path covers both hosts. Any dependency /
+  runtime failure (`cairn` / `jq` missing, daemon down, parse error)
+  is a no-op — hooks must never break a turn. `.claude-plugin/` and
+  `.codex-plugin/` manifests are sibling directories under
+  `plugin/` so the same bundle installs on both hosts, and the repo
+  root carries `.claude-plugin/marketplace.json` (with
+  `source: ./plugin` relative to the marketplace root) so the bundle
+  is discovered via `/plugin marketplace add` + `/plugin install`
+  on Claude Code and `codex plugin marketplace add` +
+  `codex plugin add` on Codex — both local-path and
+  `naoto256/cairn` remote registrations resolve through the same
+  `./plugin` relative source.
 
 ### Changed (wire breaking)
 

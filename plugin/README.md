@@ -16,24 +16,25 @@ a cairn-registered repo.
 - **`grep` nudge hook** (`hooks/hooks.json` →
   `tools/cairn-nudge.sh`). Inspects every Bash call. If the command
   starts with `grep` / `rg` / `ag` / `ack` / `egrep` / `fgrep` AND the
-  `cwd` is a cairn-registered repo, the hook blocks the call and
-  returns a short reason that names the closest cairn tool
-  (`find_symbols`, `find_impls`, `find_imports`, or `find_references`)
-  with a one-line explanation of what it returns. The agent re-decides
-  with the index in mind. Non-grep commands and non-registered cwds
-  pass through silently. Any dependency / runtime failure (missing
-  `cairn` or `jq` on `PATH`, daemon down, parse error) is a no-op so a
-  broken hook never breaks a turn.
+  `cwd` is a cairn-registered repo, the hook **lets the call run** and
+  emits a `hookSpecificOutput.additionalContext` advisory that names
+  the closest cairn tool (`find_symbols`, `find_impls`,
+  `find_imports`, or `find_references`) with a one-line explanation
+  of what it returns. The advisory surfaces in the agent's next-turn
+  context so the next call defaults to the index, but the current
+  `grep` is not interrupted. Non-grep commands and non-registered
+  cwds pass through silently. Any dependency / runtime failure
+  (missing `cairn` or `jq` on `PATH`, daemon down, parse error) is a
+  no-op so a broken hook never breaks a turn.
 
-The hook *blocks* rather than passes a soft hint because the failure
-mode this plugin is trying to fix is "agent reaches for grep on
-muscle memory and never re-reads the MCP server instructions". A
-non-blocking advisory was tried first and did not change behaviour;
-a blocking nudge with a clear reason gives the agent a single
-explicit decision point per grep call. Use a non-grep command (`cat`,
-piping through another tool, etc.) to bypass when you genuinely want
-raw-text search inside symbol bodies or in files cairn does not
-understand.
+An earlier version of this plugin hard-blocked grep with
+`permissionDecision: "deny"`. The block flipped agent behaviour in
+one call but broke flow for legitimate raw-text searches inside
+symbol bodies. The current advisory shape keeps the steer on the
+*next* call without disrupting the current one. Both Claude Code
+and Codex accept `hookSpecificOutput.additionalContext` as the
+non-blocking advisory channel on `PreToolUse`, so a single output
+shape covers both hosts.
 
 ## Prerequisites
 
@@ -82,10 +83,9 @@ hook contract.
 
 The `${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}` expansion in
 `hooks/hooks.json` handles either host's plugin-path environment
-variable, and `tools/cairn-nudge.sh` emits the appropriate
-host-shaped JSON (Claude Code's
-`{hookSpecificOutput.permissionDecision: "deny"}` vs Codex's
-`{decision: "block", reason}`) based on which env var is set.
+variable, and `tools/cairn-nudge.sh` emits the same
+`hookSpecificOutput.additionalContext` payload for both hosts —
+non-blocking advisory on `PreToolUse`.
 
 ## Configuration
 
