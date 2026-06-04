@@ -43,6 +43,7 @@ pub struct SymbolHit {
 #[derive(Debug, Clone, Default)]
 pub struct FindSymbolsArgs {
     pub query: Option<String>,
+    pub fuzzy: bool,
     pub kind: Option<String>,
     pub container: Option<String>,
     pub path_prefix: Option<String>,
@@ -566,9 +567,19 @@ fn run_find_symbols(
     if let Some(q) = args.query.as_deref()
         && !q.is_empty()
     {
-        sql.push_str(" AND (s.name = ?  OR s.qualified = ?)");
-        bound.push(Box::new(q.to_string()));
-        bound.push(Box::new(q.to_string()));
+        if args.fuzzy {
+            sql.push_str(
+                " AND s.id IN (
+                      SELECT rowid FROM symbols_fts
+                       WHERE symbols_fts MATCH ?
+                  )",
+            );
+            bound.push(Box::new(q.to_string()));
+        } else {
+            sql.push_str(" AND (s.name = ?  OR s.qualified = ?)");
+            bound.push(Box::new(q.to_string()));
+            bound.push(Box::new(q.to_string()));
+        }
     }
     if let Some(k) = args.kind.as_deref()
         && !k.is_empty()
@@ -628,7 +639,11 @@ mod tests {
         let (repo, _sha) = init_repo(&[
             (
                 "src/lib.rs",
-                "pub fn alpha() -> i32 { 1 }\n\
+                "/// User Authentication handler.\n\
+                 pub fn auth_user() {}\n\
+                 /// Authentication User reversed.\n\
+                 pub fn reverse_auth_doc() {}\n\
+                 pub fn alpha() -> i32 { 1 }\n\
                  pub fn beta() {}\n\
                  pub struct Widget;\n\
                  impl Widget {\n    pub fn render(&self) {}\n}\n",
@@ -656,6 +671,71 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "alpha");
         assert_eq!(hits[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn fuzzy_multi_token_query_matches_all_tokens() {
+        let (_repo, _db, c) = registered();
+        let hits = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some("User Authentication".into()),
+                fuzzy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"auth_user"), "{hits:?}");
+        assert!(names.contains(&"reverse_auth_doc"), "{hits:?}");
+    }
+
+    #[test]
+    fn fuzzy_quoted_query_is_exact_order_phrase() {
+        let (_repo, _db, c) = registered();
+        let hits = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some("\"User Authentication\"".into()),
+                fuzzy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "auth_user");
+    }
+
+    #[test]
+    fn fuzzy_prefix_matching_requires_star() {
+        let (_repo, _db, c) = registered();
+        let no_prefix = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some("Authent".into()),
+                fuzzy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(no_prefix.is_empty(), "{no_prefix:?}");
+
+        let prefix = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some("Authent*".into()),
+                fuzzy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = prefix.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"auth_user"), "{prefix:?}");
+        assert!(names.contains(&"reverse_auth_doc"), "{prefix:?}");
     }
 
     #[test]
