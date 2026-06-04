@@ -287,6 +287,10 @@ pub struct FindSymbolHit {
     pub branch: String,
     /// `repo:branch:file:line` string, clickable in Claude Code UI.
     pub location: String,
+    /// Short language tag (`rust`, `python`, ...), when a semantic
+    /// analyzer has enriched the blob. Omitted for syntactic-only hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub source: SourceTier,
@@ -579,4 +583,46 @@ pub struct IndexResult {
     pub files_indexed: u64,
     pub files_skipped: u64,
     pub symbols_inserted: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn find_symbol_hit_round_trips_language_some() {
+        let value = json!({
+            "id": 1,
+            "qualified": "demo::f",
+            "name": "f",
+            "kind": "function",
+            "repo": "demo",
+            "branch": "HEAD",
+            "location": "demo:HEAD:src/lib.rs:1",
+            "language": "rust",
+            "source": "semantic"
+        });
+        let hit: FindSymbolHit = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(hit.language.as_deref(), Some("rust"));
+        assert_eq!(serde_json::to_value(hit).unwrap()["language"], "rust");
+    }
+
+    #[test]
+    fn find_symbol_hit_omits_language_none() {
+        let value = json!({
+            "id": 1,
+            "qualified": "Intro",
+            "name": "Intro",
+            "kind": "section",
+            "repo": "demo",
+            "branch": "HEAD",
+            "location": "demo:HEAD:README.md:1",
+            "source": "syntactic"
+        });
+        let hit: FindSymbolHit = serde_json::from_value(value).unwrap();
+        assert_eq!(hit.language, None);
+        assert!(serde_json::to_value(hit).unwrap().get("language").is_none());
+    }
 }

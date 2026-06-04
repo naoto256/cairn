@@ -35,6 +35,7 @@ pub struct SymbolHit {
     pub path: String,
     pub line: u32,
     pub blob_sha: String,
+    pub language: Option<String>,
     pub source_tier: SourceTier,
 }
 
@@ -583,6 +584,17 @@ fn run_find_symbols(
     let mut sql = String::from(
         "SELECT s.id, s.name, s.qualified, s.kind, s.signature, s.visibility,
                  me.path, s.line_start, s.blob_sha,
+                 CASE
+                   WHEN b.analyzer_id IS NULL THEN NULL
+                   WHEN b.parser_id LIKE 'tree-sitter-%@%' THEN
+                     substr(
+                       substr(b.parser_id, 13),
+                       1,
+                       instr(substr(b.parser_id, 13), '@') - 1
+                     )
+                   WHEN b.parser_id LIKE 'tree-sitter-%' THEN substr(b.parser_id, 13)
+                   ELSE b.parser_id
+                 END AS language,
                  b.analyzer_id IS NOT NULL
            FROM symbols s
            JOIN manifest_entries me
@@ -630,7 +642,7 @@ fn run_find_symbols(
         sql.push_str(" AND me.path LIKE ?");
         bound.push(Box::new(format!("{p}%")));
     }
-    sql.push_str(" ORDER BY s.qualified LIMIT ?");
+    sql.push_str(" ORDER BY language IS NULL, language, me.path, s.line_start LIMIT ?");
     bound.push(Box::new(i64::from(limit)));
 
     let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
@@ -654,7 +666,8 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
         path: row.get(6)?,
         line: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
         blob_sha: row.get(8)?,
-        source_tier: if row.get::<_, bool>(9)? {
+        language: row.get(9)?,
+        source_tier: if row.get::<_, bool>(10)? {
             SourceTier::Semantic
         } else {
             SourceTier::Syntactic
@@ -668,6 +681,9 @@ mod tests {
     use crate::cas::store;
     use crate::register::register_repo;
     use crate::testutil::init_repo;
+    use cairn_lang_markdown as _;
+    use cairn_lang_python as _;
+    use cairn_lang_rust as _;
     use std::fs;
 
     fn registered() -> (tempfile::TempDir, tempfile::TempDir, Connection) {
@@ -815,6 +831,18 @@ mod tests {
         (db_tmp, conn)
     }
 
+    fn language_fixture() -> (tempfile::TempDir, tempfile::TempDir, Connection) {
+        let (repo, _sha) = init_repo(&[
+            ("src/b.rs", "pub fn rust_user() {}\n"),
+            ("src/a.py", "def py_user():\n    pass\n"),
+            ("src/z.md", "# User\n"),
+        ]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, repo.path(), 0).unwrap();
+        (repo, db_tmp, conn)
+    }
+
     #[test]
     fn find_by_name_returns_matching_symbol() {
         let (_repo, _db, c) = registered();
@@ -930,8 +958,37 @@ mod tests {
 
         let syntactic = hits.iter().find(|h| h.name == "syntactic_fn").unwrap();
         assert_eq!(syntactic.source_tier, SourceTier::Syntactic);
+        assert_eq!(syntactic.language, None);
         let semantic = hits.iter().find(|h| h.name == "semantic_fn").unwrap();
         assert_eq!(semantic.source_tier, SourceTier::Semantic);
+        assert_eq!(semantic.language.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn find_symbols_returns_language_and_sorts_language_path_line() {
+        let (_repo, _db, c) = language_fixture();
+        let hits = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                path_prefix: Some("src/".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let rows: Vec<(&str, Option<&str>, &str)> = hits
+            .iter()
+            .map(|h| (h.name.as_str(), h.language.as_deref(), h.path.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("py_user", Some("python"), "src/a.py"),
+                ("rust_user", Some("rust"), "src/b.rs"),
+                ("User", None, "src/z.md"),
+            ]
+        );
     }
 
     #[test]
