@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cairn_core::lsp::{Location, LspClient, Position, Url};
 use cairn_core::manifest::ManifestId;
@@ -51,6 +52,10 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
             let client = LspClient::start(&binary, repo_root, "rust-analyzer-lsp-v1")
                 .await
                 .map_err(map_lsp_error)?;
+            client
+                .wait_for_workspace_load(Duration::from_secs(120))
+                .await
+                .map_err(map_lsp_error)?;
             let mut facts = WorkspaceFacts::default();
             let result = collect_resolved_refs(&client, repo_root, files, &mut facts).await;
             let shutdown = client.shutdown().await.map_err(map_lsp_error);
@@ -80,17 +85,18 @@ async fn collect_resolved_refs(
         let Some(path) = &file.worktree_path else {
             continue;
         };
-        let source = std::fs::read(path)?;
-        let calls = collect_method_calls(&source)?;
+        let source = std::fs::read_to_string(path)?;
+        let calls = collect_method_calls(source.as_bytes())?;
         if calls.is_empty() {
             continue;
         }
         let uri = Url::from_file_path(path).map_err(map_lsp_error)?;
+        client
+            .did_open(&uri, "rust", 1, &source)
+            .await
+            .map_err(map_lsp_error)?;
         for call in calls {
-            let locations = client
-                .definition(&uri, call.position)
-                .await
-                .map_err(map_lsp_error)?;
+            let locations = definition_with_retry(client, &uri, call.position).await?;
             for target in locations {
                 let target_path = location_to_repo_path(repo_root, &target);
                 facts.resolved_refs.push(ResolvedRef {
@@ -104,6 +110,29 @@ async fn collect_resolved_refs(
         }
     }
     Ok(())
+}
+
+async fn definition_with_retry(
+    client: &LspClient,
+    uri: &Url,
+    position: Position,
+) -> Result<Vec<Location>> {
+    let mut delay = Duration::from_millis(200);
+    for attempt in 0..3 {
+        match client.definition(uri, position).await {
+            Ok(locations) => return Ok(locations),
+            Err(err) if is_file_not_found(&err) && attempt < 2 => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(err) => return Err(map_lsp_error(err)),
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn is_file_not_found(err: &cairn_core::lsp::Error) -> bool {
+    matches!(err, cairn_core::lsp::Error::Protocol(message) if message.contains("file not found"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
