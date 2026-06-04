@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
+use super::COMPLETENESS_REASON_DESC;
 
 struct GetOutline;
 
@@ -12,14 +13,18 @@ impl McpTool for GetOutline {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "get_outline".into(),
-            description: "Default tool for 'what does this file contain?' questions. Returns every function, class, method, and (for markdown) heading defined in one file, in line order, with signatures and doc strings — without loading the file body. Use this instead of `Read` when you only need the structural shape of a file, especially for files larger than a few hundred lines. Result may carry `completeness: partial` while the file's Tier-2 enrichment is still warming; the listed items are still valid.".into(),
+            description: format!(
+                "Default tool for 'what does this file or directory contain?' questions. Pass `file` for a single-file outline (the current behavior; `file` is omitted on each item because the request names it) or pass `path` to enumerate outlines across every file under that repo-root-relative string prefix in one call (each item carries `file`). Directory-mode items are returned in file → line order. Returns functions, classes, methods, and (for markdown) headings with signatures and doc strings — without loading file bodies. Default limit is 200 and maximum limit is 1000. {COMPLETENESS_REASON_DESC} Items already returned are valid."
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "file": {"type": "string", "description": "Path relative to the repo root."},
+                    "file": {"type": "string", "description": "Path relative to the repo root for single-file outline mode."},
+                    "path": {"type": "string", "description": "Repo-root-relative file-path string prefix for directory mode. Include the trailing `/` to scope to a directory."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Directory-mode cap on items. Defaults to 200; `completeness: partial` with reason `cap` means more items matched."},
                 },
-                "required": ["repo", "file"],
+                "required": ["repo"],
                 "additionalProperties": false,
             }),
         }

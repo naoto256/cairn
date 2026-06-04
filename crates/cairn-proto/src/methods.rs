@@ -141,7 +141,15 @@ mod list_repos_tests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineArgs {
     pub repo: String,
-    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// File-path string prefix relative to repo root. This is a
+    /// byte-level prefix filter, matching `find_symbols.path`
+    /// semantics: include a trailing slash to scope to a directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// Result of `get_outline`. Empty `doc`/`signature` fields are omitted on the
@@ -160,6 +168,11 @@ pub struct OutlineResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineItem {
+    /// Present in directory mode to attribute each item to a file.
+    /// Omitted in single-file mode because the request already names
+    /// the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub kind: SymbolKind,
     pub name: String,
     pub qualified: String,
@@ -624,5 +637,57 @@ mod tests {
         let hit: FindSymbolHit = serde_json::from_value(value).unwrap();
         assert_eq!(hit.language, None);
         assert!(serde_json::to_value(hit).unwrap().get("language").is_none());
+    }
+
+    #[test]
+    fn outline_args_round_trips_directory_path() {
+        let value = json!({
+            "repo": "demo",
+            "path": "src/",
+            "limit": 50
+        });
+        let args: OutlineArgs = serde_json::from_value(value).unwrap();
+        assert_eq!(args.file, None);
+        assert_eq!(args.path.as_deref(), Some("src/"));
+        assert_eq!(args.limit, Some(50));
+
+        let serialized = serde_json::to_value(args).unwrap();
+        assert!(serialized.get("file").is_none());
+        assert_eq!(serialized["path"], "src/");
+    }
+
+    #[test]
+    fn outline_item_file_is_optional_on_wire() {
+        let with_file = OutlineItem {
+            file: Some("src/lib.rs".into()),
+            kind: SymbolKind::Function,
+            name: "demo".into(),
+            qualified: "demo".into(),
+            signature: None,
+            line: 1,
+            doc: None,
+            source: SourceTier::Syntactic,
+        };
+        assert_eq!(
+            serde_json::to_value(&with_file).unwrap()["file"],
+            "src/lib.rs"
+        );
+
+        let without_file = OutlineItem {
+            file: None,
+            kind: SymbolKind::Function,
+            name: "demo".into(),
+            qualified: "demo".into(),
+            signature: None,
+            line: 1,
+            doc: None,
+            source: SourceTier::Syntactic,
+        };
+        assert!(
+            serde_json::to_value(without_file)
+                .unwrap()
+                .get("file")
+                .is_none()
+        );
     }
 }
