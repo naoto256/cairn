@@ -185,8 +185,8 @@ mod tests {
     async fn exact_limit_is_complete_and_over_limit_is_partial() {
         assert_limit_probe(
             &FindReferences,
-            json!({"repo": "demo", "symbol": "target", "kind": "call", "limit": 3}),
-            json!({"repo": "demo", "symbol": "target", "kind": "call", "limit": 2}),
+            json!({"repo": "demo", "symbol": "target", "kind": "call", "include_noise": true, "limit": 3}),
+            json!({"repo": "demo", "symbol": "target", "kind": "call", "include_noise": true, "limit": 2}),
         )
         .await;
     }
