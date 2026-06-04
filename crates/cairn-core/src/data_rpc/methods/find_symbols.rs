@@ -6,7 +6,6 @@
 //! Tier-2 layer in the legacy implementation and comes back in a
 //! later iteration.
 
-use cairn_proto::Completeness;
 use cairn_proto::common::SourceTier;
 use cairn_proto::methods::{FindSymbolArgs, FindSymbolHit, FindSymbolResult};
 use linkme::distributed_slice;
@@ -15,6 +14,7 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, trim_to_requested_limit};
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
 
@@ -31,63 +31,69 @@ impl DataMethod for FindSymbols {
         validate(&args)?;
 
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let effective_limit = args.limit.unwrap_or(50).max(1);
         let q = FindSymbolsArgs {
             query: args.query.clone(),
             fuzzy: args.fuzzy,
             kind: args.kind.as_ref().map(symbol_kind_to_str),
             container: args.container.clone(),
             path_prefix: args.path.clone(),
-            limit: args.limit,
+            limit: Some(limit_with_probe(effective_limit)),
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let requested_repo = args.repo.clone();
         let signature_only = args.signature_only;
 
-        let items = tokio::task::spawn_blocking(move || -> Result<Vec<FindSymbolHit>> {
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let aliases = match requested_repo.as_deref() {
-                Some(name) => {
-                    let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
-                        Error::RepoNotFound {
-                            alias: name.to_string(),
-                        }
-                    })?;
-                    vec![entry]
-                }
-                None => cas_registry::list_all(&index)?,
-            };
-
-            let mut out = Vec::new();
-            for entry in aliases {
-                let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                let conn = cas_store::open(&store_path)?;
-                let hits = match query::find_symbols(&conn, &anchor, &q) {
-                    Ok(h) => h,
-                    Err(Error::AnchorNotFound { .. }) => {
-                        // The requested anchor doesn't exist in this
-                        // store — skip rather than fail the whole
-                        // query (= other repos may still have it).
-                        continue;
+        let (items, capped) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<FindSymbolHit>, bool)> {
+                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+                let aliases = match requested_repo.as_deref() {
+                    Some(name) => {
+                        let entry =
+                            cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
+                                Error::RepoNotFound {
+                                    alias: name.to_string(),
+                                }
+                            })?;
+                        vec![entry]
                     }
-                    Err(other) => return Err(other),
+                    None => cas_registry::list_all(&index)?,
                 };
-                for h in hits {
-                    out.push(into_wire_hit(
-                        &entry.alias,
-                        anchor.as_str(),
-                        h,
-                        signature_only,
-                    ));
+
+                let mut out = Vec::new();
+                let mut capped = false;
+                for entry in aliases {
+                    let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
+                    let conn = cas_store::open(&store_path)?;
+                    let mut hits = match query::find_symbols(&conn, &anchor, &q) {
+                        Ok(h) => h,
+                        Err(Error::AnchorNotFound { .. }) => {
+                            // The requested anchor doesn't exist in this
+                            // store — skip rather than fail the whole
+                            // query (= other repos may still have it).
+                            continue;
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    capped |= trim_to_requested_limit(&mut hits, effective_limit);
+                    for h in hits {
+                        out.push(into_wire_hit(
+                            &entry.alias,
+                            anchor.as_str(),
+                            h,
+                            signature_only,
+                        ));
+                    }
+                    capped |= trim_to_requested_limit(&mut out, effective_limit);
                 }
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| Error::InvalidArgument(format!("find_symbols task panicked: {e}")))??;
+                Ok((out, capped))
+            })
+            .await
+            .map_err(|e| Error::InvalidArgument(format!("find_symbols task panicked: {e}")))??;
 
         Ok(serde_json::to_value(FindSymbolResult {
             items,
-            completeness: Completeness::complete(),
+            completeness: completeness_for_cap(capped),
         })
         .unwrap())
     }
@@ -131,5 +137,23 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit, signature_only: bool) -
         // The CAS query layer doesn't yet round-trip the per-fact
         // source-tier tag; default to Syntactic until it does.
         source: SourceTier::Syntactic,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::data_rpc::helpers::test_support::assert_limit_probe;
+
+    #[tokio::test]
+    async fn exact_limit_is_complete_and_over_limit_is_partial() {
+        assert_limit_probe(
+            &FindSymbols,
+            json!({"repo": "demo", "kind": "struct", "limit": 3}),
+            json!({"repo": "demo", "kind": "struct", "limit": 2}),
+        )
+        .await;
     }
 }
