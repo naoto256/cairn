@@ -5,7 +5,7 @@
 //! rust-analyzer integration planned in PR3, without pulling in the
 //! full `lsp-types` surface yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
-use tokio::time::timeout;
+use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, info};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKSPACE_LOAD_QUIET_PERIOD: Duration = Duration::from_secs(5);
 const MAX_RESTARTS: usize = 3;
 /// Cap on a single LSP message body. rust-analyzer's largest legitimate
 /// responses (workspace symbols on huge crates) stay well under this; a
@@ -133,9 +135,10 @@ pub struct LspClient {
     restarts: AtomicUsize,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
-    writer: Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>,
+    writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
     child: Mutex<Option<Child>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    progress: Arc<ProgressState>,
 }
 
 impl LspClient {
@@ -190,9 +193,10 @@ impl LspClient {
             restarts: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
             alive: Arc::new(AtomicBool::new(false)),
-            writer: Mutex::new(None),
+            writer: Arc::new(Mutex::new(None)),
             child: Mutex::new(None),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            progress: Arc::new(ProgressState::default()),
         }
     }
 
@@ -268,8 +272,10 @@ impl LspClient {
         *self.writer.lock().await = Some(Box::new(writer));
         let pending = Arc::clone(&self.pending);
         let alive = Arc::clone(&self.alive);
+        let writer = Arc::clone(&self.writer);
+        let progress = Arc::clone(&self.progress);
         tokio::spawn(async move {
-            reader_loop(reader, pending, alive).await;
+            reader_loop(reader, pending, alive, writer, progress).await;
         });
     }
 
@@ -281,9 +287,21 @@ impl LspClient {
                 json!({
                     "processId": Value::Null,
                     "rootUri": root_uri.as_str(),
-                    "capabilities": {},
+                    "capabilities": {
+                        "window": {
+                            "workDoneProgress": true
+                        },
+                        "textDocument": {
+                            "definition": {
+                                "linkSupport": true
+                            }
+                        }
+                    },
                     "initializationOptions": {
                         "cairnConfigHash": self.config_hash,
+                        "experimental": {
+                            "serverStatusNotification": true
+                        },
                     },
                 }),
             )
@@ -310,6 +328,60 @@ impl LspClient {
             )
             .await?;
         parse_definition_result(value)
+    }
+
+    /// Wait until the server reports that workspace loading has
+    /// completed via LSP `$/progress` notifications.
+    ///
+    /// # Errors
+    /// Returns [`Error::Timeout`] when no completed progress sequence
+    /// is observed before `wait_timeout` elapses.
+    pub async fn wait_for_workspace_load(&self, wait_timeout: Duration) -> Result<()> {
+        self.wait_for_workspace_load_with_quiescence(wait_timeout, WORKSPACE_LOAD_QUIET_PERIOD)
+            .await
+    }
+
+    async fn wait_for_workspace_load_with_quiescence(
+        &self,
+        wait_timeout: Duration,
+        quiet_period: Duration,
+    ) -> Result<()> {
+        self.ensure_running().await?;
+        let completed_via = timeout(
+            wait_timeout,
+            self.progress.wait_for_quiescence(quiet_period),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?;
+        info!(?completed_via, "workspace load complete");
+        Ok(())
+    }
+
+    /// Notify the server that a document is open before issuing
+    /// per-position requests against it.
+    ///
+    /// # Errors
+    /// Returns protocol/server errors from the underlying transport.
+    pub async fn did_open(
+        &self,
+        uri: &Url,
+        language_id: &str,
+        version: i32,
+        text: &str,
+    ) -> Result<()> {
+        self.ensure_running().await?;
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri.as_str(),
+                    "languageId": language_id,
+                    "version": version,
+                    "text": text,
+                }
+            }),
+        )
+        .await
     }
 
     /// Gracefully stop the server.
@@ -427,16 +499,27 @@ async fn reader_loop<R>(
     mut reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     alive: Arc<AtomicBool>,
+    writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
+    progress: Arc<ProgressState>,
 ) where
     R: AsyncRead + Send + Unpin + 'static,
 {
     loop {
         match read_lsp_message(&mut reader).await {
             Ok(Some(message)) => {
-                if let Some((id, result)) = response_result(message) {
+                log_notification(&message);
+                if let Some((id, result)) = response_result(&message) {
                     let tx = pending.lock().await.remove(&id);
                     if let Some(tx) = tx {
                         let _ = tx.send(result);
+                    }
+                } else if is_progress_notification(&message) {
+                    progress.record(&message).await;
+                } else if is_server_status_notification(&message) {
+                    progress.record_server_status(&message).await;
+                } else if let Some(response) = server_request_response(&message) {
+                    if let Some(writer) = writer.lock().await.as_mut() {
+                        let _ = write_lsp_message(writer, &response).await;
                     }
                 }
             }
@@ -454,7 +537,162 @@ async fn reader_loop<R>(
     }
 }
 
-fn response_result(message: Value) -> Option<(u64, Result<Value>)> {
+fn log_notification(message: &Value) {
+    if message.get("id").is_some() {
+        return;
+    }
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    debug!(method, "lsp_server_notification");
+}
+
+#[derive(Default)]
+struct ProgressState {
+    inner: Mutex<ProgressSnapshot>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct ProgressSnapshot {
+    active_tokens: HashSet<String>,
+    saw_begin: bool,
+    change_seq: u64,
+}
+
+impl ProgressState {
+    async fn record(&self, message: &Value) {
+        let Some(params) = message.get("params") else {
+            return;
+        };
+        let token = params
+            .get("token")
+            .map(progress_token)
+            .unwrap_or_else(|| "<missing>".to_string());
+        let Some(kind) = params
+            .get("value")
+            .and_then(|v| v.get("kind"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let title = params
+            .get("value")
+            .and_then(|v| v.get("title"))
+            .and_then(Value::as_str);
+        debug!(
+            method = "$/progress",
+            token = %token,
+            kind,
+            title,
+            "lsp_progress"
+        );
+
+        let mut inner = self.inner.lock().await;
+        inner.change_seq = inner.change_seq.saturating_add(1);
+        match kind {
+            "begin" => {
+                inner.active_tokens.insert(token);
+                inner.saw_begin = true;
+            }
+            "end" => {
+                inner.active_tokens.remove(&token);
+            }
+            _ => {}
+        }
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
+    async fn record_server_status(&self, message: &Value) {
+        let quiescent = message
+            .get("params")
+            .and_then(|params| params.get("quiescent"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let health = message
+            .get("params")
+            .and_then(|params| params.get("health"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        debug!(
+            method = "rust-analyzer/serverStatus",
+            health, quiescent, "lsp_server_status"
+        );
+        if !quiescent {
+            return;
+        }
+
+        info!(health, "rust-analyzer workspace is quiescent");
+    }
+
+    async fn wait_for_quiescence(&self, quiet_period: Duration) -> WorkspaceLoadComplete {
+        loop {
+            let ready_seq = {
+                let inner = self.inner.lock().await;
+                if inner.saw_begin && inner.active_tokens.is_empty() {
+                    Some(inner.change_seq)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(seq) = ready_seq {
+                tokio::select! {
+                    () = sleep(quiet_period) => {
+                        let inner = self.inner.lock().await;
+                        if inner.saw_begin
+                            && inner.active_tokens.is_empty()
+                            && inner.change_seq == seq
+                        {
+                            return WorkspaceLoadComplete::ProgressQuiescence;
+                        }
+                    }
+                    () = self.notify.notified() => {}
+                }
+            } else {
+                self.notify.notified().await;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLoadComplete {
+    ProgressQuiescence,
+}
+
+fn progress_token(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn is_progress_notification(message: &Value) -> bool {
+    message.get("id").is_none()
+        && message.get("method").and_then(Value::as_str) == Some("$/progress")
+}
+
+fn is_server_status_notification(message: &Value) -> bool {
+    message.get("id").is_none()
+        && message.get("method").and_then(Value::as_str) == Some("rust-analyzer/serverStatus")
+}
+
+fn server_request_response(message: &Value) -> Option<Value> {
+    let id = message.get("id")?;
+    let method = message.get("method")?.as_str()?;
+    if method != "window/workDoneProgress/create" {
+        return None;
+    }
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": Value::Null,
+    }))
+}
+
+fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
     let id = message.get("id")?.as_u64()?;
     if let Some(error) = message.get("error") {
         let detail = error
@@ -645,6 +883,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_opts_into_rust_analyzer_server_status() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(fake_server(server_io, FakeMode::RequireServerStatusOptIn));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn definition_times_out_when_server_never_replies() {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let _server = tokio::spawn(fake_server(server_io, FakeMode::DefinitionTimeout));
@@ -671,6 +928,171 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::Timeout));
+    }
+
+    #[tokio::test]
+    async fn workspace_load_waits_for_progress_quiescence() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(fake_server(server_io, FakeMode::ProgressCompletes));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        client
+            .wait_for_workspace_load_with_quiescence(
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap();
+
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_load_ignores_server_status_without_progress() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let _server = tokio::spawn(fake_server(server_io, FakeMode::ServerStatusQuiescent));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let err = client
+            .wait_for_workspace_load_with_quiescence(
+                Duration::from_millis(20),
+                Duration::from_millis(5),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Timeout));
+    }
+
+    #[tokio::test]
+    async fn workspace_load_resets_quiet_timer_when_new_progress_arrives() {
+        let progress = Arc::new(ProgressState::default());
+        let waiter = {
+            let progress = Arc::clone(&progress);
+            tokio::spawn(async move {
+                progress
+                    .wait_for_quiescence(Duration::from_millis(50))
+                    .await
+            })
+        };
+
+        progress.record(&progress_message("phase-1", "begin")).await;
+        progress.record(&progress_message("phase-1", "end")).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        progress.record(&progress_message("phase-2", "begin")).await;
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        assert!(
+            !waiter.is_finished(),
+            "quiet timer should reset when new progress begins"
+        );
+        progress.record(&progress_message("phase-2", "end")).await;
+        let completed = timeout(Duration::from_millis(100), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed, WorkspaceLoadComplete::ProgressQuiescence);
+    }
+
+    #[tokio::test]
+    async fn workspace_load_does_not_finish_on_progress_end_without_begin() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let _server = tokio::spawn(fake_server(server_io, FakeMode::ProgressEndWithoutBegin));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let err = client
+            .wait_for_workspace_load(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Timeout));
+    }
+
+    #[tokio::test]
+    async fn workspace_load_times_out_without_progress_end() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let _server = tokio::spawn(fake_server(server_io, FakeMode::ProgressNeverEnds));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let err = client
+            .wait_for_workspace_load(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Timeout));
+    }
+
+    #[tokio::test]
+    async fn did_open_notifies_server_before_definition() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(fake_server(server_io, FakeMode::RequireDidOpen));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn fake"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let uri = Url::from("file:///tmp/cairn%20fake/src/lib.rs");
+
+        client
+            .did_open(&uri, "rust", 1, "fn main() {}\n")
+            .await
+            .unwrap();
+        let locations = client
+            .definition(
+                &uri,
+                Position {
+                    line: 0,
+                    character: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(locations.len(), 1);
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -794,15 +1216,35 @@ mod tests {
         Normal,
         DefinitionTimeout,
         CrashAfterInitialize,
+        ProgressCompletes,
+        ProgressNeverEnds,
+        ProgressEndWithoutBegin,
+        ServerStatusQuiescent,
+        RequireServerStatusOptIn,
+        RequireDidOpen,
     }
 
     async fn fake_server(stream: DuplexStream, mode: FakeMode) {
         let (mut reader, mut writer) = split(stream);
+        let mut did_open = false;
         while let Some(message) = read_lsp_message(&mut reader).await.unwrap() {
             let method = message.get("method").and_then(Value::as_str);
             let id = message.get("id").and_then(Value::as_u64);
             match (method, id) {
                 (Some("initialize"), Some(id)) => {
+                    if matches!(mode, FakeMode::RequireServerStatusOptIn) {
+                        let enabled = message
+                            .get("params")
+                            .and_then(|params| params.get("initializationOptions"))
+                            .and_then(|options| options.get("experimental"))
+                            .and_then(|experimental| experimental.get("serverStatusNotification"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        assert!(
+                            enabled,
+                            "initialize did not opt into rust-analyzer/serverStatus: {message}"
+                        );
+                    }
                     write_lsp_message(
                         &mut writer,
                         &json!({
@@ -822,10 +1264,102 @@ mod tests {
                     if matches!(mode, FakeMode::CrashAfterInitialize) {
                         return;
                     }
+                    if matches!(mode, FakeMode::ServerStatusQuiescent) {
+                        write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "rust-analyzer/serverStatus",
+                                "params": {
+                                    "health": "ok",
+                                    "quiescent": true,
+                                    "message": null
+                                }
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    if matches!(mode, FakeMode::ProgressEndWithoutBegin) {
+                        write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "$/progress",
+                                "params": {
+                                    "token": "cairn-progress",
+                                    "value": { "kind": "end", "message": "ready" }
+                                }
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    if matches!(
+                        mode,
+                        FakeMode::ProgressCompletes | FakeMode::ProgressNeverEnds
+                    ) {
+                        write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": 9001,
+                                "method": "window/workDoneProgress/create",
+                                "params": { "token": "cairn-progress" }
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                        write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "$/progress",
+                                "params": {
+                                    "token": "cairn-progress",
+                                    "value": { "kind": "begin", "title": "loading workspace" }
+                                }
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                        if matches!(mode, FakeMode::ProgressCompletes) {
+                            write_lsp_message(
+                                &mut writer,
+                                &json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "$/progress",
+                                    "params": {
+                                        "token": "cairn-progress",
+                                        "value": { "kind": "end", "message": "ready" }
+                                    }
+                                }),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+                }
+                (Some("textDocument/didOpen"), None) => {
+                    did_open = true;
                 }
                 (Some("textDocument/definition"), Some(id)) => {
                     if matches!(mode, FakeMode::DefinitionTimeout) {
                         tokio::time::sleep(Duration::from_secs(60)).await;
+                    } else if matches!(mode, FakeMode::RequireDidOpen) && !did_open {
+                        write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "file not found"
+                                }
+                            }),
+                        )
+                        .await
+                        .unwrap();
                     } else {
                         write_lsp_message(
                             &mut writer,
@@ -863,5 +1397,16 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    fn progress_message(token: &str, kind: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {
+                "token": token,
+                "value": { "kind": kind }
+            }
+        })
     }
 }
