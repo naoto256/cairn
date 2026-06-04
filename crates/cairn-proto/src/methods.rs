@@ -297,12 +297,13 @@ pub struct FindSymbolHit {
 // These return facts the Tier-2 analyzer populates: trait/impl edges
 // from `syn` for Rust, and `use` statements flattened to one row per
 // imported name. Same envelope shape as `find_symbols` — `repo` is
-// required, `branch` defaults to cross-branch, hits carry their
-// originating branch.
+// optional where cross-repo search is supported, `branch` defaults to
+// cross-branch, hits carry their originating branch.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplsArgs {
-    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Match impl edges whose **trait** side equals this name. Use
     /// when answering "what implements `Display`?". Either `trait_`
     /// or `type_` must be set.

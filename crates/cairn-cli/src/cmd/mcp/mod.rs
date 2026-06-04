@@ -530,6 +530,12 @@ mod tests {
             assert!(find_symbols.description.contains(reason));
         }
 
+        let find_impls = specs.iter().find(|spec| spec.name == "find_impls").unwrap();
+        assert!(find_impls.description.contains("Omit `repo`"));
+        assert!(find_impls.description.contains("every registered repo"));
+        assert!(find_impls.description.contains("`repo:branch:file:line`"));
+        assert!(find_impls.input_schema["required"].is_null());
+
         let find_references = specs
             .iter()
             .find(|spec| spec.name == "find_references")
