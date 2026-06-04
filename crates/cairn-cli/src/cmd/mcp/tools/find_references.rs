@@ -13,7 +13,7 @@ impl McpTool for FindReferences {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "find_references".into(),
-            description: "Symmetric reference tool — both directions of the call/use graph in one primitive.\n\n  • `direction=incoming` (default) — \"who references `symbol`\". Each hit is a use site whose target is `symbol`; the hit carries the enclosing function's qualified name + `repo:branch:file:line`.\n  • `direction=outgoing` — \"what does `symbol` reference\". By default this returns only resolved call refs (`kind=call` with non-empty `target_qualified`) so it can map a function's call graph without unresolved method-call, type-ref, or annotation noise. Set `include_noise=true` to return the full legacy ref set.\n\nA `::`-bearing symbol matches the fully-qualified path first and falls back to the bare last segment if nothing matches; bare names skip straight to the name index. Pass `kind` to restrict to a single RefKind; for outgoing type/unresolved refs also set `include_noise=true`. Available wherever cairn has run its Tier-2 analyzer (Rust + Python today). Results may carry `completeness: partial` either because Tier-2 is still warming, because more matches exist than `limit`, or because method-call receiver types aren't resolved (Tier-3 territory).".into(),
+            description: "Symmetric reference tool — both directions of the call/use graph in one primitive.\n\n  • `direction=incoming` (default) — \"who references `symbol`\". Each hit is a use site whose target is `symbol`; the hit carries the enclosing function's qualified name + `repo:branch:file:line`.\n  • `direction=outgoing` — \"what does `symbol` reference\". By default this returns only resolved call refs (`kind=call` with non-empty `target_qualified`) so it can map a function's call graph without unresolved method-call, type-ref, or annotation noise. Set `include_noise=true` to return the full legacy ref set.\n\nA `::`-bearing symbol matches the fully-qualified path first and falls back to the bare last segment if nothing matches; bare names skip straight to the name index. Pass `kind` to restrict to a single RefKind; for outgoing type/unresolved refs also set `include_noise=true`. Available wherever cairn has run its Tier-2 analyzer (Rust + Python today). Results may carry `completeness: partial` either because Tier-2 is still warming, because a probe detects more matches than `limit`, or because method-call receiver types aren't resolved (Tier-3 territory).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -34,7 +34,7 @@ impl McpTool for FindReferences {
                         "enum": ["call", "type", "import", "instantiate", "read", "write", "override", "macro_invoke", "annotation"],
                     },
                     "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
-                    "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. Truncation is surfaced via `completeness: partial`."},
+                    "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
                 },
                 "required": ["repo", "symbol"],
                 "additionalProperties": false,

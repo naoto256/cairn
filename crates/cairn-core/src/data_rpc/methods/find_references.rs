@@ -5,14 +5,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use cairn_proto::Completeness;
 use cairn_proto::methods::{FindReferenceHit, FindReferencesArgs, FindReferencesResult};
 use linkme::distributed_slice;
 use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::data_rpc::helpers::with_repo_conn;
+use crate::data_rpc::helpers::{
+    completeness_for_cap, limit_with_probe, trim_to_requested_limit, with_repo_conn,
+};
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -33,41 +34,45 @@ impl DataMethod for FindReferences {
             ));
         }
 
+        let effective_limit = args.limit.unwrap_or(100).max(1);
         let q = QueryArgs {
             symbol: args.symbol.clone(),
             direction: args.direction,
             kind: args.kind,
             include_noise: args.include_noise,
-            limit: Some(args.limit.unwrap_or(100)),
+            limit: Some(limit_with_probe(effective_limit)),
         };
         let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
         let repo_alias = args.repo.clone();
 
-        let items = with_repo_conn(ctx, &repo_alias, "find_references", move |entry, conn| {
-            let worktree_root = PathBuf::from(&entry.root_path);
+        let (items, capped) =
+            with_repo_conn(ctx, &repo_alias, "find_references", move |entry, conn| {
+                let worktree_root = PathBuf::from(&entry.root_path);
 
-            let hits = match query::find_references(&conn, &anchor, &q) {
-                Ok(h) => h,
-                Err(Error::AnchorNotFound { .. }) => {
-                    // The requested branch doesn't exist as an anchor
-                    // in this repo — return an empty result rather
-                    // than failing the whole request.
-                    Vec::new()
-                }
-                Err(other) => return Err(other),
-            };
+                let mut hits = match query::find_references(&conn, &anchor, &q) {
+                    Ok(h) => h,
+                    Err(Error::AnchorNotFound { .. }) => {
+                        // The requested branch doesn't exist as an anchor
+                        // in this repo — return an empty result rather
+                        // than failing the whole request.
+                        Vec::new()
+                    }
+                    Err(other) => return Err(other),
+                };
+                let capped = trim_to_requested_limit(&mut hits, effective_limit);
 
-            let mut snippets = SnippetCache::new(worktree_root);
-            Ok(hits
-                .into_iter()
-                .map(|h| into_wire_hit(&entry.alias, anchor.as_str(), h, &mut snippets))
-                .collect())
-        })
-        .await?;
+                let mut snippets = SnippetCache::new(worktree_root);
+                let items = hits
+                    .into_iter()
+                    .map(|h| into_wire_hit(&entry.alias, anchor.as_str(), h, &mut snippets))
+                    .collect();
+                Ok((items, capped))
+            })
+            .await?;
 
         Ok(serde_json::to_value(FindReferencesResult {
             items,
-            completeness: Completeness::complete(),
+            completeness: completeness_for_cap(capped),
         })
         .unwrap())
     }
@@ -171,7 +176,20 @@ fn extract_line(bytes: &[u8], line: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::data_rpc::helpers::test_support::assert_limit_probe;
+
+    #[tokio::test]
+    async fn exact_limit_is_complete_and_over_limit_is_partial() {
+        assert_limit_probe(
+            &FindReferences,
+            json!({"repo": "demo", "symbol": "target", "kind": "call", "limit": 3}),
+            json!({"repo": "demo", "symbol": "target", "kind": "call", "limit": 2}),
+        )
+        .await;
+    }
 
     #[test]
     fn extract_line_returns_target_line_text() {

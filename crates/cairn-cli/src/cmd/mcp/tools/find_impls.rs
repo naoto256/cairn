@@ -13,7 +13,7 @@ impl McpTool for FindImpls {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "find_impls".into(),
-            description: "Default tool for trait/impl questions. Given a `trait` name, returns every `impl Trait for Foo` block in the repo — answering \"what types implement Display?\". Given a `type` name, returns every trait that type implements, plus any inherent (`impl Foo {}`) blocks — answering \"what does Foo do?\". Returns location + branch + kind (`trait` or `inherent`). Uses the syn-based semantic layer, so results reflect the current source without rust-analyzer or rustc running. At least one of `trait` / `type` must be supplied; both may be combined. Results may carry `completeness: partial` while the Tier-2 analyzer is still running; items already returned are valid.".into(),
+            description: "Default tool for trait/impl questions. Given a `trait` name, returns every `impl Trait for Foo` block in the repo — answering \"what types implement Display?\". Given a `type` name, returns every trait that type implements, plus any inherent (`impl Foo {}`) blocks — answering \"what does Foo do?\". Returns location + branch + kind (`trait` or `inherent`). Uses the syn-based semantic layer, so results reflect the current source without rust-analyzer or rustc running. At least one of `trait` / `type` must be supplied; both may be combined. Results may carry `completeness: partial` while the Tier-2 analyzer is still running or when a probe detects more matches than `limit`; items already returned are valid.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -21,7 +21,7 @@ impl McpTool for FindImpls {
                     "trait":  {"type": "string", "description": "Match impl blocks implementing this trait. e.g. `Display`."},
                     "type":   {"type": "string", "description": "Match impl blocks targeting this type. e.g. `Foo` or `crate::module::Foo`."},
                     "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
-                    "limit":  {"type": "integer", "minimum": 1, "maximum": 500},
+                    "limit":  {"type": "integer", "minimum": 1, "maximum": 500, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
                 },
                 "required": ["repo"],
                 "additionalProperties": false,
