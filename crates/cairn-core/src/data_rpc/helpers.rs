@@ -1,6 +1,6 @@
 //! Shared blocking helpers for data-RPC methods.
 
-use cairn_proto::Completeness;
+use cairn_proto::{Completeness, PartialReason};
 
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::{Error, Result};
@@ -51,7 +51,7 @@ pub(crate) fn trim_to_requested_limit<T>(rows: &mut Vec<T>, effective_limit: u32
 
 pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
     if capped {
-        Completeness::partial_truncated("cap")
+        Completeness::partial_truncated(PartialReason::Cap)
     } else {
         Completeness::complete()
     }
@@ -187,7 +187,7 @@ mod tests {
             completeness_for_cap(true),
             Completeness::Partial {
                 missing_tiers: Vec::new(),
-                reason: Some("cap".into()),
+                reason: Some(PartialReason::Cap),
             }
         );
     }

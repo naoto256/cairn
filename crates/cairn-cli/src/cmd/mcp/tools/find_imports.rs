@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC};
 
 struct FindImports;
 
@@ -13,7 +13,9 @@ impl McpTool for FindImports {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "find_imports".into(),
-            description: "List `use` statements across a repo's snapshots. Pass `file` to see exactly what one file depends on; omit it to enumerate every import in the snapshot (useful for dependency-shape questions). Each hit carries the path, the dotted module on the left of the final `::`, the imported name (or `*` for globs), an optional `as` alias, and a `is_reexport` flag set for `pub use`. Sourced from the syn semantic layer. Results may carry `completeness: partial` while the Tier-2 analyzer is still running or when a probe detects more matches than `limit`.".into(),
+            description: format!(
+                "List `use` statements across a repo's snapshots. Pass `file` to see exactly what one file depends on; omit it to enumerate every import in the snapshot (useful for dependency-shape questions). Each hit carries the path, the dotted module on the left of the final `::`, the imported name (or `*` for globs), an optional `as` alias, and a `is_reexport` flag set for `pub use`. Sourced from the syn semantic layer. {COMPLETENESS_REASON_DESC}"
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
