@@ -2,9 +2,9 @@
 //! caller's `repo` / `branch` / `query` / `kind` / `container` /
 //! `path` filters. `repo = None` walks every registered alias.
 //!
-//! `include_inherited` and `fuzzy` are not honored yet on this path;
-//! they were Tier-2 / FTS layers in the legacy implementation and
-//! come back in later iterations.
+//! `include_inherited` is not honored yet on this path; it was a
+//! Tier-2 layer in the legacy implementation and comes back in a
+//! later iteration.
 
 use cairn_proto::Completeness;
 use cairn_proto::common::SourceTier;
@@ -33,6 +33,7 @@ impl DataMethod for FindSymbols {
         let cas_data_dir = ctx.cas_data_dir.clone();
         let q = FindSymbolsArgs {
             query: args.query.clone(),
+            fuzzy: args.fuzzy,
             kind: args.kind.as_ref().map(symbol_kind_to_str),
             container: args.container.clone(),
             path_prefix: args.path.clone(),
