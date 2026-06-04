@@ -66,8 +66,9 @@ variable.
 There is nothing to configure. The plugin reads no environment
 variables of its own. The MCP server is discovered as `cairn mcp` on
 `PATH`; the nudge hook detects cairn-registered cwds by calling
-`cairn query list-repos` and substring-matching the cwd against the
-listed roots.
+`cairn query repos --json` and matching the cwd against
+`.repos[].root` as a directory prefix (the cwd is either an exact
+root or starts with `root/`).
 
 There is no built-in opt-out switch yet. To silence the nudge
 without uninstalling, remove the `PreToolUse` entry from
