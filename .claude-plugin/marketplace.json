@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "cairn",
-      "description": "Wires the cairn MCP server and a PreToolUse Bash hook that blocks grep / rg / ag / ack / egrep / fgrep in cairn-registered cwds with a reason pointing at the closest cairn tool.",
+      "description": "Wires the cairn MCP server and a PreToolUse Bash hook that, in cairn-registered cwds, lets grep / rg / ag / ack / egrep / fgrep run and adds a hookSpecificOutput.additionalContext advisory pointing at the closest cairn tool so the next call defaults to the index.",
       "author": {
         "name": "Naoto Morishima"
       },
