@@ -192,6 +192,12 @@ pub struct Ack {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Mutating requests can succeed while a best-effort side effect
+    /// fails. `register_repo` uses this when indexing and alias
+    /// registration completed but the live filesystem watcher could
+    /// not be installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcher_failed: Option<String>,
 }
 
 impl Ack {
@@ -200,6 +206,7 @@ impl Ack {
         Self {
             ok: true,
             alias: None,
+            watcher_failed: None,
         }
     }
 
@@ -208,6 +215,16 @@ impl Ack {
         Self {
             ok: true,
             alias: Some(alias.into()),
+            watcher_failed: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_alias_and_watcher_failed(alias: impl Into<String>, reason: String) -> Self {
+        Self {
+            ok: true,
+            alias: Some(alias.into()),
+            watcher_failed: Some(reason),
         }
     }
 }
