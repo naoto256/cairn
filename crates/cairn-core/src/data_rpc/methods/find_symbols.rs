@@ -37,8 +37,8 @@ impl DataMethod for FindSymbols {
             path_prefix: args.path.clone(),
             limit: Some(limit_with_probe(effective_limit)),
         };
-        let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
-        let anchor_label = anchor.as_str().to_string();
+        let anchor_arg = args.anchor.clone();
+        let branch_arg = args.branch.clone();
         let requested_repo = args.repo.clone();
         let signature_only = args.signature_only;
 
@@ -48,14 +48,20 @@ impl DataMethod for FindSymbols {
             "find_symbols",
             effective_limit,
             move |entry, conn| {
+                let anchor = crate::anchor::resolve_explicit_or_default(
+                    conn,
+                    anchor_arg.as_deref(),
+                    branch_arg.as_deref(),
+                )?;
+                let anchor_label = anchor.as_str().to_string();
                 let hits = query::find_symbols(conn, &anchor, &q)?;
                 Ok(hits
                     .into_iter()
-                    .map(|hit| (entry.alias.clone(), hit))
+                    .map(|hit| (entry.alias.clone(), anchor_label.clone(), hit))
                     .collect())
             },
-            |out: &mut Vec<(String, SymbolHit)>| {
-                out.sort_by(|(repo_a, a), (repo_b, b)| {
+            |out: &mut Vec<(String, String, SymbolHit)>| {
+                out.sort_by(|(repo_a, _, a), (repo_b, _, b)| {
                     language_sort_key(a.language.as_deref())
                         .cmp(&language_sort_key(b.language.as_deref()))
                         .then_with(|| a.path.cmp(&b.path))
@@ -68,7 +74,7 @@ impl DataMethod for FindSymbols {
         .await?;
         let items = hits
             .into_iter()
-            .map(|(repo, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
+            .map(|(repo, anchor_label, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
             .collect();
 
         Ok(serde_json::to_value(FindSymbolResult {

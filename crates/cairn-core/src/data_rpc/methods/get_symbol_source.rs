@@ -37,12 +37,18 @@ impl DataMethod for GetSymbolSource {
         let qualified = args.qualified.clone();
         let file_filter = args.file.clone();
         let signature_only = args.signature_only;
-        let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
+        let anchor_arg = args.anchor.clone();
+        let branch_arg = args.branch.clone();
         let repo_alias = args.repo.clone();
         let repo_alias_for_error = repo_alias.clone();
 
         let result = with_repo_conn(ctx, &repo_alias, "get_symbol_source", move |entry, conn| {
             let worktree_root = PathBuf::from(&entry.root_path);
+            let anchor = crate::anchor::resolve_explicit_or_default(
+                &conn,
+                anchor_arg.as_deref(),
+                branch_arg.as_deref(),
+            )?;
 
             let row =
                 query::get_symbol_source_row(&conn, &anchor, &qualified, file_filter.as_deref())?
