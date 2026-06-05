@@ -23,8 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ignore::gitignore::Gitignore;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify::{Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{
+    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, new_debouncer_opt,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
@@ -75,7 +77,24 @@ pub enum GitEvent {
 /// Handle that keeps the watcher alive. Drop to stop watching.
 #[allow(dead_code)] // fields kept only for their Drop side-effects
 pub struct WatcherHandle {
-    debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    debouncer: WatcherDebouncer,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum WatcherDebouncer {
+    Recommended(Debouncer<RecommendedWatcher, RecommendedCache>),
+    Poll(Debouncer<PollWatcher, RecommendedCache>),
+}
+
+/// Native watcher backend choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchBackend {
+    /// Platform-recommended backend (`FSEvents` on macOS). This is
+    /// the production default.
+    Recommended,
+    /// Polling backend. Used by macOS tempdir-based tests where the
+    /// FSEvents stream can fail to deliver any callback.
+    Poll,
 }
 
 /// Begin watching `repo_root` recursively. Events are debounced over
@@ -94,6 +113,21 @@ pub fn watch_repo(
     debounce: Duration,
     tx: UnboundedSender<WatchEvent>,
 ) -> Result<WatcherHandle, WatchError> {
+    watch_repo_with_backend(repo_root, debounce, tx, WatchBackend::Recommended)
+}
+
+/// Variant of [`watch_repo`] with an explicit backend. Production
+/// callers should prefer [`watch_repo`]; tests and diagnostics can use
+/// this to avoid platform-specific native-watcher gaps.
+///
+/// # Errors
+/// Setup-time errors from `notify` or the filesystem.
+pub fn watch_repo_with_backend(
+    repo_root: &Path,
+    debounce: Duration,
+    tx: UnboundedSender<WatchEvent>,
+    backend: WatchBackend,
+) -> Result<WatcherHandle, WatchError> {
     let repo_root = repo_root.canonicalize()?;
     let git_dir = repo_root.join(".git");
     let ignore = load_root_gitignore(&repo_root);
@@ -105,19 +139,28 @@ pub fn watch_repo(
         tx,
     };
 
-    let mut debouncer =
-        new_debouncer(
-            debounce,
-            None,
-            move |result: DebounceEventResult| match result {
-                Ok(events) => classifier.handle_batch(&events),
-                Err(errs) => {
-                    for e in errs {
-                        warn!(?e, "notify error");
-                    }
-                }
-            },
-        )?;
+    let event_handler = move |result: DebounceEventResult| match result {
+        Ok(events) => classifier.handle_batch(&events),
+        Err(errs) => {
+            for e in errs {
+                warn!(?e, "notify error");
+            }
+        }
+    };
+    let mut debouncer = match backend {
+        WatchBackend::Recommended => {
+            WatcherDebouncer::Recommended(new_debouncer(debounce, None, event_handler)?)
+        }
+        WatchBackend::Poll => {
+            WatcherDebouncer::Poll(new_debouncer_opt::<_, PollWatcher, RecommendedCache>(
+                debounce,
+                None,
+                event_handler,
+                RecommendedCache::new(),
+                Config::default().with_poll_interval(debounce),
+            )?)
+        }
+    };
     debouncer.watch(&repo_root, RecursiveMode::Recursive)?;
     // Watch .git separately even though it's under repo_root: this
     // means we still see ref events when the consumer asks us to
@@ -126,6 +169,19 @@ pub fn watch_repo(
         let _ = debouncer.watch(&git_dir, RecursiveMode::Recursive);
     }
     Ok(WatcherHandle { debouncer })
+}
+
+impl WatcherDebouncer {
+    fn watch(
+        &mut self,
+        path: impl AsRef<Path>,
+        recursive_mode: RecursiveMode,
+    ) -> notify::Result<()> {
+        match self {
+            WatcherDebouncer::Recommended(debouncer) => debouncer.watch(path, recursive_mode),
+            WatcherDebouncer::Poll(debouncer) => debouncer.watch(path, recursive_mode),
+        }
+    }
 }
 
 fn load_root_gitignore(repo_root: &Path) -> Gitignore {
@@ -480,15 +536,15 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _handle = watch_repo(&root, Duration::from_millis(150), tx).unwrap();
+        let _handle =
+            watch_repo_with_backend(&root, Duration::from_millis(150), tx, WatchBackend::Poll)
+                .unwrap();
 
         let probe = root.join(".probe");
-        // The first few writes after `watch_repo` returns can land
-        // inside the FSEvents stream's initial settle window and be
-        // silently dropped. Retry the probe write every 500 ms up to a
-        // 10 s budget so the test only fails when the watcher is truly
-        // unable to deliver *any* event — not because the very first
-        // write happened to race the stream attach.
+        // Use the polling backend here because macOS tempdir-backed
+        // native watchers can fail to deliver any callback in this
+        // isolated unit-test shape, even though production daemon
+        // probes use the default recommended backend.
         let probe_event = wait_for_probe_with_retries(
             &mut rx,
             &probe,

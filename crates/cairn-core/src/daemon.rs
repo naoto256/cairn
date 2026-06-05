@@ -197,8 +197,19 @@ async fn serve_one(stream: UnixStream, handler: Arc<dyn LineHandler>) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anchor::AnchorName;
+    use crate::cas::store as cas_store;
+    use crate::ctl::CtlHandler;
+    use crate::data_rpc::DataRpc;
+    use crate::paths::{CasDataDir, path_hash};
+    use crate::query::{FindSymbolsArgs, find_symbols};
+    use crate::testutil::init_repo;
+    use crate::watcher::WatchManager;
+    use cairn_watch::WatchBackend;
+    use serde_json::json;
+    use std::path::Path;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     struct EchoHandler;
 
@@ -270,5 +281,120 @@ mod tests {
         let mut buf = Vec::new();
         let n = read_line_capped(&mut reader, &mut buf, cap).await.unwrap();
         assert_eq!(n, cap);
+    }
+
+    #[tokio::test]
+    async fn watcher_reindexes_repo_registered_via_daemon_control() {
+        let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
+        let runtime_tmp = tempfile::tempdir().unwrap();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().to_path_buf());
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas_data_dir.ensure().unwrap();
+        let watch_manager = Arc::new(WatchManager::with_backend(
+            cas_data_dir.clone(),
+            WatchBackend::Poll,
+        ));
+        let shutdown = Arc::new(Notify::new());
+
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let cas_data_dir = cas_data_dir.clone();
+            let shutdown = shutdown.clone();
+            let watch_manager = watch_manager.clone();
+            async move {
+                let daemon = Daemon {
+                    paths,
+                    data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
+                    control_handler: Arc::new(CtlHandler::with_watch_manager(
+                        cas_data_dir,
+                        shutdown.clone(),
+                        env!("CARGO_PKG_VERSION"),
+                        Some(watch_manager),
+                    )),
+                    shutdown,
+                };
+                daemon.run().await.unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let register = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "register_repo",
+            "params": {
+                "alias": "watched",
+                "path": repo.path(),
+            }
+        });
+        let response = send_control_request(&paths.control, &register.to_string()).await;
+        assert!(
+            response.contains("\"result\""),
+            "register response: {response}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let symbol_name = "daemon_watcher_probe_symbol";
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            format!("pub fn initial_symbol() {{}}\npub fn {symbol_name}() {{}}\n"),
+        )
+        .unwrap();
+
+        let canonical = std::fs::canonicalize(repo.path()).unwrap();
+        let store_path = cas_data_dir.store_db_path(&path_hash(&canonical));
+        let found = poll_for_symbol(&store_path, &canonical, symbol_name).await;
+        assert!(found, "watcher did not reindex symbol {symbol_name}");
+
+        shutdown.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon_task).await;
+    }
+
+    async fn send_control_request(socket: &Path, line: &str) -> String {
+        let mut conn = UnixStream::connect(socket).await.unwrap();
+        conn.write_all(line.as_bytes()).await.unwrap();
+        conn.write_all(b"\n").await.unwrap();
+        conn.flush().await.unwrap();
+
+        let mut reader = BufReader::new(conn);
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        response
+    }
+
+    async fn poll_for_symbol(store_path: &Path, repo_root: &Path, symbol_name: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if symbol_exists(store_path, repo_root, symbol_name) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn symbol_exists(store_path: &Path, repo_root: &Path, symbol_name: &str) -> bool {
+        let Ok(conn) = cas_store::open(store_path) else {
+            return false;
+        };
+        let Ok(worktree_id) = conn.query_row(
+            "SELECT worktree_id FROM worktrees WHERE path = ?1",
+            [repo_root.to_string_lossy().as_ref()],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return false;
+        };
+        find_symbols(
+            &conn,
+            &AnchorName::tentative(worktree_id),
+            &FindSymbolsArgs {
+                query: Some(symbol_name.to_string()),
+                ..FindSymbolsArgs::default()
+            },
+        )
+        .is_ok_and(|hits| hits.iter().any(|hit| hit.name == symbol_name))
     }
 }
