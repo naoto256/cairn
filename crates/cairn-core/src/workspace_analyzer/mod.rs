@@ -46,6 +46,11 @@ pub trait WorkspaceAnalyzer: Send + Sync {
     /// Short language tag this analyzer enriches, e.g. `"rust"`.
     fn language(&self) -> &'static str;
 
+    /// Parser id whose Tier-1 symbols/refs this analyzer enriches.
+    /// Keeping this on the analyzer makes the persistence boundary
+    /// explicit instead of guessing from language strings.
+    fn parser_id(&self) -> &'static str;
+
     /// Analyze one manifest worth of files rooted at `repo_root`.
     ///
     /// PR1 only establishes the boundary. Later PRs will add concrete
@@ -176,7 +181,13 @@ fn run_workspace_analyzers(
 
         match analyzer.analyze_workspace(repo_root, manifest_id, &files) {
             Ok(facts) => {
-                let n = persist_resolved_refs(conn, manifest_id, analyzer.id(), &facts)?;
+                let n = persist_resolved_refs(
+                    conn,
+                    manifest_id,
+                    analyzer.id(),
+                    analyzer.parser_id(),
+                    &facts,
+                )?;
                 inserted += n;
                 mark_run(
                     conn,
@@ -347,6 +358,7 @@ fn persist_resolved_refs(
     conn: &mut Connection,
     manifest_id: ManifestId,
     analyzer_id: &str,
+    parser_id: &str,
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
     let tx = conn.transaction()?;
@@ -364,11 +376,16 @@ fn persist_resolved_refs(
         let Some(source_blob) = blob_for_path(&tx, manifest_id, &r.source_path)? else {
             continue;
         };
-        let Some(parser_id) = parser_for_blob(&tx, &source_blob)? else {
+        let Some(parser_id) = parser_for_blob(&tx, &source_blob, parser_id)? else {
             continue;
         };
-        let Some((target_qualified, target_name)) =
-            target_symbol_for_location(&tx, manifest_id, r.target_path.as_deref(), &r.target)?
+        let Some((target_qualified, target_name)) = target_symbol_for_location(
+            &tx,
+            manifest_id,
+            &parser_id,
+            r.target_path.as_deref(),
+            &r.target,
+        )?
         else {
             continue;
         };
@@ -425,13 +442,13 @@ fn blob_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Resu
         .optional()?)
 }
 
-fn parser_for_blob(conn: &Connection, blob_sha: &str) -> Result<Option<String>> {
+fn parser_for_blob(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT parser_id FROM blobs
-             WHERE blob_sha = ?1 AND parser_id = 'tree-sitter-rust'
+             WHERE blob_sha = ?1 AND parser_id = ?2
              LIMIT 1",
-            params![blob_sha],
+            params![blob_sha, parser_id],
             |r| r.get(0),
         )
         .optional()?)
@@ -440,6 +457,7 @@ fn parser_for_blob(conn: &Connection, blob_sha: &str) -> Result<Option<String>> 
 fn target_symbol_for_location(
     conn: &Connection,
     manifest_id: ManifestId,
+    parser_id: &str,
     target_path: Option<&str>,
     location: &Location,
 ) -> Result<Option<(String, String)>> {
@@ -457,12 +475,12 @@ fn target_symbol_for_location(
         .query_row(
             "SELECT qualified, name FROM symbols
              WHERE blob_sha = ?1
-               AND parser_id = 'tree-sitter-rust'
-               AND line_start <= ?2 AND line_end >= ?2
+               AND parser_id = ?2
+               AND line_start <= ?3 AND line_end >= ?3
                AND kind IN ('function', 'method', 'test')
              ORDER BY (line_end - line_start) ASC, line_start DESC
              LIMIT 1",
-            params![blob_sha, line],
+            params![blob_sha, parser_id, line],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
@@ -548,6 +566,10 @@ mod tests {
             "fake"
         }
 
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
         fn analyze_workspace(
             &self,
             _repo_root: &Path,
@@ -580,6 +602,10 @@ mod tests {
             "rust"
         }
 
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-rust"
+        }
+
         fn analyze_workspace(
             &self,
             _repo_root: &Path,
@@ -603,6 +629,10 @@ mod tests {
 
         fn language(&self) -> &'static str {
             "rust"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-rust"
         }
 
         fn analyze_workspace(
@@ -709,8 +739,14 @@ mod tests {
             }],
         };
 
-        let inserted =
-            persist_resolved_refs(&mut conn, ManifestId(1), "rust-analyzer-lsp", &facts).unwrap();
+        let inserted = persist_resolved_refs(
+            &mut conn,
+            ManifestId(1),
+            "rust-analyzer-lsp",
+            "tree-sitter-rust",
+            &facts,
+        )
+        .unwrap();
 
         assert_eq!(inserted, 1);
         let row: (String, String, String, Option<i64>, i64) = conn
@@ -726,6 +762,97 @@ mod tests {
         assert_eq!(row.2, "tier3-rust-analyzer");
         assert!(row.3.is_some());
         assert_eq!(row.4, 7);
+    }
+
+    #[test]
+    fn persist_resolved_refs_uses_analyzer_parser_id_for_python_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "shared-source-sha";
+        let target_sha = "shared-target-sha";
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'pkg/b.py', ?1), (1, 'pkg/a.py', ?2)",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES
+               (?1, 'tree-sitter-go', 1, 0),
+               (?1, 'tree-sitter-python', 1, 0),
+               (?2, 'tree-sitter-python', 1, 0),
+               (?2, 'tree-sitter-rust', 1, 0)",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, 'tree-sitter-python', 'run', 'run', 'function',
+                0, 200, 1, 10, 'python'),
+               (?2, 'tree-sitter-rust', 'wrong', 'rust::wrong', 'method',
+                0, 10, 2, 2, 'syn'),
+               (?2, 'tree-sitter-python', 'm', 'A.m', 'method',
+                0, 30, 2, 3, 'python')",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: vec![ResolvedRef {
+                source_path: "pkg/b.py".to_string(),
+                source_position: Position {
+                    line: 5,
+                    character: 6,
+                },
+                source_byte_range: 42..43,
+                target: Location {
+                    uri: crate::lsp::Url::from("file:///repo/pkg/a.py"),
+                    range: crate::lsp::Range {
+                        start: Position {
+                            line: 1,
+                            character: 8,
+                        },
+                        end: Position {
+                            line: 1,
+                            character: 9,
+                        },
+                    },
+                },
+                target_path: Some("pkg/a.py".to_string()),
+            }],
+        };
+
+        let inserted = persist_resolved_refs(
+            &mut conn,
+            ManifestId(1),
+            "pyright-lsp",
+            "tree-sitter-python",
+            &facts,
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 1);
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT parser_id, target_name, target_qualified FROM refs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "tree-sitter-python");
+        assert_eq!(row.1, "m");
+        assert_eq!(row.2, "A.m");
     }
 
     #[test]

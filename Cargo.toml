@@ -9,6 +9,7 @@ members = [
     "crates/cairn-lang-rust",
     "crates/cairn-lang-rust-tier3",
     "crates/cairn-lang-python",
+    "crates/cairn-lang-python-tier3",
     "crates/cairn-lang-markdown",
     "crates/cairn-lang-typescript",
     "crates/cairn-lang-go",
@@ -95,6 +96,7 @@ cairn-lang-treesitter-generic = { path = "crates/cairn-lang-treesitter-generic" 
 cairn-lang-rust = { path = "crates/cairn-lang-rust" }
 cairn-lang-rust-tier3 = { path = "crates/cairn-lang-rust-tier3" }
 cairn-lang-python = { path = "crates/cairn-lang-python" }
+cairn-lang-python-tier3 = { path = "crates/cairn-lang-python-tier3" }
 cairn-lang-markdown = { path = "crates/cairn-lang-markdown" }
 cairn-lang-typescript = { path = "crates/cairn-lang-typescript" }
 cairn-lang-go = { path = "crates/cairn-lang-go" }

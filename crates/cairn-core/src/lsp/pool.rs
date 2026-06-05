@@ -45,6 +45,28 @@ impl PoolKey {
             config_hash: config_hash.to_string(),
         })
     }
+
+    /// Build a pyright key from the repo root and launch configuration.
+    ///
+    /// # Errors
+    /// Returns an LSP protocol error when the repo root cannot be
+    /// canonicalized.
+    pub fn pyright(
+        repo_root: &Path,
+        analyzer_id: &str,
+        binary: &Path,
+        config_hash: &str,
+    ) -> Result<Self> {
+        let canonical_repo_root = std::fs::canonicalize(repo_root).map_err(|e| {
+            super::Error::Protocol(format!("canonicalize {}: {e}", repo_root.display()))
+        })?;
+        Ok(Self {
+            canonical_repo_root,
+            analyzer_id: analyzer_id.to_string(),
+            binary: binary.to_path_buf(),
+            config_hash: config_hash.to_string(),
+        })
+    }
 }
 
 /// Launch and readiness settings for a pooled rust-analyzer client.
@@ -57,6 +79,15 @@ pub struct RustAnalyzerSpawnSpec {
     pub workspace_load_timeout: Duration,
 }
 
+/// Launch and readiness settings for a pooled pyright-langserver client.
+#[derive(Debug, Clone)]
+pub struct PyrightSpawnSpec {
+    pub binary: PathBuf,
+    pub workspace_root: PathBuf,
+    pub config_hash: String,
+    pub request_timeout: Duration,
+}
+
 /// Borrowed pooled client plus document synchronization state.
 pub struct PooledRustAnalyzer<'a> {
     client: &'a LspClient,
@@ -65,6 +96,37 @@ pub struct PooledRustAnalyzer<'a> {
 
 impl PooledRustAnalyzer<'_> {
     /// Open or fully replace a document in rust-analyzer.
+    ///
+    /// # Errors
+    /// Returns protocol/server errors from the underlying LSP client.
+    pub async fn sync_document(&mut self, uri: &Url, language_id: &str, text: &str) -> Result<()> {
+        if let Some(version) = self.opened_documents.get_mut(uri.as_str()) {
+            *version = version.saturating_add(1);
+            self.client.did_change(uri, *version, text).await
+        } else {
+            self.opened_documents.insert(uri.as_str().to_string(), 1);
+            self.client.did_open(uri, language_id, 1, text).await
+        }
+    }
+
+    /// Resolve the definition at `uri` + `position`.
+    ///
+    /// # Errors
+    /// Returns timeout/protocol/server errors from the underlying LSP
+    /// request.
+    pub async fn definition(&self, uri: &Url, position: Position) -> Result<Vec<super::Location>> {
+        self.client.definition(uri, position).await
+    }
+}
+
+/// Borrowed pooled pyright client plus document synchronization state.
+pub struct PooledPyright<'a> {
+    client: &'a LspClient,
+    opened_documents: &'a mut HashMap<String, i32>,
+}
+
+impl PooledPyright<'_> {
+    /// Open or fully replace a document in pyright.
     ///
     /// # Errors
     /// Returns protocol/server errors from the underlying LSP client.
@@ -131,6 +193,26 @@ impl LspClientPool {
         let entry = self.entry(key)?;
         self.runtime
             .block_on(async move { entry.with_client(spawn_spec, work).await })
+    }
+
+    /// Borrow a long-lived pyright client for `key`, lazily spawning
+    /// it when needed.
+    ///
+    /// # Errors
+    /// Returns LSP spawn/readiness/protocol errors from the pooled
+    /// client.
+    pub fn with_pyright<T, F>(
+        &self,
+        key: PoolKey,
+        spawn_spec: PyrightSpawnSpec,
+        work: F,
+    ) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut PooledPyright<'a>) -> ClientWork<'a, T>,
+    {
+        let entry = self.entry(key)?;
+        self.runtime
+            .block_on(async move { entry.with_pyright_client(spawn_spec, work).await })
     }
 
     /// Gracefully stop all live clients and clear the registry.
@@ -221,6 +303,48 @@ impl PoolEntry {
             .as_ref()
             .ok_or_else(|| super::Error::ServerExited(None.into()))?;
         let mut pooled = PooledRustAnalyzer {
+            client,
+            opened_documents,
+        };
+        let result = work(&mut pooled).await;
+        if matches!(result, Err(super::Error::ServerExited(_))) {
+            let client = state.client.take();
+            state.opened_documents.clear();
+            if let Some(client) = client {
+                let _ = client.shutdown().await;
+            }
+        }
+        result
+    }
+
+    async fn with_pyright_client<T, F>(&self, spec: PyrightSpawnSpec, work: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut PooledPyright<'a>) -> ClientWork<'a, T>,
+    {
+        let mut state = self.state.lock().await;
+        if state.client.is_none() {
+            let client = LspClient::start_pyright_with_timeout(
+                &spec.binary,
+                &spec.workspace_root,
+                &spec.config_hash,
+                spec.request_timeout,
+            )
+            .await?;
+            // Pyright does not emit rust-analyzer's `$/progress`
+            // workspace-load notifications; the initialize response is
+            // the readiness gate for didOpen + definition requests.
+            state.client = Some(client);
+            state.opened_documents.clear();
+        }
+
+        let PoolEntryState {
+            client,
+            opened_documents,
+        } = &mut *state;
+        let client = client
+            .as_ref()
+            .ok_or_else(|| super::Error::ServerExited(None.into()))?;
+        let mut pooled = PooledPyright {
             client,
             opened_documents,
         };
