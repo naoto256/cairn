@@ -165,6 +165,8 @@ pub struct DoctorCheck {
     pub status: DoctorStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +175,37 @@ pub enum DoctorStatus {
     Pass,
     Warn,
     Fail,
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_check_omits_absent_remediation_and_roundtrips_present_value() {
+        let without_remediation = DoctorCheck {
+            name: "data directory".into(),
+            status: DoctorStatus::Pass,
+            detail: Some("/tmp/cairn".into()),
+            remediation: None,
+        };
+        let value = serde_json::to_value(&without_remediation).unwrap();
+        assert!(value.get("remediation").is_none());
+        let back: DoctorCheck = serde_json::from_value(value).unwrap();
+        assert_eq!(back.remediation, None);
+
+        let with_remediation: DoctorCheck = serde_json::from_value(serde_json::json!({
+            "name": "repo `demo` root present",
+            "status": "fail",
+            "detail": "/tmp/missing",
+            "remediation": "restore the directory"
+        }))
+        .unwrap();
+        assert_eq!(
+            with_remediation.remediation.as_deref(),
+            Some("restore the directory")
+        );
+    }
 }
 
 // ─── remove_repo ──────────────────────────────────────────────────────────

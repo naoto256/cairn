@@ -1,17 +1,23 @@
 //! `doctor` — environment / dependency / registry sanity checks.
 
+use std::path::{Path, PathBuf};
+
 use cairn_proto::control::{DoctorCheck, DoctorReport, DoctorStatus};
 use linkme::distributed_slice;
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx};
 use crate::Result;
-use crate::cas::registry as cas_registry;
+use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::paths::CasDataDir;
 use crate::workspace_analyzer::all_workspace_analyzers;
 
 include!(concat!(env!("OUT_DIR"), "/expected_backend_crates.rs"));
 
 struct Doctor;
+
+const RUST_ANALYZER_ID: &str = "rust-analyzer-lsp";
 
 #[async_trait::async_trait]
 impl ControlMethod for Doctor {
@@ -26,19 +32,20 @@ impl ControlMethod for Doctor {
             .iter()
             .map(|b| b.name())
             .collect();
-        checks.push(DoctorCheck {
-            name: "language backends linked".into(),
-            status: if backend_names.is_empty() {
+        checks.push(doctor_check(
+            "language backends linked",
+            if backend_names.is_empty() {
                 DoctorStatus::Fail
             } else {
                 DoctorStatus::Pass
             },
-            detail: Some(format!(
+            Some(format!(
                 "{} backend(s): {}",
                 backend_names.len(),
                 backend_names.join(", ")
             )),
-        });
+            None,
+        ));
         checks.push(backend_registration_coherence_check(
             &backend_names,
             &workspace_analyzer_ids(),
@@ -48,15 +55,18 @@ impl ControlMethod for Doctor {
         let writable = std::fs::metadata(&cas_root)
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false);
-        checks.push(DoctorCheck {
-            name: "data directory".into(),
-            status: if writable {
+        checks.push(doctor_check(
+            "data directory",
+            if writable {
                 DoctorStatus::Pass
             } else {
                 DoctorStatus::Fail
             },
-            detail: Some(cas_root.to_string_lossy().to_string()),
-        });
+            Some(cas_root.to_string_lossy().to_string()),
+            None,
+        ));
+
+        checks.push(tier3_binary_check());
 
         let cas_data_dir = ctx.cas_data_dir.clone();
         let aliases_result =
@@ -68,30 +78,36 @@ impl ControlMethod for Doctor {
             .map_err(|e| crate::Error::InvalidArgument(format!("doctor task panicked: {e}")))?;
 
         match aliases_result {
-            Ok(entries) if entries.is_empty() => checks.push(DoctorCheck {
-                name: "registered repositories".into(),
-                status: DoctorStatus::Warn,
-                detail: Some("no repos registered yet".into()),
-            }),
+            Ok(entries) if entries.is_empty() => checks.push(doctor_check(
+                "registered repositories",
+                DoctorStatus::Warn,
+                Some("no repos registered yet".into()),
+                None,
+            )),
             Ok(entries) => {
-                for entry in entries {
-                    let exists = std::path::Path::new(&entry.root_path).is_dir();
-                    checks.push(DoctorCheck {
-                        name: format!("repo `{}` root present", entry.alias),
-                        status: if exists {
-                            DoctorStatus::Pass
-                        } else {
-                            DoctorStatus::Fail
-                        },
-                        detail: Some(entry.root_path),
-                    });
+                for entry in &entries {
+                    checks.push(registered_repo_path_check(entry));
                 }
+                if let Some(watch_manager) = ctx.watch_manager.as_ref() {
+                    checks.extend(alias_watcher_checks(&entries, watch_manager));
+                }
+
+                let store_data_dir = ctx.cas_data_dir.clone();
+                let store_entries = entries.clone();
+                let store_probes = tokio::task::spawn_blocking(move || {
+                    probe_alias_stores(&store_data_dir, &store_entries)
+                })
+                .await
+                .map_err(|e| crate::Error::InvalidArgument(format!("doctor task panicked: {e}")))?;
+                checks.extend(tentative_snapshot_checks(&store_probes));
+                checks.extend(tier3_run_checks(&store_probes));
             }
-            Err(e) => checks.push(DoctorCheck {
-                name: "alias index readable".into(),
-                status: DoctorStatus::Fail,
-                detail: Some(e.to_string()),
-            }),
+            Err(e) => checks.push(doctor_check(
+                "alias index readable",
+                DoctorStatus::Fail,
+                Some(e.to_string()),
+                None,
+            )),
         }
 
         Ok(serde_json::to_value(DoctorReport { checks }).unwrap())
@@ -102,11 +118,323 @@ impl ControlMethod for Doctor {
 #[distributed_slice(CONTROL_METHODS)]
 static REGISTER: fn() -> Box<dyn ControlMethod> = || Box::new(Doctor);
 
+fn doctor_check(
+    name: impl Into<String>,
+    status: DoctorStatus,
+    detail: Option<String>,
+    remediation: Option<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name: name.into(),
+        status,
+        detail,
+        remediation,
+    }
+}
+
 fn workspace_analyzer_ids() -> Vec<&'static str> {
     all_workspace_analyzers()
         .iter()
         .map(|analyzer| analyzer.id())
         .collect()
+}
+
+fn registered_repo_path_check(entry: &cas_registry::AliasEntry) -> DoctorCheck {
+    let exists = Path::new(&entry.root_path).is_dir();
+    doctor_check(
+        format!("repo `{}` root present", entry.alias),
+        if exists {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Fail
+        },
+        Some(entry.root_path.clone()),
+        (!exists).then(|| {
+            format!(
+                "Run `cairn ctl remove-repo --alias {}` (registry will keep the on-disk store for other aliases pointing at this path), or restore the directory at {}.",
+                entry.alias, entry.root_path
+            )
+        }),
+    )
+}
+
+fn alias_watcher_checks(
+    entries: &[cas_registry::AliasEntry],
+    watch_manager: &crate::watcher::WatchManager,
+) -> Vec<DoctorCheck> {
+    entries
+        .iter()
+        .map(|entry| {
+            let watching = watch_manager.is_watching_alias(&entry.alias);
+            doctor_check(
+                format!("repo `{}` watcher active", entry.alias),
+                if watching {
+                    DoctorStatus::Pass
+                } else {
+                    DoctorStatus::Warn
+                },
+                Some(if watching {
+                    format!("watching {}", entry.root_path)
+                } else {
+                    "alias registered but no live FS watcher; tentative-default reads will fall back to HEAD until the next reindex_repo".into()
+                }),
+                (!watching).then(|| {
+                    format!(
+                        "Run `cairn ctl remove-repo --alias {}` then `cairn ctl register-repo --alias {} {}` to re-establish the FS watcher. Restarting the daemon is an alternative that re-installs every alias's watcher in one shot.",
+                        entry.alias, entry.alias, entry.root_path
+                    )
+                }),
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct AliasStoreProbe {
+    alias: String,
+    store_path: PathBuf,
+    result: std::result::Result<AliasStoreState, String>,
+}
+
+#[derive(Debug, Clone)]
+struct AliasStoreState {
+    tentative_manifest_id: Option<i64>,
+    tier3_run: Option<Tier3Run>,
+}
+
+#[derive(Debug, Clone)]
+struct Tier3Run {
+    manifest_id: i64,
+    status: String,
+    error: Option<String>,
+}
+
+fn probe_alias_stores(
+    cas_data_dir: &CasDataDir,
+    entries: &[cas_registry::AliasEntry],
+) -> Vec<AliasStoreProbe> {
+    entries
+        .iter()
+        .map(|entry| probe_alias_store(cas_data_dir, entry))
+        .collect()
+}
+
+fn probe_alias_store(
+    cas_data_dir: &CasDataDir,
+    entry: &cas_registry::AliasEntry,
+) -> AliasStoreProbe {
+    let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
+    let result = probe_alias_store_inner(&store_path, &entry.root_path).map_err(|e| e.to_string());
+    AliasStoreProbe {
+        alias: entry.alias.clone(),
+        store_path,
+        result,
+    }
+}
+
+fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasStoreState> {
+    if !store_path.exists() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "CAS store does not exist: {}",
+            store_path.display()
+        )));
+    }
+    let conn = cas_store::open(store_path)?;
+    let worktree_id = conn
+        .query_row(
+            "SELECT worktree_id FROM worktrees WHERE path = ?1",
+            params![root_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    let tentative_manifest_id = match worktree_id {
+        Some(id) => conn
+            .query_row(
+                "SELECT manifest_id FROM anchors WHERE anchor_name = ?1",
+                params![format!("tentative/{id}")],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let tier3_run = match tentative_manifest_id {
+        Some(manifest_id) => conn
+            .query_row(
+                "SELECT manifest_id, status, error FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = ?2",
+                params![manifest_id, RUST_ANALYZER_ID],
+                |r| {
+                    Ok(Tier3Run {
+                        manifest_id: r.get(0)?,
+                        status: r.get(1)?,
+                        error: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?,
+        None => None,
+    };
+    Ok(AliasStoreState {
+        tentative_manifest_id,
+        tier3_run,
+    })
+}
+
+fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
+    probes
+        .iter()
+        .map(|probe| match &probe.result {
+            Ok(state) => match state.tentative_manifest_id {
+                Some(manifest_id) => doctor_check(
+                    format!("repo `{}` tentative snapshot present", probe.alias),
+                    DoctorStatus::Pass,
+                    Some(format!("tentative anchor -> manifest_id {manifest_id}")),
+                    None,
+                ),
+                None => doctor_check(
+                    format!("repo `{}` tentative snapshot present", probe.alias),
+                    DoctorStatus::Warn,
+                    Some("no tentative anchor yet; reads will fall back to HEAD (committed-only)".into()),
+                    Some(format!(
+                        "Run `cairn ctl reindex-repo --alias {}` to build the tentative snapshot.",
+                        probe.alias
+                    )),
+                ),
+            },
+            Err(error) => doctor_check(
+                format!("repo `{}` tentative snapshot present", probe.alias),
+                DoctorStatus::Fail,
+                Some(error.clone()),
+                Some(format!(
+                    "Run `cairn ctl remove-repo --alias {}` then re-register, or restore the CAS file at {}.",
+                    probe.alias,
+                    probe.store_path.display()
+                )),
+            ),
+        })
+        .collect()
+}
+
+fn tier3_binary_check() -> DoctorCheck {
+    match resolve_rust_analyzer() {
+        Some(path) => doctor_check(
+            "rust-analyzer binary discoverable",
+            DoctorStatus::Pass,
+            Some(path.to_string_lossy().to_string()),
+            None,
+        ),
+        None => doctor_check(
+            "rust-analyzer binary discoverable",
+            DoctorStatus::Warn,
+            Some("rust-analyzer not found on daemon PATH".into()),
+            Some("Install rust-analyzer (`rustup component add rust-analyzer`) and ensure it's on the daemon's PATH; Tier-3 (LSP) facts will not be available until then.".into()),
+        ),
+    }
+}
+
+fn resolve_rust_analyzer() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("RUST_ANALYZER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("rust-analyzer"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
+    probes
+        .iter()
+        .map(|probe| match &probe.result {
+            Ok(state) => tier3_run_check(&probe.alias, state),
+            Err(error) => doctor_check(
+                format!("repo `{}` Tier-3 analyzer status", probe.alias),
+                DoctorStatus::Fail,
+                Some(error.clone()),
+                Some(format!(
+                    "Run `cairn ctl remove-repo --alias {}` then re-register, or restore the CAS file at {}.",
+                    probe.alias,
+                    probe.store_path.display()
+                )),
+            ),
+        })
+        .collect()
+}
+
+fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
+    match &state.tier3_run {
+        Some(run) if run.status == "succeeded" => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Pass,
+            Some(format!(
+                "last Tier-3 run succeeded at manifest {}",
+                run.manifest_id
+            )),
+            None,
+        ),
+        Some(run) if run.status == "skipped" => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Pass,
+            Some(format!(
+                "last Tier-3 run skipped at manifest {} (= LSP binary missing OR transient ContentModified)",
+                run.manifest_id
+            )),
+            None,
+        ),
+        Some(run) if run.status == "pending" => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Pass,
+            Some(format!(
+                "Tier-3 run queued at manifest {} (= analyzer scheduled but not yet started)",
+                run.manifest_id
+            )),
+            None,
+        ),
+        Some(run) if run.status == "running" => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Pass,
+            Some(format!(
+                "Tier-3 run in progress at manifest {}",
+                run.manifest_id
+            )),
+            None,
+        ),
+        Some(run) if run.status == "failed" => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!(
+                "last Tier-3 run failed: {}",
+                run.error.as_deref().unwrap_or("unknown error")
+            )),
+            Some(format!(
+                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl reindex-repo --alias {alias}`.",
+                run.manifest_id
+            )),
+        ),
+        Some(run) => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!(
+                "Tier-3 run reported status `{}` at manifest {} (not recognized by this doctor build)",
+                run.status, run.manifest_id
+            )),
+            Some(format!(
+                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` and check daemon logs if the status persists."
+            )),
+        ),
+        None => doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some("no Tier-3 run recorded for this alias".into()),
+            Some(format!(
+                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` or wait for the next file edit to drive a watcher tick."
+            )),
+        ),
+    }
 }
 
 fn backend_registration_coherence_check(
@@ -126,20 +454,21 @@ fn backend_registration_coherence_check(
         .collect::<Vec<_>>();
 
     if missing.is_empty() {
-        return DoctorCheck {
-            name: "backend registration coherence".into(),
-            status: DoctorStatus::Pass,
-            detail: Some(format!(
+        return doctor_check(
+            "backend registration coherence",
+            DoctorStatus::Pass,
+            Some(format!(
                 "{} runtime backend crate(s) registered",
                 EXPECTED_BACKEND_CRATES.len()
             )),
-        };
+            None,
+        );
     }
 
-    DoctorCheck {
-        name: "backend registration coherence".into(),
-        status: DoctorStatus::Warn,
-        detail: Some(
+    doctor_check(
+        "backend registration coherence",
+        DoctorStatus::Warn,
+        Some(
             missing
                 .into_iter()
                 .map(|expected| {
@@ -154,7 +483,8 @@ fn backend_registration_coherence_check(
                 .collect::<Vec<_>>()
                 .join("; "),
         ),
-    }
+        None,
+    )
 }
 
 impl ExpectedRegistry {
@@ -169,6 +499,13 @@ impl ExpectedRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas::registry;
+    use crate::paths::CasDataDir;
+    use crate::watcher::WatchManager;
+    use cairn_watch::WatchBackend;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Notify;
 
     #[test]
     fn backend_registration_coherence_passes_when_expected_entries_are_registered() {
@@ -192,5 +529,360 @@ mod tests {
         assert!(detail.contains("cairn-lang-typescript"));
         assert!(detail.contains("LANGUAGE_BACKENDS"));
         assert!(detail.contains("use cairn_lang_typescript as _;"));
+    }
+
+    #[test]
+    fn missing_repo_path_check_includes_remediation() {
+        let entry = cas_registry::AliasEntry {
+            alias: "gone".into(),
+            root_path: "/definitely/missing/cairn/repo".into(),
+            repo_hash: "hash".into(),
+            registered_at_ns: 0,
+        };
+
+        let check = registered_repo_path_check(&entry);
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        let remediation = check.remediation.expect("remediation");
+        assert!(remediation.contains("remove-repo --alias gone"));
+        assert!(remediation.contains("/definitely/missing/cairn/repo"));
+    }
+
+    #[test]
+    fn watcher_check_warns_with_remediation_when_alias_is_not_watched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = WatchManager::with_backend(
+            Arc::new(CasDataDir::with_root(tmp.path().join("data"))),
+            WatchBackend::Poll,
+        );
+        let entries = [cas_registry::AliasEntry {
+            alias: "demo".into(),
+            root_path: tmp.path().join("repo").to_string_lossy().to_string(),
+            repo_hash: "hash".into(),
+            registered_at_ns: 0,
+        }];
+
+        let checks = alias_watcher_checks(&entries, &manager);
+
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        assert!(
+            checks[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("no live FS watcher")
+        );
+        assert!(
+            checks[0]
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("register-repo --alias demo")
+        );
+    }
+
+    #[test]
+    fn tentative_snapshot_checks_cover_present_missing_and_store_error() {
+        let probes = vec![
+            AliasStoreProbe {
+                alias: "ok".into(),
+                store_path: PathBuf::from("/tmp/ok/store.db"),
+                result: Ok(AliasStoreState {
+                    tentative_manifest_id: Some(7),
+                    tier3_run: None,
+                }),
+            },
+            AliasStoreProbe {
+                alias: "missing".into(),
+                store_path: PathBuf::from("/tmp/missing/store.db"),
+                result: Ok(AliasStoreState {
+                    tentative_manifest_id: None,
+                    tier3_run: None,
+                }),
+            },
+            AliasStoreProbe {
+                alias: "bad".into(),
+                store_path: PathBuf::from("/tmp/bad/store.db"),
+                result: Err("not a database".into()),
+            },
+        ];
+
+        let checks = tentative_snapshot_checks(&probes);
+
+        assert_eq!(checks[0].status, DoctorStatus::Pass);
+        assert!(
+            checks[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("manifest_id 7")
+        );
+        assert_eq!(checks[1].status, DoctorStatus::Warn);
+        assert!(
+            checks[1]
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("reindex-repo")
+        );
+        assert_eq!(checks[2].status, DoctorStatus::Fail);
+        assert!(
+            checks[2]
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("remove-repo")
+        );
+    }
+
+    #[test]
+    fn tier3_run_checks_map_statuses_to_actionable_results() {
+        let succeeded = tier3_run_check(
+            "ok",
+            &AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_run: Some(Tier3Run {
+                    manifest_id: 1,
+                    status: "succeeded".into(),
+                    error: None,
+                }),
+            },
+        );
+        let skipped = tier3_run_check(
+            "skip",
+            &AliasStoreState {
+                tentative_manifest_id: Some(2),
+                tier3_run: Some(Tier3Run {
+                    manifest_id: 2,
+                    status: "skipped".into(),
+                    error: Some("content modified".into()),
+                }),
+            },
+        );
+        let pending = tier3_run_check(
+            "pending",
+            &AliasStoreState {
+                tentative_manifest_id: Some(5),
+                tier3_run: Some(Tier3Run {
+                    manifest_id: 5,
+                    status: "pending".into(),
+                    error: None,
+                }),
+            },
+        );
+        let running = tier3_run_check(
+            "running",
+            &AliasStoreState {
+                tentative_manifest_id: Some(6),
+                tier3_run: Some(Tier3Run {
+                    manifest_id: 6,
+                    status: "running".into(),
+                    error: None,
+                }),
+            },
+        );
+        let failed = tier3_run_check(
+            "fail",
+            &AliasStoreState {
+                tentative_manifest_id: Some(3),
+                tier3_run: Some(Tier3Run {
+                    manifest_id: 3,
+                    status: "failed".into(),
+                    error: Some("boom".into()),
+                }),
+            },
+        );
+        let missing = tier3_run_check(
+            "missing",
+            &AliasStoreState {
+                tentative_manifest_id: Some(4),
+                tier3_run: None,
+            },
+        );
+
+        assert_eq!(succeeded.status, DoctorStatus::Pass);
+        assert_eq!(skipped.status, DoctorStatus::Pass);
+        assert!(
+            skipped
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("ContentModified")
+        );
+        assert_eq!(pending.status, DoctorStatus::Pass);
+        assert!(pending.detail.as_deref().unwrap().contains("queued"));
+        assert!(pending.remediation.is_none());
+        assert_eq!(running.status, DoctorStatus::Pass);
+        assert!(running.detail.as_deref().unwrap().contains("in progress"));
+        assert!(running.remediation.is_none());
+        assert_eq!(failed.status, DoctorStatus::Warn);
+        assert!(
+            failed
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("manifest 3")
+        );
+        assert_eq!(missing.status, DoctorStatus::Warn);
+        assert!(
+            missing
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("reindex-repo")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_dispatch_reports_live_watcher_tentative_anchor_and_tier3_success() {
+        let fixture = DoctorFixture::new();
+        fixture.seed_alias("demo", true, Some("succeeded"), None);
+        fixture
+            .watch_manager
+            .watch_alias("demo".into(), fixture.repo_path("demo"))
+            .unwrap();
+
+        let report = fixture.run_doctor().await;
+
+        let watcher = find_check(&report, "repo `demo` watcher active");
+        assert_eq!(watcher.status, DoctorStatus::Pass);
+        let tentative = find_check(&report, "repo `demo` tentative snapshot present");
+        assert_eq!(tentative.status, DoctorStatus::Pass);
+        let tier3 = find_check(&report, "repo `demo` Tier-3 analyzer status");
+        assert_eq!(tier3.status, DoctorStatus::Pass);
+        assert!(tier3.detail.as_deref().unwrap().contains("succeeded"));
+    }
+
+    #[tokio::test]
+    async fn doctor_dispatch_reports_missing_watcher_and_tentative_with_remediation() {
+        let fixture = DoctorFixture::new();
+        fixture.seed_alias("demo", false, None, None);
+
+        let report = fixture.run_doctor().await;
+
+        let watcher = find_check(&report, "repo `demo` watcher active");
+        assert_eq!(watcher.status, DoctorStatus::Warn);
+        assert!(
+            watcher
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("register-repo --alias demo")
+        );
+        let tentative = find_check(&report, "repo `demo` tentative snapshot present");
+        assert_eq!(tentative.status, DoctorStatus::Warn);
+        assert!(
+            tentative
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("reindex-repo")
+        );
+    }
+
+    struct DoctorFixture {
+        _tmp: tempfile::TempDir,
+        cas_data_dir: Arc<CasDataDir>,
+        watch_manager: Arc<WatchManager>,
+        repos_root: PathBuf,
+    }
+
+    impl DoctorFixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let cas_data_dir = Arc::new(CasDataDir::with_root(tmp.path().join("data")));
+            cas_data_dir.ensure().unwrap();
+            let watch_manager = Arc::new(WatchManager::with_backend(
+                cas_data_dir.clone(),
+                WatchBackend::Poll,
+            ));
+            let repos_root = tmp.path().join("repos");
+            std::fs::create_dir_all(&repos_root).unwrap();
+            Self {
+                _tmp: tmp,
+                cas_data_dir,
+                watch_manager,
+                repos_root,
+            }
+        }
+
+        fn repo_path(&self, alias: &str) -> PathBuf {
+            self.repos_root.join(alias)
+        }
+
+        fn seed_alias(
+            &self,
+            alias: &str,
+            with_tentative: bool,
+            tier3_status: Option<&str>,
+            tier3_error: Option<&str>,
+        ) {
+            let repo_path = self.repo_path(alias);
+            std::fs::create_dir_all(&repo_path).unwrap();
+            let repo_hash = format!("{alias}-hash");
+            let mut index = registry::open(&self.cas_data_dir.index_db_path()).unwrap();
+            {
+                let tx = index.transaction().unwrap();
+                registry::upsert(&tx, alias, &repo_path.to_string_lossy(), &repo_hash, 0).unwrap();
+                tx.commit().unwrap();
+            }
+
+            let store_path = self.cas_data_dir.store_db_path(&repo_hash);
+            let store = cas_store::open(&store_path).unwrap();
+            store
+                .execute(
+                    "INSERT INTO worktrees (path, registered_at_ns) VALUES (?1, 0)",
+                    params![repo_path.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+            let worktree_id = store.last_insert_rowid();
+            store
+                .execute(
+                    "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+                     VALUES (1, 'tentative', 0)",
+                    [],
+                )
+                .unwrap();
+            if with_tentative {
+                store
+                    .execute(
+                        "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+                         VALUES (?1, 1, 0)",
+                        params![format!("tentative/{worktree_id}")],
+                    )
+                    .unwrap();
+            }
+            if let Some(status) = tier3_status {
+                store
+                    .execute(
+                        "INSERT INTO workspace_analysis_runs
+                           (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                            status, started_at_ns, finished_at_ns, error)
+                         VALUES (1, ?1, 1, 'cfg', ?2, 0, 1, ?3)",
+                        params![RUST_ANALYZER_ID, status, tier3_error],
+                    )
+                    .unwrap();
+            }
+        }
+
+        async fn run_doctor(&self) -> DoctorReport {
+            let ctx = CtlCtx {
+                cas_data_dir: self.cas_data_dir.clone(),
+                shutdown: Arc::new(Notify::new()),
+                watch_manager: Some(self.watch_manager.clone()),
+                version: "test",
+                started_at: Instant::now(),
+            };
+            let value = Doctor.dispatch(&ctx, Value::Null).await.unwrap();
+            serde_json::from_value(value).unwrap()
+        }
+    }
+
+    fn find_check<'a>(report: &'a DoctorReport, name: &str) -> &'a DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("missing check `{name}` in {:#?}", report.checks))
     }
 }
