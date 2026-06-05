@@ -26,6 +26,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKSPACE_LOAD_QUIET_PERIOD: Duration = Duration::from_secs(5);
 const MAX_RESTARTS: usize = 3;
+pub const CONTENT_MODIFIED_ERROR_CODE: i64 = -32801;
 /// Cap on a single LSP message body. rust-analyzer's largest legitimate
 /// responses (workspace symbols on huge crates) stay well under this; a
 /// `Content-Length` above the cap is treated as a malicious or runaway
@@ -48,6 +49,21 @@ pub enum Error {
     ServerExited(ExitStatusDetail),
     #[error("LSP protocol error: {0}")]
     Protocol(String),
+    #[error("LSP protocol error: {message}")]
+    ResponseError { code: i64, message: String },
+}
+
+impl Error {
+    #[must_use]
+    pub fn is_content_modified(&self) -> bool {
+        matches!(
+            self,
+            Self::ResponseError {
+                code: CONTENT_MODIFIED_ERROR_CODE,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -736,11 +752,15 @@ fn server_request_response(message: &Value) -> Option<Value> {
 fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
     let id = message.get("id")?.as_u64()?;
     if let Some(error) = message.get("error") {
-        let detail = error
+        let message = error
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("unknown LSP error");
-        return Some((id, Err(Error::Protocol(detail.to_string()))));
+            .unwrap_or("unknown LSP error")
+            .to_string();
+        if let Some(code) = error.get("code").and_then(Value::as_i64) {
+            return Some((id, Err(Error::ResponseError { code, message })));
+        }
+        return Some((id, Err(Error::Protocol(message))));
     }
     Some((
         id,
@@ -1253,6 +1273,23 @@ mod tests {
 
         let locations = parse_definition_result(value).unwrap();
         assert_eq!(locations[0].range.start.character, 4);
+    }
+
+    #[test]
+    fn response_result_preserves_lsp_error_code() {
+        let (_, result) = response_result(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {
+                "code": CONTENT_MODIFIED_ERROR_CODE,
+                "message": "content modified"
+            }
+        }))
+        .unwrap();
+
+        let err = result.unwrap_err();
+        assert!(err.is_content_modified());
+        assert_eq!(err.to_string(), "LSP protocol error: content modified");
     }
 
     #[tokio::test]
