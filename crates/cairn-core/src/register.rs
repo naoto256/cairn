@@ -40,6 +40,7 @@ pub struct RegisterOutcome {
     pub branch: Option<String>,
     pub committed_manifest: ManifestId,
     pub tentative_manifest: ManifestId,
+    pub analyzers_skipped_due_to_dedup: bool,
     /// Number of `(blob, parser)` pairs that were parsed fresh
     /// (= not reused from a prior call).
     pub blobs_parsed: usize,
@@ -58,6 +59,44 @@ pub fn register_repo(
     worktree_path: &Path,
     now_ns: i64,
 ) -> Result<RegisterOutcome> {
+    register_repo_inner(
+        conn,
+        worktree_path,
+        now_ns,
+        true,
+        run_registered_workspace_analyzers,
+    )
+}
+
+/// Force a full analyzer pass for an already-registered repo.
+///
+/// This backs the explicit `reindex_repo` control method; unlike the
+/// watcher/default path, it does not short-circuit unchanged
+/// tentative manifests.
+pub(crate) fn register_repo_force_analyzers(
+    conn: &mut Connection,
+    worktree_path: &Path,
+    now_ns: i64,
+) -> Result<RegisterOutcome> {
+    register_repo_inner(
+        conn,
+        worktree_path,
+        now_ns,
+        false,
+        run_registered_workspace_analyzers,
+    )
+}
+
+fn register_repo_inner<F>(
+    conn: &mut Connection,
+    worktree_path: &Path,
+    now_ns: i64,
+    dedupe_unchanged_tentative: bool,
+    mut run_analyzers: F,
+) -> Result<RegisterOutcome>
+where
+    F: FnMut(&mut Connection, &Path, ManifestId, &[ManifestEntry], i64) -> Result<usize>,
+{
     let backends = all_backends();
     let include = |hint: &PathHint<'_>| {
         if pick_backend_for_path(&backends, hint.path).is_some() {
@@ -72,6 +111,8 @@ pub fn register_repo(
     let tx = conn.transaction()?;
 
     let worktree_id = upsert_worktree(&tx, worktree_path, now_ns)?;
+    let tentative_anchor = AnchorName::tentative(worktree_id);
+    let prior_tentative = anchor::resolve(&tx, &tentative_anchor)?;
 
     // Manifest construction — reuse a committed manifest if one
     // already exists for this commit.
@@ -80,7 +121,23 @@ pub fn register_repo(
         None => manifest::build_from_git_tree(&tx, worktree_path, &head_commit, now_ns, include)?,
     };
 
-    let tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, include)?;
+    let built_tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, include)?;
+    let built_tentative_entries = manifest::get_entries(&tx, built_tentative)?;
+    let (tentative, tentative_entries, analyzers_skipped_due_to_dedup) =
+        if dedupe_unchanged_tentative
+            && let Some(prior) = prior_tentative
+            && manifest::get_entries(&tx, prior)? == built_tentative_entries
+        {
+            manifest::delete_manifest(&tx, built_tentative)?;
+            debug!(
+                repo = %worktree_path.display(),
+                manifest_id = prior.0,
+                "tentative manifest unchanged; skipping analyzer pass"
+            );
+            (prior, built_tentative_entries, true)
+        } else {
+            (built_tentative, built_tentative_entries, false)
+        };
 
     // Anchors.
     anchor::set(&tx, &AnchorName::head(), committed, now_ns)?;
@@ -93,14 +150,13 @@ pub fn register_repo(
         &live_ref_names(worktree_path, "refs/heads")?,
     )?;
     prune_stale_ref_anchors(&tx, "tag/", &live_ref_names(worktree_path, "refs/tags")?)?;
-    anchor::set(&tx, &AnchorName::tentative(worktree_id), tentative, now_ns)?;
+    anchor::set(&tx, &tentative_anchor, tentative, now_ns)?;
 
     // Collect every (blob_sha, source) pair we need to ensure is
     // parsed. Source tells us where to fetch the content from:
     // committed blobs come from git, tentative-only blobs from the
     // worktree.
     let committed_entries = manifest::get_entries(&tx, committed)?;
-    let tentative_entries = manifest::get_entries(&tx, tentative)?;
     tx.commit()?;
 
     let blobs_parsed = parse_pending_blobs(
@@ -111,13 +167,10 @@ pub fn register_repo(
         &tentative_entries,
         now_ns,
     )?;
-    let _workspace_refs = run_registered_workspace_analyzers(
-        conn,
-        worktree_path,
-        tentative,
-        &tentative_entries,
-        now_ns,
-    )?;
+    if !analyzers_skipped_due_to_dedup {
+        let _workspace_refs =
+            run_analyzers(conn, worktree_path, tentative, &tentative_entries, now_ns)?;
+    }
 
     Ok(RegisterOutcome {
         worktree_id,
@@ -125,6 +178,7 @@ pub fn register_repo(
         branch,
         committed_manifest: committed,
         tentative_manifest: tentative,
+        analyzers_skipped_due_to_dedup,
         blobs_parsed,
     })
 }
@@ -387,6 +441,7 @@ mod tests {
     use crate::testutil::{init_repo, run_git};
     use cairn_lang_python::PythonBackend;
     use cairn_lang_rust as _;
+    use std::cell::Cell;
     use std::fs;
 
     fn python_backends() -> Vec<Box<dyn LanguageBackend>> {
@@ -457,6 +512,54 @@ mod tests {
         );
         // Worktree row should be the same; upsert is idempotent.
         assert_eq!(first.worktree_id, second.worktree_id);
+    }
+
+    #[test]
+    fn unchanged_tentative_manifest_skips_analyzer_pass_on_second_register() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let analyzer_runs = Cell::new(0);
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(0)
+        })
+        .unwrap();
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(0)
+        })
+        .unwrap();
+
+        assert!(!first.analyzers_skipped_due_to_dedup);
+        assert!(second.analyzers_skipped_due_to_dedup);
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+        assert_eq!(analyzer_runs.get(), 1);
+    }
+
+    #[test]
+    fn force_reindex_does_not_dedupe_unchanged_tentative_manifest() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let analyzer_runs = Cell::new(0);
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, false, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(0)
+        })
+        .unwrap();
+        let second = register_repo_inner(&mut conn, repo.path(), 2, false, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(0)
+        })
+        .unwrap();
+
+        assert!(!first.analyzers_skipped_due_to_dedup);
+        assert!(!second.analyzers_skipped_due_to_dedup);
+        assert_ne!(second.tentative_manifest, first.tentative_manifest);
+        assert_eq!(analyzer_runs.get(), 2);
     }
 
     #[test]
