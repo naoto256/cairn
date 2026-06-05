@@ -1,0 +1,27 @@
+[package]
+name = "cairn-lang-python-tier3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Python Tier-3 workspace analyzer backed by pyright LSP."
+
+[dependencies]
+cairn-core.workspace = true
+linkme.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
+
+[dev-dependencies]
+cairn-lang-python.workspace = true
+rusqlite.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

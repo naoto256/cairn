@@ -66,7 +66,7 @@ impl ControlMethod for Doctor {
             None,
         ));
 
-        checks.push(tier3_binary_check());
+        checks.extend(tier3_binary_checks());
 
         let cas_data_dir = ctx.cas_data_dir.clone();
         let aliases_result =
@@ -315,19 +315,46 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
         .collect()
 }
 
-fn tier3_binary_check() -> DoctorCheck {
-    match resolve_rust_analyzer() {
+fn tier3_binary_checks() -> Vec<DoctorCheck> {
+    vec![rust_analyzer_binary_check(), pyright_binary_check()]
+}
+
+fn rust_analyzer_binary_check() -> DoctorCheck {
+    binary_check(
+        "rust-analyzer binary discoverable",
+        resolve_rust_analyzer(),
+        "rust-analyzer not found on daemon PATH",
+        "Install rust-analyzer (`rustup component add rust-analyzer`) and ensure it's on the daemon's PATH; Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn pyright_binary_check() -> DoctorCheck {
+    binary_check(
+        "pyright binary discoverable",
+        resolve_pyright(),
+        "pyright-langserver not found on daemon PATH",
+        "Install pyright (`pip install pyright` or `npm i -g pyright`) and ensure pyright-langserver is on the daemon's PATH; Python Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn binary_check(
+    name: &str,
+    resolved: Option<PathBuf>,
+    missing_detail: &str,
+    remediation: &str,
+) -> DoctorCheck {
+    match resolved {
         Some(path) => doctor_check(
-            "rust-analyzer binary discoverable",
+            name,
             DoctorStatus::Pass,
             Some(path.to_string_lossy().to_string()),
             None,
         ),
         None => doctor_check(
-            "rust-analyzer binary discoverable",
+            name,
             DoctorStatus::Warn,
-            Some("rust-analyzer not found on daemon PATH".into()),
-            Some("Install rust-analyzer (`rustup component add rust-analyzer`) and ensure it's on the daemon's PATH; Tier-3 (LSP) facts will not be available until then.".into()),
+            Some(missing_detail.into()),
+            Some(remediation.into()),
         ),
     }
 }
@@ -342,6 +369,20 @@ fn resolve_rust_analyzer() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("rust-analyzer"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_pyright() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PYRIGHT")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("pyright-langserver"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -510,7 +551,7 @@ mod tests {
     #[test]
     fn backend_registration_coherence_passes_when_expected_entries_are_registered() {
         let language_backends = ["rust", "python", "markdown", "typescript", "go"];
-        let workspace_analyzers = ["rust-analyzer-lsp"];
+        let workspace_analyzers = ["pyright-lsp", "rust-analyzer-lsp"];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 
@@ -520,7 +561,7 @@ mod tests {
     #[test]
     fn backend_registration_coherence_warns_for_missing_runtime_entry() {
         let language_backends = ["rust", "python", "markdown", "go"];
-        let workspace_analyzers = ["rust-analyzer-lsp"];
+        let workspace_analyzers = ["pyright-lsp", "rust-analyzer-lsp"];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 
