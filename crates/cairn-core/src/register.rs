@@ -16,6 +16,7 @@
 //! 6. Sets `HEAD`, `branch/<name>` (if on a branch), and
 //!    `tentative/<worktree_id>` anchors to the right manifests.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -86,6 +87,12 @@ pub fn register_repo(
     if let Some(name) = &branch {
         anchor::set(&tx, &AnchorName::branch(name), committed, now_ns)?;
     }
+    prune_stale_ref_anchors(
+        &tx,
+        "branch/",
+        &live_ref_names(worktree_path, "refs/heads")?,
+    )?;
+    prune_stale_ref_anchors(&tx, "tag/", &live_ref_names(worktree_path, "refs/tags")?)?;
     anchor::set(&tx, &AnchorName::tentative(worktree_id), tentative, now_ns)?;
 
     // Collect every (blob_sha, source) pair we need to ensure is
@@ -292,6 +299,36 @@ fn detect_branch(repo_root: &Path) -> Option<String> {
     raw.strip_prefix("refs/heads/").map(str::to_string)
 }
 
+fn live_ref_names(repo_root: &Path, namespace: &str) -> Result<HashSet<String>> {
+    let refs = run_git_capture(
+        repo_root,
+        &["for-each-ref", "--format=%(refname:strip=2)", namespace],
+    )?;
+    Ok(refs
+        .lines()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn prune_stale_ref_anchors(
+    tx: &rusqlite::Transaction<'_>,
+    prefix: &str,
+    live_refs: &HashSet<String>,
+) -> Result<usize> {
+    let mut pruned = 0;
+    for anchor in anchor::list_prefix(tx, prefix)? {
+        let Some(name) = anchor.name.as_str().strip_prefix(prefix) else {
+            continue;
+        };
+        if !live_refs.contains(name) && anchor::delete(tx, &anchor.name)? {
+            pruned += 1;
+            debug!(anchor = %anchor.name.as_str(), "pruned stale git ref anchor");
+        }
+    }
+    Ok(pruned)
+}
+
 fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -347,7 +384,7 @@ pub(crate) fn load_blob_or_worktree(
 mod tests {
     use super::*;
     use crate::cas::store;
-    use crate::testutil::init_repo;
+    use crate::testutil::{init_repo, run_git};
     use cairn_lang_python::PythonBackend;
     use cairn_lang_rust as _;
     use std::fs;
@@ -420,6 +457,74 @@ mod tests {
         );
         // Worktree row should be the same; upsert is idempotent.
         assert_eq!(first.worktree_id, second.worktree_id);
+    }
+
+    #[test]
+    fn re_register_prunes_deleted_branch_anchor() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        run_git(repo.path(), &["checkout", "-q", "-b", "gone"]);
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn f() {}\npub fn g() {}\n",
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "-A"]);
+        run_git(repo.path(), &["commit", "-q", "-m", "probe branch"]);
+
+        let branch_outcome = register_repo(&mut conn, repo.path(), 1).unwrap();
+        assert_eq!(branch_outcome.branch.as_deref(), Some("gone"));
+        assert!(
+            anchor::resolve(&conn, &AnchorName::branch("gone"))
+                .unwrap()
+                .is_some()
+        );
+        run_git(repo.path(), &["tag", "v-stale"]);
+        {
+            let tx = conn.transaction().unwrap();
+            anchor::set(
+                &tx,
+                &AnchorName::tag("v-stale"),
+                branch_outcome.committed_manifest,
+                1,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(
+            anchor::resolve(&conn, &AnchorName::tag("v-stale"))
+                .unwrap()
+                .is_some()
+        );
+
+        run_git(repo.path(), &["checkout", "-q", "main"]);
+        run_git(repo.path(), &["branch", "-D", "gone"]);
+        run_git(repo.path(), &["tag", "-d", "v-stale"]);
+
+        let main_outcome = register_repo(&mut conn, repo.path(), 2).unwrap();
+        assert_eq!(main_outcome.branch.as_deref(), Some("main"));
+        assert!(
+            anchor::resolve(&conn, &AnchorName::branch("gone"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            anchor::resolve(&conn, &AnchorName::tag("v-stale"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            anchor::resolve(&conn, &AnchorName::head())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            anchor::resolve(&conn, &AnchorName::branch("main"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
