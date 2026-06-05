@@ -7,6 +7,40 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.1.0-alpha.4] — Unreleased
 
+### Added
+
+- **Daemon-managed live file watcher.** `cairn_watch::watch_repo`
+  shipped fully implemented in earlier alphas but was never
+  instantiated by the daemon, so the README / MCP
+  `SERVER_INSTRUCTIONS` "always-current index" claim was aspirational
+  — the index only refreshed on explicit `cairn ctl reindex-repo`.
+  The new `cairn_core::watcher::WatchManager` owns one
+  `WatcherHandle` per registered alias, coalesces bursts over 500ms,
+  and calls the same `register_repo` code path used by `reindex_repo`
+  to refresh both HEAD and the tentative snapshot. `register_repo`
+  pre-validates the repo path as a directory before any CAS mutation
+  and reports post-commit watcher install failures via a new
+  `Ack.watcher_failed: Option<String>` (wire-additive) so callers
+  see degraded-success rather than misleading errors after state has
+  been committed. Replacement of an existing alias stops the prior
+  watcher before installing the new one, so a failed re-install
+  leaves the alias unwatched rather than stale-wrong-path-watched.
+- **Default anchor resolves to `tentative/<id>` when unspecified.**
+  Read methods (`find_symbols` / `find_impls` / `find_imports` /
+  `find_references` / `get_outline` / `get_symbol_source`) that
+  receive neither an `anchor` nor a `branch` arg now resolve to the
+  registered worktree's tentative snapshot (= committed HEAD + every
+  uncommitted edit the live watcher has picked up), falling back to
+  `HEAD` when no tentative anchor exists yet for the store. Pair
+  this with the new daemon-managed watcher and the
+  "always-current" promise is finally honest at the working-tree
+  level — an AI agent that just wrote a new function sees it on the
+  next `find_symbols` call without needing to commit first. Explicit
+  `anchor="HEAD"` or `branch="..."` callers are unaffected. New
+  `cairn_core::anchor::resolve_explicit_or_default` lives next to
+  the existing `resolve_wire`; the latter is kept for callers that
+  genuinely want the old explicit-or-HEAD semantics.
+
 ### Changed (wire additive)
 
 - **`cairn-proto::ImportsArgs.repo`** and **`FindReferencesArgs.repo`**

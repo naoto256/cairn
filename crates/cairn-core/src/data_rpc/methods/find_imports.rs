@@ -27,8 +27,8 @@ impl DataMethod for FindImports {
             file: args.file.clone(),
             limit: Some(limit_with_probe(effective_limit)),
         };
-        let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
-        let anchor_label = anchor.as_str().to_string();
+        let anchor_arg = args.anchor.clone();
+        let branch_arg = args.branch.clone();
         let requested_repo = args.repo.clone();
 
         let (items, capped) = with_one_or_all_stores(
@@ -37,6 +37,12 @@ impl DataMethod for FindImports {
             "find_imports",
             effective_limit,
             move |entry, conn| {
+                let anchor = crate::anchor::resolve_explicit_or_default(
+                    conn,
+                    anchor_arg.as_deref(),
+                    branch_arg.as_deref(),
+                )?;
+                let anchor_label = anchor.as_str().to_string();
                 let hits = query::find_imports(conn, &anchor, &q)?;
                 Ok(hits
                     .into_iter()
@@ -102,7 +108,7 @@ mod tests {
         let fixture = cross_repo_fixture();
 
         let all = FindImports
-            .dispatch(&fixture.ctx, json!({"limit": 10}))
+            .dispatch(&fixture.ctx, json!({"limit": 10, "anchor": "HEAD"}))
             .await
             .unwrap();
         let items = all["items"].as_array().unwrap();
@@ -123,7 +129,7 @@ mod tests {
         );
 
         let capped = FindImports
-            .dispatch(&fixture.ctx, json!({"limit": 2}))
+            .dispatch(&fixture.ctx, json!({"limit": 2, "anchor": "HEAD"}))
             .await
             .unwrap();
         assert_eq!(capped["items"].as_array().unwrap().len(), 2);
