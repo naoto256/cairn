@@ -54,6 +54,9 @@ impl ControlMethod for RemoveRepo {
                 alias: args.alias.clone(),
             });
         }
+        if let Some(watch_manager) = &ctx.watch_manager {
+            watch_manager.unwatch_alias(&args.alias);
+        }
         Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
     }
 }

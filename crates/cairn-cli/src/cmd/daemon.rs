@@ -12,6 +12,7 @@ use cairn_core::daemon::Daemon;
 use cairn_core::data_rpc::DataRpc;
 use cairn_core::paths::CasDataDir;
 use cairn_core::sockets::SocketPaths;
+use cairn_core::watcher::WatchManager;
 use clap::Args as ClapArgs;
 use tokio::sync::Notify;
 use tracing::info;
@@ -40,6 +41,8 @@ pub async fn run(args: Args) -> Result<()> {
     });
     cas_data_dir.ensure()?;
     info!(root = %cas_data_dir.root().display(), "storage open");
+    let watch_manager = Arc::new(WatchManager::new(cas_data_dir.clone()));
+    spawn_registered_watchers(watch_manager.clone());
 
     let shutdown = Arc::new(Notify::new());
     spawn_signal_handler(shutdown.clone());
@@ -47,10 +50,11 @@ pub async fn run(args: Args) -> Result<()> {
     let daemon = Daemon {
         paths,
         data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
-        control_handler: Arc::new(CtlHandler::new(
+        control_handler: Arc::new(CtlHandler::with_watch_manager(
             cas_data_dir,
             shutdown.clone(),
             env!("CARGO_PKG_VERSION"),
+            Some(watch_manager),
         )),
         shutdown,
     };
@@ -81,5 +85,13 @@ fn spawn_signal_handler(shutdown: Arc<Notify>) {
             _ = sigterm.recv() => info!("SIGTERM received; shutting down"),
         }
         shutdown.notify_waiters();
+    });
+}
+
+fn spawn_registered_watchers(watch_manager: Arc<WatchManager>) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = watch_manager.start_registered() {
+            tracing::warn!(error = %err, "failed to start registered repo watchers");
+        }
     });
 }
