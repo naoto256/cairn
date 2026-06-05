@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use cairn_core::workspace_analyzer::{
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
+use tracing::debug;
 use tree_sitter::Node;
 
 const ANALYZER_ID: &str = "rust-analyzer-lsp";
@@ -25,6 +27,7 @@ const ANALYZER_REVISION: u32 = 1;
 const CONFIG_HASH: &str = "rust-analyzer-lsp-v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKSPACE_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct RustAnalyzerWorkspaceAnalyzer;
 
@@ -125,10 +128,40 @@ async fn definition_with_retry(
     uri: &Url,
     position: Position,
 ) -> Result<Vec<Location>> {
+    definition_with_retry_from(|| client.definition(uri, position), uri, position).await
+}
+
+async fn definition_with_retry_from<F, Fut>(
+    mut definition: F,
+    uri: &Url,
+    position: Position,
+) -> Result<Vec<Location>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = cairn_core::lsp::Result<Vec<Location>>>,
+{
     let mut delay = Duration::from_millis(200);
+    let mut retried_content_modified = false;
     for attempt in 0..3 {
-        match client.definition(uri, position).await {
+        match definition().await {
             Ok(locations) => return Ok(locations),
+            Err(err) if err.is_content_modified() && !retried_content_modified => {
+                debug!(
+                    uri = uri.as_str(),
+                    ?position,
+                    "rust-analyzer content modified; retrying definition once"
+                );
+                retried_content_modified = true;
+                tokio::time::sleep(CONTENT_MODIFIED_RETRY_DELAY).await;
+            }
+            Err(err) if err.is_content_modified() => {
+                debug!(
+                    uri = uri.as_str(),
+                    ?position,
+                    "rust-analyzer content modified after retry; skipping definition"
+                );
+                return Ok(Vec::new());
+            }
             Err(err) if is_file_not_found(&err) && attempt < 2 => {
                 tokio::time::sleep(delay).await;
                 delay *= 2;
@@ -141,6 +174,10 @@ async fn definition_with_retry(
 
 fn is_file_not_found(err: &cairn_core::lsp::Error) -> bool {
     matches!(err, cairn_core::lsp::Error::Protocol(message) if message.contains("file not found"))
+        || matches!(
+            err,
+            cairn_core::lsp::Error::ResponseError { message, .. } if message.contains("file not found")
+        )
 }
 
 fn core_error_to_lsp(err: Error) -> cairn_core::lsp::Error {
@@ -258,6 +295,8 @@ fn map_lsp_error(err: cairn_core::lsp::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::future::ready;
 
     #[test]
     fn method_call_collector_finds_method_identifier_positions() {
@@ -299,5 +338,32 @@ fn main() {
 
         let rel = location_to_repo_path(Path::new("/tmp/repo"), &location).unwrap();
         assert_eq!(rel, "crates/foo/src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn content_modified_retries_once_then_skips_definition() {
+        let attempts = Cell::new(0);
+        let uri = Url::from("file:///tmp/repo/src/lib.rs");
+        let position = Position {
+            line: 3,
+            character: 12,
+        };
+
+        let locations = definition_with_retry_from(
+            || {
+                attempts.set(attempts.get() + 1);
+                ready(Err(cairn_core::lsp::Error::ResponseError {
+                    code: cairn_core::lsp::CONTENT_MODIFIED_ERROR_CODE,
+                    message: "content modified".into(),
+                }))
+            },
+            &uri,
+            position,
+        )
+        .await
+        .unwrap();
+
+        assert!(locations.is_empty());
+        assert_eq!(attempts.get(), 2);
     }
 }
