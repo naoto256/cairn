@@ -8,7 +8,7 @@ use cairn_proto::control::Ack;
 use cairn_proto::methods::RegisterRepoArgs;
 use linkme::distributed_slice;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
@@ -29,6 +29,12 @@ impl ControlMethod for RegisterRepo {
         let path = std::path::PathBuf::from(&args.path);
         let canonical = std::fs::canonicalize(&path)
             .map_err(|e| Error::InvalidArgument(format!("canonicalize {}: {e}", args.path)))?;
+        if !canonical.is_dir() {
+            return Err(Error::InvalidArgument(format!(
+                "repo path is not a directory: {}",
+                canonical.display()
+            )));
+        }
         let repo_hash = path_hash(&canonical);
 
         let cas_data_dir = ctx.cas_data_dir.clone();
@@ -73,10 +79,18 @@ impl ControlMethod for RegisterRepo {
             blobs_parsed = outcome.blobs_parsed,
             "register_repo complete"
         );
+        let mut ack = Ack::with_alias(args.alias.clone());
         if let Some(watch_manager) = &ctx.watch_manager {
-            watch_manager.watch_alias(args.alias.clone(), canonical)?;
+            if let Err(err) = watch_manager.watch_alias(args.alias.clone(), canonical) {
+                warn!(
+                    alias = %args.alias,
+                    error = %err,
+                    "register_repo completed but watcher start failed"
+                );
+                ack = Ack::with_alias_and_watcher_failed(args.alias.clone(), err.to_string());
+            }
         }
-        Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
+        Ok(serde_json::to_value(ack).unwrap())
     }
 }
 

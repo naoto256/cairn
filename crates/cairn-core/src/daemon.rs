@@ -198,6 +198,7 @@ async fn serve_one(stream: UnixStream, handler: Arc<dyn LineHandler>) -> std::io
 mod tests {
     use super::*;
     use crate::anchor::AnchorName;
+    use crate::cas::registry as cas_registry;
     use crate::cas::store as cas_store;
     use crate::ctl::CtlHandler;
     use crate::data_rpc::DataRpc;
@@ -346,6 +347,71 @@ mod tests {
         let store_path = cas_data_dir.store_db_path(&path_hash(&canonical));
         let found = poll_for_symbol(&store_path, &canonical, symbol_name).await;
         assert!(found, "watcher did not reindex symbol {symbol_name}");
+
+        shutdown.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon_task).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_register_reports_degraded_when_watcher_start_fails() {
+        let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
+        let runtime_tmp = tempfile::tempdir().unwrap();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().to_path_buf());
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas_data_dir.ensure().unwrap();
+        let watch_manager = Arc::new(WatchManager::with_failing_watcher(cas_data_dir.clone()));
+        let shutdown = Arc::new(Notify::new());
+
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let cas_data_dir = cas_data_dir.clone();
+            let shutdown = shutdown.clone();
+            let watch_manager = watch_manager.clone();
+            async move {
+                let daemon = Daemon {
+                    paths,
+                    data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
+                    control_handler: Arc::new(CtlHandler::with_watch_manager(
+                        cas_data_dir,
+                        shutdown.clone(),
+                        env!("CARGO_PKG_VERSION"),
+                        Some(watch_manager),
+                    )),
+                    shutdown,
+                };
+                daemon.run().await.unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let register = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "register_repo",
+            "params": {
+                "alias": "degraded",
+                "path": repo.path(),
+            }
+        });
+        let response = send_control_request(&paths.control, &register.to_string()).await;
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["ok"], true);
+        assert_eq!(value["result"]["alias"], "degraded");
+        assert!(
+            value["result"]["watcher_failed"]
+                .as_str()
+                .is_some_and(|s| s.contains("injected watcher start failure")),
+            "register response: {response}"
+        );
+
+        let index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+        assert!(
+            cas_registry::lookup_by_alias(&index, "degraded")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!watch_manager.is_watching_alias("degraded"));
 
         shutdown.notify_waiters();
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon_task).await;
