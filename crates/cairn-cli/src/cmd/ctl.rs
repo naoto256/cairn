@@ -199,5 +199,8 @@ fn render_doctor(r: &DoctorReport) {
             Some(d) => println!("{tag} {}: {}", c.name, d),
             None => println!("{tag} {}", c.name),
         }
+        if let Some(remediation) = &c.remediation {
+            println!("      fix: {remediation}");
+        }
     }
 }

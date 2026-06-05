@@ -137,7 +137,6 @@ impl WatchManager {
         }
     }
 
-    #[cfg(test)]
     pub fn is_watching_alias(&self, alias: &str) -> bool {
         self.watchers
             .lock()
