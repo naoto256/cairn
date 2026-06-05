@@ -742,6 +742,7 @@ mod tests {
     use cairn_lang_markdown as _;
     use cairn_lang_python as _;
     use cairn_lang_rust as _;
+    use cairn_lang_typescript as _;
     use std::fs;
 
     fn registered() -> (tempfile::TempDir, tempfile::TempDir, Connection) {
@@ -1280,6 +1281,40 @@ mod tests {
             hits.iter()
                 .any(|h| h.target_name == "Widget" && h.kind == RefKind::Type),
             "type refs missing from include_noise refs: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn references_include_typescript_tier2_call_refs() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/app.ts",
+            "function caller() {\n\
+                 foo();\n\
+             }\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, _repo.path(), 0).unwrap();
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "foo".into(),
+                direction: ReferenceDirection::Incoming,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            hits.iter().any(|h| {
+                h.target_name == "foo"
+                    && h.target_qualified.as_deref() == Some("foo")
+                    && h.enclosing_qualified.as_deref() == Some("caller")
+                    && h.path == "src/app.ts"
+            }),
+            "TypeScript Tier-2 call ref missing from query results: {hits:?}"
         );
     }
 

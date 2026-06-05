@@ -6,8 +6,12 @@
 
 #![forbid(unsafe_code)]
 
+mod analyzer;
+
+use std::sync::Arc;
+
 use cairn_lang_api::{
-    ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
+    Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
     SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
@@ -36,6 +40,10 @@ impl LanguageBackend for TypescriptBackend {
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
         extract(source, &language, TypescriptVisitor::new())
+    }
+
+    fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
+        Some(analyzer::analyzer())
     }
 }
 
