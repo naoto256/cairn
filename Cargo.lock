@@ -239,6 +239,7 @@ dependencies = [
  "cairn-core",
  "linkme",
  "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-rust",
 ]
