@@ -111,7 +111,10 @@ mod tests {
         let fixture = cross_repo_fixture();
 
         let all = FindImpls
-            .dispatch(&fixture.ctx, json!({"trait": "Trait", "limit": 10, "anchor": "HEAD"}))
+            .dispatch(
+                &fixture.ctx,
+                json!({"trait": "Trait", "limit": 10, "anchor": "HEAD"}),
+            )
             .await
             .unwrap();
         let items = all["items"].as_array().unwrap();
@@ -132,7 +135,10 @@ mod tests {
         );
 
         let capped = FindImpls
-            .dispatch(&fixture.ctx, json!({"trait": "Trait", "limit": 2, "anchor": "HEAD"}))
+            .dispatch(
+                &fixture.ctx,
+                json!({"trait": "Trait", "limit": 2, "anchor": "HEAD"}),
+            )
             .await
             .unwrap();
         assert_eq!(capped["items"].as_array().unwrap().len(), 2);

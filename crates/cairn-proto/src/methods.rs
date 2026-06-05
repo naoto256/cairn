@@ -193,9 +193,14 @@ pub struct OutlineItem {
 /// dump every indexed symbol, which is rarely what an agent wants).
 /// The filters AND together.
 ///
-/// `repo = None` searches every registered repo. `branch = None`
-/// searches every snapshot owned by the (matching) repo. Pass them to
-/// narrow. Hits always name the repo / branch they came from.
+/// `repo = None` searches every registered repo. Omitting both
+/// `branch` and `anchor` resolves to the registered worktree's
+/// `tentative/<id>` snapshot (= committed HEAD plus uncommitted
+/// edits the daemon's file watcher has picked up), falling back to
+/// `HEAD` when no tentative snapshot exists yet. Pass them explicitly
+/// to opt in to committed-only state (`anchor = "HEAD"`) or a
+/// specific branch (`branch = "<name>"`). Hits always name the
+/// repo / branch they came from.
 ///
 /// `query` was required in 0.2.0 and is now optional so that
 /// `{kind: "class"}` alone enumerates classes, `{container: "Foo"}`
@@ -314,8 +319,11 @@ pub struct FindSymbolHit {
 // These return facts the Tier-2 analyzer populates: trait/impl edges
 // from `syn` for Rust, and `use` statements flattened to one row per
 // imported name. Same envelope shape as `find_symbols` — `repo` is
-// optional where cross-repo search is supported, `branch` defaults to
-// cross-branch, hits carry their originating branch.
+// optional where cross-repo search is supported; omitting both
+// `branch` and `anchor` resolves to the registered worktree's
+// `tentative/<id>` snapshot (= committed HEAD plus uncommitted edits
+// the watcher has picked up), falling back to `HEAD` when no
+// tentative snapshot exists yet. Hits carry their originating branch.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplsArgs {
@@ -420,8 +428,10 @@ pub struct ImportHit {
 //
 // "Who calls / uses this symbol?" Driven by the Tier-2 `refs` table
 // populated by the syn body-visitor (calls + method calls today; more
-// kinds when the analyzer learns them). Cross-branch by default, same
-// envelope shape as `find_symbols` / `find_impls`.
+// kinds when the analyzer learns them). Same envelope shape as
+// `find_symbols` / `find_impls`: omitting both `branch` and `anchor`
+// resolves to the registered worktree's `tentative/<id>` snapshot,
+// falling back to `HEAD` when no tentative snapshot exists yet.
 
 /// Direction of a reference query. Symmetric primitives let an agent
 /// ask both "who calls X?" and "what does X call?" with the same tool.
