@@ -40,8 +40,8 @@ impl DataMethod for FindReferences {
             include_noise: args.include_noise,
             limit: Some(limit_with_probe(effective_limit)),
         };
-        let anchor = crate::anchor::resolve_wire(args.anchor.as_deref(), args.branch.as_deref());
-        let anchor_label = anchor.as_str().to_string();
+        let anchor_arg = args.anchor.clone();
+        let branch_arg = args.branch.clone();
         let requested_repo = args.repo.clone();
 
         let (items, capped) = with_one_or_all_stores(
@@ -50,6 +50,12 @@ impl DataMethod for FindReferences {
             "find_references",
             effective_limit,
             move |entry, conn| {
+                let anchor = crate::anchor::resolve_explicit_or_default(
+                    conn,
+                    anchor_arg.as_deref(),
+                    branch_arg.as_deref(),
+                )?;
+                let anchor_label = anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
                 let hits = query::find_references(conn, &anchor, &q)?;
                 let mut snippets = SnippetCache::new(worktree_root);
@@ -198,7 +204,7 @@ mod tests {
         let all = FindReferences
             .dispatch(
                 &fixture.ctx,
-                json!({"symbol": "target", "kind": "call", "include_noise": true, "limit": 10}),
+                json!({"symbol": "target", "kind": "call", "include_noise": true, "limit": 10, "anchor": "HEAD"}),
             )
             .await
             .unwrap();
@@ -222,7 +228,7 @@ mod tests {
         let capped = FindReferences
             .dispatch(
                 &fixture.ctx,
-                json!({"symbol": "target", "kind": "call", "include_noise": true, "limit": 2}),
+                json!({"symbol": "target", "kind": "call", "include_noise": true, "limit": 2, "anchor": "HEAD"}),
             )
             .await
             .unwrap();

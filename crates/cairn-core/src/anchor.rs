@@ -86,6 +86,43 @@ pub fn resolve_wire(anchor: Option<&str>, branch: Option<&str>) -> AnchorName {
     }
 }
 
+/// Pick an anchor for a read query, preferring the store's tentative
+/// snapshot when the caller gave no explicit anchor or branch.
+///
+/// The tentative snapshot reflects the working tree (= dirty /
+/// uncommitted files included), which matches the "always-current"
+/// promise the daemon's file watcher upholds. Falling back to `HEAD`
+/// when no tentative anchor exists yet (e.g. a brand-new store) keeps
+/// the read query from failing.
+///
+/// Resolution order:
+///   1. Explicit `anchor` arg wins, even if it's `HEAD`.
+///   2. Explicit `branch` arg wraps to `branch/<name>`.
+///   3. Otherwise, the first `tentative/*` anchor present in this
+///      store. There is at most one per registered worktree, so this
+///      is unambiguous in practice.
+///   4. Otherwise `HEAD`.
+///
+/// # Errors
+/// SQLite failure during the tentative-lookup step (step 3).
+pub fn resolve_explicit_or_default(
+    conn: &Connection,
+    anchor: Option<&str>,
+    branch: Option<&str>,
+) -> Result<AnchorName> {
+    if let Some(a) = anchor {
+        return Ok(AnchorName::from(a.to_string()));
+    }
+    if let Some(b) = branch {
+        return Ok(AnchorName::branch(b));
+    }
+    let tentative = list_prefix(conn, "tentative/")?;
+    if let Some(first) = tentative.into_iter().next() {
+        return Ok(first.name);
+    }
+    Ok(AnchorName::head())
+}
+
 /// Sort key for anchor names in wire output. Used to order:
 /// 1. The labels within a single `branches: Vec<String>` group.
 /// 2. The snapshot groups themselves in `list_repos` / `status`.
@@ -397,5 +434,52 @@ mod tests {
         let tx = c.transaction().unwrap();
         let err = set(&tx, &AnchorName::head(), ManifestId(9999), 0).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("foreign"));
+    }
+
+    #[test]
+    fn resolve_explicit_or_default_prefers_tentative_when_no_args() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m_head = placeholder_manifest(&tx, "committed");
+        let m_tent = placeholder_manifest(&tx, "tentative");
+        set(&tx, &AnchorName::head(), m_head, 0).unwrap();
+        set(&tx, &AnchorName::tentative(42), m_tent, 0).unwrap();
+        tx.commit().unwrap();
+
+        // No explicit args → tentative wins over HEAD.
+        let resolved = resolve_explicit_or_default(&c, None, None).unwrap();
+        assert_eq!(resolved.as_str(), "tentative/42");
+    }
+
+    #[test]
+    fn resolve_explicit_or_default_falls_back_to_head_without_tentative() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "committed");
+        set(&tx, &AnchorName::head(), m, 0).unwrap();
+        tx.commit().unwrap();
+
+        // No tentative anchor present → HEAD.
+        let resolved = resolve_explicit_or_default(&c, None, None).unwrap();
+        assert_eq!(resolved.as_str(), "HEAD");
+    }
+
+    #[test]
+    fn resolve_explicit_or_default_respects_explicit_anchor_over_tentative() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m_head = placeholder_manifest(&tx, "committed");
+        let m_tent = placeholder_manifest(&tx, "tentative");
+        set(&tx, &AnchorName::head(), m_head, 0).unwrap();
+        set(&tx, &AnchorName::tentative(7), m_tent, 0).unwrap();
+        tx.commit().unwrap();
+
+        // Explicit HEAD beats the tentative default.
+        let resolved = resolve_explicit_or_default(&c, Some("HEAD"), None).unwrap();
+        assert_eq!(resolved.as_str(), "HEAD");
+
+        // Explicit branch arg also beats the tentative default.
+        let resolved = resolve_explicit_or_default(&c, None, Some("main")).unwrap();
+        assert_eq!(resolved.as_str(), "branch/main");
     }
 }

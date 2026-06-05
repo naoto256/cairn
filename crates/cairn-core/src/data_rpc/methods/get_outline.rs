@@ -7,7 +7,6 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::anchor::AnchorName;
 use crate::data_rpc::helpers::{
     completeness_for_cap, limit_with_probe, trim_to_requested_limit, with_repo_conn,
 };
@@ -34,13 +33,13 @@ impl DataMethod for GetOutline {
         let file = args.file.clone();
         let path = args.path.clone();
         let effective_limit = args.limit.unwrap_or(200).clamp(1, 1000);
-        let anchor = AnchorName::head();
 
         let (items, capped) = with_repo_conn(
             ctx,
             &repo_alias,
             "outline",
             move |_entry, conn| -> Result<(Vec<OutlineItem>, bool)> {
+                let anchor = crate::anchor::resolve_explicit_or_default(&conn, None, None)?;
                 if let Some(file) = file {
                     let raw = match query::get_outline(&conn, &anchor, &file, None) {
                         Ok(r) => r,
