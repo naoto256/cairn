@@ -2,6 +2,7 @@
 //! a single `ParsedData` ready for `cas::blob::insert`.
 
 use cairn_lang_api::{ExtractError, LanguageBackend};
+use tracing::debug;
 
 use crate::cas::ParsedData;
 
@@ -12,13 +13,25 @@ use crate::cas::ParsedData;
 /// are dropped.
 ///
 /// # Errors
-/// [`ExtractError`] from either pass, propagated as-is.
+/// [`ExtractError`] from the syntactic pass, propagated as-is. Semantic
+/// extraction errors degrade to `semantic: None` so Tier-1 facts remain
+/// indexable.
 pub fn parse(backend: &dyn LanguageBackend, content: &[u8]) -> Result<ParsedData, ExtractError> {
     let syntactic = backend.extract_syntactic(content)?;
-    let semantic = backend
-        .analyzer()
-        .map(|a| a.extract_semantic(content))
-        .transpose()?;
+    let semantic =
+        backend
+            .analyzer()
+            .and_then(|analyzer| match analyzer.extract_semantic(content) {
+                Ok(facts) => Some(facts),
+                Err(err) => {
+                    debug!(
+                        analyzer = analyzer.name(),
+                        error = %err,
+                        "tier-2 semantic extraction failed; preserving syntactic facts only"
+                    );
+                    None
+                }
+            });
     Ok(ParsedData {
         syntactic,
         semantic,
@@ -28,6 +41,9 @@ pub fn parse(backend: &dyn LanguageBackend, content: &[u8]) -> Result<ParsedData
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use cairn_lang_api::{Analyzer, SymbolFact, SymbolKind, SyntacticFacts, Visibility};
     use cairn_lang_rust::RustBackend;
 
     #[test]
@@ -57,11 +73,90 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_propagates() {
-        // Empty input parses fine on every current backend, so use a
-        // backend-agnostic shape: invalid utf-8 would fail. RustBackend
-        // accepts arbitrary bytes via tree-sitter, so this just
-        // asserts the function shape compiles + runs without panic.
-        let _ = parse(&RustBackend, b"").unwrap();
+    fn semantic_error_degrades_to_syntactic_only() {
+        let data = parse(&BackendWithFailingAnalyzer, b"ignored").unwrap();
+
+        assert!(data.semantic.is_none());
+        assert_eq!(data.syntactic.symbols.len(), 1);
+        assert_eq!(data.syntactic.symbols[0].name, "syntactic_only");
+    }
+
+    #[test]
+    fn syntactic_error_still_propagates() {
+        let err = parse(&BackendWithFailingSyntax, b"ignored").unwrap_err();
+        assert!(err.to_string().contains("syntactic failed"));
+    }
+
+    struct BackendWithFailingAnalyzer;
+
+    impl LanguageBackend for BackendWithFailingAnalyzer {
+        fn name(&self) -> &'static str {
+            "test-syntax-ok"
+        }
+
+        fn file_patterns(&self) -> &'static [&'static str] {
+            &["*.test"]
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "test-syntax-ok"
+        }
+
+        fn extract_syntactic(&self, _source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
+            Ok(SyntacticFacts {
+                symbols: vec![SymbolFact {
+                    name: "syntactic_only".into(),
+                    qualified: "syntactic_only".into(),
+                    kind: SymbolKind::Function,
+                    signature: None,
+                    doc: None,
+                    visibility: Some(Visibility::Public),
+                    byte_range: 0..1,
+                    line_range: 1..1,
+                    body_start: None,
+                    parent_idx: None,
+                }],
+                ..SyntacticFacts::default()
+            })
+        }
+
+        fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
+            Some(Arc::new(FailingAnalyzer))
+        }
+    }
+
+    struct BackendWithFailingSyntax;
+
+    impl LanguageBackend for BackendWithFailingSyntax {
+        fn name(&self) -> &'static str {
+            "test-syntax-fails"
+        }
+
+        fn file_patterns(&self) -> &'static [&'static str] {
+            &["*.test"]
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "test-syntax-fails"
+        }
+
+        fn extract_syntactic(&self, _source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
+            Err(ExtractError::ParserFailure("syntactic failed".into()))
+        }
+    }
+
+    struct FailingAnalyzer;
+
+    impl Analyzer for FailingAnalyzer {
+        fn name(&self) -> &'static str {
+            "test-semantic-fails"
+        }
+
+        fn extract_semantic(
+            &self,
+            _source: &[u8],
+        ) -> Result<cairn_lang_api::SemanticFacts, ExtractError> {
+            Err(ExtractError::ParserFailure("semantic failed".into()))
+        }
     }
 }
