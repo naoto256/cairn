@@ -54,6 +54,8 @@ pub enum Error {
     AnchorNotFound { name: String },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error(transparent)]
+    Lsp(#[from] lsp::Error),
     #[error("schema corruption: {0}")]
     SchemaCorruption(String),
 }
