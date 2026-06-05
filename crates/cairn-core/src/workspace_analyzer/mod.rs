@@ -13,12 +13,12 @@ use linkme::distributed_slice;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::Result;
 use crate::cas::kind_conv::ref_kind_to_str;
 use crate::lsp::{Location, Position};
 use crate::manifest::{ManifestEntry, ManifestId};
+use crate::{Error, Result};
 
 /// Linker-time registry of workspace analyzers.
 ///
@@ -107,7 +107,24 @@ pub fn run_registered_workspace_analyzers(
     entries: &[ManifestEntry],
     now_ns: i64,
 ) -> Result<usize> {
-    let analyzers = all_workspace_analyzers();
+    run_workspace_analyzers(
+        conn,
+        repo_root,
+        manifest_id,
+        entries,
+        now_ns,
+        all_workspace_analyzers(),
+    )
+}
+
+fn run_workspace_analyzers(
+    conn: &mut Connection,
+    repo_root: &Path,
+    manifest_id: ManifestId,
+    entries: &[ManifestEntry],
+    now_ns: i64,
+    analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
+) -> Result<usize> {
     let mut inserted = 0;
     let config_hash = config_hash(repo_root);
 
@@ -177,16 +194,23 @@ pub fn run_registered_workspace_analyzers(
             }
             Err(err) => {
                 let message = err.to_string();
-                let status = if message.contains("LSP binary not available") {
+                let status = if is_content_modified_error(&err) {
+                    debug!(
+                        analyzer_id = analyzer.id(),
+                        error = %message,
+                        "transient: rust-analyzer content-modified during run"
+                    );
+                    RunStatus::Skipped
+                } else if message.contains("LSP binary not available") {
                     RunStatus::Skipped
                 } else {
+                    warn!(
+                        analyzer_id = analyzer.id(),
+                        error = %message,
+                        "workspace analyzer failed"
+                    );
                     RunStatus::Failed
                 };
-                warn!(
-                    analyzer_id = analyzer.id(),
-                    error = %message,
-                    "workspace analyzer failed"
-                );
                 mark_run(
                     conn,
                     RunRecord {
@@ -205,6 +229,10 @@ pub fn run_registered_workspace_analyzers(
     }
 
     Ok(inserted)
+}
+
+fn is_content_modified_error(err: &Error) -> bool {
+    matches!(err, Error::Lsp(lsp_err) if lsp_err.is_content_modified())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -535,6 +563,61 @@ mod tests {
     static FAKE_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
         || Box::new(FakeWorkspaceAnalyzer);
 
+    struct SuccessfulRustAnalyzer {
+        facts: WorkspaceFacts,
+    }
+
+    impl WorkspaceAnalyzer for SuccessfulRustAnalyzer {
+        fn id(&self) -> &'static str {
+            "rust-analyzer-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "rust"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+        ) -> Result<WorkspaceFacts> {
+            Ok(self.facts.clone())
+        }
+    }
+
+    struct ContentModifiedRustAnalyzer;
+
+    impl WorkspaceAnalyzer for ContentModifiedRustAnalyzer {
+        fn id(&self) -> &'static str {
+            "rust-analyzer-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "rust"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+        ) -> Result<WorkspaceFacts> {
+            Err(Error::Lsp(crate::lsp::Error::ResponseError {
+                code: crate::lsp::CONTENT_MODIFIED_ERROR_CODE,
+                message: "content modified".into(),
+            }))
+        }
+    }
+
     #[test]
     fn discovers_registered_workspace_analyzer() {
         let analyzers = all_workspace_analyzers();
@@ -643,5 +726,128 @@ mod tests {
         assert_eq!(row.2, "tier3-rust-analyzer");
         assert!(row.3.is_some());
         assert_eq!(row.4, 7);
+    }
+
+    #[test]
+    fn content_modified_run_is_skipped_without_deleting_prior_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/main.rs"), "fn main() { foo(); }\n").unwrap();
+        std::fs::write(repo_root.join("src/lib.rs"), "pub fn foo() {}\n").unwrap();
+
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "source-sha";
+        let target_sha = "target-sha";
+        let manifest_id = ManifestId(1);
+        let entries = vec![
+            ManifestEntry {
+                path: "src/main.rs".into(),
+                blob_sha: source_sha.into(),
+            },
+            ManifestEntry {
+                path: "src/lib.rs".into(),
+                blob_sha: target_sha.into(),
+            },
+        ];
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/main.rs', ?1), (1, 'src/lib.rs', ?2)",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'tree-sitter-rust', 1, 0), (?2, 'tree-sitter-rust', 1, 0)",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, 'tree-sitter-rust', 'main', 'crate::main', 'function',
+                0, 200, 1, 10, 'syn'),
+               (?2, 'tree-sitter-rust', 'foo', 'crate::foo', 'function',
+                0, 20, 1, 1, 'syn')",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: vec![ResolvedRef {
+                source_path: "src/main.rs".to_string(),
+                source_position: Position {
+                    line: 0,
+                    character: 12,
+                },
+                source_byte_range: 12..15,
+                target: Location {
+                    uri: crate::lsp::Url::from("file:///repo/src/lib.rs"),
+                    range: crate::lsp::Range {
+                        start: Position {
+                            line: 0,
+                            character: 7,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 10,
+                        },
+                    },
+                },
+                target_path: Some("src/lib.rs".to_string()),
+            }],
+        };
+
+        let inserted = run_workspace_analyzers(
+            &mut conn,
+            &repo_root,
+            manifest_id,
+            &entries,
+            10,
+            vec![Box::new(SuccessfulRustAnalyzer { facts })],
+        )
+        .unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(tier3_ref_count(&conn), 1);
+
+        let inserted = run_workspace_analyzers(
+            &mut conn,
+            &repo_root,
+            manifest_id,
+            &entries,
+            20,
+            vec![Box::new(ContentModifiedRustAnalyzer)],
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        assert_eq!(tier3_ref_count(&conn), 1);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'rust-analyzer-lsp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "skipped");
+    }
+
+    fn tier3_ref_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM refs WHERE source = 'tier3-rust-analyzer'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 }

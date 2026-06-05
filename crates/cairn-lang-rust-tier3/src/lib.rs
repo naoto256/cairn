@@ -154,14 +154,6 @@ where
                 retried_content_modified = true;
                 tokio::time::sleep(CONTENT_MODIFIED_RETRY_DELAY).await;
             }
-            Err(err) if err.is_content_modified() => {
-                debug!(
-                    uri = uri.as_str(),
-                    ?position,
-                    "rust-analyzer content modified after retry; skipping definition"
-                );
-                return Ok(Vec::new());
-            }
             Err(err) if is_file_not_found(&err) && attempt < 2 => {
                 tokio::time::sleep(delay).await;
                 delay *= 2;
@@ -181,7 +173,10 @@ fn is_file_not_found(err: &cairn_core::lsp::Error) -> bool {
 }
 
 fn core_error_to_lsp(err: Error) -> cairn_core::lsp::Error {
-    cairn_core::lsp::Error::Protocol(err.to_string())
+    match err {
+        Error::Lsp(err) => err,
+        err => cairn_core::lsp::Error::Protocol(err.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,7 +284,7 @@ fn hex_value(b: u8) -> Option<u8> {
 }
 
 fn map_lsp_error(err: cairn_core::lsp::Error) -> Error {
-    Error::InvalidArgument(err.to_string())
+    Error::Lsp(err)
 }
 
 #[cfg(test)]
@@ -341,7 +336,51 @@ fn main() {
     }
 
     #[tokio::test]
-    async fn content_modified_retries_once_then_skips_definition() {
+    async fn content_modified_retry_success_preserves_locations() {
+        let attempts = Cell::new(0);
+        let uri = Url::from("file:///tmp/repo/src/lib.rs");
+        let position = Position {
+            line: 3,
+            character: 12,
+        };
+        let location = Location {
+            uri: Url::from("file:///tmp/repo/src/lib.rs"),
+            range: cairn_core::lsp::Range {
+                start: Position {
+                    line: 9,
+                    character: 4,
+                },
+                end: Position {
+                    line: 9,
+                    character: 7,
+                },
+            },
+        };
+
+        let locations = definition_with_retry_from(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    ready(Err(cairn_core::lsp::Error::ResponseError {
+                        code: cairn_core::lsp::CONTENT_MODIFIED_ERROR_CODE,
+                        message: "content modified".into(),
+                    }))
+                } else {
+                    ready(Ok(vec![location.clone()]))
+                }
+            },
+            &uri,
+            position,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(locations, vec![location]);
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_content_modified_retries_once_then_returns_error() {
         let attempts = Cell::new(0);
         let uri = Url::from("file:///tmp/repo/src/lib.rs");
         let position = Position {
@@ -361,9 +400,9 @@ fn main() {
             position,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(locations.is_empty());
+        assert!(matches!(locations, Error::Lsp(err) if err.is_content_modified()));
         assert_eq!(attempts.get(), 2);
     }
 }
