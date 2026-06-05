@@ -12,7 +12,7 @@ use tracing::info;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::register::register_repo as cas_register;
+use crate::register::register_repo_force_analyzers as cas_register;
 use crate::{Error, Result};
 
 struct ReindexRepo;
