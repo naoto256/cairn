@@ -1,12 +1,12 @@
 //! Blob-scoped TypeScript Tier-2 analyzer.
 //!
 //! PR1 intentionally stays syntactic: it reparses one `.ts` blob with
-//! tree-sitter and emits call refs plus annotation/type refs. Imports,
-//! impl edges, and doc overrides remain Tier-1/follow-up surfaces.
+//! tree-sitter and emits call refs, annotation/type refs, and heritage
+//! impl edges. Imports and doc overrides remain Tier-1/follow-up surfaces.
 
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, RefFact, RefKind, SemanticFacts, TypeRole};
+use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, TypeRole};
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -54,6 +54,9 @@ impl TsSemanticWalker {
         }
 
         match node.kind() {
+            // TS namespaces (`internal_module`) are not yet pushed;
+            // doing so would require Tier-1 to recognize them too.
+            // Tracked as a future PR.
             "class_declaration" | "interface_declaration" | "enum_declaration" => {
                 self.walk_container(node, source);
             }
@@ -91,12 +94,54 @@ impl TsSemanticWalker {
         if let Some(name) = declaration_name(node, source) {
             let qualified = self.qualify(&name);
             let previous_enclosing = self.enclosing.replace(qualified.clone());
+            self.emit_heritage(node, source, &qualified);
             self.containers.push(name);
             self.walk_children(node, source);
             self.containers.pop();
             self.enclosing = previous_enclosing;
         } else {
             self.walk_children(node, source);
+        }
+    }
+
+    fn emit_heritage(&mut self, node: Node<'_>, source: &[u8], type_qualified: &str) {
+        match node.kind() {
+            "class_declaration" => {
+                if let Some(heritage) = find_direct_child(node, "class_heritage") {
+                    for clause in direct_children_by_kind(heritage, "extends_clause") {
+                        self.emit_heritage_clause(clause, source, type_qualified, "inherit");
+                    }
+                    for clause in direct_children_by_kind(heritage, "implements_clause") {
+                        self.emit_heritage_clause(clause, source, type_qualified, "implement");
+                    }
+                }
+            }
+            "interface_declaration" => {
+                for clause in direct_children_by_kind(node, "extends_type_clause") {
+                    self.emit_heritage_clause(clause, source, type_qualified, "inherit");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_heritage_clause(
+        &mut self,
+        clause: Node<'_>,
+        source: &[u8],
+        type_qualified: &str,
+        kind: &str,
+    ) {
+        let mut cursor = clause.walk();
+        for child in clause.named_children(&mut cursor) {
+            if let Some((interface_qualified, name_node)) = heritage_name(child, source) {
+                self.facts.impls.push(ImplFact {
+                    type_qualified: type_qualified.to_string(),
+                    interface_qualified: Some(interface_qualified),
+                    kind: kind.to_string(),
+                    line: line_of(name_node),
+                });
+            }
         }
     }
 
@@ -237,7 +282,9 @@ impl TsSemanticWalker {
 }
 
 fn declaration_name(node: Node<'_>, source: &[u8]) -> Option<String> {
-    child_by_field(node, "name").map(|name| node_text(name, source).to_string())
+    child_by_field(node, "name")
+        .or_else(|| child_by_field(node, "identifier"))
+        .map(|name| node_text(name, source).to_string())
 }
 
 fn callable_name(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -269,6 +316,25 @@ fn normalized_text(node: Node<'_>, source: &[u8]) -> String {
     node_text(node, source).split_whitespace().collect()
 }
 
+fn heritage_name<'a>(node: Node<'a>, source: &[u8]) -> Option<(String, Node<'a>)> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "nested_type_identifier" => {
+            Some((normalized_text(node, source), node))
+        }
+        "generic_type" | "expression_with_type_arguments" => {
+            first_named_child(node).and_then(|child| heritage_name(child, source))
+        }
+        // Mixin / computed bases need semantic resolution, so PR2 skips them.
+        "call_expression" | "new_expression" | "subscript_expression" => None,
+        "type_arguments" => None,
+        _ => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| heritage_name(child, source))
+        }
+    }
+}
+
 fn is_builtin_type(text: &str) -> bool {
     matches!(
         text,
@@ -291,6 +357,13 @@ fn find_direct_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .find(|child| child.kind() == kind)
+}
+
+fn direct_children_by_kind<'a>(node: Node<'a>, kind: &str) -> Vec<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == kind)
+        .collect()
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -343,6 +416,10 @@ mod tests {
 
     fn refs(src: &str) -> Vec<RefFact> {
         semantic(src).refs
+    }
+
+    fn impls(src: &str) -> Vec<ImplFact> {
+        semantic(src).impls
     }
 
     #[test]
@@ -432,8 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn leaves_non_pr1_fact_sets_empty() {
-        let facts = semantic("import { Foo } from './foo'; class C extends B implements I {}");
+    fn leaves_non_heritage_fact_sets_empty() {
+        let facts = semantic("import { Foo } from './foo'; class C {}");
         assert!(facts.imports.is_empty());
         assert!(facts.impls.is_empty());
         assert!(facts.doc_overrides.is_empty());
@@ -455,6 +532,114 @@ mod tests {
             r.kind == RefKind::Call
                 && r.target_name == "bar"
                 && r.enclosing_qualified.as_deref() == Some("alsoOk")
+        }));
+    }
+
+    #[test]
+    fn emits_class_extends_inheritance_edge() {
+        let impls = impls(
+            "class A {}\n\
+             \n\
+             class Dog extends Animal {}",
+        );
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].type_qualified, "Dog");
+        assert_eq!(impls[0].interface_qualified.as_deref(), Some("Animal"));
+        assert_eq!(impls[0].kind, "inherit");
+        assert_eq!(impls[0].line, 3);
+    }
+
+    #[test]
+    fn emits_class_implements_edge() {
+        let impls = impls("class Dog implements Pet {}");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].type_qualified, "Dog");
+        assert_eq!(impls[0].interface_qualified.as_deref(), Some("Pet"));
+        assert_eq!(impls[0].kind, "implement");
+    }
+
+    #[test]
+    fn emits_class_extends_and_multiple_implements_edges() {
+        let impls = impls("class Dog extends Animal implements Pet, Walker {}");
+        let rows: Vec<(&str, Option<&str>, &str)> = impls
+            .iter()
+            .map(|i| {
+                (
+                    i.type_qualified.as_str(),
+                    i.interface_qualified.as_deref(),
+                    i.kind.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Dog", Some("Animal"), "inherit"),
+                ("Dog", Some("Pet"), "implement"),
+                ("Dog", Some("Walker"), "implement"),
+            ]
+        );
+    }
+
+    #[test]
+    fn emits_interface_extends_edge() {
+        let impls = impls("interface A extends B {}");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].type_qualified, "A");
+        assert_eq!(impls[0].interface_qualified.as_deref(), Some("B"));
+        assert_eq!(impls[0].kind, "inherit");
+    }
+
+    #[test]
+    fn emits_interface_multiple_extends_edges() {
+        let impls = impls("interface A extends B, C {}");
+        let bases: Vec<&str> = impls
+            .iter()
+            .map(|i| i.interface_qualified.as_deref().unwrap())
+            .collect();
+        assert_eq!(bases, vec!["B", "C"]);
+        assert!(impls.iter().all(|i| i.type_qualified == "A"));
+        assert!(impls.iter().all(|i| i.kind == "inherit"));
+    }
+
+    #[test]
+    fn strips_generic_arguments_from_heritage_names() {
+        let impls = impls("class Dog extends Animal<string> {}");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].interface_qualified.as_deref(), Some("Animal"));
+    }
+
+    #[test]
+    fn skips_call_expression_mixin_bases() {
+        let impls = impls("class C extends Mixin(Base) {}");
+        assert!(impls.is_empty(), "{impls:?}");
+    }
+
+    #[test]
+    fn namespace_class_heritage_matches_tier1_unqualified_container_limit() {
+        let impls = impls("namespace ns { export class Dog extends Animal {} }");
+        assert!(
+            impls.iter().any(|i| {
+                i.type_qualified == "Dog"
+                    && i.interface_qualified.as_deref() == Some("Animal")
+                    && i.kind == "inherit"
+            }),
+            "{impls:?}"
+        );
+    }
+
+    #[test]
+    fn recovered_parse_keeps_impls_from_valid_regions() {
+        let impls = impls(
+            "class Ok extends Base {}\n\
+             function broken() { let x: =; }\n\
+             interface AlsoOk extends Other {}\n",
+        );
+        assert!(impls.iter().any(|i| {
+            i.type_qualified == "Ok" && i.interface_qualified.as_deref() == Some("Base")
+        }));
+        assert!(impls.iter().any(|i| {
+            i.type_qualified == "AlsoOk" && i.interface_qualified.as_deref() == Some("Other")
         }));
     }
 
