@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use cairn_lang_go as _;
 use cairn_lang_markdown as _;
 use cairn_lang_python as _;
+use cairn_lang_python_tier3 as _;
 use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
 use cairn_lang_typescript as _;
@@ -98,6 +99,6 @@ mod tests {
             .collect::<Vec<_>>();
         analyzer_ids.sort_unstable();
 
-        assert_eq!(analyzer_ids, ["rust-analyzer-lsp"]);
+        assert_eq!(analyzer_ids, ["pyright-lsp", "rust-analyzer-lsp"]);
     }
 }

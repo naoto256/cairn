@@ -8,7 +8,7 @@
 pub mod pool;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -146,8 +146,9 @@ pub struct Location {
 
 pub struct LspClient {
     binary_path: Option<PathBuf>,
+    args: Vec<String>,
     workspace_root: PathBuf,
-    config_hash: String,
+    initialization_options: Value,
     timeout: Duration,
     max_restarts: usize,
     restarts: AtomicUsize,
@@ -186,8 +187,32 @@ impl LspClient {
         check_binary_available(binary_path, request_timeout).await?;
         let client = Self::new(
             Some(binary_path.to_path_buf()),
+            Vec::new(),
             workspace_root.to_path_buf(),
-            config_hash.to_string(),
+            rust_analyzer_initialization_options(config_hash),
+            request_timeout,
+            MAX_RESTARTS,
+        );
+        client.spawn_process().await?;
+        Ok(client)
+    }
+
+    /// Start a pyright-langserver subprocess using a custom request timeout.
+    ///
+    /// # Errors
+    /// See [`Self::start`].
+    pub async fn start_pyright_with_timeout(
+        binary_path: &Path,
+        workspace_root: &Path,
+        _config_hash: &str,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        check_pyright_available(binary_path)?;
+        let client = Self::new(
+            Some(binary_path.to_path_buf()),
+            vec!["--stdio".to_string()],
+            workspace_root.to_path_buf(),
+            json!({}),
             request_timeout,
             MAX_RESTARTS,
         );
@@ -197,15 +222,17 @@ impl LspClient {
 
     fn new(
         binary_path: Option<PathBuf>,
+        args: Vec<String>,
         workspace_root: PathBuf,
-        config_hash: String,
+        initialization_options: Value,
         request_timeout: Duration,
         max_restarts: usize,
     ) -> Self {
         Self {
             binary_path,
+            args,
             workspace_root,
-            config_hash,
+            initialization_options,
             timeout: request_timeout,
             max_restarts,
             restarts: AtomicUsize::new(0),
@@ -232,8 +259,9 @@ impl LspClient {
     {
         let client = Self::new(
             None,
+            Vec::new(),
             workspace_root.to_path_buf(),
-            config_hash.to_string(),
+            rust_analyzer_initialization_options(config_hash),
             request_timeout,
             0,
         );
@@ -257,6 +285,7 @@ impl LspClient {
         }
 
         let mut child = Command::new(binary_path)
+            .args(&self.args)
             .current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -299,12 +328,25 @@ impl LspClient {
 
     async fn initialize(&self) -> Result<()> {
         let root_uri = Url::from_file_path(&self.workspace_root)?;
+        let root_path = self.workspace_root.to_string_lossy();
+        let workspace_name = self
+            .workspace_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
         let _: Value = self
             .request(
                 "initialize",
                 json!({
                     "processId": Value::Null,
+                    "rootPath": root_path,
                     "rootUri": root_uri.as_str(),
+                    "workspaceFolders": [
+                        {
+                            "uri": root_uri.as_str(),
+                            "name": workspace_name,
+                        }
+                    ],
                     "capabilities": {
                         "window": {
                             "workDoneProgress": true
@@ -315,12 +357,7 @@ impl LspClient {
                             }
                         }
                     },
-                    "initializationOptions": {
-                        "cairnConfigHash": self.config_hash,
-                        "experimental": {
-                            "serverStatusNotification": true
-                        },
-                    },
+                    "initializationOptions": self.initialization_options.clone(),
                 }),
             )
             .await
@@ -531,6 +568,15 @@ impl LspClient {
     }
 }
 
+fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
+    json!({
+        "cairnConfigHash": config_hash,
+        "experimental": {
+            "serverStatusNotification": true
+        },
+    })
+}
+
 async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -> Result<()> {
     let output = timeout(
         request_timeout,
@@ -550,6 +596,49 @@ async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -
     } else {
         Err(Error::BinaryMissing(binary_path.to_path_buf()))
     }
+}
+
+fn check_pyright_available(binary_path: &Path) -> Result<()> {
+    let resolved = resolve_executable(binary_path)
+        .ok_or_else(|| Error::BinaryMissing(binary_path.to_path_buf()))?;
+    if is_executable(&resolved) {
+        Ok(())
+    } else {
+        Err(Error::BinaryMissing(binary_path.to_path_buf()))
+    }
+}
+
+fn resolve_executable(binary_path: &Path) -> Option<PathBuf> {
+    if has_path_separator(binary_path) {
+        return binary_path.exists().then(|| binary_path.to_path_buf());
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(binary_path))
+            .find(|candidate| candidate.exists())
+    })
+}
+
+fn has_path_separator(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+        || path.components().count() > 1
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 async fn reader_loop<R>(

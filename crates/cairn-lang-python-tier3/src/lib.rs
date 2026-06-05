@@ -1,9 +1,9 @@
-//! Rust Tier-3 workspace analyzer.
+//! Python Tier-3 workspace analyzer backed by pyright LSP.
 //!
-//! The syn Tier-2 analyzer records method calls by bare method name.
-//! This crate asks rust-analyzer for the definition under each method
-//! identifier so the core runner can persist a resolved
-//! `target_qualified` ref.
+//! The tree-sitter Tier-2 analyzer records receiver calls by bare
+//! method name. This crate asks pyright for the definition under each
+//! attribute call's method identifier so the core runner can persist a
+//! resolved `target_qualified` ref.
 
 #![forbid(unsafe_code)]
 
@@ -11,7 +11,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_core::lsp::pool::{self as lsp_pool, PoolKey, PooledRustAnalyzer, RustAnalyzerSpawnSpec};
+use cairn_core::lsp::pool::{self as lsp_pool, PoolKey, PooledPyright, PyrightSpawnSpec};
 use cairn_core::lsp::{Location, Position, Url};
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
@@ -22,16 +22,15 @@ use linkme::distributed_slice;
 use tracing::debug;
 use tree_sitter::Node;
 
-const ANALYZER_ID: &str = "rust-analyzer-lsp";
+const ANALYZER_ID: &str = "pyright-lsp";
 const ANALYZER_REVISION: u32 = 1;
-const CONFIG_HASH: &str = "rust-analyzer-lsp-v1";
+const CONFIG_HASH: &str = "pyright-lsp-v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const WORKSPACE_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-pub struct RustAnalyzerWorkspaceAnalyzer;
+pub struct PyrightWorkspaceAnalyzer;
 
-impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
+impl WorkspaceAnalyzer for PyrightWorkspaceAnalyzer {
     fn id(&self) -> &'static str {
         ANALYZER_ID
     }
@@ -41,11 +40,11 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
     }
 
     fn language(&self) -> &'static str {
-        "rust"
+        "python"
     }
 
     fn parser_id(&self) -> &'static str {
-        "tree-sitter-rust"
+        "tree-sitter-python"
     }
 
     fn analyze_workspace(
@@ -54,20 +53,19 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
     ) -> Result<WorkspaceFacts> {
-        let binary = rust_analyzer_binary();
-        let key = PoolKey::rust_analyzer(repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
+        let binary = pyright_binary();
+        let key = PoolKey::pyright(repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
             .map_err(map_lsp_error)?;
-        let spawn_spec = RustAnalyzerSpawnSpec {
+        let spawn_spec = PyrightSpawnSpec {
             binary,
             workspace_root: repo_root.to_path_buf(),
             config_hash: CONFIG_HASH.to_string(),
             request_timeout: REQUEST_TIMEOUT,
-            workspace_load_timeout: WORKSPACE_LOAD_TIMEOUT,
         };
         let repo_root = repo_root.to_path_buf();
         let files = files.to_vec();
         let pool = lsp_pool::global().map_err(map_lsp_error)?;
-        pool.with_rust_analyzer(key, spawn_spec, |client| {
+        pool.with_pyright(key, spawn_spec, |client| {
             Box::pin(async move {
                 let mut facts = WorkspaceFacts::default();
                 collect_resolved_refs(client, &repo_root, &files, &mut facts)
@@ -81,17 +79,17 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
 }
 
 #[distributed_slice(WORKSPACE_ANALYZERS)]
-static REGISTER_RUST_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
-    || Box::new(RustAnalyzerWorkspaceAnalyzer);
+static REGISTER_PYTHON_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
+    || Box::new(PyrightWorkspaceAnalyzer);
 
-fn rust_analyzer_binary() -> PathBuf {
-    std::env::var_os("RUST_ANALYZER")
+fn pyright_binary() -> PathBuf {
+    std::env::var_os("PYRIGHT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rust-analyzer"))
+        .unwrap_or_else(|| PathBuf::from("pyright-langserver"))
 }
 
 async fn collect_resolved_refs(
-    client: &mut PooledRustAnalyzer<'_>,
+    client: &mut PooledPyright<'_>,
     repo_root: &Path,
     files: &[WorkspaceFile],
     facts: &mut WorkspaceFacts,
@@ -107,7 +105,7 @@ async fn collect_resolved_refs(
         }
         let uri = Url::from_file_path(path).map_err(map_lsp_error)?;
         client
-            .sync_document(&uri, "rust", &source)
+            .sync_document(&uri, "python", &source)
             .await
             .map_err(map_lsp_error)?;
         for call in calls {
@@ -128,7 +126,7 @@ async fn collect_resolved_refs(
 }
 
 async fn definition_with_retry(
-    client: &PooledRustAnalyzer<'_>,
+    client: &PooledPyright<'_>,
     uri: &Url,
     position: Position,
 ) -> Result<Vec<Location>> {
@@ -145,15 +143,25 @@ where
     Fut: Future<Output = cairn_core::lsp::Result<Vec<Location>>>,
 {
     let mut delay = Duration::from_millis(200);
+    let mut retried_empty_definition = false;
     let mut retried_content_modified = false;
     for attempt in 0..3 {
         match definition().await {
+            Ok(locations) if !locations.is_empty() => return Ok(locations),
+            // Pyright can return an empty definition result for a
+            // document that was just didOpen'd before its analysis pass
+            // completes. One retry covers the typical post-didOpen lag.
+            Ok(_) if !retried_empty_definition => {
+                retried_empty_definition = true;
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
             Ok(locations) => return Ok(locations),
             Err(err) if err.is_content_modified() && !retried_content_modified => {
                 debug!(
                     uri = uri.as_str(),
                     ?position,
-                    "rust-analyzer content modified; retrying definition once"
+                    "pyright content modified; retrying definition once"
                 );
                 retried_content_modified = true;
                 tokio::time::sleep(CONTENT_MODIFIED_RETRY_DELAY).await;
@@ -191,21 +199,21 @@ struct MethodCallSite {
 }
 
 fn collect_method_calls(source: &[u8]) -> Result<Vec<MethodCallSite>> {
-    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&language)
-        .map_err(|e| Error::InvalidArgument(format!("tree-sitter rust: {e}")))?;
+        .map_err(|e| Error::InvalidArgument(format!("tree-sitter python: {e}")))?;
     let tree = parser
         .parse(source, None)
-        .ok_or_else(|| Error::InvalidArgument("tree-sitter rust parse failed".into()))?;
+        .ok_or_else(|| Error::InvalidArgument("tree-sitter python parse failed".into()))?;
     let mut out = Vec::new();
     collect_method_calls_from_node(tree.root_node(), &mut out);
     Ok(out)
 }
 
 fn collect_method_calls_from_node(node: Node<'_>, out: &mut Vec<MethodCallSite>) {
-    if node.kind() == "call_expression"
+    if node.kind() == "call"
         && let Some(function) = node.child_by_field_name("function")
         && let Some(method) = method_identifier(function)
     {
@@ -228,25 +236,9 @@ fn collect_method_calls_from_node(node: Node<'_>, out: &mut Vec<MethodCallSite>)
 
 fn method_identifier(function: Node<'_>) -> Option<Node<'_>> {
     match function.kind() {
-        "field_expression" => function.child_by_field_name("field"),
-        "scoped_identifier" | "generic_function" | "scoped_type_identifier" => function
-            .child_by_field_name("name")
-            .or_else(|| last_identifier_child(function)),
+        "attribute" => function.child_by_field_name("attribute"),
         _ => None,
     }
-}
-
-fn last_identifier_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut found = None;
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind().ends_with("identifier") {
-            found = Some(child);
-        } else if let Some(inner) = last_identifier_child(child) {
-            found = Some(inner);
-        }
-    }
-    found
 }
 
 fn location_to_repo_path(repo_root: &Path, location: &Location) -> Option<String> {
@@ -295,34 +287,57 @@ fn map_lsp_error(err: cairn_core::lsp::Error) -> Error {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::fs;
     use std::future::ready;
+    use std::process::Command;
+
+    use cairn_core::anchor::AnchorName;
+    use cairn_core::cas::store;
+    use cairn_core::query::{FindReferencesArgs, find_references};
+    use cairn_core::register::register_repo;
+    use cairn_lang_python as _;
 
     #[test]
-    fn method_call_collector_finds_method_identifier_positions() {
+    fn method_call_collector_finds_attribute_call_positions() {
         let source = br#"
-struct Foo;
-impl Foo {
-    fn bar(&self) {}
-}
-fn main() {
-    let f = Foo;
-    f.bar();
-    String::new();
-}
+class Foo:
+    def bar(self):
+        pass
+
+def main(obj):
+    obj.method()
+    foo()
 "#;
 
         let calls = collect_method_calls(source).unwrap();
 
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].position.line, 7);
-        assert_eq!(calls[0].position.character, 6);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].position.line, 6);
+        assert_eq!(calls[0].position.character, 8);
         assert!(calls[0].byte_end > calls[0].byte_start);
+    }
+
+    #[test]
+    fn nested_receiver_chain_reports_innermost_method() {
+        let source = b"def main(a):\n    a.b.c()\n";
+
+        let calls = collect_method_calls(source).unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].position.line, 1);
+        assert_eq!(calls[0].position.character, 8);
+    }
+
+    #[test]
+    fn malformed_python_input_does_not_panic() {
+        let calls = collect_method_calls(b"def main(:\n").unwrap();
+        assert!(calls.is_empty());
     }
 
     #[test]
     fn file_uri_maps_to_repo_relative_path() {
         let location = Location {
-            uri: Url::from("file:///tmp/repo/crates/foo/src/lib.rs"),
+            uri: Url::from("file:///tmp/repo/pkg/foo.py"),
             range: cairn_core::lsp::Range {
                 start: Position {
                     line: 0,
@@ -336,19 +351,19 @@ fn main() {
         };
 
         let rel = location_to_repo_path(Path::new("/tmp/repo"), &location).unwrap();
-        assert_eq!(rel, "crates/foo/src/lib.rs");
+        assert_eq!(rel, "pkg/foo.py");
     }
 
     #[tokio::test]
     async fn content_modified_retry_success_preserves_locations() {
         let attempts = Cell::new(0);
-        let uri = Url::from("file:///tmp/repo/src/lib.rs");
+        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
         let position = Position {
             line: 3,
             character: 12,
         };
         let location = Location {
-            uri: Url::from("file:///tmp/repo/src/lib.rs"),
+            uri: Url::from("file:///tmp/repo/pkg/foo.py"),
             range: cairn_core::lsp::Range {
                 start: Position {
                     line: 9,
@@ -384,9 +399,74 @@ fn main() {
     }
 
     #[tokio::test]
+    async fn empty_definition_retries_once_then_returns_resolved() {
+        let attempts = Cell::new(0);
+        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
+        let position = Position {
+            line: 5,
+            character: 6,
+        };
+        let location = Location {
+            uri: Url::from("file:///tmp/repo/pkg/foo.py"),
+            range: cairn_core::lsp::Range {
+                start: Position {
+                    line: 1,
+                    character: 8,
+                },
+                end: Position {
+                    line: 1,
+                    character: 9,
+                },
+            },
+        };
+
+        let locations = definition_with_retry_from(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    ready(Ok(Vec::new()))
+                } else {
+                    ready(Ok(vec![location.clone()]))
+                }
+            },
+            &uri,
+            position,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(locations, vec![location]);
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_empty_definition_retries_once_then_returns_empty() {
+        let attempts = Cell::new(0);
+        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
+        let position = Position {
+            line: 5,
+            character: 6,
+        };
+
+        let locations = definition_with_retry_from(
+            || {
+                attempts.set(attempts.get() + 1);
+                ready(Ok(Vec::new()))
+            },
+            &uri,
+            position,
+        )
+        .await
+        .unwrap();
+
+        assert!(locations.is_empty());
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test]
     async fn repeated_content_modified_retries_once_then_returns_error() {
         let attempts = Cell::new(0);
-        let uri = Url::from("file:///tmp/repo/src/lib.rs");
+        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
         let position = Position {
             line: 3,
             character: 12,
@@ -408,5 +488,120 @@ fn main() {
 
         assert!(matches!(locations, Error::Lsp(err) if err.is_content_modified()));
         assert_eq!(attempts.get(), 2);
+    }
+
+    /// Runs only when pyright-langserver is available on PATH (or via
+    /// PYRIGHT) because it exercises the real LSP binary startup and
+    /// definition path instead of the unit-test mocks.
+    #[test]
+    fn real_pyright_register_repo_surfaces_resolved_method_reference() {
+        if resolve_test_pyright().is_none() {
+            eprintln!("pyright not on PATH; skipping integration test");
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let pkg = repo.path().join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        fs::write(
+            pkg.join("a.py"),
+            "class A:\n    def m(self):\n        pass\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("b.py"),
+            "from pkg.a import A\n\n\ndef run():\n    a = A()\n    a.m()\n",
+        )
+        .unwrap();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "fixture"]);
+
+        let db = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db.path().join("store.db")).unwrap();
+        register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        let hits = find_references(
+            &conn,
+            &AnchorName::head(),
+            &FindReferencesArgs {
+                symbol: "m".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let runs = workspace_runs(&conn);
+        let ref_sources = ref_sources(&conn);
+
+        assert!(
+            hits.iter().any(|hit| {
+                hit.path == "pkg/b.py"
+                    && hit.line == 6
+                    && hit.target_name == "m"
+                    && hit.target_qualified.as_deref() == Some("A.m")
+            }),
+            "expected resolved pyright method ref in pkg/b.py, got hits={hits:?}, runs={runs:?}, ref_sources={ref_sources:?}"
+        );
+    }
+
+    fn resolve_test_pyright() -> Option<PathBuf> {
+        let binary = pyright_binary();
+        if binary.components().count() > 1 {
+            return binary.exists().then_some(binary);
+        }
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(&binary))
+                .find(|candidate| candidate.exists())
+        })
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn workspace_runs(conn: &rusqlite::Connection) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT analyzer_id, status, error
+                 FROM workspace_analysis_runs
+                 ORDER BY analyzer_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn ref_sources(conn: &rusqlite::Connection) -> Vec<(String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, target_qualified
+                 FROM refs
+                 ORDER BY source, target_qualified",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
     }
 }

@@ -24,6 +24,7 @@ cairn-proto.workspace = true
 cairn-lang-rust.workspace = true
 cairn-lang-rust-tier3.workspace = true
 cairn-lang-python.workspace = true
+cairn-lang-python-tier3.workspace = true
 cairn-lang-markdown.workspace = true
 cairn-lang-typescript.workspace = true
 cairn-lang-go.workspace = true
