@@ -128,8 +128,12 @@ resolved method-call refs back into `refs` under
 `find_references` automatically. If `rust-analyzer` is not on
 `PATH` the analyzer logs the run as `Skipped` and leaves Tier-1 /
 Tier-2 facts untouched. TypeScript covers `*.ts`, `*.mts`,
-`*.cts`; `.tsx` lives in a separate upstream grammar and is
-intentionally a follow-up backend. Go covers `*.go` (functions,
+`*.cts`, with a blob-scoped Tier-2 analyzer for call refs and
+type-role refs (params, returns, fields, aliases, generic
+bounds); member-expression calls are intentionally left
+unresolved pending import-derived alias tracking, mirroring the
+Rust / Python receiver-type policy. `.tsx` lives in a separate
+upstream grammar and is intentionally a follow-up backend. Go covers `*.go` (functions,
 methods with receiver-qualified names, named types, top-level
 constants and variables, imports); Tier-2 via `gopls` is reserved
 as future work, and exported-vs-unexported visibility (Go's
