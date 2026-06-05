@@ -26,6 +26,8 @@ const REINDEX_DEBOUNCE: Duration = Duration::from_millis(500);
 pub struct WatchManager {
     cas_data_dir: Arc<CasDataDir>,
     backend: WatchBackend,
+    #[cfg(test)]
+    fail_watcher_start: bool,
     watchers: Mutex<HashMap<String, RepoWatcher>>,
 }
 
@@ -51,6 +53,19 @@ impl WatchManager {
         Self {
             cas_data_dir,
             backend,
+            #[cfg(test)]
+            fail_watcher_start: false,
+            watchers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_failing_watcher(cas_data_dir: Arc<CasDataDir>) -> Self {
+        Self {
+            cas_data_dir,
+            backend: WatchBackend::Poll,
+            fail_watcher_start: true,
             watchers: Mutex::new(HashMap::new()),
         }
     }
@@ -76,6 +91,14 @@ impl WatchManager {
 
     /// Start or replace the watcher for one alias.
     pub fn watch_alias(&self, alias: String, root_path: PathBuf) -> Result<()> {
+        self.unwatch_alias(&alias);
+        #[cfg(test)]
+        if self.fail_watcher_start {
+            return Err(Error::InvalidArgument(
+                "injected watcher start failure".into(),
+            ));
+        }
+
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = watch_repo_with_backend(&root_path, WATCH_DEBOUNCE, tx, self.backend)
             .map_err(|e| {
@@ -112,6 +135,14 @@ impl WatchManager {
         {
             info!(alias = %alias, "repo watcher stopped");
         }
+    }
+
+    #[cfg(test)]
+    pub fn is_watching_alias(&self, alias: &str) -> bool {
+        self.watchers
+            .lock()
+            .expect("watch manager mutex poisoned")
+            .contains_key(alias)
     }
 }
 
