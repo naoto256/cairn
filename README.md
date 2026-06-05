@@ -31,8 +31,12 @@ Storage is content-addressed, modelled on git's object store:
 `blob_sha` is git's blob hash, so the same file content parses once
 and is shared across every branch / tag / worktree that references
 it. Switching branches re-binds anchors instead of accreting per-branch
-databases. Detached HEAD checkouts don't create snapshot rows. Past
-states stay queryable through the branch anchors that hold them.
+databases. Detached HEAD checkouts don't create snapshot rows.
+`branch/<n>` and `tag/<n>` anchors track live git refs: a ref that
+disappears from `git for-each-ref` (deleted branch, expired tag) is
+pruned from the anchor table on the next register / reindex pass,
+so `cairn ctl status` and `list_repos` don't keep stale labels.
+`HEAD` and `tentative/<id>` are not subject to that prune.
 
 Substrate sources:
 [`anchor.rs`](crates/cairn-core/src/anchor.rs),

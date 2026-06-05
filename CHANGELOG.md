@@ -7,6 +7,23 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.1.0-alpha.4] — Unreleased
 
+### Fixed
+
+- **Stale `branch/*` / `tag/*` anchors no longer linger in
+  `cairn ctl status` after a local git ref deletion.** Surfaced by
+  the closed-beta stress test against tokio (`#6`): a local branch
+  deleted via `git branch -D` after its anchors were registered
+  continued to appear in snapshot labels until the daemon was
+  restarted with a fresh CAS. `register_repo` (which the file
+  watcher calls on every reindex) now reconciles stored
+  `branch/*` / `tag/*` anchors against `git for-each-ref` output
+  inside the same transaction as the anchor upserts, deleting any
+  whose suffix is no longer a live ref. `HEAD` and `tentative/*`
+  are intentionally not pruned. As a consequence, deleted-ref
+  history is no longer retained via the anchor table — see the
+  `find_history` note at the bottom of this file for the
+  implication on the roadmapped feature.
+
 ### Added
 
 - **Daemon-managed live file watcher.** `cairn_watch::watch_repo`
@@ -369,8 +386,13 @@ upgrade path. Re-register your repos.
 - Cross-repo blob deduplication: each registered repo gets its own
   CAS store. Two repos with byte-identical files do not share blobs.
 - `find_history` (= "where did this symbol exist before it got
-  deleted?"). The branch anchors retain past manifests, so the
-  substrate is in place; the query method is unwired.
+  deleted?"). Not yet substrate-complete: branch / tag anchors now
+  track live git refs and are pruned when the underlying ref
+  disappears (so stale labels don't accumulate in
+  `cairn ctl status`), which means deleted-ref history is no longer
+  retained via those anchors. A future implementation will need its
+  own manifest-retention mechanism (e.g. an explicit history table
+  or a reflog-style pin).
 
 [0.1.0-alpha.4]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...HEAD
 [0.1.0-alpha.3]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.3
