@@ -299,9 +299,12 @@ pub struct FindSymbolHit {
     /// repos. The wire format always emits this; older clients that
     /// passed `repo` explicitly can ignore it.
     pub repo: String,
-    /// Snapshot the hit came from. Carried alongside `location` so a
-    /// cross-branch query (the default) can distinguish identically
-    /// located symbols that exist on multiple branches.
+    /// Anchor label the hit was extracted from — `HEAD`,
+    /// `branch/<n>`, `tag/<n>`, or `tentative/<id>`. Carried
+    /// alongside `location` so a query that scans multiple snapshots
+    /// (or whose default resolved to the worktree's tentative
+    /// snapshot) can distinguish identically-located symbols across
+    /// those snapshots.
     pub branch: String,
     /// `repo:branch:file:line` string, clickable in Claude Code UI.
     pub location: String,
