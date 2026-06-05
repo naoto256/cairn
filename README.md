@@ -94,10 +94,15 @@ discovery commands (`find`, `refs`, `impls`, `imports`); each hit
 carries its origin in a `repo:branch:file:line` location prefix.
 `source` and `outline` still target a single repo.
 
-`--anchor <name>` selects a non-default state:
-`HEAD` (default), `branch/<n>`, `tag/<n>`, `tentative/<id>`.
-The plain `--branch <n>` shorthand is equivalent to
-`--anchor branch/<n>`.
+`--anchor <name>` selects a specific snapshot: `HEAD` (committed
+only), `branch/<n>`, `tag/<n>`, or `tentative/<id>`. The plain
+`--branch <n>` shorthand is equivalent to `--anchor branch/<n>`.
+When both are omitted, the read defaults to the registered
+worktree's `tentative/<id>` snapshot — the daemon's file watcher
+keeps it in sync with the working tree, so an edit you just made is
+visible without a commit. Pass `--anchor HEAD` explicitly to scope
+back to committed-only state. A brand-new store with no tentative
+anchor yet falls back to `HEAD` automatically.
 
 ### MCP
 
