@@ -73,6 +73,9 @@ impl ControlMethod for RegisterRepo {
             blobs_parsed = outcome.blobs_parsed,
             "register_repo complete"
         );
+        if let Some(watch_manager) = &ctx.watch_manager {
+            watch_manager.watch_alias(args.alias.clone(), canonical)?;
+        }
         Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
     }
 }

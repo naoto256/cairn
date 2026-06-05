@@ -32,6 +32,7 @@ use tracing::debug;
 use crate::daemon::LineHandler;
 use crate::jsonrpc_errors;
 use crate::paths::CasDataDir;
+use crate::watcher::WatchManager;
 use crate::{Error, Result};
 
 pub mod methods;
@@ -65,6 +66,7 @@ pub static CONTROL_METHODS: [fn() -> Box<dyn ControlMethod>] = [..];
 pub struct CtlCtx {
     pub cas_data_dir: Arc<CasDataDir>,
     pub shutdown: Arc<Notify>,
+    pub watch_manager: Option<Arc<WatchManager>>,
     pub version: &'static str,
     pub started_at: Instant,
 }
@@ -86,6 +88,16 @@ impl CtlHandler {
         shutdown: Arc<Notify>,
         version: &'static str,
     ) -> Self {
+        Self::with_watch_manager(cas_data_dir, shutdown, version, None)
+    }
+
+    #[must_use]
+    pub fn with_watch_manager(
+        cas_data_dir: Arc<CasDataDir>,
+        shutdown: Arc<Notify>,
+        version: &'static str,
+        watch_manager: Option<Arc<WatchManager>>,
+    ) -> Self {
         let mut methods: HashMap<&'static str, Box<dyn ControlMethod>> = HashMap::new();
         for ctor in CONTROL_METHODS {
             let method = ctor();
@@ -95,6 +107,7 @@ impl CtlHandler {
             ctx: CtlCtx {
                 cas_data_dir,
                 shutdown,
+                watch_manager,
                 version,
                 started_at: Instant::now(),
             },
