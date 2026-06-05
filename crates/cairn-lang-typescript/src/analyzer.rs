@@ -67,6 +67,10 @@ impl TsSemanticWalker {
                 self.emit_call(node, source);
                 self.walk_children(node, source);
             }
+            "new_expression" => {
+                self.emit_constructor_call(node, source);
+                self.walk_children(node, source);
+            }
             "public_field_definition" | "property_signature" => {
                 self.emit_direct_type_annotation(node, source, TypeRole::Field);
                 self.walk_children(node, source);
@@ -169,6 +173,29 @@ impl TsSemanticWalker {
             return;
         };
         let Some((target_name, target_qualified, target_node)) = callee_target(function, source)
+        else {
+            return;
+        };
+        self.facts.refs.push(RefFact {
+            target_name,
+            target_qualified,
+            kind: RefKind::Call,
+            type_role: None,
+            enclosing_idx: None,
+            enclosing_qualified: self.enclosing.clone(),
+            byte_range: target_node.start_byte()..target_node.end_byte(),
+            line: line_of(target_node),
+        });
+    }
+
+    fn emit_constructor_call(&mut self, node: Node<'_>, source: &[u8]) {
+        let Some(constructor) = child_by_field(node, "constructor")
+            .or_else(|| child_by_field(node, "function"))
+            .or_else(|| first_named_child(node))
+        else {
+            return;
+        };
+        let Some((target_name, target_qualified, target_node)) = callee_target(constructor, source)
         else {
             return;
         };
@@ -299,6 +326,10 @@ fn callee_target<'a>(node: Node<'a>, source: &[u8]) -> Option<(String, Option<St
             let name = node_text(node, source).to_string();
             Some((name.clone(), Some(name), node))
         }
+        "instantiation_expression" | "optional_chain" => {
+            let callee = first_named_child(node)?;
+            callee_target(callee, source)
+        }
         "member_expression" => {
             let property = child_by_field(node, "property").or_else(|| last_named_child(node))?;
             let name = node_text(property, source).to_string();
@@ -409,6 +440,7 @@ fn named_child_after_keyword<'a>(node: Node<'a>, source: &[u8], keyword: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_lang_api::LanguageBackend;
 
     fn semantic(src: &str) -> SemanticFacts {
         TypescriptAnalyzer.extract_semantic(src.as_bytes()).unwrap()
@@ -420,6 +452,12 @@ mod tests {
 
     fn impls(src: &str) -> Vec<ImplFact> {
         semantic(src).impls
+    }
+
+    fn call_ref<'a>(refs: &'a [RefFact], name: &str) -> &'a RefFact {
+        refs.iter()
+            .find(|r| r.kind == RefKind::Call && r.target_name == name)
+            .unwrap()
     }
 
     #[test]
@@ -447,11 +485,57 @@ mod tests {
     #[test]
     fn keeps_receiver_method_calls_unresolved() {
         let refs = refs("function caller(obj: Obj) { obj.method(); }");
-        let call = refs
-            .iter()
-            .find(|r| r.kind == RefKind::Call && r.target_name == "method")
-            .unwrap();
+        let call = call_ref(&refs, "method");
         assert_eq!(call.target_qualified, None);
+    }
+
+    #[test]
+    fn handles_optional_chaining_calls_unresolved() {
+        let refs = refs("function caller(obj: Obj) { obj?.method(); obj?.deep?.other(); }");
+        let method = call_ref(&refs, "method");
+        let other = call_ref(&refs, "other");
+
+        assert_eq!(method.target_qualified, None);
+        assert_eq!(other.target_qualified, None);
+    }
+
+    #[test]
+    fn handles_generic_callees_with_existing_call_policy() {
+        let refs = refs("function caller(obj: Obj) { foo<T>(); obj.method<T>(); }");
+        let bare = call_ref(&refs, "foo");
+        let method = call_ref(&refs, "method");
+
+        assert_eq!(bare.target_qualified.as_deref(), Some("foo"));
+        assert_eq!(method.target_qualified, None);
+    }
+
+    #[test]
+    fn handles_constructor_calls_as_call_refs() {
+        let refs = refs("function caller() { new Foo(); new Box<T>(); new mod.Foo(); }");
+
+        assert_eq!(
+            call_ref(&refs, "Foo").target_qualified.as_deref(),
+            Some("Foo")
+        );
+        assert_eq!(
+            call_ref(&refs, "Box").target_qualified.as_deref(),
+            Some("Box")
+        );
+        assert!(
+            refs.iter().any(|r| {
+                r.kind == RefKind::Call && r.target_name == "Foo" && r.target_qualified.is_none()
+            }),
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_import_member_call_stays_unresolved() {
+        let refs = refs("import * as ns from './x';\nfunction caller() { ns.foo(); }");
+        let call = call_ref(&refs, "foo");
+
+        assert_eq!(call.target_qualified, None);
+        assert_eq!(call.enclosing_qualified.as_deref(), Some("caller"));
     }
 
     #[test]
@@ -517,6 +601,24 @@ mod tests {
     }
 
     #[test]
+    fn pure_import_file_emits_no_semantic_facts() {
+        let facts = semantic("import { x } from './y';");
+
+        assert!(facts.imports.is_empty());
+        assert!(facts.refs.is_empty());
+        assert!(facts.impls.is_empty());
+        assert!(facts.doc_overrides.is_empty());
+    }
+
+    #[test]
+    fn tsx_patterns_remain_out_of_scope() {
+        let backend = crate::TypescriptBackend;
+
+        assert_eq!(backend.file_patterns(), &["*.ts", "*.mts", "*.cts"]);
+        assert!(!backend.file_patterns().contains(&"*.tsx"));
+    }
+
+    #[test]
     fn recovered_parse_keeps_refs_from_valid_regions() {
         let refs = refs(
             "function ok() { foo(); }\n\
@@ -532,6 +634,32 @@ mod tests {
             r.kind == RefKind::Call
                 && r.target_name == "bar"
                 && r.enclosing_qualified.as_deref() == Some("alsoOk")
+        }));
+    }
+
+    #[test]
+    fn recovered_parse_keeps_mixed_valid_shapes() {
+        let facts = semantic(
+            "module broken { interface Mid extends Base { value: ; } }\n\
+             class Derived extends Parent { ok() { foo(); } broken() { let x: =; } }\n\
+             function generic() { bad<; recovered<T>(); }\n",
+        );
+
+        assert!(facts.impls.iter().any(|i| {
+            i.type_qualified == "Mid" && i.interface_qualified.as_deref() == Some("Base")
+        }));
+        assert!(facts.impls.iter().any(|i| {
+            i.type_qualified == "Derived" && i.interface_qualified.as_deref() == Some("Parent")
+        }));
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Call
+                && r.target_name == "foo"
+                && r.enclosing_qualified.as_deref() == Some("Derived.ok")
+        }));
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Call
+                && r.target_name == "recovered"
+                && r.target_qualified.as_deref() == Some("recovered")
         }));
     }
 
@@ -647,5 +775,21 @@ mod tests {
     fn empty_or_malformed_input_is_empty_ok() {
         assert_eq!(semantic("").refs.len(), 0);
         assert_eq!(semantic("function {").refs.len(), 0);
+    }
+
+    #[test]
+    fn semantic_degrade_is_empty_facts_not_error() {
+        // TypeScript Tier-2 intentionally never returns ExtractError:
+        // parser setup/tree absence degrade to empty SemanticFacts, and
+        // unsupported recovered syntax is skipped node-by-node. PR #48's
+        // parse-pipeline preservation is therefore a no-op for TS today.
+        let facts = TypescriptAnalyzer
+            .extract_semantic(b"\0\0\0 function {")
+            .unwrap();
+
+        assert!(facts.imports.is_empty());
+        assert!(facts.refs.is_empty());
+        assert!(facts.impls.is_empty());
+        assert!(facts.doc_overrides.is_empty());
     }
 }
