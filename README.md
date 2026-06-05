@@ -127,7 +127,12 @@ resolved method-call refs back into `refs` under
 `source = tier3-rust-analyzer`; consumers see them through
 `find_references` automatically. If `rust-analyzer` is not on
 `PATH` the analyzer logs the run as `Skipped` and leaves Tier-1 /
-Tier-2 facts untouched. TypeScript covers `*.ts`, `*.mts`,
+Tier-2 facts untouched. Python Tier-3 via `pyright` is wired in
+`cairn-lang-python-tier3`: when `pyright-langserver` is
+discoverable, `register_repo` runs it once per snapshot and emits
+resolved method-call refs back into `refs` under
+`source = pyright-lsp`; same Skipped semantics if the binary is
+absent. TypeScript covers `*.ts`, `*.mts`,
 `*.cts`, with a blob-scoped Tier-2 analyzer for call refs,
 type-role refs (params, returns, fields, aliases, generic
 bounds), and class / interface inheritance edges (`extends` /
