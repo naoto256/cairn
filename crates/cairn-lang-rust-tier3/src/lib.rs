@@ -21,6 +21,7 @@ use cairn_core::workspace_analyzer::{
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
+use serde_json::{Value, json};
 use tracing::debug;
 use tree_sitter::Node;
 
@@ -69,6 +70,8 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
                 timeout: WORKSPACE_LOAD_TIMEOUT,
             },
             language_id: "rust",
+            launch_args: Vec::new(),
+            initialization_options: rust_analyzer_initialization_options(CONFIG_HASH),
         };
         let repo_root = repo_root.to_path_buf();
         let files = files.to_vec();
@@ -94,6 +97,15 @@ fn rust_analyzer_binary() -> PathBuf {
     std::env::var_os("RUST_ANALYZER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("rust-analyzer"))
+}
+
+fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
+    json!({
+        "cairnConfigHash": config_hash,
+        "experimental": {
+            "serverStatusNotification": true
+        },
+    })
 }
 
 async fn collect_resolved_refs(

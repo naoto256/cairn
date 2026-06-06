@@ -1,7 +1,8 @@
 # Long-lived rust-analyzer design
 
-Status: Phase 1 design only. This document intentionally does not prescribe
-or include implementation changes.
+Status: Historical Rust-first design. The implemented pool is now shared by
+rust-analyzer, pyright, and gopls; this note records the original lifecycle
+and ownership rationale.
 
 ## Context
 
@@ -11,9 +12,9 @@ the process down. That keeps ownership simple, but it pays the workspace
 warmup cost on every reindex and makes rust-analyzer readiness handling the
 dominant source of latency.
 
-The target design is a daemon-scoped pool of long-lived rust-analyzer clients
-that can be reused across workspace analysis runs while keeping the public
-analyzer API small.
+The target design is a daemon-scoped pool of long-lived LSP clients that can
+be reused across workspace analysis runs while keeping the public analyzer API
+small.
 
 ## Goals
 
@@ -28,8 +29,8 @@ analyzer API small.
 
 ## Non-goals
 
-- A generic multi-language LSP pool.
-- Cross-repo sharing of one rust-analyzer process.
+- Editor-grade multi-language synchronization beyond workspace-analysis use.
+- Cross-repo sharing of one language server process.
 - Fine-grained interactive editor-style synchronization in the first PR.
 - Changing the per-blob `Analyzer` API.
 
@@ -70,7 +71,7 @@ harder to reason about.
 Recommended lookup key:
 
 ```text
-canonical_repo_root + analyzer_id + rust_analyzer_binary + config_hash
+canonical_repo_root + language + analyzer_id + lsp_binary + config_hash
 ```
 
 The canonical repo root is a better primary key than a user-visible alias
@@ -84,7 +85,7 @@ Thread safety should avoid holding the whole registry lock during spawn:
 - The registry itself is guarded by a `RwLock` or `Mutex`.
 - Each entry owns its own state lock for spawn/restart/shutdown.
 - Concurrent callers for the same key share the same entry and await the same
-  spawn instead of launching duplicate rust-analyzer processes.
+  spawn instead of launching duplicate LSP server processes.
 - Concurrent callers for different repos do not block each other except for a
   short registry lookup/insert.
 
@@ -105,17 +106,16 @@ executes async LSP work on that runtime. This keeps the `WorkspaceAnalyzer`
 trait unchanged and keeps the reader tasks alive for the lifetime of the pool.
 
 A later refactor can pass an explicit daemon runtime or workspace analysis
-context, but that should not be required for the first long-lived
-rust-analyzer PR.
+context, but that should not be required for the first long-lived LSP pool PR.
 
 ## File change propagation
 
 Use simple full-text synchronization first.
 
-For each workspace analysis run, the Rust analyzer already receives the set of
-Rust files from the current manifest entries and reads the current worktree
-contents. Before sending definition requests for a file, the pool should ensure
-rust-analyzer has the current text:
+For each workspace analysis run, the analyzer already receives the set of files
+from the current manifest entries and reads the current worktree contents.
+Before sending definition requests for a file, the pool should ensure the LSP
+server has the current text:
 
 - If the document is not open in the pooled client, send `textDocument/didOpen`.
 - If it is already open, send a full-text `textDocument/didChange` with a
@@ -142,7 +142,7 @@ clear ownership contract:
   max-restart policy.
 - If restart fails, the workspace analysis run fails through the existing
   analyzer error path so `workspace_analysis_runs` records the failure.
-- Restart should reinitialize rust-analyzer and re-open documents needed by
+- Restart should reinitialize the LSP server and re-open documents needed by
   the current analysis run.
 
 The daemon shutdown path should call `pool.shutdown_all()`. Shutdown should:
@@ -156,25 +156,25 @@ The pool should not rely on process exit or object drop alone for cleanup.
 
 ## Multi-repo behavior
 
-Run one rust-analyzer process per canonical repo root. Do not use one shared
-process with dynamic workspace folders in the first implementation.
+Run one LSP server process per canonical repo root and analyzer key. Do not use
+one shared process with dynamic workspace folders in the first implementation.
 
-This matches rust-analyzer's workspace model, keeps failure isolation simple,
+This matches language server workspace models, keeps failure isolation simple,
 and avoids cross-repo cache invalidation ambiguity. The tradeoff is memory:
-large Rust workspaces can consume hundreds of MB to more than 1 GB per
-process. Lazy spawn plus idle eviction are therefore required parts of the
-design, not optional polish.
+large workspaces can consume hundreds of MB to more than 1 GB per process.
+Lazy spawn plus idle eviction are therefore required parts of the design, not
+optional polish.
 
 ## Launch control and status
 
-The pool should only spawn rust-analyzer when a Rust workspace analysis run has
-Rust files to analyze. Non-Rust repos should not create a process.
+The pool should only spawn a language server when a workspace analysis run has
+files for that analyzer. Unrelated repos should not create a process.
 
 Launch configuration should remain explicit:
 
-- Use the configured rust-analyzer binary when provided.
-- Preserve the existing fallback to `rust-analyzer` on `PATH` unless the
-  product decision is to require `RUST_ANALYZER` for Tier-3 enablement.
+- Use the configured language server binary when provided.
+- Preserve each analyzer's existing fallback binary on `PATH` unless the
+  product decision is to require explicit configuration for Tier-3 enablement.
 - Include the resolved binary identity in the pool key.
 - Surface binary-not-found or startup-timeout failures through the existing
   workspace analysis failure/skipped path.
@@ -195,7 +195,7 @@ path observable through `workspace_analysis_runs`.
 
 Avoid changing the `WorkspaceAnalyzer` trait in the first implementation.
 
-The Rust Tier-3 analyzer can call a small `cairn-core` pool API internally:
+Tier-3 analyzers can call a small `cairn-core` pool API internally:
 
 ```text
 get_or_spawn_lsp(key, spawn_spec)
@@ -206,7 +206,7 @@ shutdown_all()
 The exact names can follow local style, but the important boundary is that
 `WorkspaceAnalyzer::analyze_workspace` still receives the same repo root,
 manifest id, and file list. Pool access should be an implementation detail of
-the Rust Tier-3 analyzer and `cairn-core::lsp`.
+the Tier-3 analyzer and `cairn-core::lsp`.
 
 `LspClient::shutdown(self)` consumes the client today. Pool eviction may need
 either:
@@ -226,8 +226,8 @@ Recommended split:
    - Add or stabilize `didOpen`, full-text `didChange`, and readiness behavior.
    - Add tests with fake LSP IO.
    - Estimate: 150-250 LOC.
-2. Long-lived rust-analyzer pool integration.
-   - Add pool, keying, lazy spawn, dedicated runtime thread, and Rust Tier-3
+2. Long-lived LSP pool integration.
+   - Add pool, keying, lazy spawn, dedicated runtime thread, and Tier-3
      analyzer usage.
    - No idle eviction in this PR if shutdown is implemented.
    - Estimate: 250-400 LOC.
@@ -241,8 +241,8 @@ easier to review failures and preserve the existing analyzer boundary.
 
 ## Open questions
 
-- Should Tier-3 require `RUST_ANALYZER`, or is the current `PATH` fallback part
-  of the supported interface?
+- Should Tier-3 require explicit language-server env vars, or are the current
+  `PATH` fallbacks part of the supported interface?
 - What idle timeout should be the default: 15 minutes, 20 minutes, or a
   configurable value?
 - Should status be exposed immediately through a CLI/debug endpoint, or is

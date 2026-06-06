@@ -208,6 +208,7 @@ dependencies = [
  "cairn-lang-go",
  "linkme",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -245,6 +246,7 @@ dependencies = [
  "cairn-lang-python",
  "linkme",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -271,6 +273,7 @@ version = "0.1.0-alpha.4"
 dependencies = [
  "cairn-core",
  "linkme",
+ "serde_json",
  "tokio",
  "tracing",
  "tree-sitter",

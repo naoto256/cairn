@@ -21,6 +21,7 @@ use cairn_core::workspace_analyzer::{
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
+use serde_json::json;
 use tracing::debug;
 use tree_sitter::Node;
 
@@ -66,6 +67,8 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
             availability: AvailabilityStrategy::VersionNoFlag,
             readiness: ReadinessStrategy::InitializeResponseOnly,
             language_id: "go",
+            launch_args: Vec::new(),
+            initialization_options: json!({}),
         };
         let repo_root = repo_root.to_path_buf();
         let files = files.to_vec();
