@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/cairn-cli",
+    "crates/cairn",
     "crates/cairn-core",
     "crates/cairn-proto",
     "crates/cairn-lang-api",

@@ -7,7 +7,7 @@
 //! framing, the accept loops, and the shared shutdown signal.
 //!
 //! `cairn.sock` speaks plain JSON-RPC 2.0, not MCP. MCP framing is
-//! the job of `cairn mcp` (the stdio front-end in `cairn-cli`),
+//! the job of `cairn mcp` (the stdio front-end in the `cairn` crate),
 //! which translates each MCP `tools/call` into either a data RPC
 //! (`get_outline` / `find_symbols` / `list_repos`) or a control message
 //! (`register_repo` / `reindex_repo`) and wraps the response back into

@@ -169,6 +169,14 @@ versions follow [SemVer](https://semver.org/).
   so that downstream packagers (and any future crates.io publish
   attempt by a contributor) have the right manifest data.
 
+### Renamed
+
+- **Workspace crate `cairn-cli` renamed to `cairn`.** The binary
+  is the multi-mode umbrella entry point (`cairn daemon`,
+  `cairn ctl …`, MCP stdio server) — not just a CLI — and the
+  crate name now reflects that. Source-from-git installs use
+  `cargo install --git URL cairn` (was `cairn-cli`).
+
 ### Internal
 
 - **`query.rs` split into per-family modules** (`#57`).

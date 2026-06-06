@@ -566,7 +566,7 @@ fn backend_registration_coherence_check(
                 .into_iter()
                 .map(|expected| {
                     format!(
-                        "{} is declared for runtime linking but `{}` is missing from {} - likely missing `{}` in cairn-cli/src/main.rs",
+                        "{} is declared for runtime linking but `{}` is missing from {} - likely missing `{}` in crates/cairn/src/main.rs",
                         expected.crate_name,
                         expected.runtime_id,
                         expected.registry.label(),

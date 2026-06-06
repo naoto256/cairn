@@ -1,5 +1,5 @@
 [package]
-name = "cairn-cli"
+name = "cairn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

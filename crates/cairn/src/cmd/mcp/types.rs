@@ -7,7 +7,7 @@
 //! the MCP-specific handshake (`initialize`, `tools/list`,
 //! `tools/call`) and the content-block result wrapping.
 //!
-//! Lives in `cairn-cli`, not in `cairn-proto`, because MCP framing is
+//! Lives in the `cairn` binary crate, not in `cairn-proto`, because MCP framing is
 //! a property of the `cairn serve` front-end alone — the daemon and
 //! every out-of-tree consumer (cairn-graph, cairn-audit, future LSP
 //! front-end) speak the protocol-neutral surfaces in
