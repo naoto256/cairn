@@ -198,8 +198,8 @@ Avoid changing the `WorkspaceAnalyzer` trait in the first implementation.
 The Rust Tier-3 analyzer can call a small `cairn-core` pool API internally:
 
 ```text
-get_or_spawn_rust_analyzer(key, spawn_spec)
-with_rust_analyzer(key, spawn_spec, |client| ...)
+get_or_spawn_lsp(key, spawn_spec)
+with_lsp(key, spawn_spec, |client| ...)
 shutdown_all()
 ```
 
