@@ -4,7 +4,7 @@ Local, symbol-aware code index. A daemon-backed index for fast,
 structural code search across the repos you've registered — definitions,
 references, impls, imports, source bodies — with no external service.
 
-Status: **0.1.0-alpha.3**. Wire schemas (JSON-RPC + MCP), on-disk
+Status: **0.1.0**. Wire schemas (JSON-RPC + MCP), on-disk
 format, and CLI flags are current-state-of-the-day; do not depend on
 them staying stable until 1.0.
 
@@ -44,12 +44,23 @@ Substrate sources:
 [`cas/blob.rs`](crates/cairn-core/src/cas/blob.rs),
 [`cas/schema.rs`](crates/cairn-core/src/cas/schema.rs).
 
-## Install
+## Installation
 
-```sh
-cargo build --release
-cp target/release/cairn ~/.cargo/bin/
-```
+Cairn ships via Homebrew, GitHub Releases (`.deb` / prebuilt binaries),
+and `cargo install --git`. See [Releases](https://github.com/naoto256/cairn/releases)
+for downloads.
+
+### Why no crates.io?
+
+Cairn is intentionally not published to crates.io. The names `cairn`,
+`cairn-cli`, and `cairn-core` are already held by unrelated projects
+(a placeholder, an autonomous-settlement CLI, and a knowledge-provenance
+index, respectively), and crates.io's flat, first-come-first-served
+namespace makes a clean, brand-aligned publish impractical. Distribution
+through Homebrew and prebuilt binaries serves users better in this
+case — Rust developers can still build from source via:
+
+    cargo install --git https://github.com/naoto256/cairn cairn-cli
 
 Requires Rust 1.85+ and a working `git` on `PATH`.
 

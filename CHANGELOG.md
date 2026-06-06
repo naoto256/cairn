@@ -5,10 +5,28 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [0.1.0-alpha.4] — Unreleased
+## [0.1.0] — 2026-06-07
 
 ### Fixed
 
+- **`rust-analyzer ContentModified` noise suppressed** (`#44`).
+  The Tier-3 Rust pool used to surface `ContentModified` cancellations
+  from `rust-analyzer` as analyzer failures, polluting `cairn ctl
+  doctor` output during normal in-flight edits. The error is now
+  reclassified as a benign retry signal and dropped from the
+  user-visible failure stream.
+- **Watcher dedupes tentative writes when content-identical**
+  (`#45`). A `notify` event that resolves to bytes already hashed
+  into the tentative snapshot no longer triggers a parse / CAS
+  pass; the snapshot pointer is left alone. Fixes a feedback loop
+  observed under editors that touch files (`mtime`-only updates)
+  without changing content.
+- **Tier-2 analyzer failure no longer poisons Tier-1 facts for the
+  same blob** (`#48`). A semantic-pass panic / error now leaves the
+  syntactic symbols, refs, imports, and impls already committed
+  for that blob intact, so a single misbehaving Tier-2 analyzer
+  degrades to "Tier-1 only" for the affected file rather than
+  losing the file from the index outright.
 - **Stale `branch/*` / `tag/*` anchors no longer linger in
   `cairn ctl status` after a local git ref deletion.** Surfaced by
   the closed-beta stress test against tokio (`#6`): a local branch
@@ -26,6 +44,53 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **TypeScript Tier-2 analyzer** (`#47`, `#49`, `#51`). The
+  `cairn-lang-typescript` crate gains a blob-scoped Tier-2 pass that
+  resolves call references, type-role refs (parameters, return
+  positions, fields, type aliases, generic bounds), and class /
+  interface inheritance edges (`extends` / `implements`). Member-
+  expression calls remain intentionally unresolved pending
+  import-derived alias tracking, mirroring the Rust / Python
+  receiver-type policy. Subsequent hardening (`#51`) tightens the
+  reference-emission rules against pathological grammar shapes
+  observed during the closed-beta corpus run.
+- **Python Tier-3 analyzer via `pyright-langserver`** (`#50`,
+  `#52`). New `cairn-lang-python-tier3` crate. When
+  `pyright-langserver` is discoverable on `PATH`, `register_repo`
+  runs it once per snapshot and emits resolved method-call refs
+  under `source = pyright-lsp`; consumers see them through
+  `find_references` automatically. If the binary is absent the
+  analyzer logs `Skipped` and Tier-1 / Tier-2 facts are untouched.
+  Import-resolution test coverage lands alongside the doctor
+  per-analyzer Tier-3 surface (`#52`).
+- **Go Tier-3 analyzer via `gopls`** (`#53`). New
+  `cairn-lang-go-tier3` crate, same Skipped-on-missing-binary
+  semantics as the Rust and Python Tier-3 paths. The same PR
+  fixes a Tier-1 visibility miscall where exported-vs-unexported
+  was inferred incorrectly for receiver-qualified method names.
+- **`cairn ctl doctor` actionable hints + watcher / snapshot /
+  Tier-3 checks** (`#46`, `#52`). `doctor` now produces actionable
+  remediation strings (concrete `cairn ctl …` commands the user
+  can paste), surfaces watcher install state per alias, reports
+  snapshot freshness against the registered worktree, and runs a
+  per-analyzer Tier-3 availability probe so a missing
+  `rust-analyzer` / `pyright-langserver` / `gopls` is visible
+  without spelunking through the daemon log. `#59` rewrites the
+  failure-detail strings to read coherently as full sentences.
+- **LSP pool generalization** (`#54`, `#55`). `cairn-core::lsp`
+  factors out an `LspSpawnSpec` plus an `Availability` /
+  `Readiness` strategy pair so the three Tier-3 analyzers
+  (`rust-analyzer`, `pyright-langserver`, `gopls`) plug into the
+  same pool without per-analyzer branching at the call site.
+  Pool sizing, shutdown ordering, and error propagation all
+  consolidate into one place.
+- **LSP front-end handles server-initiated requests** (`#56`).
+  The pool now responds to server-→client requests
+  (`workspace/configuration`, registration capabilities, dynamic
+  client capability negotiation) instead of treating any
+  inbound request as a protocol violation, unblocking analyzers
+  that refuse to serve diagnostics until their config probe is
+  answered.
 - **Daemon-managed live file watcher.** `cairn_watch::watch_repo`
   shipped fully implemented in earlier alphas but was never
   instantiated by the daemon, so the README / MCP
@@ -86,8 +151,40 @@ versions follow [SemVer](https://semver.org/).
   `find_impls` wording introduced in alpha.3). `repo` is removed
   from `input_schema.required[]`.
 
+### Packaging
+
+- **Release binary archives built in CI** (`#62`). Tagged releases
+  produce signed `.tar.gz` / `.zip` archives for macOS (arm64,
+  x86_64) and Linux (x86_64) attached directly to the GitHub
+  Release.
+- **Homebrew tap** (`#63`). `naoto256/tap/cairn` ships the formula
+  pointing at the CI-built archives, so `brew install
+  naoto256/tap/cairn` is the standard macOS install path.
+- **Debian package metadata** (`#65`). `cargo deb`-buildable
+  `.deb` is produced for the linux-x86_64 target and uploaded
+  alongside the binary archives.
+- **Cargo metadata threaded through every workspace crate**
+  (`#61`). `description`, `license`, `repository`, `homepage`,
+  `readme`, and `categories` are populated on every member crate
+  so that downstream packagers (and any future crates.io publish
+  attempt by a contributor) have the right manifest data.
+
 ### Internal
 
+- **`query.rs` split into per-family modules** (`#57`).
+  `cairn-core::query` factors the 1.7k-LOC dispatcher into one
+  module per query family (`symbols`, `refs`, `impls`,
+  `imports`, `outline`, `source`) with a thin re-export layer.
+  No behavioural change.
+- **`wire-frontend` panic paths converted to `Error` returns**
+  (`#58`). Every `unwrap` / `expect` reachable from a wire
+  request is now a typed error mapped to the JSON-RPC error
+  channel, so a malformed inbound frame no longer takes down
+  the frontend task.
+- **`lsp/mod.rs` split into per-concern modules** (`#60`).
+  Pool, transport, capability negotiation, and request
+  bookkeeping land in separate modules under
+  `cairn-core::lsp`, matching the `query.rs` split above.
 - **`data_rpc::helpers::with_one_or_all_stores<T, F, S>`** extracts
   the previously-duplicated cross-repo dispatch shape (spawn_blocking
   + registry lookup / list_all + `AnchorNotFound continue-skip` +
