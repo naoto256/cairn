@@ -1,0 +1,77 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach assets to when dry_run is false"
+        required: false
+        type: string
+      dry_run:
+        description: "Build and package without uploading release assets"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: cairn
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: cairn
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
+
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin cairn
+
+      - name: Codesign macOS binary
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(cargo pkgid -p cairn-cli | sed 's/.*#//')"
+          archive_base="cairn-v${version}-${{ matrix.target }}"
+          staging="dist/${archive_base}"
+
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${staging}/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "${staging}/"
+          tar -czf "dist/${archive_base}.tar.gz" -C dist "${archive_base}"
+
+      - name: Upload release asset
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "release tag is required when dry_run is false" >&2
+            exit 1
+          fi
+
+          gh release upload "${RELEASE_TAG}" dist/*.tar.gz --clobber
