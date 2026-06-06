@@ -32,3 +32,6 @@ _*.md
 !.env.example
 *.pem
 *.key
+
+# Design investigation notes live in Synapsai vault (Knowledge/cairn-{lang}-tier{N}-design.md)
+crates/cairn-lang-*/docs/
