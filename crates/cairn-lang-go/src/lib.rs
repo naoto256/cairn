@@ -153,6 +153,7 @@ fn emit_symbol(
     let signature = signature_slice(node, source, body_start);
     let doc = extract_doc(node, source);
     let parent_idx = None;
+    let visibility = Some(go_visibility(&name));
 
     facts.symbols.push(SymbolFact {
         name,
@@ -160,12 +161,24 @@ fn emit_symbol(
         kind,
         signature,
         doc,
-        visibility: Some(Visibility::Public),
+        visibility,
         byte_range: node.byte_range(),
         line_range: line_of(node)..end_line_of(node),
         body_start,
         parent_idx,
     });
+}
+
+fn go_visibility(name: &str) -> Visibility {
+    if name
+        .as_bytes()
+        .first()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
 }
 
 fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
@@ -389,6 +402,65 @@ var V = 0
                 .as_deref()
                 .unwrap()
                 .contains("doc on m")
+        );
+    }
+
+    #[test]
+    fn visibility_follows_go_export_capitalization() {
+        let src = br#"
+package main
+
+func Foo() {}
+func bar() {}
+
+type Animal struct {}
+type animal struct {}
+
+type Recv struct {}
+func (r *Recv) Method() {}
+func (r *Recv) method() {}
+
+const ConstName = 1
+const constName = 2
+
+var VarName = 3
+var varName = 4
+"#;
+        let facts = GoBackend.extract_syntactic(src).unwrap();
+
+        assert_eq!(symbol(&facts, "Foo").visibility, Some(Visibility::Public));
+        assert_eq!(symbol(&facts, "bar").visibility, Some(Visibility::Private));
+        assert_eq!(
+            symbol(&facts, "Animal").visibility,
+            Some(Visibility::Public)
+        );
+        assert_eq!(
+            symbol(&facts, "animal").visibility,
+            Some(Visibility::Private)
+        );
+        assert_eq!(
+            symbol(&facts, "Method").visibility,
+            Some(Visibility::Public)
+        );
+        assert_eq!(
+            symbol(&facts, "method").visibility,
+            Some(Visibility::Private)
+        );
+        assert_eq!(
+            symbol(&facts, "ConstName").visibility,
+            Some(Visibility::Public)
+        );
+        assert_eq!(
+            symbol(&facts, "constName").visibility,
+            Some(Visibility::Private)
+        );
+        assert_eq!(
+            symbol(&facts, "VarName").visibility,
+            Some(Visibility::Public)
+        );
+        assert_eq!(
+            symbol(&facts, "varName").visibility,
+            Some(Visibility::Private)
         );
     }
 

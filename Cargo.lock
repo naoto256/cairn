@@ -136,6 +136,7 @@ dependencies = [
  "cairn-core",
  "cairn-lang-api",
  "cairn-lang-go",
+ "cairn-lang-go-tier3",
  "cairn-lang-markdown",
  "cairn-lang-python",
  "cairn-lang-python-tier3",
@@ -195,6 +196,21 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-go",
+]
+
+[[package]]
+name = "cairn-lang-go-tier3"
+version = "0.1.0-alpha.4"
+dependencies = [
+ "cairn-core",
+ "cairn-lang-go",
+ "linkme",
+ "rusqlite",
+ "tempfile",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-go",
 ]

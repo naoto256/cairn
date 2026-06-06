@@ -220,6 +220,29 @@ impl LspClient {
         Ok(client)
     }
 
+    /// Start a gopls subprocess using a custom request timeout.
+    ///
+    /// # Errors
+    /// See [`Self::start`].
+    pub async fn start_gopls_with_timeout(
+        binary_path: &Path,
+        workspace_root: &Path,
+        _config_hash: &str,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        check_gopls_available(binary_path, request_timeout).await?;
+        let client = Self::new(
+            Some(binary_path.to_path_buf()),
+            Vec::new(),
+            workspace_root.to_path_buf(),
+            json!({}),
+            request_timeout,
+            MAX_RESTARTS,
+        );
+        client.spawn_process().await?;
+        Ok(client)
+    }
+
     fn new(
         binary_path: Option<PathBuf>,
         args: Vec<String>,
@@ -581,6 +604,27 @@ async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -
     let output = timeout(
         request_timeout,
         Command::new(binary_path).arg("--version").output(),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::BinaryMissing(binary_path.to_path_buf())
+        } else {
+            Error::Spawn(e)
+        }
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::BinaryMissing(binary_path.to_path_buf()))
+    }
+}
+
+async fn check_gopls_available(binary_path: &Path, request_timeout: Duration) -> Result<()> {
+    let output = timeout(
+        request_timeout,
+        Command::new(binary_path).arg("version").output(),
     )
     .await
     .map_err(|_| Error::Timeout)?
