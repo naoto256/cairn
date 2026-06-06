@@ -90,19 +90,19 @@ linkme = "0.3"
 clap = { version = "4", features = ["derive"] }
 
 # Internal crates
-cairn-core = { path = "crates/cairn-core" }
-cairn-proto = { path = "crates/cairn-proto" }
-cairn-lang-api = { path = "crates/cairn-lang-api" }
-cairn-lang-treesitter-generic = { path = "crates/cairn-lang-treesitter-generic" }
-cairn-lang-rust = { path = "crates/cairn-lang-rust" }
-cairn-lang-rust-tier3 = { path = "crates/cairn-lang-rust-tier3" }
-cairn-lang-python = { path = "crates/cairn-lang-python" }
-cairn-lang-python-tier3 = { path = "crates/cairn-lang-python-tier3" }
-cairn-lang-markdown = { path = "crates/cairn-lang-markdown" }
-cairn-lang-typescript = { path = "crates/cairn-lang-typescript" }
-cairn-lang-go = { path = "crates/cairn-lang-go" }
-cairn-lang-go-tier3 = { path = "crates/cairn-lang-go-tier3" }
-cairn-watch = { path = "crates/cairn-watch" }
+cairn-core = { version = "0.1.0-alpha.4", path = "crates/cairn-core" }
+cairn-proto = { version = "0.1.0-alpha.4", path = "crates/cairn-proto" }
+cairn-lang-api = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-api" }
+cairn-lang-treesitter-generic = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-treesitter-generic" }
+cairn-lang-rust = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-rust" }
+cairn-lang-rust-tier3 = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-rust-tier3" }
+cairn-lang-python = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-python" }
+cairn-lang-python-tier3 = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-python-tier3" }
+cairn-lang-markdown = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-markdown" }
+cairn-lang-typescript = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-typescript" }
+cairn-lang-go = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-go" }
+cairn-lang-go-tier3 = { version = "0.1.0-alpha.4", path = "crates/cairn-lang-go-tier3" }
+cairn-watch = { version = "0.1.0-alpha.4", path = "crates/cairn-watch" }
 
 [profile.release]
 lto = "thin"
