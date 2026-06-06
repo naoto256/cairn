@@ -8,7 +8,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Cairn: daemon, serve relay, and management CLI."
+description = "Local, symbol-aware code index. Daemon-backed structural code search across registered repos with no external service."
+keywords = ["code-search", "code-index", "mcp", "lsp", "claude-code"]
+categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
 name = "cairn"
