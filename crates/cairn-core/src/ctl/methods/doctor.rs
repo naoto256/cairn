@@ -37,11 +37,15 @@ impl ControlMethod for Doctor {
             } else {
                 DoctorStatus::Pass
             },
-            Some(format!(
-                "{} backend(s): {}",
-                backend_names.len(),
-                backend_names.join(", ")
-            )),
+            Some(if backend_names.is_empty() {
+                "none linked".into()
+            } else {
+                format!(
+                    "{} backend(s): {}",
+                    backend_names.len(),
+                    backend_names.join(", ")
+                )
+            }),
             None,
         ));
         checks.push(backend_registration_coherence_check(
@@ -60,7 +64,11 @@ impl ControlMethod for Doctor {
             } else {
                 DoctorStatus::Fail
             },
-            Some(cas_root.to_string_lossy().to_string()),
+            Some(if writable {
+                cas_root.to_string_lossy().to_string()
+            } else {
+                format!("not writable: {}", cas_root.display())
+            }),
             None,
         ));
 
@@ -146,7 +154,11 @@ fn registered_repo_path_check(entry: &cas_registry::AliasEntry) -> DoctorCheck {
         } else {
             DoctorStatus::Fail
         },
-        Some(entry.root_path.clone()),
+        Some(if exists {
+            entry.root_path.clone()
+        } else {
+            format!("missing: {}", entry.root_path)
+        }),
         (!exists).then(|| {
             format!(
                 "Run `cairn ctl remove-repo --alias {}` (registry will keep the on-disk store for other aliases pointing at this path), or restore the directory at {}.",
@@ -174,7 +186,7 @@ fn alias_watcher_checks(
                 Some(if watching {
                     format!("watching {}", entry.root_path)
                 } else {
-                    "alias registered but no live FS watcher; tentative-default reads will fall back to HEAD until the next reindex_repo".into()
+                    "not watching (alias registered but no live FS watcher; tentative-default reads will fall back to HEAD until the next reindex_repo)".into()
                 }),
                 (!watching).then(|| {
                     format!(
@@ -295,7 +307,7 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                 None => doctor_check(
                     format!("repo `{}` tentative snapshot present", probe.alias),
                     DoctorStatus::Warn,
-                    Some("no tentative anchor yet; reads will fall back to HEAD (committed-only)".into()),
+                    Some("no tentative anchor yet (reads will fall back to HEAD)".into()),
                     Some(format!(
                         "Run `cairn ctl reindex-repo --alias {}` to build the tentative snapshot.",
                         probe.alias
@@ -328,7 +340,7 @@ fn rust_analyzer_binary_check() -> DoctorCheck {
     binary_check(
         "rust-analyzer binary discoverable",
         resolve_rust_analyzer(),
-        "rust-analyzer not found on daemon PATH",
+        "rust-analyzer not on PATH",
         "Install rust-analyzer (`rustup component add rust-analyzer`) and ensure it's on the daemon's PATH; Tier-3 (LSP) facts will not be available until then.",
     )
 }
@@ -337,7 +349,7 @@ fn pyright_binary_check() -> DoctorCheck {
     binary_check(
         "pyright binary discoverable",
         resolve_pyright(),
-        "pyright-langserver not found on daemon PATH",
+        "pyright-langserver not on PATH",
         "Install pyright (`pip install pyright` or `npm i -g pyright`) and ensure pyright-langserver is on the daemon's PATH; Python Tier-3 (LSP) facts will not be available until then.",
     )
 }
@@ -346,7 +358,7 @@ fn gopls_binary_check() -> DoctorCheck {
     binary_check(
         "gopls binary discoverable",
         resolve_gopls(),
-        "gopls not found on daemon PATH",
+        "gopls not on PATH",
         "Install gopls (`go install golang.org/x/tools/gopls@latest`) and ensure it's on the daemon's PATH; Go Tier-3 (LSP) facts will not be available until then.",
     )
 }
@@ -626,6 +638,10 @@ mod tests {
         let check = registered_repo_path_check(&entry);
 
         assert_eq!(check.status, DoctorStatus::Fail);
+        assert_eq!(
+            check.detail.as_deref(),
+            Some("missing: /definitely/missing/cairn/repo")
+        );
         let remediation = check.remediation.expect("remediation");
         assert!(remediation.contains("remove-repo --alias gone"));
         assert!(remediation.contains("/definitely/missing/cairn/repo"));
@@ -648,12 +664,11 @@ mod tests {
         let checks = alias_watcher_checks(&entries, &manager);
 
         assert_eq!(checks[0].status, DoctorStatus::Warn);
-        assert!(
-            checks[0]
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("no live FS watcher")
+        assert_eq!(
+            checks[0].detail.as_deref(),
+            Some(
+                "not watching (alias registered but no live FS watcher; tentative-default reads will fall back to HEAD until the next reindex_repo)"
+            )
         );
         assert!(
             checks[0]
@@ -701,6 +716,10 @@ mod tests {
                 .contains("manifest_id 7")
         );
         assert_eq!(checks[1].status, DoctorStatus::Warn);
+        assert_eq!(
+            checks[1].detail.as_deref(),
+            Some("no tentative anchor yet (reads will fall back to HEAD)")
+        );
         assert!(
             checks[1]
                 .remediation
@@ -709,6 +728,7 @@ mod tests {
                 .contains("reindex-repo")
         );
         assert_eq!(checks[2].status, DoctorStatus::Fail);
+        assert_eq!(checks[2].detail.as_deref(), Some("not a database"));
         assert!(
             checks[2]
                 .remediation
@@ -902,6 +922,13 @@ mod tests {
         assert_eq!(watcher.status, DoctorStatus::Warn);
         assert!(
             watcher
+                .detail
+                .as_deref()
+                .unwrap()
+                .starts_with("not watching")
+        );
+        assert!(
+            watcher
                 .remediation
                 .as_deref()
                 .unwrap()
@@ -909,6 +936,10 @@ mod tests {
         );
         let tentative = find_check(&report, "repo `demo` tentative snapshot present");
         assert_eq!(tentative.status, DoctorStatus::Warn);
+        assert_eq!(
+            tentative.detail.as_deref(),
+            Some("no tentative anchor yet (reads will fall back to HEAD)")
+        );
         assert!(
             tentative
                 .remediation
