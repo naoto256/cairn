@@ -612,7 +612,11 @@ async fn reader_loop<R>(
         match read_lsp_message(&mut reader).await {
             Ok(Some(message)) => {
                 log_notification(&message);
-                if let Some((id, result)) = response_result(&message) {
+                if let Some(response) = server_request_response(&message) {
+                    if let Some(writer) = writer.lock().await.as_mut() {
+                        let _ = write_lsp_message(writer, &response).await;
+                    }
+                } else if let Some((id, result)) = response_result(&message) {
                     let tx = pending.lock().await.remove(&id);
                     if let Some(tx) = tx {
                         let _ = tx.send(result);
@@ -621,10 +625,6 @@ async fn reader_loop<R>(
                     progress.record(&message).await;
                 } else if is_server_status_notification(&message) {
                     progress.record_server_status(&message).await;
-                } else if let Some(response) = server_request_response(&message) {
-                    if let Some(writer) = writer.lock().await.as_mut() {
-                        let _ = write_lsp_message(writer, &response).await;
-                    }
                 }
             }
             Ok(None) => {
@@ -797,6 +797,9 @@ fn server_request_response(message: &Value) -> Option<Value> {
 }
 
 fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
+    if message.get("method").is_some() {
+        return None;
+    }
     let id = message.get("id")?.as_u64()?;
     if let Some(error) = message.get("error") {
         let message = error
@@ -1339,6 +1342,58 @@ mod tests {
         assert_eq!(err.to_string(), "LSP protocol error: content modified");
     }
 
+    #[test]
+    fn response_result_ignores_server_requests() {
+        assert!(
+            response_result(&json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "window/workDoneProgress/create",
+                "params": { "token": "index" }
+            }))
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_work_done_progress_request_is_answered_before_definition() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(fake_server(
+            server_io,
+            FakeMode::RequireProgressCreateResponse,
+        ));
+        let (client_reader, client_writer) = split(client_io);
+        let client = LspClient::start_with_io(
+            client_reader,
+            client_writer,
+            Path::new("/tmp/cairn fake"),
+            "cfg",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let uri = Url::from("file:///tmp/cairn%20fake/src/lib.rs");
+
+        client
+            .did_open(&uri, "go", 1, "package main\n")
+            .await
+            .unwrap();
+        let locations = client
+            .definition(
+                &uri,
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(locations.len(), 1);
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn oversized_content_length_is_rejected_before_allocation() {
         // A `Content-Length` above MAX_BODY_SIZE must be refused before
@@ -1408,16 +1463,25 @@ mod tests {
         ServerStatusQuiescent,
         RequireServerStatusOptIn,
         RequireDidOpen,
+        RequireProgressCreateResponse,
         RecordDocumentSync(tokio::sync::mpsc::UnboundedSender<Value>),
     }
 
     async fn fake_server(stream: DuplexStream, mode: FakeMode) {
         let (mut reader, mut writer) = split(stream);
         let mut did_open = false;
+        let mut progress_create_response = false;
+        let mut pending_definition = None;
         while let Some(message) = read_lsp_message(&mut reader).await.unwrap() {
             let method = message.get("method").and_then(Value::as_str);
             let id = message.get("id").and_then(Value::as_u64);
             match (method, id) {
+                (None, Some(9001)) if matches!(mode, FakeMode::RequireProgressCreateResponse) => {
+                    progress_create_response = true;
+                    if let Some(id) = pending_definition.take() {
+                        write_definition_result(&mut writer, id).await;
+                    }
+                }
                 (Some("initialize"), Some(id)) => {
                     if matches!(mode, FakeMode::RequireServerStatusOptIn) {
                         let enabled = message
@@ -1477,6 +1541,19 @@ mod tests {
                                     "token": "cairn-progress",
                                     "value": { "kind": "end", "message": "ready" }
                                 }
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    if matches!(mode, FakeMode::RequireProgressCreateResponse) {
+                        write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": 9001,
+                                "method": "window/workDoneProgress/create",
+                                "params": { "token": "cairn-progress" }
                             }),
                         )
                         .await
@@ -1543,6 +1620,10 @@ mod tests {
                 (Some("textDocument/definition"), Some(id)) => {
                     if matches!(mode, FakeMode::DefinitionTimeout) {
                         tokio::time::sleep(Duration::from_secs(60)).await;
+                    } else if matches!(mode, FakeMode::RequireProgressCreateResponse)
+                        && !progress_create_response
+                    {
+                        pending_definition = Some(id);
                     } else if matches!(mode, FakeMode::RequireDidOpen) && !did_open {
                         write_lsp_message(
                             &mut writer,
@@ -1558,24 +1639,7 @@ mod tests {
                         .await
                         .unwrap();
                     } else {
-                        write_lsp_message(
-                            &mut writer,
-                            &json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": [
-                                    {
-                                        "uri": "file:///tmp/cairn%20fake/src/lib.rs",
-                                        "range": {
-                                            "start": { "line": 2, "character": 8 },
-                                            "end": { "line": 2, "character": 14 }
-                                        }
-                                    }
-                                ]
-                            }),
-                        )
-                        .await
-                        .unwrap();
+                        write_definition_result(&mut writer, id).await;
                     }
                 }
                 (Some("shutdown"), Some(id)) => {
@@ -1594,6 +1658,30 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    async fn write_definition_result<W>(writer: &mut W, id: u64)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        write_lsp_message(
+            writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [
+                    {
+                        "uri": "file:///tmp/cairn%20fake/src/lib.rs",
+                        "range": {
+                            "start": { "line": 2, "character": 8 },
+                            "end": { "line": 2, "character": 14 }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
     }
 
     fn progress_message(token: &str, kind: &str) -> Value {
