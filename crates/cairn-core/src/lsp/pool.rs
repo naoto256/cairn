@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -17,7 +17,7 @@ use super::{LspClient, Position, Result, Url};
 
 type ClientWork<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
-/// Registry key for one long-lived rust-analyzer process.
+/// Registry key for one long-lived LSP server process.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {
     pub canonical_repo_root: PathBuf,
@@ -83,6 +83,8 @@ pub struct LspSpawnSpec {
     pub availability: AvailabilityStrategy,
     pub readiness: ReadinessStrategy,
     pub language_id: &'static str,
+    pub launch_args: Vec<String>,
+    pub initialization_options: Value,
 }
 
 /// Borrowed pooled client plus document synchronization state.
@@ -216,29 +218,6 @@ struct PoolEntryState {
     opened_documents: HashMap<String, i32>,
 }
 
-fn launch_args(availability: &AvailabilityStrategy) -> Vec<String> {
-    match availability {
-        AvailabilityStrategy::PathExistsExecutable => vec!["--stdio".to_string()],
-        AvailabilityStrategy::VersionFlag | AvailabilityStrategy::VersionNoFlag => Vec::new(),
-    }
-}
-
-fn initialization_options(spec: &LspSpawnSpec) -> Value {
-    if spec.language_id == "rust" {
-        return rust_analyzer_initialization_options(&spec.config_hash);
-    }
-    json!({})
-}
-
-fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
-    json!({
-        "cairnConfigHash": config_hash,
-        "experimental": {
-            "serverStatusNotification": true
-        },
-    })
-}
-
 async fn check_lsp_available(
     binary_path: &Path,
     strategy: &AvailabilityStrategy,
@@ -340,9 +319,9 @@ impl PoolEntry {
             check_lsp_available(&spec.binary, &spec.availability, spec.request_timeout).await?;
             let client = LspClient::start_configured(
                 &spec.binary,
-                launch_args(&spec.availability),
+                spec.launch_args.clone(),
                 &spec.workspace_root,
-                initialization_options(&spec),
+                spec.initialization_options.clone(),
                 spec.request_timeout,
             )
             .await?;
@@ -644,10 +623,18 @@ mod tests {
                 timeout: Duration::from_secs(2),
             },
             language_id: "rust",
+            launch_args: Vec::new(),
+            initialization_options: serde_json::json!({
+                "experimental": {
+                    "serverStatusNotification": true
+                }
+            }),
         };
         let pyright = LspSpawnSpec {
             readiness: ReadinessStrategy::InitializeResponseOnly,
             language_id: "python",
+            launch_args: vec!["--stdio".to_string()],
+            initialization_options: serde_json::json!({}),
             ..rust.clone()
         };
 
@@ -660,10 +647,11 @@ mod tests {
             ReadinessStrategy::InitializeResponseOnly
         ));
         assert_eq!(
-            initialization_options(&rust)["experimental"]["serverStatusNotification"],
+            rust.initialization_options["experimental"]["serverStatusNotification"],
             true
         );
-        assert_eq!(initialization_options(&pyright), serde_json::json!({}));
+        assert_eq!(pyright.launch_args, vec!["--stdio"]);
+        assert_eq!(pyright.initialization_options, serde_json::json!({}));
     }
 
     #[test]

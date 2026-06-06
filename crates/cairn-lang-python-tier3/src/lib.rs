@@ -21,6 +21,7 @@ use cairn_core::workspace_analyzer::{
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
+use serde_json::json;
 use tracing::debug;
 use tree_sitter::Node;
 
@@ -66,6 +67,8 @@ impl WorkspaceAnalyzer for PyrightWorkspaceAnalyzer {
             availability: AvailabilityStrategy::PathExistsExecutable,
             readiness: ReadinessStrategy::InitializeResponseOnly,
             language_id: "python",
+            launch_args: vec!["--stdio".to_string()],
+            initialization_options: json!({}),
         };
         let repo_root = repo_root.to_path_buf();
         let files = files.to_vec();

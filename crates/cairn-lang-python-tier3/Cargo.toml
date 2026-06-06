@@ -13,6 +13,7 @@ description = "Python Tier-3 workspace analyzer backed by pyright LSP."
 [dependencies]
 cairn-core.workspace = true
 linkme.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tree-sitter.workspace = true
