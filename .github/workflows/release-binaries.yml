@@ -15,8 +15,7 @@ on:
         default: true
         type: boolean
 
-permissions:
-  contents: write
+permissions: { contents: write }
 
 jobs:
   build:
@@ -75,3 +74,41 @@ jobs:
           fi
 
           gh release upload "${RELEASE_TAG}" dist/*.tar.gz --clobber
+
+      - name: Dry-run summary
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        shell: bash
+        run: ls -lh dist/*.tar.gz
+
+  deb:
+    name: Build Debian package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
+
+      - name: Install cargo-deb
+        run: cargo install --locked cargo-deb
+
+      - name: Build Debian package
+        run: cargo deb --locked -p cairn-cli --output dist
+
+      - name: Upload release asset
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "release tag is required when dry_run is false" >&2
+            exit 1
+          fi
+
+          gh release upload "${RELEASE_TAG}" dist/*.deb --clobber
+
+      - name: Dry-run summary
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        shell: bash
+        run: ls -lh dist/*.deb

@@ -46,3 +46,16 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[package.metadata.deb]
+maintainer = "Naoto Morishima"
+depends = "$auto, systemd"
+section = "utils"
+priority = "optional"
+assets = [
+    ["../../target/release/cairn", "usr/bin/cairn", "755"],
+    ["../../README.md", "usr/share/doc/cairn/README.md", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/cairn/LICENSE-APACHE", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/cairn/LICENSE-MIT", "644"],
+    ["../../dist/deb/systemd/cairn.service", "usr/lib/systemd/user/cairn.service", "644"],
+]
