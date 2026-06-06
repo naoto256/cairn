@@ -161,7 +161,7 @@ fn registered_repo_path_check(entry: &cas_registry::AliasEntry) -> DoctorCheck {
         }),
         (!exists).then(|| {
             format!(
-                "Run `cairn ctl remove-repo --alias {}` (registry will keep the on-disk store for other aliases pointing at this path), or restore the directory at {}.",
+                "Run `cairn ctl remove-repo --alias {}` to drop the alias entry (on-disk data is kept for any other aliases at the same path), or restore the directory at {}.",
                 entry.alias, entry.root_path
             )
         }),
