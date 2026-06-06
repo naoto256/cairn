@@ -437,20 +437,36 @@ mod tests {
     use crate::lsp::Error;
 
     #[cfg(unix)]
-    fn fake_probe_binary(expected_arg: &'static str) -> tempfile::NamedTempFile {
-        use std::io::Write;
+    struct FakeProbeBinary {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeProbeBinary {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_probe_binary(expected_arg: &'static str) -> FakeProbeBinary {
+        use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"{expected_arg}\" ]; then exit 0; fi\nexit 1"
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-lsp");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"{expected_arg}\" ]; then exit 0; fi\nexit 1"
+            ),
         )
         .unwrap();
-        let mut perms = file.as_file().metadata().unwrap().permissions();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
-        file.as_file().set_permissions(perms).unwrap();
-        file
+        fs::set_permissions(&path, perms).unwrap();
+        FakeProbeBinary { _dir: dir, path }
     }
 
     #[test]
