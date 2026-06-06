@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cairn_watch::{WatchBackend, WatchEvent, WatcherHandle, watch_repo_with_backend};
@@ -111,37 +111,32 @@ impl WatchManager {
             rx,
         ));
 
-        self.watchers
-            .lock()
-            .expect("watch manager mutex poisoned")
-            .insert(
-                alias.clone(),
-                RepoWatcher {
-                    _handle: handle,
-                    task,
-                },
-            );
+        self.lock_recovering().insert(
+            alias.clone(),
+            RepoWatcher {
+                _handle: handle,
+                task,
+            },
+        );
         info!(alias = %alias, path = %root_path.display(), "repo watcher started");
         Ok(())
     }
 
     pub fn unwatch_alias(&self, alias: &str) {
-        if self
-            .watchers
-            .lock()
-            .expect("watch manager mutex poisoned")
-            .remove(alias)
-            .is_some()
-        {
+        if self.lock_recovering().remove(alias).is_some() {
             info!(alias = %alias, "repo watcher stopped");
         }
     }
 
     pub fn is_watching_alias(&self, alias: &str) -> bool {
-        self.watchers
-            .lock()
-            .expect("watch manager mutex poisoned")
-            .contains_key(alias)
+        self.lock_recovering().contains_key(alias)
+    }
+
+    fn lock_recovering(&self) -> MutexGuard<'_, HashMap<String, RepoWatcher>> {
+        self.watchers.lock().unwrap_or_else(|poisoned| {
+            warn!("watch manager mutex poisoned; recovering watcher registry");
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -188,4 +183,25 @@ fn now_ns() -> Result<i64> {
             .as_nanos(),
     )
     .unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watcher_registry_recovers_after_mutex_poison() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = WatchManager::with_backend(
+            Arc::new(CasDataDir::with_root(tmp.path().to_path_buf())),
+            WatchBackend::Poll,
+        );
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.watchers.lock().unwrap();
+            panic!("poison watcher registry");
+        }));
+
+        assert!(!manager.is_watching_alias("missing"));
+    }
 }
