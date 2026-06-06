@@ -13,6 +13,7 @@ members = [
     "crates/cairn-lang-markdown",
     "crates/cairn-lang-typescript",
     "crates/cairn-lang-go",
+    "crates/cairn-lang-go-tier3",
     "crates/cairn-watch",
 ]
 
@@ -100,6 +101,7 @@ cairn-lang-python-tier3 = { path = "crates/cairn-lang-python-tier3" }
 cairn-lang-markdown = { path = "crates/cairn-lang-markdown" }
 cairn-lang-typescript = { path = "crates/cairn-lang-typescript" }
 cairn-lang-go = { path = "crates/cairn-lang-go" }
+cairn-lang-go-tier3 = { path = "crates/cairn-lang-go-tier3" }
 cairn-watch = { path = "crates/cairn-watch" }
 
 [profile.release]

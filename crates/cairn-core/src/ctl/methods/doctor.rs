@@ -317,7 +317,11 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
 }
 
 fn tier3_binary_checks() -> Vec<DoctorCheck> {
-    vec![rust_analyzer_binary_check(), pyright_binary_check()]
+    vec![
+        rust_analyzer_binary_check(),
+        pyright_binary_check(),
+        gopls_binary_check(),
+    ]
 }
 
 fn rust_analyzer_binary_check() -> DoctorCheck {
@@ -335,6 +339,15 @@ fn pyright_binary_check() -> DoctorCheck {
         resolve_pyright(),
         "pyright-langserver not found on daemon PATH",
         "Install pyright (`pip install pyright` or `npm i -g pyright`) and ensure pyright-langserver is on the daemon's PATH; Python Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn gopls_binary_check() -> DoctorCheck {
+    binary_check(
+        "gopls binary discoverable",
+        resolve_gopls(),
+        "gopls not found on daemon PATH",
+        "Install gopls (`go install golang.org/x/tools/gopls@latest`) and ensure it's on the daemon's PATH; Go Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -384,6 +397,20 @@ fn resolve_pyright() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("pyright-langserver"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_gopls() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GOPLS")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("gopls"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -566,7 +593,7 @@ mod tests {
     #[test]
     fn backend_registration_coherence_passes_when_expected_entries_are_registered() {
         let language_backends = ["rust", "python", "markdown", "typescript", "go"];
-        let workspace_analyzers = ["pyright-lsp", "rust-analyzer-lsp"];
+        let workspace_analyzers = ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 
@@ -576,7 +603,7 @@ mod tests {
     #[test]
     fn backend_registration_coherence_warns_for_missing_runtime_entry() {
         let language_backends = ["rust", "python", "markdown", "go"];
-        let workspace_analyzers = ["pyright-lsp", "rust-analyzer-lsp"];
+        let workspace_analyzers = ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 

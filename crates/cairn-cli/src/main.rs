@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 // the rlib in the final link line. Adding a new language backend
 // means adding one more `use ... as _;` line here.
 use cairn_lang_go as _;
+use cairn_lang_go_tier3 as _;
 use cairn_lang_markdown as _;
 use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
@@ -99,6 +100,9 @@ mod tests {
             .collect::<Vec<_>>();
         analyzer_ids.sort_unstable();
 
-        assert_eq!(analyzer_ids, ["pyright-lsp", "rust-analyzer-lsp"]);
+        assert_eq!(
+            analyzer_ids,
+            ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"]
+        );
     }
 }
