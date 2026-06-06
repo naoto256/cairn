@@ -64,13 +64,17 @@ struct Entry {
 
 fn expected_entry(crate_name: &str) -> Entry {
     let import_hint = format!("use {} as _;", crate_name.replace('-', "_"));
-    if crate_name == "cairn-lang-rust-tier3" || crate_name == "cairn-lang-python-tier3" {
+    if crate_name == "cairn-lang-rust-tier3"
+        || crate_name == "cairn-lang-python-tier3"
+        || crate_name == "cairn-lang-go-tier3"
+    {
         return Entry {
             crate_name: crate_name.to_string(),
             registry: "WorkspaceAnalyzer",
             runtime_id: match crate_name {
                 "cairn-lang-rust-tier3" => "rust-analyzer-lsp",
                 "cairn-lang-python-tier3" => "pyright-lsp",
+                "cairn-lang-go-tier3" => "gopls-lsp",
                 _ => unreachable!(),
             }
             .to_string(),

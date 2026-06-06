@@ -141,9 +141,13 @@ unresolved pending import-derived alias tracking, mirroring the
 Rust / Python receiver-type policy. `.tsx` lives in a separate
 upstream grammar and is intentionally a follow-up backend. Go covers `*.go` (functions,
 methods with receiver-qualified names, named types, top-level
-constants and variables, imports); Tier-2 via `gopls` is reserved
-as future work, and exported-vs-unexported visibility (Go's
-first-letter convention) is currently uniformly `Public`.
+constants and variables, imports). Go Tier-3 via `gopls` is wired in
+`cairn-lang-go-tier3`: when a `gopls` binary is discoverable,
+`register_repo` runs it once per snapshot and emits resolved
+method-call refs back into `refs` under `source = gopls-lsp`; same
+Skipped semantics if the binary is absent. Exported-vs-unexported
+visibility is determined by Go's first-letter capitalization
+convention.
 
 Files are picked by extension first (`*.py`, `*.rs`, `*.md`, `*.ts`,
 `*.go`, ...); extensionless executables (`bin/foo` with mode

@@ -67,6 +67,28 @@ impl PoolKey {
             config_hash: config_hash.to_string(),
         })
     }
+
+    /// Build a gopls key from the repo root and launch configuration.
+    ///
+    /// # Errors
+    /// Returns an LSP protocol error when the repo root cannot be
+    /// canonicalized.
+    pub fn gopls(
+        repo_root: &Path,
+        analyzer_id: &str,
+        binary: &Path,
+        config_hash: &str,
+    ) -> Result<Self> {
+        let canonical_repo_root = std::fs::canonicalize(repo_root).map_err(|e| {
+            super::Error::Protocol(format!("canonicalize {}: {e}", repo_root.display()))
+        })?;
+        Ok(Self {
+            canonical_repo_root,
+            analyzer_id: analyzer_id.to_string(),
+            binary: binary.to_path_buf(),
+            config_hash: config_hash.to_string(),
+        })
+    }
 }
 
 /// Launch and readiness settings for a pooled rust-analyzer client.
@@ -82,6 +104,15 @@ pub struct RustAnalyzerSpawnSpec {
 /// Launch and readiness settings for a pooled pyright-langserver client.
 #[derive(Debug, Clone)]
 pub struct PyrightSpawnSpec {
+    pub binary: PathBuf,
+    pub workspace_root: PathBuf,
+    pub config_hash: String,
+    pub request_timeout: Duration,
+}
+
+/// Launch and readiness settings for a pooled gopls client.
+#[derive(Debug, Clone)]
+pub struct GoplsSpawnSpec {
     pub binary: PathBuf,
     pub workspace_root: PathBuf,
     pub config_hash: String,
@@ -127,6 +158,37 @@ pub struct PooledPyright<'a> {
 
 impl PooledPyright<'_> {
     /// Open or fully replace a document in pyright.
+    ///
+    /// # Errors
+    /// Returns protocol/server errors from the underlying LSP client.
+    pub async fn sync_document(&mut self, uri: &Url, language_id: &str, text: &str) -> Result<()> {
+        if let Some(version) = self.opened_documents.get_mut(uri.as_str()) {
+            *version = version.saturating_add(1);
+            self.client.did_change(uri, *version, text).await
+        } else {
+            self.opened_documents.insert(uri.as_str().to_string(), 1);
+            self.client.did_open(uri, language_id, 1, text).await
+        }
+    }
+
+    /// Resolve the definition at `uri` + `position`.
+    ///
+    /// # Errors
+    /// Returns timeout/protocol/server errors from the underlying LSP
+    /// request.
+    pub async fn definition(&self, uri: &Url, position: Position) -> Result<Vec<super::Location>> {
+        self.client.definition(uri, position).await
+    }
+}
+
+/// Borrowed pooled gopls client plus document synchronization state.
+pub struct PooledGopls<'a> {
+    client: &'a LspClient,
+    opened_documents: &'a mut HashMap<String, i32>,
+}
+
+impl PooledGopls<'_> {
+    /// Open or fully replace a document in gopls.
     ///
     /// # Errors
     /// Returns protocol/server errors from the underlying LSP client.
@@ -213,6 +275,21 @@ impl LspClientPool {
         let entry = self.entry(key)?;
         self.runtime
             .block_on(async move { entry.with_pyright_client(spawn_spec, work).await })
+    }
+
+    /// Borrow a long-lived gopls client for `key`, lazily spawning it
+    /// when needed.
+    ///
+    /// # Errors
+    /// Returns LSP spawn/readiness/protocol errors from the pooled
+    /// client.
+    pub fn with_gopls<T, F>(&self, key: PoolKey, spawn_spec: GoplsSpawnSpec, work: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut PooledGopls<'a>) -> ClientWork<'a, T>,
+    {
+        let entry = self.entry(key)?;
+        self.runtime
+            .block_on(async move { entry.with_gopls_client(spawn_spec, work).await })
     }
 
     /// Gracefully stop all live clients and clear the registry.
@@ -359,6 +436,49 @@ impl PoolEntry {
         result
     }
 
+    async fn with_gopls_client<T, F>(&self, spec: GoplsSpawnSpec, work: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut PooledGopls<'a>) -> ClientWork<'a, T>,
+    {
+        let mut state = self.state.lock().await;
+        if state.client.is_none() {
+            let client = LspClient::start_gopls_with_timeout(
+                &spec.binary,
+                &spec.workspace_root,
+                &spec.config_hash,
+                spec.request_timeout,
+            )
+            .await?;
+            // gopls v0.22.0 did not emit `$/progress`
+            // workspace-load sequences in a direct probe against a
+            // small module. The initialize response is the readiness
+            // gate here; rust-analyzer keeps its progress-wait path.
+            state.client = Some(client);
+            state.opened_documents.clear();
+        }
+
+        let PoolEntryState {
+            client,
+            opened_documents,
+        } = &mut *state;
+        let client = client
+            .as_ref()
+            .ok_or_else(|| super::Error::ServerExited(None.into()))?;
+        let mut pooled = PooledGopls {
+            client,
+            opened_documents,
+        };
+        let result = work(&mut pooled).await;
+        if matches!(result, Err(super::Error::ServerExited(_))) {
+            let client = state.client.take();
+            state.opened_documents.clear();
+            if let Some(client) = client {
+                let _ = client.shutdown().await;
+            }
+        }
+        result
+    }
+
     async fn shutdown(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         state.opened_documents.clear();
@@ -410,12 +530,14 @@ mod tests {
         let key_b =
             PoolKey::rust_analyzer(repo.path(), "rust-analyzer-lsp", Path::new("ra"), "cfg-b")
                 .unwrap();
+        let key_go = PoolKey::gopls(repo.path(), "gopls-lsp", Path::new("gopls"), "cfg-a").unwrap();
 
         assert_eq!(
             key_a.canonical_repo_root,
             std::fs::canonicalize(repo.path()).unwrap()
         );
         assert_ne!(key_a, key_b);
+        assert_eq!(key_go.analyzer_id, "gopls-lsp");
     }
 
     #[test]
