@@ -37,9 +37,11 @@ use cairn_proto::jsonrpc::{
 };
 use clap::Args as ClapArgs;
 use linkme::distributed_slice;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing::error;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "cairn";
@@ -232,19 +234,27 @@ impl Dispatcher {
         let resp = match req.method.as_str() {
             "initialize" => RpcResponse {
                 jsonrpc: JsonRpcVersion::V2,
-                id,
-                result: Some(serde_json::to_value(initialize_result()).unwrap()),
+                id: id.clone(),
+                result: Some(match serialize_result(&id, initialize_result()) {
+                    Ok(value) => value,
+                    Err(resp) => return Some(serialize(&resp)),
+                }),
                 error: None,
             },
             "notifications/initialized" => return None,
             "tools/list" => RpcResponse {
                 jsonrpc: JsonRpcVersion::V2,
-                id,
+                id: id.clone(),
                 result: Some(
-                    serde_json::to_value(ToolsListResult {
-                        tools: self.tool_specs(),
-                    })
-                    .unwrap(),
+                    match serialize_result(
+                        &id,
+                        ToolsListResult {
+                            tools: self.tool_specs(),
+                        },
+                    ) {
+                        Ok(value) => value,
+                        Err(resp) => return Some(serialize(&resp)),
+                    },
                 ),
                 error: None,
             },
@@ -408,7 +418,10 @@ fn mcp_wrap_rpc_response(id: RequestId, resp: RpcResponse) -> RpcResponse {
         content: vec![ContentBlock::Text { text }],
         is_error: false,
     };
-    let mut wrapped = serde_json::to_value(result).unwrap();
+    let mut wrapped = match serialize_result(&id, result) {
+        Ok(value) => value,
+        Err(resp) => return resp,
+    };
     if let Value::Object(ref mut map) = wrapped {
         map.insert("structuredContent".into(), value);
     }
@@ -418,6 +431,20 @@ fn mcp_wrap_rpc_response(id: RequestId, resp: RpcResponse) -> RpcResponse {
         result: Some(wrapped),
         error: None,
     }
+}
+
+fn serialize_result<T: Serialize>(
+    id: &RequestId,
+    result: T,
+) -> std::result::Result<Value, RpcResponse> {
+    serde_json::to_value(result).map_err(|err| {
+        error!(error = %err, "failed to serialize MCP response result");
+        error_resp(
+            id.clone(),
+            error_code::INTERNAL_ERROR,
+            "internal: response serialization failed",
+        )
+    })
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
