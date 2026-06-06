@@ -8,7 +8,7 @@
 pub mod pool;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -197,45 +197,23 @@ impl LspClient {
         Ok(client)
     }
 
-    /// Start a pyright-langserver subprocess using a custom request timeout.
+    /// Start an LSP subprocess after the caller has performed any
+    /// server-specific availability probe.
     ///
     /// # Errors
-    /// See [`Self::start`].
-    pub async fn start_pyright_with_timeout(
+    /// Returns spawn/handshake/protocol errors from the LSP server.
+    pub async fn start_configured(
         binary_path: &Path,
+        args: Vec<String>,
         workspace_root: &Path,
-        _config_hash: &str,
+        initialization_options: Value,
         request_timeout: Duration,
     ) -> Result<Self> {
-        check_pyright_available(binary_path)?;
         let client = Self::new(
             Some(binary_path.to_path_buf()),
-            vec!["--stdio".to_string()],
+            args,
             workspace_root.to_path_buf(),
-            json!({}),
-            request_timeout,
-            MAX_RESTARTS,
-        );
-        client.spawn_process().await?;
-        Ok(client)
-    }
-
-    /// Start a gopls subprocess using a custom request timeout.
-    ///
-    /// # Errors
-    /// See [`Self::start`].
-    pub async fn start_gopls_with_timeout(
-        binary_path: &Path,
-        workspace_root: &Path,
-        _config_hash: &str,
-        request_timeout: Duration,
-    ) -> Result<Self> {
-        check_gopls_available(binary_path, request_timeout).await?;
-        let client = Self::new(
-            Some(binary_path.to_path_buf()),
-            Vec::new(),
-            workspace_root.to_path_buf(),
-            json!({}),
+            initialization_options,
             request_timeout,
             MAX_RESTARTS,
         );
@@ -619,70 +597,6 @@ async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -
     } else {
         Err(Error::BinaryMissing(binary_path.to_path_buf()))
     }
-}
-
-async fn check_gopls_available(binary_path: &Path, request_timeout: Duration) -> Result<()> {
-    let output = timeout(
-        request_timeout,
-        Command::new(binary_path).arg("version").output(),
-    )
-    .await
-    .map_err(|_| Error::Timeout)?
-    .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::BinaryMissing(binary_path.to_path_buf())
-        } else {
-            Error::Spawn(e)
-        }
-    })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::BinaryMissing(binary_path.to_path_buf()))
-    }
-}
-
-fn check_pyright_available(binary_path: &Path) -> Result<()> {
-    let resolved = resolve_executable(binary_path)
-        .ok_or_else(|| Error::BinaryMissing(binary_path.to_path_buf()))?;
-    if is_executable(&resolved) {
-        Ok(())
-    } else {
-        Err(Error::BinaryMissing(binary_path.to_path_buf()))
-    }
-}
-
-fn resolve_executable(binary_path: &Path) -> Option<PathBuf> {
-    if has_path_separator(binary_path) {
-        return binary_path.exists().then(|| binary_path.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(binary_path))
-            .find(|candidate| candidate.exists())
-    })
-}
-
-fn has_path_separator(path: &Path) -> bool {
-    path.components()
-        .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
-        || path.components().count() > 1
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    path.metadata()
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.metadata()
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
 }
 
 async fn reader_loop<R>(
