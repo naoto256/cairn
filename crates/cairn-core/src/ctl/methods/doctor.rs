@@ -17,8 +17,6 @@ include!(concat!(env!("OUT_DIR"), "/expected_backend_crates.rs"));
 
 struct Doctor;
 
-const RUST_ANALYZER_ID: &str = "rust-analyzer-lsp";
-
 #[async_trait::async_trait]
 impl ControlMethod for Doctor {
     fn name(&self) -> &'static str {
@@ -199,11 +197,12 @@ struct AliasStoreProbe {
 #[derive(Debug, Clone)]
 struct AliasStoreState {
     tentative_manifest_id: Option<i64>,
-    tier3_run: Option<Tier3Run>,
+    tier3_runs: Vec<Tier3Run>,
 }
 
 #[derive(Debug, Clone)]
 struct Tier3Run {
+    analyzer_id: String,
     manifest_id: i64,
     status: String,
     error: Option<String>,
@@ -257,26 +256,28 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             .optional()?,
         None => None,
     };
-    let tier3_run = match tentative_manifest_id {
-        Some(manifest_id) => conn
-            .query_row(
-                "SELECT manifest_id, status, error FROM workspace_analysis_runs
-                 WHERE manifest_id = ?1 AND analyzer_id = ?2",
-                params![manifest_id, RUST_ANALYZER_ID],
-                |r| {
-                    Ok(Tier3Run {
-                        manifest_id: r.get(0)?,
-                        status: r.get(1)?,
-                        error: r.get(2)?,
-                    })
-                },
-            )
-            .optional()?,
-        None => None,
+    let tier3_runs = match tentative_manifest_id {
+        Some(manifest_id) => {
+            let mut stmt = conn.prepare(
+                "SELECT analyzer_id, manifest_id, status, error FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1
+                 ORDER BY analyzer_id",
+            )?;
+            stmt.query_map(params![manifest_id], |r| {
+                Ok(Tier3Run {
+                    analyzer_id: r.get(0)?,
+                    manifest_id: r.get(1)?,
+                    status: r.get(2)?,
+                    error: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        None => Vec::new(),
     };
     Ok(AliasStoreState {
         tentative_manifest_id,
-        tier3_run,
+        tier3_runs,
     })
 }
 
@@ -407,74 +408,86 @@ fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
 }
 
 fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
-    match &state.tier3_run {
-        Some(run) if run.status == "succeeded" => doctor_check(
-            format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Pass,
-            Some(format!(
-                "last Tier-3 run succeeded at manifest {}",
-                run.manifest_id
-            )),
-            None,
-        ),
-        Some(run) if run.status == "skipped" => doctor_check(
-            format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Pass,
-            Some(format!(
-                "last Tier-3 run skipped at manifest {} (= LSP binary missing OR transient ContentModified)",
-                run.manifest_id
-            )),
-            None,
-        ),
-        Some(run) if run.status == "pending" => doctor_check(
-            format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Pass,
-            Some(format!(
-                "Tier-3 run queued at manifest {} (= analyzer scheduled but not yet started)",
-                run.manifest_id
-            )),
-            None,
-        ),
-        Some(run) if run.status == "running" => doctor_check(
-            format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Pass,
-            Some(format!(
-                "Tier-3 run in progress at manifest {}",
-                run.manifest_id
-            )),
-            None,
-        ),
-        Some(run) if run.status == "failed" => doctor_check(
-            format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Warn,
-            Some(format!(
-                "last Tier-3 run failed: {}",
-                run.error.as_deref().unwrap_or("unknown error")
-            )),
-            Some(format!(
-                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl reindex-repo --alias {alias}`.",
-                run.manifest_id
-            )),
-        ),
-        Some(run) => doctor_check(
-            format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Warn,
-            Some(format!(
-                "Tier-3 run reported status `{}` at manifest {} (not recognized by this doctor build)",
-                run.status, run.manifest_id
-            )),
-            Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` and check daemon logs if the status persists."
-            )),
-        ),
-        None => doctor_check(
+    if state.tier3_runs.is_empty() {
+        return doctor_check(
             format!("repo `{alias}` Tier-3 analyzer status"),
             DoctorStatus::Warn,
             Some("no Tier-3 run recorded for this alias".into()),
             Some(format!(
                 "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` or wait for the next file edit to drive a watcher tick."
             )),
-        ),
+        );
+    }
+
+    let detail = tier3_runs_detail(&state.tier3_runs);
+    if let Some(run) = state.tier3_runs.iter().find(|run| run.status == "failed") {
+        return doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!(
+                "{detail}; {} failed: {}",
+                run.analyzer_id,
+                run.error.as_deref().unwrap_or("unknown error")
+            )),
+            Some(format!(
+                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl reindex-repo --alias {alias}`.",
+                run.manifest_id
+            )),
+        );
+    }
+
+    if let Some(run) = state.tier3_runs.iter().find(|run| {
+        !matches!(
+            run.status.as_str(),
+            "succeeded" | "skipped" | "pending" | "running"
+        )
+    }) {
+        return doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!(
+                "{detail}; {} reported status `{}` at manifest {} (not recognized by this doctor build)",
+                run.analyzer_id, run.status, run.manifest_id
+            )),
+            Some(format!(
+                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` and check daemon logs if the status persists."
+            )),
+        );
+    }
+
+    doctor_check(
+        format!("repo `{alias}` Tier-3 analyzer status"),
+        DoctorStatus::Pass,
+        Some(detail),
+        None,
+    )
+}
+
+fn tier3_runs_detail(runs: &[Tier3Run]) -> String {
+    let manifest_id = runs
+        .iter()
+        .map(|run| run.manifest_id)
+        .min()
+        .unwrap_or_default();
+    let statuses = runs
+        .iter()
+        .map(|run| {
+            let status = tier3_status_label(run);
+            format!("{}={status}", run.analyzer_id)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Tier-3 analyzer runs at manifest {manifest_id}: {statuses}")
+}
+
+fn tier3_status_label(run: &Tier3Run) -> String {
+    match (run.status.as_str(), run.error.as_deref()) {
+        ("succeeded", _) => "succeeded".into(),
+        ("skipped", Some(error)) => format!("skipped ({error})"),
+        ("skipped", None) => "skipped".into(),
+        ("pending", _) => "queued".into(),
+        ("running", _) => "in progress".into(),
+        (status, _) => status.into(),
     }
 }
 
@@ -547,6 +560,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::Notify;
+
+    const RUST_ANALYZER_ID: &str = "rust-analyzer-lsp";
 
     #[test]
     fn backend_registration_coherence_passes_when_expected_entries_are_registered() {
@@ -630,7 +645,7 @@ mod tests {
                 store_path: PathBuf::from("/tmp/ok/store.db"),
                 result: Ok(AliasStoreState {
                     tentative_manifest_id: Some(7),
-                    tier3_run: None,
+                    tier3_runs: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -638,7 +653,7 @@ mod tests {
                 store_path: PathBuf::from("/tmp/missing/store.db"),
                 result: Ok(AliasStoreState {
                     tentative_manifest_id: None,
-                    tier3_run: None,
+                    tier3_runs: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -682,62 +697,67 @@ mod tests {
             "ok",
             &AliasStoreState {
                 tentative_manifest_id: Some(1),
-                tier3_run: Some(Tier3Run {
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
                     manifest_id: 1,
                     status: "succeeded".into(),
                     error: None,
-                }),
+                }],
             },
         );
         let skipped = tier3_run_check(
             "skip",
             &AliasStoreState {
                 tentative_manifest_id: Some(2),
-                tier3_run: Some(Tier3Run {
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
                     manifest_id: 2,
                     status: "skipped".into(),
-                    error: Some("content modified".into()),
-                }),
+                    error: Some("ContentModified".into()),
+                }],
             },
         );
         let pending = tier3_run_check(
             "pending",
             &AliasStoreState {
                 tentative_manifest_id: Some(5),
-                tier3_run: Some(Tier3Run {
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
                     manifest_id: 5,
                     status: "pending".into(),
                     error: None,
-                }),
+                }],
             },
         );
         let running = tier3_run_check(
             "running",
             &AliasStoreState {
                 tentative_manifest_id: Some(6),
-                tier3_run: Some(Tier3Run {
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
                     manifest_id: 6,
                     status: "running".into(),
                     error: None,
-                }),
+                }],
             },
         );
         let failed = tier3_run_check(
             "fail",
             &AliasStoreState {
                 tentative_manifest_id: Some(3),
-                tier3_run: Some(Tier3Run {
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
                     manifest_id: 3,
                     status: "failed".into(),
                     error: Some("boom".into()),
-                }),
+                }],
             },
         );
         let missing = tier3_run_check(
             "missing",
             &AliasStoreState {
                 tentative_manifest_id: Some(4),
-                tier3_run: None,
+                tier3_runs: Vec::new(),
             },
         );
 
@@ -774,6 +794,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tier3_run_check_reports_python_success_when_rust_skips() {
+        let check = tier3_run_check(
+            "py",
+            &AliasStoreState {
+                tentative_manifest_id: Some(9),
+                tier3_runs: vec![
+                    Tier3Run {
+                        analyzer_id: "pyright-lsp".into(),
+                        manifest_id: 9,
+                        status: "succeeded".into(),
+                        error: None,
+                    },
+                    Tier3Run {
+                        analyzer_id: RUST_ANALYZER_ID.into(),
+                        manifest_id: 9,
+                        status: "skipped".into(),
+                        error: Some("no matching files".into()),
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(check.status, DoctorStatus::Pass);
+        let detail = check.detail.as_deref().unwrap();
+        assert!(detail.contains("pyright-lsp=succeeded"));
+        assert!(detail.contains("rust-analyzer-lsp=skipped (no matching files)"));
+    }
+
     #[tokio::test]
     async fn doctor_dispatch_reports_live_watcher_tentative_anchor_and_tier3_success() {
         let fixture = DoctorFixture::new();
@@ -792,6 +841,27 @@ mod tests {
         let tier3 = find_check(&report, "repo `demo` Tier-3 analyzer status");
         assert_eq!(tier3.status, DoctorStatus::Pass);
         assert!(tier3.detail.as_deref().unwrap().contains("succeeded"));
+    }
+
+    #[tokio::test]
+    async fn doctor_dispatch_reports_per_analyzer_tier3_status_when_multiple_runs_present() {
+        let fixture = DoctorFixture::new();
+        fixture.seed_alias("demo", true, None, None);
+        fixture.seed_workspace_run("demo", "pyright-lsp", "succeeded", None);
+        fixture.seed_workspace_run(
+            "demo",
+            RUST_ANALYZER_ID,
+            "skipped",
+            Some("no matching files"),
+        );
+
+        let report = fixture.run_doctor().await;
+
+        let tier3 = find_check(&report, "repo `demo` Tier-3 analyzer status");
+        assert_eq!(tier3.status, DoctorStatus::Pass);
+        let detail = tier3.detail.as_deref().unwrap();
+        assert!(detail.contains("pyright-lsp=succeeded"));
+        assert!(detail.contains("rust-analyzer-lsp=skipped"));
     }
 
     #[tokio::test]
@@ -894,16 +964,28 @@ mod tests {
                     .unwrap();
             }
             if let Some(status) = tier3_status {
-                store
-                    .execute(
-                        "INSERT INTO workspace_analysis_runs
-                           (manifest_id, analyzer_id, analyzer_revision, config_hash,
-                            status, started_at_ns, finished_at_ns, error)
-                         VALUES (1, ?1, 1, 'cfg', ?2, 0, 1, ?3)",
-                        params![RUST_ANALYZER_ID, status, tier3_error],
-                    )
-                    .unwrap();
+                self.seed_workspace_run(alias, RUST_ANALYZER_ID, status, tier3_error);
             }
+        }
+
+        fn seed_workspace_run(
+            &self,
+            alias: &str,
+            analyzer_id: &str,
+            status: &str,
+            error: Option<&str>,
+        ) {
+            let store_path = self.cas_data_dir.store_db_path(&format!("{alias}-hash"));
+            let store = cas_store::open(&store_path).unwrap();
+            store
+                .execute(
+                    "INSERT INTO workspace_analysis_runs
+                       (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                        status, started_at_ns, finished_at_ns, error)
+                     VALUES (1, ?1, 1, 'cfg', ?2, 0, 1, ?3)",
+                    params![analyzer_id, status, error],
+                )
+                .unwrap();
         }
 
         async fn run_doctor(&self) -> DoctorReport {
