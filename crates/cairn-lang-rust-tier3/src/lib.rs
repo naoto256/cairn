@@ -11,7 +11,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_core::lsp::pool::{self as lsp_pool, PoolKey, PooledRustAnalyzer, RustAnalyzerSpawnSpec};
+use cairn_core::lsp::pool::{
+    self as lsp_pool, AvailabilityStrategy, LspSpawnSpec, PoolKey, PooledLsp, ReadinessStrategy,
+};
 use cairn_core::lsp::{Location, Position, Url};
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
@@ -55,19 +57,23 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
         files: &[WorkspaceFile],
     ) -> Result<WorkspaceFacts> {
         let binary = rust_analyzer_binary();
-        let key = PoolKey::rust_analyzer(repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
+        let key = PoolKey::lsp("rust", repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
             .map_err(map_lsp_error)?;
-        let spawn_spec = RustAnalyzerSpawnSpec {
+        let spawn_spec = LspSpawnSpec {
             binary,
             workspace_root: repo_root.to_path_buf(),
             config_hash: CONFIG_HASH.to_string(),
             request_timeout: REQUEST_TIMEOUT,
-            workspace_load_timeout: WORKSPACE_LOAD_TIMEOUT,
+            availability: AvailabilityStrategy::VersionFlag,
+            readiness: ReadinessStrategy::ProgressQuiescence {
+                timeout: WORKSPACE_LOAD_TIMEOUT,
+            },
+            language_id: "rust",
         };
         let repo_root = repo_root.to_path_buf();
         let files = files.to_vec();
         let pool = lsp_pool::global().map_err(map_lsp_error)?;
-        pool.with_rust_analyzer(key, spawn_spec, |client| {
+        pool.with_lsp(key, spawn_spec, |client| {
             Box::pin(async move {
                 let mut facts = WorkspaceFacts::default();
                 collect_resolved_refs(client, &repo_root, &files, &mut facts)
@@ -91,7 +97,7 @@ fn rust_analyzer_binary() -> PathBuf {
 }
 
 async fn collect_resolved_refs(
-    client: &mut PooledRustAnalyzer<'_>,
+    client: &mut PooledLsp<'_>,
     repo_root: &Path,
     files: &[WorkspaceFile],
     facts: &mut WorkspaceFacts,
@@ -107,7 +113,7 @@ async fn collect_resolved_refs(
         }
         let uri = Url::from_file_path(path).map_err(map_lsp_error)?;
         client
-            .sync_document(&uri, "rust", &source)
+            .sync_document(&uri, &source)
             .await
             .map_err(map_lsp_error)?;
         for call in calls {
@@ -128,7 +134,7 @@ async fn collect_resolved_refs(
 }
 
 async fn definition_with_retry(
-    client: &PooledRustAnalyzer<'_>,
+    client: &PooledLsp<'_>,
     uri: &Url,
     position: Position,
 ) -> Result<Vec<Location>> {

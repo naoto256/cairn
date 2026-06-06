@@ -11,7 +11,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_core::lsp::pool::{self as lsp_pool, GoplsSpawnSpec, PoolKey, PooledGopls};
+use cairn_core::lsp::pool::{
+    self as lsp_pool, AvailabilityStrategy, LspSpawnSpec, PoolKey, PooledLsp, ReadinessStrategy,
+};
 use cairn_core::lsp::{Location, Position, Url};
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
@@ -54,18 +56,21 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
         files: &[WorkspaceFile],
     ) -> Result<WorkspaceFacts> {
         let binary = gopls_binary();
-        let key =
-            PoolKey::gopls(repo_root, ANALYZER_ID, &binary, CONFIG_HASH).map_err(map_lsp_error)?;
-        let spawn_spec = GoplsSpawnSpec {
+        let key = PoolKey::lsp("go", repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
+            .map_err(map_lsp_error)?;
+        let spawn_spec = LspSpawnSpec {
             binary,
             workspace_root: repo_root.to_path_buf(),
             config_hash: CONFIG_HASH.to_string(),
             request_timeout: REQUEST_TIMEOUT,
+            availability: AvailabilityStrategy::VersionNoFlag,
+            readiness: ReadinessStrategy::InitializeResponseOnly,
+            language_id: "go",
         };
         let repo_root = repo_root.to_path_buf();
         let files = files.to_vec();
         let pool = lsp_pool::global().map_err(map_lsp_error)?;
-        pool.with_gopls(key, spawn_spec, |client| {
+        pool.with_lsp(key, spawn_spec, |client| {
             Box::pin(async move {
                 let mut facts = WorkspaceFacts::default();
                 collect_resolved_refs(client, &repo_root, &files, &mut facts)
@@ -89,7 +94,7 @@ fn gopls_binary() -> PathBuf {
 }
 
 async fn collect_resolved_refs(
-    client: &mut PooledGopls<'_>,
+    client: &mut PooledLsp<'_>,
     repo_root: &Path,
     files: &[WorkspaceFile],
     facts: &mut WorkspaceFacts,
@@ -105,7 +110,7 @@ async fn collect_resolved_refs(
         }
         let uri = Url::from_file_path(path).map_err(map_lsp_error)?;
         client
-            .sync_document(&uri, "go", &source)
+            .sync_document(&uri, &source)
             .await
             .map_err(map_lsp_error)?;
         for call in calls {
@@ -126,7 +131,7 @@ async fn collect_resolved_refs(
 }
 
 async fn definition_with_retry(
-    client: &PooledGopls<'_>,
+    client: &PooledLsp<'_>,
     uri: &Url,
     position: Position,
 ) -> Result<Vec<Location>> {
