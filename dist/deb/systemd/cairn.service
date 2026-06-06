@@ -1,0 +1,17 @@
+[Unit]
+Description=Cairn code-intelligence index daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cairn daemon
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+# The daemon only touches per-user paths under XDG_DATA_HOME and
+# XDG_RUNTIME_DIR; nothing system-wide. Run with no extra privileges.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
