@@ -495,25 +495,71 @@ def main(obj):
     /// definition path instead of the unit-test mocks.
     #[test]
     fn real_pyright_register_repo_surfaces_resolved_method_reference() {
+        assert_real_pyright_fixture_resolves(
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/a.py", "class A:\n    def m(self):\n        pass\n"),
+                (
+                    "pkg/b.py",
+                    "from pkg.a import A\n\n\ndef run():\n    a = A()\n    a.m()\n",
+                ),
+            ],
+            "pkg/b.py",
+            6,
+        );
+    }
+
+    #[test]
+    fn real_pyright_register_repo_resolves_relative_import_method_reference() {
+        assert_real_pyright_fixture_resolves(
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/a.py", "class A:\n    def m(self):\n        pass\n"),
+                (
+                    "pkg/b.py",
+                    "from .a import A\n\n\ndef run():\n    a = A()\n    a.m()\n",
+                ),
+            ],
+            "pkg/b.py",
+            6,
+        );
+    }
+
+    #[test]
+    fn real_pyright_register_repo_resolves_cross_package_method_reference() {
+        assert_real_pyright_fixture_resolves(
+            &[
+                ("pkg_a/__init__.py", ""),
+                ("pkg_a/a.py", "class A:\n    def m(self):\n        pass\n"),
+                ("pkg_b/__init__.py", ""),
+                (
+                    "pkg_b/b.py",
+                    "from pkg_a.a import A\n\n\ndef run():\n    a = A()\n    a.m()\n",
+                ),
+            ],
+            "pkg_b/b.py",
+            6,
+        );
+    }
+
+    fn assert_real_pyright_fixture_resolves(
+        files: &[(&str, &str)],
+        expected_path: &str,
+        expected_line: u32,
+    ) {
         if resolve_test_pyright().is_none() {
             eprintln!("pyright not on PATH; skipping integration test");
             return;
         }
 
         let repo = tempfile::tempdir().unwrap();
-        let pkg = repo.path().join("pkg");
-        fs::create_dir_all(&pkg).unwrap();
-        fs::write(pkg.join("__init__.py"), "").unwrap();
-        fs::write(
-            pkg.join("a.py"),
-            "class A:\n    def m(self):\n        pass\n",
-        )
-        .unwrap();
-        fs::write(
-            pkg.join("b.py"),
-            "from pkg.a import A\n\n\ndef run():\n    a = A()\n    a.m()\n",
-        )
-        .unwrap();
+        for (path, content) in files {
+            let path = repo.path().join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
         git(repo.path(), &["init"]);
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "fixture"]);
@@ -536,12 +582,12 @@ def main(obj):
 
         assert!(
             hits.iter().any(|hit| {
-                hit.path == "pkg/b.py"
-                    && hit.line == 6
+                hit.path == expected_path
+                    && hit.line == expected_line
                     && hit.target_name == "m"
                     && hit.target_qualified.as_deref() == Some("A.m")
             }),
-            "expected resolved pyright method ref in pkg/b.py, got hits={hits:?}, runs={runs:?}, ref_sources={ref_sources:?}"
+            "expected resolved pyright method ref in {expected_path}, got hits={hits:?}, runs={runs:?}, ref_sources={ref_sources:?}"
         );
     }
 
