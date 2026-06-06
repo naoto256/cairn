@@ -9,7 +9,7 @@ fn main() {
         .and_then(Path::parent)
         .expect("cairn-core lives under crates/cairn-core");
     let workspace_manifest = workspace_root.join("Cargo.toml");
-    let cli_manifest = workspace_root.join("crates/cairn-cli/Cargo.toml");
+    let cli_manifest = workspace_root.join("crates/cairn/Cargo.toml");
 
     println!("cargo:rerun-if-changed={}", workspace_manifest.display());
     println!("cargo:rerun-if-changed={}", cli_manifest.display());
@@ -104,7 +104,7 @@ fn language_workspace_members(path: &Path) -> Vec<String> {
 }
 
 fn language_cli_dependencies(path: &Path) -> Vec<String> {
-    let manifest = fs::read_to_string(path).expect("read cairn-cli Cargo.toml");
+    let manifest = fs::read_to_string(path).expect("read cairn Cargo.toml");
     let mut in_dependencies = false;
     let mut deps = Vec::new();
     for line in manifest.lines() {

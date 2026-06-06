@@ -16,7 +16,7 @@
 //! Both protocols ride newline-delimited JSON for simplicity. MCP-specific
 //! types are intentionally *not* in this crate — they live next to the
 //! one binary that speaks MCP (`cairn serve`), under
-//! `cairn-cli/src/cmd/mcp.rs`. Out-of-tree consumers
+//! `cairn/src/cmd/mcp.rs`. Out-of-tree consumers
 //! (cairn-graph, cairn-audit, future LSP front-end) reach for the
 //! protocol-neutral surfaces in [`methods`] and [`control`] and never
 //! need to depend on MCP.

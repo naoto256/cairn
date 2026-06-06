@@ -50,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(cargo pkgid -p cairn-cli | sed 's/.*#//')"
+          version="$(cargo pkgid -p cairn | sed 's/.*#//')"
           archive_base="cairn-v${version}-${{ matrix.target }}"
           staging="dist/${archive_base}"
 
@@ -90,7 +90,7 @@ jobs:
         run: cargo install --locked cargo-deb
 
       - name: Build Debian package
-        run: cargo deb --locked -p cairn-cli --output dist
+        run: cargo deb --locked -p cairn --output dist
 
       - name: Upload release asset
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)

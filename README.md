@@ -60,7 +60,7 @@ namespace makes a clean, brand-aligned publish impractical. Distribution
 through Homebrew and prebuilt binaries serves users better in this
 case — Rust developers can still build from source via:
 
-    cargo install --git https://github.com/naoto256/cairn cairn-cli
+    cargo install --git https://github.com/naoto256/cairn cairn
 
 Requires Rust 1.85+ and a working `git` on `PATH`.
 
