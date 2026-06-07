@@ -4,9 +4,9 @@ Local, symbol-aware code index. A daemon-backed index for fast,
 structural code search across the repos you've registered — definitions,
 references, impls, imports, source bodies — with no external service.
 
-Status: **0.1.0**. Wire schemas (JSON-RPC + MCP), on-disk
-format, and CLI flags are current-state-of-the-day; do not depend on
-them staying stable until 1.0.
+Status: **0.1.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
+and CLI flags follow SemVer 0.x rules — minor releases may break
+compatibility. 1.0 will tag once these surfaces stabilize.
 
 ## Why
 
@@ -46,23 +46,54 @@ Substrate sources:
 
 ## Installation
 
-Cairn ships via Homebrew, GitHub Releases (`.deb` / prebuilt binaries),
-and `cargo install --git`. See [Releases](https://github.com/naoto256/cairn/releases)
-for downloads.
+### Homebrew (macOS)
+
+```sh
+brew tap naoto256/cairn
+brew install cairn
+```
+
+### Debian / Ubuntu
+
+Download `cairn_<version>-1_amd64.deb` from the
+[latest release](https://github.com/naoto256/cairn/releases/latest),
+then:
+
+```sh
+sudo apt install ./cairn_*.deb
+```
+
+### Prebuilt binary (any OS / target in the matrix)
+
+Download the tarball for your target from
+[Releases](https://github.com/naoto256/cairn/releases/latest), extract,
+and put `cairn` on your `PATH`:
+
+```sh
+tar -xzf cairn-v<version>-<target>.tar.gz
+install cairn-v<version>-<target>/cairn ~/.local/bin/
+```
+
+### From source (Rust 1.85+, working `git`)
+
+```sh
+cargo install --git https://github.com/naoto256/cairn cairn
+```
+
+Optional runtime dependencies for Tier-3 cross-file resolution:
+`rust-analyzer`, `pyright-langserver`, `gopls` (see Languages
+section).
 
 ### Why no crates.io?
 
 Cairn is intentionally not published to crates.io. The names `cairn`,
-`cairn-cli`, and `cairn-core` are already held by unrelated projects
-(a placeholder, an autonomous-settlement CLI, and a knowledge-provenance
+`cairn-cli` (the historical workspace crate name, now renamed to
+`cairn`), and `cairn-core` are already held by unrelated projects (a
+placeholder, an autonomous-settlement CLI, and a knowledge-provenance
 index, respectively), and crates.io's flat, first-come-first-served
-namespace makes a clean, brand-aligned publish impractical. Distribution
-through Homebrew and prebuilt binaries serves users better in this
-case — Rust developers can still build from source via:
-
-    cargo install --git https://github.com/naoto256/cairn cairn
-
-Requires Rust 1.85+ and a working `git` on `PATH`.
+namespace makes a clean, brand-aligned publish impractical.
+Distribution through Homebrew and prebuilt binaries serves users better
+in this case.
 
 ## Use
 
@@ -77,6 +108,10 @@ Runs in the foreground. Data dir defaults to
 `$XDG_DATA_HOME/cairn/` on Linux. Sockets land in
 `~/Library/Caches/cairn/` (macOS) or `$XDG_RUNTIME_DIR/cairn/` (Linux),
 both clamped to mode 0700.
+
+Run it in a separate terminal (or via `brew services start cairn` on
+macOS, or the systemd user unit in `dist/deb/systemd/cairn.service` on
+Linux) before any `cairn ctl` or `cairn query` command.
 
 Sample `LaunchAgent` plist and `systemd` user unit live in
 [`contrib/`](contrib).
@@ -109,6 +144,11 @@ discovery commands (`find`, `refs`, `impls`, `imports`); each hit
 carries its origin in a `repo:branch:file:line` location prefix.
 `source` and `outline` still target a single repo.
 
+Note: `outline` takes `<alias>` as positional because it browses a
+single repo. `source` takes `--repo <alias>` as a flag because
+fully-qualified symbol names can collide with file paths if positional.
+This asymmetry is intentional.
+
 `--anchor <name>` selects a specific snapshot: `HEAD` (committed
 only), `branch/<n>`, `tag/<n>`, or `tentative/<id>`. The plain
 `--branch <n>` shorthand is equivalent to `--anchor branch/<n>`.
@@ -126,6 +166,14 @@ MCP client. Each MCP tool maps one-to-one onto the query / ctl methods
 above.
 
 ## Languages
+
+| Language | Tier-1 (syntax) | Tier-2 (semantic) | Tier-3 (cross-file) |
+|---|---|---|---|
+| Rust | ✅ | ✅ | ✅ (rust-analyzer) |
+| Python | ✅ | ✅ | ✅ (pyright-langserver) |
+| TypeScript / TSX | ✅ (TS only) | ✅ | – |
+| Go | ✅ | ✅ | ✅ (gopls) |
+| Markdown | ✅ | – | – |
 
 Tier-1 (syntactic, tree-sitter) for Rust / Python / Markdown /
 TypeScript / Go plus a generic tree-sitter fallback. Python
@@ -150,9 +198,11 @@ bounds), and class / interface inheritance edges (`extends` /
 `implements`); member-expression calls are intentionally left
 unresolved pending import-derived alias tracking, mirroring the
 Rust / Python receiver-type policy. `.tsx` lives in a separate
-upstream grammar and is intentionally a follow-up backend. Go covers `*.go` (functions,
-methods with receiver-qualified names, named types, top-level
-constants and variables, imports). Go Tier-3 via `gopls` is wired in
+upstream grammar and is intentionally a follow-up backend.
+
+Go covers `*.go` (functions, methods with receiver-qualified names,
+named types, top-level constants and variables, imports). Go Tier-3 via
+`gopls` is wired in
 `cairn-lang-go-tier3`: when a `gopls` binary is discoverable,
 `register_repo` runs it once per snapshot and emits resolved
 method-call refs back into `refs` under `source = gopls-lsp`; same

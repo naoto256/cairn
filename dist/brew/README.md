@@ -1,36 +1,39 @@
-# cairn Homebrew tap setup
+# cairn Homebrew tap maintenance
+
+> **Note**: this is the tap maintainer's reference. End users should run
+> `brew tap naoto256/cairn`, then `brew install cairn` — see the top-level
+> [README Installation section](../../README.md#installation).
 
 The Homebrew tap repository `naoto256/homebrew-cairn` is the source of truth
-for the actual formula. This directory only keeps the setup notes and the
+for the live formula. This directory keeps maintainer notes and the
 post-release checksum bump scaffold for that tap.
 
 Do not keep a live `Formula/cairn.rb` in this repository.
 
-## Initial tap formula
+## Supported release assets
 
-After publishing `v0.1.0`, create `Formula/cairn.rb` in
-`naoto256/homebrew-cairn`. The formula should:
+The tap formula installs the matching release archive for each supported
+target:
 
-- install the matching release asset for each supported target:
-  `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu` (darwin x86_64 is
-  intentionally not in the matrix; build from source via cargo)
-- set `version "0.1.0"`
+- `aarch64-apple-darwin`
+- `x86_64-unknown-linux-gnu`
+
+macOS x86_64 is intentionally not in the release matrix; users on that target
+should build from source with `cargo install --git https://github.com/naoto256/cairn cairn`.
+
+The formula should:
+
+- set `version` to the published release version
 - install the `cairn` binary into `bin`
-- install the LaunchAgent plist (`contrib/cairn-daemon.plist`) into the
-  formula's prefix so `brew services` can wire it
 - define a `service do` block that runs `cairn daemon`
 - include caveats for first setup:
   `cairn ctl register-repo --alias <name> /path/to/repo`, then optionally
   `brew services start cairn` for daemon auto-start
 - include the Claude Code plugin registration hint:
-  `claude plugin install naoto256-cairn` (= the marketplace at
-  `.claude-plugin/marketplace.json` is reachable from the github source)
+  `/plugin marketplace add naoto256/cairn`, then
+  `/plugin install cairn@naoto256-cairn`
 
-The initial tap formula may use temporary zeroed `sha256` values while the
-release assets are being wired, but the tap PR should replace them before
-merge.
-
-Template for the initial tap formula:
+## Formula template
 
 ```ruby
 class Cairn < Formula
@@ -42,7 +45,6 @@ class Cairn < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/naoto256/cairn/releases/download/v#{version}/cairn-v#{version}-aarch64-apple-darwin.tar.gz"
-      # Fill after release.
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
@@ -50,7 +52,6 @@ class Cairn < Formula
   on_linux do
     if Hardware::CPU.intel?
       url "https://github.com/naoto256/cairn/releases/download/v#{version}/cairn-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      # Fill after release.
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
@@ -76,13 +77,13 @@ class Cairn < Formula
         brew services start cairn
 
       For the Claude Code plugin integration:
-        claude plugin marketplace add naoto256/cairn
-        claude plugin install cairn@naoto256-cairn
+        /plugin marketplace add naoto256/cairn
+        /plugin install cairn@naoto256-cairn
     EOS
   end
 
   test do
-    assert_match "cairn 0.1.0", shell_output("#{bin}/cairn --version")
+    assert_match "cairn #{version}", shell_output("#{bin}/cairn --version")
   end
 end
 ```
@@ -96,8 +97,8 @@ dist/brew/scripts/bump-brew-formula.sh vX.Y.Z [tap-repo-dir]
 ```
 
 The script clones `naoto256/homebrew-cairn` (or reuses the supplied
-directory), updates `version` + `sha256` for each platform asset, commits
-the change, pushes a branch, and opens a PR in the tap repo via `gh`.
+directory), updates `version` + `sha256` for each platform asset, commits the
+change, pushes a branch, and opens a PR in the tap repo via `gh`.
 
-Set `CAIRN_BREW_DRY_RUN=1` to update files without committing or opening
-a PR — useful for verifying the script against a tag before merge.
+Set `CAIRN_BREW_DRY_RUN=1` to update files without committing or opening a PR
+— useful for verifying the script against a tag before merge.

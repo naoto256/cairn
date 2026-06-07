@@ -148,18 +148,18 @@ versions follow [SemVer](https://semver.org/).
 - **MCP** tool descriptions for `find_imports` and `find_references`
   lead with "Omit `repo` to search every registered repo; each hit
   carries its repo in the `location` prefix" (mirroring the
-  `find_impls` wording introduced in alpha.3). `repo` is removed
-  from `input_schema.required[]`.
+  `find_impls` wording introduced in an earlier 0.1.0 pre-release).
+  `repo` is removed from `input_schema.required[]`.
 
 ### Packaging
 
 - **Release binary archives built in CI** (`#62`). Tagged releases
-  produce signed `.tar.gz` / `.zip` archives for macOS (arm64,
-  x86_64) and Linux (x86_64) attached directly to the GitHub
-  Release.
-- **Homebrew tap** (`#63`). `naoto256/tap/cairn` ships the formula
-  pointing at the CI-built archives, so `brew install
-  naoto256/tap/cairn` is the standard macOS install path.
+  produce `.tar.gz` archives for macOS (aarch64) and Linux (x86_64)
+  attached directly to the GitHub Release. macOS x86_64 is
+  intentionally out of the matrix — build from source for that target.
+- **Homebrew tap** (`#63`). `naoto256/homebrew-cairn` ships the formula
+  pointing at the CI-built archives, so `brew tap naoto256/cairn`
+  followed by `brew install cairn` is the standard macOS install path.
 - **Debian package metadata** (`#65`). `cargo deb`-buildable
   `.deb` is produced for the linux-x86_64 target and uploaded
   alongside the binary archives.
@@ -361,8 +361,8 @@ cached parse on the next pass.
   extension-first + shebang-sniffing file selection rule (PEP 723 /
   `uv run --script` included).
 - **README status line** — broadened to call out wire schemas (JSON-
-  RPC + MCP) and CLI flags alongside the on-disk format as
-  current-state-of-the-day.
+  RPC + MCP), CLI flags, and on-disk format as SemVer 0.x surfaces
+  that may still change before 1.0.
 - **MCP tool `branch` descriptions** unified across `find_symbols` /
   `find_impls` / `find_references` / `find_imports` /
   `get_symbol_source`. Lifted to a single `BRANCH_PARAM_DESC` const
@@ -499,7 +499,7 @@ upgrade path. Re-register your repos.
   own manifest-retention mechanism (e.g. an explicit history table
   or a reflog-style pin).
 
-[0.1.0-alpha.4]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...HEAD
+[0.1.0]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...v0.1.0
 [0.1.0-alpha.3]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.1
