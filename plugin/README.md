@@ -27,15 +27,6 @@ a cairn-registered repo.
   (missing `cairn` or `jq` on `PATH`, daemon down, parse error) is a
   no-op so a broken hook never breaks a turn.
 
-An earlier version of this plugin hard-blocked grep with
-`permissionDecision: "deny"`. The block flipped agent behaviour in
-one call but broke flow for legitimate raw-text searches inside
-symbol bodies. The current advisory shape keeps the steer on the
-*next* call without disrupting the current one. Both Claude Code
-and Codex accept `hookSpecificOutput.additionalContext` as the
-non-blocking advisory channel on `PreToolUse`, so a single output
-shape covers both hosts.
-
 ## Prerequisites
 
 - `cairn daemon` is running. (`cairn daemon` is the long-lived index
@@ -56,14 +47,14 @@ subdir as the install source.
 
 From a published GitHub remote:
 
-```
+```sh
 /plugin marketplace add naoto256/cairn
 /plugin install cairn@naoto256-cairn
 ```
 
 From a local checkout (handy during development):
 
-```
+```sh
 /plugin marketplace add /absolute/path/to/cairn
 /plugin install cairn@naoto256-cairn
 ```
@@ -89,14 +80,15 @@ non-blocking advisory on `PreToolUse`.
 
 ## Configuration
 
-There is nothing to configure. The plugin reads no environment
-variables of its own. The MCP server is discovered as `cairn mcp` on
-`PATH`; the nudge hook detects cairn-registered cwds by calling
-`cairn query repos --json` and matching the cwd against
-`.repos[].root` as a directory prefix (the cwd is either an exact
-root or starts with `root/`).
+The MCP server is discovered as `cairn mcp` on `PATH`; the nudge hook
+detects cairn-registered cwds by calling `cairn query repos --json` and
+matching the cwd against `.repos[].root` as a directory prefix (the cwd
+is either an exact root or starts with `root/`).
 
-There is no built-in opt-out switch yet. To silence the nudge
-without uninstalling, remove the `PreToolUse` entry from
-`hooks/hooks.json` or make `tools/cairn-nudge.sh` non-executable.
-A first-class disable mechanism is a candidate follow-up.
+To silence the nudge, either uninstall the plugin:
+
+```sh
+/plugin uninstall cairn@naoto256-cairn
+```
+
+or set `CAIRN_NUDGE_DISABLED=1` in your shell before launching the host.

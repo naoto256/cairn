@@ -14,6 +14,8 @@
 # Any failure (jq missing, cairn missing, parse error) is a no-op —
 # hooks must never break a turn.
 
+[ "${CAIRN_NUDGE_DISABLED:-0}" = "1" ] && exit 0
+
 if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
