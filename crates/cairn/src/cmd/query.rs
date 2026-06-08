@@ -20,7 +20,7 @@ use cairn_proto::methods::{
     FindReferencesResult, FindSymbolResult, GetSymbolSourceResult, ImplsResult, ImportsResult,
     ListReposResult, OutlineResult,
 };
-use clap::{Args as ClapArgs, Subcommand};
+use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -143,6 +143,14 @@ enum QueryCommand {
         repo: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        /// Query direction: incoming = who references the symbol;
+        /// outgoing = what the symbol references.
+        #[arg(long, value_enum)]
+        direction: Option<CliReferenceDirection>,
+        /// For outgoing queries, include unresolved method calls,
+        /// type refs, annotations, and duplicate Tier-2/Tier-3 rows.
+        #[arg(long)]
+        include_noise: bool,
         #[arg(long)]
         branch: Option<String>,
         /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -152,6 +160,21 @@ enum QueryCommand {
         #[arg(long)]
         limit: Option<u32>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliReferenceDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl CliReferenceDirection {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+        }
+    }
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -279,6 +302,8 @@ pub async fn run(args: Args) -> Result<()> {
             symbol,
             repo,
             kind,
+            direction,
+            include_noise,
             branch,
             anchor,
             limit,
@@ -290,6 +315,15 @@ pub async fn run(args: Args) -> Result<()> {
             p.insert("symbol".into(), Value::String(symbol.clone()));
             if let Some(k) = kind {
                 p.insert("kind".into(), Value::String(k.clone()));
+            }
+            if let Some(direction) = direction {
+                p.insert(
+                    "direction".into(),
+                    Value::String(direction.as_wire().into()),
+                );
+            }
+            if *include_noise {
+                p.insert("include_noise".into(), Value::Bool(true));
             }
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));

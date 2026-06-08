@@ -4,7 +4,7 @@
 //! on one source blob at a time. LSP-class analyzers such as
 //! rust-analyzer need a wider view: a repository root, a manifest, and
 //! the set of files visible in that snapshot. This module defines that
-//! boundary without starting any external analyzer process yet.
+//! boundary and persists facts emitted by registered workspace analyzers.
 
 use std::path::{Path, PathBuf};
 
@@ -52,10 +52,6 @@ pub trait WorkspaceAnalyzer: Send + Sync {
     fn parser_id(&self) -> &'static str;
 
     /// Analyze one manifest worth of files rooted at `repo_root`.
-    ///
-    /// PR1 only establishes the boundary. Later PRs will add concrete
-    /// fields to [`WorkspaceFacts`] and wire a long-lived analyzer
-    /// service behind this call.
     fn analyze_workspace(
         &self,
         repo_root: &Path,

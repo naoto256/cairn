@@ -130,7 +130,7 @@ store alive while any other label still references it.
 
 ```sh
 cairn query find <name>             [--repo <alias>]   # symbol by name
-cairn query refs <name>             [--repo <alias>]   # callers / use sites
+cairn query refs <name>             [--repo <alias>]   # incoming / outgoing refs
 cairn query source <qualified-name> --repo <alias>     # source body
 cairn query outline <alias> <file>                     # per-file outline
 cairn query impls --type <T>        [--repo <alias>]   # what T implements
