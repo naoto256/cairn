@@ -48,24 +48,41 @@ subdir as the install source.
 From a published GitHub remote:
 
 ```sh
-/plugin marketplace add naoto256/cairn
-/plugin install cairn@naoto256-cairn
+claude plugin marketplace add naoto256/cairn
+claude plugin install cairn@naoto256-cairn
 ```
 
 From a local checkout (handy during development):
 
 ```sh
-/plugin marketplace add /absolute/path/to/cairn
-/plugin install cairn@naoto256-cairn
+claude plugin marketplace add /absolute/path/to/cairn
+claude plugin install cairn@naoto256-cairn
 ```
 
 After install, restart the Claude Code session so the MCP server
 registration and hook take effect.
 
 See https://code.claude.com/docs/en/discover-plugins for the full
-slash-command reference.
+plugin command reference.
 
 ### Codex
+
+From a published GitHub remote:
+
+```sh
+codex plugin marketplace add naoto256/cairn
+codex plugin add cairn@naoto256-cairn
+```
+
+From a local checkout (handy during development):
+
+```sh
+codex plugin marketplace add /absolute/path/to/cairn
+codex plugin add cairn@naoto256-cairn
+```
+
+After install, restart the Codex session so the MCP server registration
+and hook take effect.
 
 Codex reads `.codex-plugin/plugin.json`, `.mcp.json`, and
 `hooks/hooks.json` from the same `plugin/` directory. See
