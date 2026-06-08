@@ -5,6 +5,41 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.1.1] — 2026-06-08
+
+### Fixed
+
+- **CLI `cairn query refs` now mirrors the MCP reference-query
+  surface.** The command accepts `--direction incoming|outgoing` and
+  `--include-noise`, so shell users can ask both "who references this
+  symbol?" and "what does this symbol reference?" without dropping to
+  JSON-RPC. `incoming` remains the default behavior.
+
+### Changed
+
+- **README refreshed for the 0.1.1 release.** The docs now lead with
+  Cairn's AI-agent use case, document Homebrew / Debian service
+  registration, move Architecture behind the user-facing workflow,
+  simplify the Languages section, and expand `cairn query refs`
+  around incoming vs outgoing lookups and `--include-noise`.
+- **In-tree Homebrew tap scaffolding removed.** The live formula is
+  maintained in `naoto256/homebrew-cairn`; keeping a formula template
+  and checksum bump script in this repository created a second source
+  of truth that could drift from the tap.
+- **Workspace crate versions bumped to `0.1.1`.** The binary
+  `--version`, Debian package metadata, and release artifacts now
+  report the patch release version.
+- **Claude Code / Codex plugin manifests bumped to `0.1.1`.** The
+  packaged plugin version now matches the daemon version it launches.
+
+### Internal
+
+- **`workspace_analyzer` split by concern.** The public trait/types stay
+  in `mod.rs`; run orchestration, Tier-3 reference persistence, and
+  file-URI path helpers now live in `run.rs`, `persist.rs`, and
+  `path.rs`. This is a readability refactor with no intended behavior
+  change.
+
 ## [0.1.0] — 2026-06-07
 
 ### Fixed
@@ -302,11 +337,11 @@ cached parse on the next pass.
   `plugin/` so the same bundle installs on both hosts, and the repo
   root carries `.claude-plugin/marketplace.json` (with
   `source: ./plugin` relative to the marketplace root) so the bundle
-  is discovered via `/plugin marketplace add` + `/plugin install`
-  on Claude Code and `codex plugin marketplace add` +
-  `codex plugin add` on Codex — both local-path and
-  `naoto256/cairn` remote registrations resolve through the same
-  `./plugin` relative source.
+  is discovered via `claude plugin marketplace add` +
+  `claude plugin install` on Claude Code and
+  `codex plugin marketplace add` + `codex plugin add` on Codex —
+  both local-path and `naoto256/cairn` remote registrations resolve
+  through the same `./plugin` relative source.
 
 ### Changed (wire breaking)
 
@@ -499,6 +534,7 @@ upgrade path. Re-register your repos.
   own manifest-retention mechanism (e.g. an explicit history table
   or a reflog-style pin).
 
+[0.1.1]: https://github.com/naoto256/cairn/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...v0.1.0
 [0.1.0-alpha.3]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.2
