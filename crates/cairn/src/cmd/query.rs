@@ -135,7 +135,7 @@ enum QueryCommand {
         #[arg(long)]
         limit: Option<u32>,
     },
-    /// Call / use sites of a symbol.
+    /// Incoming or outgoing references for a symbol.
     Refs {
         /// Symbol name or qualified path.
         symbol: String,
