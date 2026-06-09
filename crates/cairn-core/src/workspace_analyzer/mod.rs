@@ -8,6 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
+// Re-exported so language crates can declare their pass's ref kind
+// without depending on cairn-proto directly.
+pub use cairn_proto::RefKind;
 use linkme::distributed_slice;
 use serde::{Deserialize, Serialize};
 
@@ -23,10 +26,14 @@ use crate::workspace_analyzer::persist::persist_resolved_refs;
 #[cfg(test)]
 use crate::workspace_analyzer::run::run_workspace_analyzers;
 
+mod lsp_pass;
 mod path;
 mod persist;
 mod run;
 
+pub use lsp_pass::{
+    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, run_lsp_definition_pass,
+};
 pub use run::run_registered_workspace_analyzers;
 
 /// Linker-time registry of workspace analyzers.
@@ -57,8 +64,20 @@ pub trait WorkspaceAnalyzer: Send + Sync {
 
     /// Parser id whose Tier-1 symbols/refs this analyzer enriches.
     /// Keeping this on the analyzer makes the persistence boundary
-    /// explicit instead of guessing from language strings.
+    /// explicit instead of guessing from language strings. The runner
+    /// also selects this analyzer's input files by it: a manifest
+    /// entry participates iff its blob was indexed under this parser,
+    /// reusing the Tier-1 dispatch decision (extension and shebang)
+    /// instead of re-deriving file patterns.
     fn parser_id(&self) -> &'static str;
+
+    /// Repo-root-relative config files whose content feeds this
+    /// analyzer's run staleness hash (`config_hash` on
+    /// `workspace_analysis_runs`). Defaults to none, meaning only the
+    /// analyzer revision invalidates prior runs.
+    fn config_paths(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Analyze one manifest worth of files rooted at `repo_root`.
     fn analyze_workspace(
@@ -94,6 +113,8 @@ pub struct ResolvedRef {
     pub source_position: Position,
     /// Byte range of the source method identifier.
     pub source_byte_range: std::ops::Range<usize>,
+    /// How the source site uses the target symbol.
+    pub kind: RefKind,
     /// Definition target returned by the analyzer.
     pub target: Location,
     /// Target path relative to the repository root when the analyzer
@@ -278,6 +299,7 @@ mod tests {
                     character: 8,
                 },
                 source_byte_range: 40..43,
+                kind: RefKind::Call,
                 target: Location {
                     uri: crate::lsp::Url::from("file:///repo/src/lib.rs"),
                     range: crate::lsp::Range {
@@ -315,9 +337,89 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, "bar");
         assert_eq!(row.1, "crate::Foo::bar");
-        assert_eq!(row.2, "tier3-rust-analyzer");
+        assert_eq!(row.2, "tier3-rust-analyzer-lsp");
         assert!(row.3.is_some());
         assert_eq!(row.4, 7);
+    }
+
+    #[test]
+    fn persist_resolved_refs_skips_out_of_repo_targets_and_clears_legacy_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "source-sha";
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/main.rs', ?1)",
+            params![source_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'tree-sitter-rust', 1, 0)",
+            params![source_sha],
+        )
+        .unwrap();
+        // A leftover 0.1.x row written under the legacy source alias.
+        conn.execute(
+            "INSERT INTO refs
+               (blob_sha, parser_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES (?1, 'tree-sitter-rust', 'old', 'crate::old', 'call',
+                     0, 3, 1, 'tier3-rust-analyzer')",
+            params![source_sha],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: vec![ResolvedRef {
+                source_path: "src/main.rs".to_string(),
+                source_position: Position {
+                    line: 6,
+                    character: 8,
+                },
+                source_byte_range: 40..43,
+                kind: RefKind::Call,
+                target: Location {
+                    uri: crate::lsp::Url::from(
+                        "file:///home/u/.cargo/registry/src/index/dep-1.0/src/lib.rs",
+                    ),
+                    range: crate::lsp::Range {
+                        start: Position {
+                            line: 2,
+                            character: 7,
+                        },
+                        end: Position {
+                            line: 2,
+                            character: 10,
+                        },
+                    },
+                },
+                // Out-of-repo definition target: no manifest path.
+                target_path: None,
+            }],
+        };
+
+        let inserted = persist_resolved_refs(
+            &mut conn,
+            ManifestId(1),
+            "rust-analyzer-lsp",
+            "tree-sitter-rust",
+            &facts,
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "legacy-source row should be cleared");
     }
 
     #[test]
@@ -372,6 +474,7 @@ mod tests {
                     character: 6,
                 },
                 source_byte_range: 42..43,
+                kind: RefKind::Call,
                 target: Location {
                     uri: crate::lsp::Url::from("file:///repo/pkg/a.py"),
                     range: crate::lsp::Range {
@@ -473,6 +576,7 @@ mod tests {
                     character: 12,
                 },
                 source_byte_range: 12..15,
+                kind: RefKind::Call,
                 target: Location {
                     uri: crate::lsp::Url::from("file:///repo/src/lib.rs"),
                     range: crate::lsp::Range {
@@ -527,7 +631,7 @@ mod tests {
 
     fn tier3_ref_count(conn: &Connection) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM refs WHERE source = 'tier3-rust-analyzer'",
+            "SELECT COUNT(*) FROM refs WHERE source = 'tier3-rust-analyzer-lsp'",
             [],
             |r| r.get(0),
         )

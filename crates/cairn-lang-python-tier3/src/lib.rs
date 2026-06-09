@@ -3,33 +3,32 @@
 //! The tree-sitter Tier-2 analyzer records receiver calls by bare
 //! method name. This crate asks pyright for the definition under each
 //! attribute call's method identifier so the core runner can persist a
-//! resolved `target_qualified` ref.
+//! resolved `target_qualified` ref. The LSP pipeline itself (pooling,
+//! document sync, retry, path mapping) lives in cairn-core's
+//! definition-pass substrate; this crate contributes the pyright
+//! launch spec and the grammar-specific call-site extraction.
 
 #![forbid(unsafe_code)]
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_core::lsp::pool::{
-    self as lsp_pool, AvailabilityStrategy, LspSpawnSpec, PoolKey, PooledLsp, ReadinessStrategy,
-};
-use cairn_core::lsp::{Location, Position, Url};
+use cairn_core::lsp::Position;
+use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrategy};
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    ResolvedRef, WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
+    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
+    WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
 use serde_json::json;
-use tracing::debug;
 use tree_sitter::Node;
 
 const ANALYZER_ID: &str = "pyright-lsp";
-const ANALYZER_REVISION: u32 = 1;
-const CONFIG_HASH: &str = "pyright-lsp-v1";
+const ANALYZER_REVISION: u32 = 2;
+const POOL_CONFIG_ID: &str = "pyright-lsp-v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct PyrightWorkspaceAnalyzer;
 
@@ -50,39 +49,44 @@ impl WorkspaceAnalyzer for PyrightWorkspaceAnalyzer {
         "tree-sitter-python"
     }
 
+    fn config_paths(&self) -> &'static [&'static str] {
+        &["pyrightconfig.json", "pyproject.toml"]
+    }
+
     fn analyze_workspace(
         &self,
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
     ) -> Result<WorkspaceFacts> {
-        let binary = pyright_binary();
-        let key = PoolKey::lsp("python", repo_root, ANALYZER_ID, &binary, CONFIG_HASH)
-            .map_err(map_lsp_error)?;
-        let spawn_spec = LspSpawnSpec {
-            binary,
-            workspace_root: repo_root.to_path_buf(),
-            config_hash: CONFIG_HASH.to_string(),
-            request_timeout: REQUEST_TIMEOUT,
-            availability: AvailabilityStrategy::PathExistsExecutable,
-            readiness: ReadinessStrategy::InitializeResponseOnly,
-            language_id: "python",
-            launch_args: vec!["--stdio".to_string()],
-            initialization_options: json!({}),
-        };
-        let repo_root = repo_root.to_path_buf();
-        let files = files.to_vec();
-        let pool = lsp_pool::global().map_err(map_lsp_error)?;
-        pool.with_lsp(key, spawn_spec, |client| {
-            Box::pin(async move {
-                let mut facts = WorkspaceFacts::default();
-                collect_resolved_refs(client, &repo_root, &files, &mut facts)
-                    .await
-                    .map_err(core_error_to_lsp)?;
-                Ok(facts)
-            })
-        })
-        .map_err(map_lsp_error)
+        run_lsp_definition_pass(
+            LspDefinitionPass {
+                analyzer_id: ANALYZER_ID,
+                language: "python",
+                ref_kind: RefKind::Call,
+                spawn_spec: LspSpawnSpec {
+                    binary: pyright_binary(),
+                    workspace_root: repo_root.to_path_buf(),
+                    config_hash: POOL_CONFIG_ID.to_string(),
+                    request_timeout: REQUEST_TIMEOUT,
+                    availability: AvailabilityStrategy::PathExistsExecutable,
+                    readiness: ReadinessStrategy::InitializeResponseOnly,
+                    language_id: "python",
+                    launch_args: vec!["--stdio".to_string()],
+                    initialization_options: json!({}),
+                },
+                retry: DefinitionRetryPolicy {
+                    // Pyright can return an empty definition result for
+                    // a document that was just didOpen'd before its
+                    // analysis pass completes.
+                    retry_empty_definition: true,
+                    retry_file_not_found: true,
+                },
+                collect_definition_sites: collect_method_calls,
+            },
+            repo_root,
+            files,
+        )
     }
 }
 
@@ -96,117 +100,7 @@ fn pyright_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("pyright-langserver"))
 }
 
-async fn collect_resolved_refs(
-    client: &mut PooledLsp<'_>,
-    repo_root: &Path,
-    files: &[WorkspaceFile],
-    facts: &mut WorkspaceFacts,
-) -> Result<()> {
-    for file in files {
-        let Some(path) = &file.worktree_path else {
-            continue;
-        };
-        let source = std::fs::read_to_string(path)?;
-        let calls = collect_method_calls(source.as_bytes())?;
-        if calls.is_empty() {
-            continue;
-        }
-        let uri = Url::from_file_path(path).map_err(map_lsp_error)?;
-        client
-            .sync_document(&uri, &source)
-            .await
-            .map_err(map_lsp_error)?;
-        for call in calls {
-            let locations = definition_with_retry(client, &uri, call.position).await?;
-            for target in locations {
-                let target_path = location_to_repo_path(repo_root, &target);
-                facts.resolved_refs.push(ResolvedRef {
-                    source_path: file.path.clone(),
-                    source_position: call.position,
-                    source_byte_range: call.byte_start..call.byte_end,
-                    target,
-                    target_path,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn definition_with_retry(
-    client: &PooledLsp<'_>,
-    uri: &Url,
-    position: Position,
-) -> Result<Vec<Location>> {
-    definition_with_retry_from(|| client.definition(uri, position), uri, position).await
-}
-
-async fn definition_with_retry_from<F, Fut>(
-    mut definition: F,
-    uri: &Url,
-    position: Position,
-) -> Result<Vec<Location>>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = cairn_core::lsp::Result<Vec<Location>>>,
-{
-    let mut delay = Duration::from_millis(200);
-    let mut retried_empty_definition = false;
-    let mut retried_content_modified = false;
-    for attempt in 0..3 {
-        match definition().await {
-            Ok(locations) if !locations.is_empty() => return Ok(locations),
-            // Pyright can return an empty definition result for a
-            // document that was just didOpen'd before its analysis pass
-            // completes. One retry covers the typical post-didOpen lag.
-            Ok(_) if !retried_empty_definition => {
-                retried_empty_definition = true;
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
-            Ok(locations) => return Ok(locations),
-            Err(err) if err.is_content_modified() && !retried_content_modified => {
-                debug!(
-                    uri = uri.as_str(),
-                    ?position,
-                    "pyright content modified; retrying definition once"
-                );
-                retried_content_modified = true;
-                tokio::time::sleep(CONTENT_MODIFIED_RETRY_DELAY).await;
-            }
-            Err(err) if is_file_not_found(&err) && attempt < 2 => {
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
-            Err(err) => return Err(map_lsp_error(err)),
-        }
-    }
-    Ok(Vec::new())
-}
-
-fn is_file_not_found(err: &cairn_core::lsp::Error) -> bool {
-    matches!(err, cairn_core::lsp::Error::Protocol(message) if message.contains("file not found"))
-        || matches!(
-            err,
-            cairn_core::lsp::Error::ResponseError { message, .. } if message.contains("file not found")
-        )
-}
-
-fn core_error_to_lsp(err: Error) -> cairn_core::lsp::Error {
-    match err {
-        Error::Lsp(err) => err,
-        err => cairn_core::lsp::Error::Protocol(err.to_string()),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MethodCallSite {
-    position: Position,
-    byte_start: usize,
-    byte_end: usize,
-}
-
-fn collect_method_calls(source: &[u8]) -> Result<Vec<MethodCallSite>> {
+fn collect_method_calls(source: &[u8]) -> Result<Vec<DefinitionSite>> {
     let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -220,13 +114,13 @@ fn collect_method_calls(source: &[u8]) -> Result<Vec<MethodCallSite>> {
     Ok(out)
 }
 
-fn collect_method_calls_from_node(node: Node<'_>, out: &mut Vec<MethodCallSite>) {
+fn collect_method_calls_from_node(node: Node<'_>, out: &mut Vec<DefinitionSite>) {
     if node.kind() == "call"
         && let Some(function) = node.child_by_field_name("function")
         && let Some(method) = method_identifier(function)
     {
         let start = method.start_position();
-        out.push(MethodCallSite {
+        out.push(DefinitionSite {
             position: Position {
                 line: u32::try_from(start.row).unwrap_or(u32::MAX),
                 character: u32::try_from(start.column).unwrap_or(u32::MAX),
@@ -249,54 +143,10 @@ fn method_identifier(function: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn location_to_repo_path(repo_root: &Path, location: &Location) -> Option<String> {
-    let path = file_uri_to_path(location.uri.as_str())?;
-    let rel = path.strip_prefix(repo_root).ok()?;
-    Some(rel.to_string_lossy().replace('\\', "/"))
-}
-
-fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    let path = uri.strip_prefix("file://")?;
-    percent_decode(path).map(PathBuf::from)
-}
-
-fn percent_decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = *bytes.get(i + 1)?;
-            let lo = *bytes.get(i + 2)?;
-            out.push(hex_value(hi)? * 16 + hex_value(lo)?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn map_lsp_error(err: cairn_core::lsp::Error) -> Error {
-    Error::Lsp(err)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::fs;
-    use std::future::ready;
     use std::process::Command;
 
     use cairn_core::anchor::AnchorName;
@@ -340,162 +190,6 @@ def main(obj):
     fn malformed_python_input_does_not_panic() {
         let calls = collect_method_calls(b"def main(:\n").unwrap();
         assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn file_uri_maps_to_repo_relative_path() {
-        let location = Location {
-            uri: Url::from("file:///tmp/repo/pkg/foo.py"),
-            range: cairn_core::lsp::Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: 0,
-                    character: 1,
-                },
-            },
-        };
-
-        let rel = location_to_repo_path(Path::new("/tmp/repo"), &location).unwrap();
-        assert_eq!(rel, "pkg/foo.py");
-    }
-
-    #[tokio::test]
-    async fn content_modified_retry_success_preserves_locations() {
-        let attempts = Cell::new(0);
-        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
-        let position = Position {
-            line: 3,
-            character: 12,
-        };
-        let location = Location {
-            uri: Url::from("file:///tmp/repo/pkg/foo.py"),
-            range: cairn_core::lsp::Range {
-                start: Position {
-                    line: 9,
-                    character: 4,
-                },
-                end: Position {
-                    line: 9,
-                    character: 7,
-                },
-            },
-        };
-
-        let locations = definition_with_retry_from(
-            || {
-                attempts.set(attempts.get() + 1);
-                if attempts.get() == 1 {
-                    ready(Err(cairn_core::lsp::Error::ResponseError {
-                        code: cairn_core::lsp::CONTENT_MODIFIED_ERROR_CODE,
-                        message: "content modified".into(),
-                    }))
-                } else {
-                    ready(Ok(vec![location.clone()]))
-                }
-            },
-            &uri,
-            position,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(locations, vec![location]);
-        assert_eq!(attempts.get(), 2);
-    }
-
-    #[tokio::test]
-    async fn empty_definition_retries_once_then_returns_resolved() {
-        let attempts = Cell::new(0);
-        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
-        let position = Position {
-            line: 5,
-            character: 6,
-        };
-        let location = Location {
-            uri: Url::from("file:///tmp/repo/pkg/foo.py"),
-            range: cairn_core::lsp::Range {
-                start: Position {
-                    line: 1,
-                    character: 8,
-                },
-                end: Position {
-                    line: 1,
-                    character: 9,
-                },
-            },
-        };
-
-        let locations = definition_with_retry_from(
-            || {
-                attempts.set(attempts.get() + 1);
-                if attempts.get() == 1 {
-                    ready(Ok(Vec::new()))
-                } else {
-                    ready(Ok(vec![location.clone()]))
-                }
-            },
-            &uri,
-            position,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(locations, vec![location]);
-        assert_eq!(attempts.get(), 2);
-    }
-
-    #[tokio::test]
-    async fn repeated_empty_definition_retries_once_then_returns_empty() {
-        let attempts = Cell::new(0);
-        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
-        let position = Position {
-            line: 5,
-            character: 6,
-        };
-
-        let locations = definition_with_retry_from(
-            || {
-                attempts.set(attempts.get() + 1);
-                ready(Ok(Vec::new()))
-            },
-            &uri,
-            position,
-        )
-        .await
-        .unwrap();
-
-        assert!(locations.is_empty());
-        assert_eq!(attempts.get(), 2);
-    }
-
-    #[tokio::test]
-    async fn repeated_content_modified_retries_once_then_returns_error() {
-        let attempts = Cell::new(0);
-        let uri = Url::from("file:///tmp/repo/pkg/foo.py");
-        let position = Position {
-            line: 3,
-            character: 12,
-        };
-
-        let locations = definition_with_retry_from(
-            || {
-                attempts.set(attempts.get() + 1);
-                ready(Err(cairn_core::lsp::Error::ResponseError {
-                    code: cairn_core::lsp::CONTENT_MODIFIED_ERROR_CODE,
-                    message: "content modified".into(),
-                }))
-            },
-            &uri,
-            position,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(locations, Error::Lsp(err) if err.is_content_modified()));
-        assert_eq!(attempts.get(), 2);
     }
 
     /// Runs only when pyright-langserver is available on PATH (or via

@@ -1,4 +1,3 @@
-use cairn_proto::RefKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
@@ -7,7 +6,11 @@ use crate::lsp::Location;
 use crate::manifest::ManifestId;
 
 use super::WorkspaceFacts;
-use super::path::file_uri_to_manifest_path;
+
+/// 0.1.x persisted rust-analyzer refs under this alias instead of the
+/// uniform `tier3-<analyzer_id>` scheme. Cleared alongside the current
+/// source so reindexing does not leave duplicate rows behind.
+const LEGACY_RUST_REF_SOURCE: &str = "tier3-rust-analyzer";
 
 pub(super) fn persist_resolved_refs(
     conn: &mut Connection,
@@ -17,14 +20,16 @@ pub(super) fn persist_resolved_refs(
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
     let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM refs
-          WHERE source = ?1
-            AND blob_sha IN (
-                SELECT blob_sha FROM manifest_entries WHERE manifest_id = ?2
-            )",
-        params![ref_source(analyzer_id), manifest_id.0],
-    )?;
+    for source in ref_sources_to_clear(analyzer_id) {
+        tx.execute(
+            "DELETE FROM refs
+              WHERE source = ?1
+                AND blob_sha IN (
+                    SELECT blob_sha FROM manifest_entries WHERE manifest_id = ?2
+                )",
+            params![source, manifest_id.0],
+        )?;
+    }
 
     let mut inserted = 0;
     for r in &facts.resolved_refs {
@@ -34,13 +39,14 @@ pub(super) fn persist_resolved_refs(
         let Some(parser_id) = parser_for_blob(&tx, &source_blob, parser_id)? else {
             continue;
         };
-        let Some((target_qualified, target_name)) = target_symbol_for_location(
-            &tx,
-            manifest_id,
-            &parser_id,
-            r.target_path.as_deref(),
-            &r.target,
-        )?
+        // A `None` target_path means the definition resolved outside
+        // the repo root (dependency or stdlib); there is no manifest
+        // row to attach it to, so the ref is skipped.
+        let Some(target_path) = r.target_path.as_deref() else {
+            continue;
+        };
+        let Some((target_qualified, target_name)) =
+            target_symbol_for_location(&tx, manifest_id, &parser_id, target_path, &r.target)?
         else {
             continue;
         };
@@ -65,7 +71,7 @@ pub(super) fn persist_resolved_refs(
                 enclosing_id,
                 target_name,
                 target_qualified,
-                ref_kind_to_str(RefKind::Call),
+                ref_kind_to_str(r.kind),
                 byte_start,
                 byte_end,
                 line,
@@ -80,10 +86,15 @@ pub(super) fn persist_resolved_refs(
 }
 
 fn ref_source(analyzer_id: &str) -> String {
-    if analyzer_id == "rust-analyzer-lsp" {
-        return "tier3-rust-analyzer".to_string();
-    }
     format!("tier3-{analyzer_id}")
+}
+
+fn ref_sources_to_clear(analyzer_id: &str) -> Vec<String> {
+    let mut sources = vec![ref_source(analyzer_id)];
+    if analyzer_id == "rust-analyzer-lsp" {
+        sources.push(LEGACY_RUST_REF_SOURCE.to_string());
+    }
+    sources
 }
 
 fn blob_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Result<Option<String>> {
@@ -113,16 +124,10 @@ fn target_symbol_for_location(
     conn: &Connection,
     manifest_id: ManifestId,
     parser_id: &str,
-    target_path: Option<&str>,
+    target_path: &str,
     location: &Location,
 ) -> Result<Option<(String, String)>> {
-    let Some(path) = target_path
-        .map(str::to_string)
-        .or_else(|| file_uri_to_manifest_path(location.uri.as_str()))
-    else {
-        return Ok(None);
-    };
-    let Some(blob_sha) = blob_for_path(conn, manifest_id, &path)? else {
+    let Some(blob_sha) = blob_for_path(conn, manifest_id, target_path)? else {
         return Ok(None);
     };
     let line = i64::from(location.range.start.line.saturating_add(1));
