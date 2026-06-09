@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha1::{Digest, Sha1};
 use tracing::{debug, warn};
 
@@ -45,10 +45,10 @@ pub(super) fn run_workspace_analyzers(
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
 ) -> Result<usize> {
     let mut inserted = 0;
-    let config_hash = config_hash(repo_root);
 
     for analyzer in analyzers {
-        let files = workspace_files_for(analyzer.language(), repo_root, entries);
+        let config_hash = config_hash(repo_root, analyzer.config_paths());
+        let files = workspace_files_for(conn, analyzer.parser_id(), repo_root, entries)?;
         if files.is_empty() {
             mark_run(
                 conn,
@@ -123,10 +123,10 @@ pub(super) fn run_workspace_analyzers(
                     debug!(
                         analyzer_id = analyzer.id(),
                         error = %message,
-                        "transient: rust-analyzer content-modified during run"
+                        "transient: LSP content-modified during run"
                     );
                     RunStatus::Skipped
-                } else if message.contains("LSP binary not available") {
+                } else if is_binary_missing_error(&err) {
                     RunStatus::Skipped
                 } else {
                     warn!(
@@ -158,6 +158,10 @@ pub(super) fn run_workspace_analyzers(
 
 fn is_content_modified_error(err: &Error) -> bool {
     matches!(err, Error::Lsp(lsp_err) if lsp_err.is_content_modified())
+}
+
+fn is_binary_missing_error(err: &Error) -> bool {
+    matches!(err, Error::Lsp(crate::lsp::Error::BinaryMissing(_)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,39 +228,39 @@ fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Select the manifest entries this analyzer should see: those whose
+/// blob was indexed under the analyzer's Tier-1 parser. This reuses
+/// the indexer's backend dispatch (extension and shebang detection)
+/// instead of maintaining a parallel extension table here.
 fn workspace_files_for(
-    language: &str,
+    conn: &Connection,
+    parser_id: &str,
     repo_root: &Path,
     entries: &[ManifestEntry],
-) -> Vec<WorkspaceFile> {
-    entries
-        .iter()
-        .filter(|entry| file_matches_language(&entry.path, language))
-        .map(|entry| {
-            let worktree_path = repo_root.join(&entry.path);
-            WorkspaceFile {
-                path: entry.path.clone(),
-                blob_sha: entry.blob_sha.clone(),
-                worktree_path: worktree_path.exists().then_some(worktree_path),
-            }
-        })
-        .collect()
-}
-
-fn file_matches_language(path: &str, language: &str) -> bool {
-    match language {
-        "rust" => path.ends_with(".rs"),
-        "python" => path.ends_with(".py"),
-        "typescript" => path.ends_with(".ts") || path.ends_with(".tsx"),
-        "go" => path.ends_with(".go"),
-        "markdown" => path.ends_with(".md") || path.ends_with(".markdown"),
-        _ => false,
+) -> Result<Vec<WorkspaceFile>> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM blobs WHERE blob_sha = ?1 AND parser_id = ?2 LIMIT 1")?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let indexed: Option<i64> = stmt
+            .query_row(params![entry.blob_sha, parser_id], |r| r.get(0))
+            .optional()?;
+        if indexed.is_none() {
+            continue;
+        }
+        let worktree_path = repo_root.join(&entry.path);
+        files.push(WorkspaceFile {
+            path: entry.path.clone(),
+            blob_sha: entry.blob_sha.clone(),
+            worktree_path: worktree_path.exists().then_some(worktree_path),
+        });
     }
+    Ok(files)
 }
 
-fn config_hash(repo_root: &Path) -> String {
+fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
     let mut hasher = Sha1::new();
-    for rel in ["Cargo.toml", "rust-toolchain.toml", "rust-toolchain"] {
+    for rel in config_paths {
         let path = repo_root.join(rel);
         if let Ok(bytes) = std::fs::read(&path) {
             hasher.update(rel.as_bytes());
