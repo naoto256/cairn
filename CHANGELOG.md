@@ -5,6 +5,42 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.2.0] — 2026-06-10
+
+### Breaking
+
+- **Tier-3 rust reference `source` label renamed.** Rust refs
+  persisted by `rust-analyzer` now carry
+  `source = tier3-rust-analyzer-lsp`, replacing the legacy
+  `tier3-rust-analyzer` alias and matching the uniform
+  `tier3-<analyzer>-lsp` scheme that Python (`tier3-pyright-lsp`) and
+  Go (`tier3-gopls-lsp`) already used. Clients matching on the old
+  string need to update; rows under the legacy label are cleared and
+  re-stamped on the next reindex, so no duplicate facts are left
+  behind.
+
+### Added
+
+- **`list_repos` snapshot `status` is now a real diagnostic.** The
+  field reports `empty` (no files in the manifest), `no_analyzer`
+  (only languages without a semantic backend), or `stale`
+  (analyzer-capable files but zero indexed symbols — `reindex_repo`
+  is the usual fix) instead of always `ready`. A registered repo
+  that looks "complete but empty" can now be told apart from one
+  that simply has nothing to index.
+- **`get_outline` accepts `kind` and `max_depth` filters.** `kind`
+  restricts items to a single symbol kind (mirroring
+  `find_symbols.kind`); `max_depth` caps directory depth relative to
+  `path`, so `max_depth = 1` yields a module-level summary of a
+  crate or package root without burning the item cap on nested
+  files. Both are optional and default to the previous behavior.
+
+### Internal
+
+- **Tier-3 LSP definition pass hoisted into a core substrate.** The
+  per-language Tier-3 crates now share the definition-resolution
+  pass instead of duplicating it per analyzer.
+
 ## [0.1.1] — 2026-06-08
 
 ### Fixed
@@ -534,6 +570,7 @@ upgrade path. Re-register your repos.
   own manifest-retention mechanism (e.g. an explicit history table
   or a reflog-style pin).
 
+[0.2.0]: https://github.com/naoto256/cairn/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/naoto256/cairn/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...v0.1.0
 [0.1.0-alpha.3]: https://github.com/naoto256/cairn/releases/tag/v0.1.0-alpha.3
