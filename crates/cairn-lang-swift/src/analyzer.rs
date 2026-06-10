@@ -10,9 +10,19 @@
 //!   in the extension's inheritance clause (extensions can only add
 //!   conformances, never superclasses).
 //! - same-file call refs at name level. Bare calls (`foo()`,
-//!   `Type()`) carry a resolved `target_qualified`; member calls
-//!   (`obj.method()`) stay unresolved like the TypeScript analyzer.
+//!   `Type()`) carry a resolved `target_qualified` set to the bare
+//!   name. Member calls (`obj.method()`) parse as
+//!   `navigation_expression`; a post-pass resolves the tail segment
+//!   against a same-file index of method, constructor (`init`),
+//!   property, and enum-case qualified names — extension members
+//!   qualify under the extended type, protocol property requirements
+//!   and enum cases under the containing nominal. When several
+//!   same-file definitions share the bare name, the first one walked
+//!   wins; cross-file callees keep `target_qualified: None` and stay
+//!   hidden from `find_references`' default outgoing view (visible
+//!   with `include_noise`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
@@ -40,8 +50,10 @@ impl Analyzer for SwiftAnalyzer {
             facts: SemanticFacts::default(),
             containers: Vec::new(),
             enclosing: None,
+            member_qualifieds: HashMap::new(),
         };
         walker.walk(tree.root_node(), source);
+        walker.resolve_same_file_member_calls();
         Ok(walker.facts)
     }
 }
@@ -54,6 +66,11 @@ struct SwiftSemanticWalker {
     facts: SemanticFacts,
     containers: Vec<String>,
     enclosing: Option<String>,
+    /// Bare member name → first-walked qualified name for
+    /// same-file methods, constructors (`init`), properties (incl.
+    /// protocol requirements), and enum cases. Used to resolve
+    /// `obj.member` navigation_expression calls after the walk.
+    member_qualifieds: HashMap<String, String>,
 }
 
 impl SwiftSemanticWalker {
@@ -71,6 +88,14 @@ impl SwiftSemanticWalker {
             }
             "init_declaration" => {
                 self.walk_callable(node, source, Some("init"));
+            }
+            "property_declaration" | "protocol_property_declaration" => {
+                self.record_property_members(node, source);
+                self.walk_children(node, source);
+            }
+            "enum_entry" => {
+                self.record_enum_case_members(node, source);
+                self.walk_children(node, source);
             }
             "call_expression" => {
                 self.emit_call(node, source);
@@ -136,9 +161,60 @@ impl SwiftSemanticWalker {
             return;
         };
         let qualified = self.qualify(&name);
+        if !self.containers.is_empty() {
+            self.record_member(&name, &qualified);
+        }
         let previous_enclosing = self.enclosing.replace(qualified);
         self.walk_children(node, source);
         self.enclosing = previous_enclosing;
+    }
+
+    fn record_property_members(&mut self, node: Node<'_>, source: &[u8]) {
+        if self.containers.is_empty() {
+            return;
+        }
+        let mut cursor = node.walk();
+        let patterns: Vec<Node<'_>> = node.children_by_field_name("name", &mut cursor).collect();
+        let mut names: Vec<String> = Vec::new();
+        for pattern in patterns {
+            collect_pattern_names(pattern, source, &mut names);
+        }
+        for name in names {
+            let qualified = self.qualify(&name);
+            self.member_qualifieds.entry(name).or_insert(qualified);
+        }
+    }
+
+    fn record_enum_case_members(&mut self, node: Node<'_>, source: &[u8]) {
+        if self.containers.is_empty() {
+            return;
+        }
+        let mut cursor = node.walk();
+        for name_node in node.children_by_field_name("name", &mut cursor) {
+            if !name_node.is_named() {
+                continue;
+            }
+            let name = node_text(name_node, source).to_string();
+            let qualified = self.qualify(&name);
+            self.member_qualifieds.entry(name).or_insert(qualified);
+        }
+    }
+
+    fn record_member(&mut self, name: &str, qualified: &str) {
+        self.member_qualifieds
+            .entry(name.to_string())
+            .or_insert_with(|| qualified.to_string());
+    }
+
+    fn resolve_same_file_member_calls(&mut self) {
+        for r in self.facts.refs.iter_mut() {
+            if r.kind != RefKind::Call || r.target_qualified.is_some() {
+                continue;
+            }
+            if let Some(qualified) = self.member_qualifieds.get(&r.target_name) {
+                r.target_qualified = Some(qualified.clone());
+            }
+        }
     }
 
     fn emit_call(&mut self, node: Node<'_>, source: &[u8]) {
@@ -224,6 +300,17 @@ fn callee_target<'a>(node: Node<'a>, source: &[u8]) -> Option<(String, Option<St
             Some((name, None, member))
         }
         _ => None,
+    }
+}
+
+fn collect_pattern_names(node: Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    if node.kind() == "simple_identifier" {
+        out.push(node_text(node, source).to_string());
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_pattern_names(child, source, out);
     }
 }
 
@@ -329,12 +416,88 @@ mod tests {
     }
 
     #[test]
-    fn member_calls_stay_unresolved_at_name_level() {
+    fn member_calls_stay_unresolved_when_no_same_file_definition() {
+        // No same-file definition of `add` exists → cross-file callee
+        // keeps `target_qualified: None` so the default outgoing view
+        // hides it from `find_references`.
         let refs = refs("func caller() { store.add(user) }");
-        let call = &refs[0];
-        assert_eq!(call.target_name, "add");
+        let call = refs
+            .iter()
+            .find(|r| r.target_name == "add")
+            .expect("add call");
         assert_eq!(call.target_qualified, None);
         assert_eq!(call.enclosing_qualified.as_deref(), Some("caller"));
+    }
+
+    #[test]
+    fn navigation_expression_call_resolves_against_same_file_method() {
+        // `store.add(user)` resolves to `UserStore.add` because the
+        // method is defined in the same file. Bare-name fallback alone
+        // would leave it None and hide it from `find_references`.
+        let refs = refs(
+            "class UserStore {\n\
+             \tfunc add(_ user: User) {}\n\
+             }\n\
+             func caller(store: UserStore, user: User) { store.add(user) }\n",
+        );
+        let call = refs
+            .iter()
+            .find(|r| r.target_name == "add" && r.enclosing_qualified.as_deref() == Some("caller"))
+            .expect("caller's add call");
+        assert_eq!(call.target_qualified.as_deref(), Some("UserStore.add"));
+    }
+
+    #[test]
+    fn navigation_expression_resolves_against_extension_init_and_property() {
+        let refs = refs(
+            "extension UserStore {\n\
+             \tinit(seed: Int) {}\n\
+             \tvar handler: () -> Void { {} }\n\
+             }\n\
+             func caller(store: UserStore) {\n\
+             \tstore.init()\n\
+             \tstore.handler()\n\
+             }\n",
+        );
+        let init_call = refs
+            .iter()
+            .find(|r| r.target_name == "init" && r.enclosing_qualified.as_deref() == Some("caller"))
+            .expect("init call");
+        assert_eq!(
+            init_call.target_qualified.as_deref(),
+            Some("UserStore.init")
+        );
+        let handler_call = refs
+            .iter()
+            .find(|r| {
+                r.target_name == "handler" && r.enclosing_qualified.as_deref() == Some("caller")
+            })
+            .expect("handler call");
+        assert_eq!(
+            handler_call.target_qualified.as_deref(),
+            Some("UserStore.handler")
+        );
+    }
+
+    #[test]
+    fn navigation_expression_takes_first_candidate_when_method_name_collides() {
+        // Two same-file methods share the bare name `find`. The
+        // first-walked definition wins; cross-file disambiguation is
+        // out of scope for the same-file resolver.
+        let refs = refs(
+            "class Store {\n\
+             \tfunc find() {}\n\
+             }\n\
+             class UserStore {\n\
+             \tfunc find() {}\n\
+             }\n\
+             func caller(s: UserStore) { s.find() }\n",
+        );
+        let call = refs
+            .iter()
+            .find(|r| r.target_name == "find" && r.enclosing_qualified.as_deref() == Some("caller"))
+            .expect("find call");
+        assert_eq!(call.target_qualified.as_deref(), Some("Store.find"));
     }
 
     #[test]
