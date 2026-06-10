@@ -1,5 +1,6 @@
 //! `doctor` — environment / dependency / registry sanity checks.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use cairn_proto::control::{DoctorCheck, DoctorReport, DoctorStatus};
@@ -210,6 +211,7 @@ struct AliasStoreProbe {
 struct AliasStoreState {
     tentative_manifest_id: Option<i64>,
     tier3_runs: Vec<Tier3Run>,
+    expected_tier3_analyzer_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,29 +270,53 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             .optional()?,
         None => None,
     };
-    let tier3_runs = match tentative_manifest_id {
+    let (tier3_runs, expected_tier3_analyzer_ids) = match tentative_manifest_id {
         Some(manifest_id) => {
+            let parser_ids = manifest_parser_ids(&conn, manifest_id)?;
+            let mut expected_tier3_analyzer_ids = all_workspace_analyzers()
+                .into_iter()
+                .filter(|analyzer| parser_ids.contains(analyzer.parser_id()))
+                .map(|analyzer| analyzer.id().to_string())
+                .collect::<Vec<_>>();
+            expected_tier3_analyzer_ids.sort();
+
             let mut stmt = conn.prepare(
                 "SELECT analyzer_id, manifest_id, status, error FROM workspace_analysis_runs
                  WHERE manifest_id = ?1
                  ORDER BY analyzer_id",
             )?;
-            stmt.query_map(params![manifest_id], |r| {
-                Ok(Tier3Run {
-                    analyzer_id: r.get(0)?,
-                    manifest_id: r.get(1)?,
-                    status: r.get(2)?,
-                    error: r.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+            let tier3_runs = stmt
+                .query_map(params![manifest_id], |r| {
+                    Ok(Tier3Run {
+                        analyzer_id: r.get(0)?,
+                        manifest_id: r.get(1)?,
+                        status: r.get(2)?,
+                        error: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            (tier3_runs, expected_tier3_analyzer_ids)
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     Ok(AliasStoreState {
         tentative_manifest_id,
         tier3_runs,
+        expected_tier3_analyzer_ids,
     })
+}
+
+fn manifest_parser_ids(conn: &rusqlite::Connection, manifest_id: i64) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT b.parser_id
+           FROM blobs b
+           JOIN manifest_entries me ON me.blob_sha = b.blob_sha
+          WHERE me.manifest_id = ?1",
+    )?;
+    let parser_ids = stmt
+        .query_map(params![manifest_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(parser_ids)
 }
 
 fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
@@ -674,6 +700,18 @@ fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
 
 fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
     if state.tier3_runs.is_empty() {
+        let missing = missing_tier3_analyzer_ids(state);
+        if !missing.is_empty() {
+            return doctor_check(
+                format!("repo `{alias}` Tier-3 analyzer status"),
+                DoctorStatus::Warn,
+                Some(tier3_runs_detail(state)),
+                Some(format!(
+                    "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` to record the current workspace analyzer set."
+                )),
+            );
+        }
+
         return doctor_check(
             format!("repo `{alias}` Tier-3 analyzer status"),
             DoctorStatus::Warn,
@@ -684,7 +722,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
         );
     }
 
-    let detail = tier3_runs_detail(&state.tier3_runs);
+    let detail = tier3_runs_detail(state);
     if let Some(run) = state.tier3_runs.iter().find(|run| run.status == "failed") {
         return doctor_check(
             format!("repo `{alias}` Tier-3 analyzer status"),
@@ -720,6 +758,18 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
         );
     }
 
+    let missing = missing_tier3_analyzer_ids(state);
+    if !missing.is_empty() {
+        return doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(detail),
+            Some(format!(
+                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` to record the current workspace analyzer set."
+            )),
+        );
+    }
+
     doctor_check(
         format!("repo `{alias}` Tier-3 analyzer status"),
         DoctorStatus::Pass,
@@ -728,21 +778,43 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
     )
 }
 
-fn tier3_runs_detail(runs: &[Tier3Run]) -> String {
-    let manifest_id = runs
+fn tier3_runs_detail(state: &AliasStoreState) -> String {
+    let manifest_id = state
+        .tier3_runs
         .iter()
         .map(|run| run.manifest_id)
         .min()
+        .or(state.tentative_manifest_id)
         .unwrap_or_default();
-    let statuses = runs
+    let mut statuses = state
+        .tier3_runs
         .iter()
         .map(|run| {
             let status = tier3_status_label(run);
             format!("{}={status}", run.analyzer_id)
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    statuses.extend(
+        missing_tier3_analyzer_ids(state)
+            .into_iter()
+            .map(|analyzer_id| format!("{analyzer_id}=not yet recorded (run reindex)")),
+    );
+    let statuses = statuses.join(", ");
     format!("Tier-3 analyzer runs at manifest {manifest_id}: {statuses}")
+}
+
+fn missing_tier3_analyzer_ids(state: &AliasStoreState) -> Vec<String> {
+    let recorded = state
+        .tier3_runs
+        .iter()
+        .map(|run| run.analyzer_id.as_str())
+        .collect::<HashSet<_>>();
+    state
+        .expected_tier3_analyzer_ids
+        .iter()
+        .filter(|analyzer_id| !recorded.contains(analyzer_id.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn tier3_status_label(run: &Tier3Run) -> String {
@@ -961,6 +1033,7 @@ mod tests {
                 result: Ok(AliasStoreState {
                     tentative_manifest_id: Some(7),
                     tier3_runs: Vec::new(),
+                    expected_tier3_analyzer_ids: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -969,6 +1042,7 @@ mod tests {
                 result: Ok(AliasStoreState {
                     tentative_manifest_id: None,
                     tier3_runs: Vec::new(),
+                    expected_tier3_analyzer_ids: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1023,6 +1097,7 @@ mod tests {
                     status: "succeeded".into(),
                     error: None,
                 }],
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
         let skipped = tier3_run_check(
@@ -1035,6 +1110,7 @@ mod tests {
                     status: "skipped".into(),
                     error: Some("ContentModified".into()),
                 }],
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
         let pending = tier3_run_check(
@@ -1047,6 +1123,7 @@ mod tests {
                     status: "pending".into(),
                     error: None,
                 }],
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
         let running = tier3_run_check(
@@ -1059,6 +1136,7 @@ mod tests {
                     status: "running".into(),
                     error: None,
                 }],
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
         let failed = tier3_run_check(
@@ -1071,6 +1149,7 @@ mod tests {
                     status: "failed".into(),
                     error: Some("boom".into()),
                 }],
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
         let missing = tier3_run_check(
@@ -1078,6 +1157,7 @@ mod tests {
             &AliasStoreState {
                 tentative_manifest_id: Some(4),
                 tier3_runs: Vec::new(),
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
 
@@ -1134,6 +1214,7 @@ mod tests {
                         error: Some("no matching files".into()),
                     },
                 ],
+                expected_tier3_analyzer_ids: Vec::new(),
             },
         );
 
@@ -1141,6 +1222,35 @@ mod tests {
         let detail = check.detail.as_deref().unwrap();
         assert!(detail.contains("pyright-lsp=succeeded"));
         assert!(detail.contains("rust-analyzer-lsp=skipped (no matching files)"));
+    }
+
+    #[test]
+    fn tier3_run_check_reports_expected_analyzer_without_run_record() {
+        let check = tier3_run_check(
+            "stale",
+            &AliasStoreState {
+                tentative_manifest_id: Some(10),
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "old-analyzer".into(),
+                    manifest_id: 10,
+                    status: "succeeded".into(),
+                    error: None,
+                }],
+                expected_tier3_analyzer_ids: vec!["new-analyzer".into(), "old-analyzer".into()],
+            },
+        );
+
+        assert_eq!(check.status, DoctorStatus::Warn);
+        let detail = check.detail.as_deref().unwrap();
+        assert!(detail.contains("old-analyzer=succeeded"));
+        assert!(detail.contains("new-analyzer=not yet recorded (run reindex)"));
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("reindex-repo --alias stale")
+        );
     }
 
     #[tokio::test]
@@ -1182,6 +1292,25 @@ mod tests {
         let detail = tier3.detail.as_deref().unwrap();
         assert!(detail.contains("pyright-lsp=succeeded"));
         assert!(detail.contains("rust-analyzer-lsp=skipped"));
+    }
+
+    #[tokio::test]
+    async fn doctor_dispatch_reports_registered_workspace_analyzer_without_run_record() {
+        let fixture = DoctorFixture::new();
+        fixture.seed_alias("demo", true, None, None);
+        fixture.seed_manifest_blob("demo", "sha-fake", "fake-parser");
+
+        let report = fixture.run_doctor().await;
+
+        let tier3 = find_check(&report, "repo `demo` Tier-3 analyzer status");
+        assert_eq!(tier3.status, DoctorStatus::Warn);
+        assert!(
+            tier3
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("fake-workspace=not yet recorded (run reindex)")
+        );
     }
 
     #[tokio::test]
@@ -1315,6 +1444,26 @@ mod tests {
                         status, started_at_ns, finished_at_ns, error)
                      VALUES (1, ?1, 1, 'cfg', ?2, 0, 1, ?3)",
                     params![analyzer_id, status, error],
+                )
+                .unwrap();
+        }
+
+        fn seed_manifest_blob(&self, alias: &str, blob_sha: &str, parser_id: &str) {
+            let store_path = self.cas_data_dir.store_db_path(&format!("{alias}-hash"));
+            let store = cas_store::open(&store_path).unwrap();
+            store
+                .execute(
+                    "INSERT INTO blobs
+                       (blob_sha, parser_id, parser_revision, parsed_at_ns)
+                     VALUES (?1, ?2, 1, 0)",
+                    params![blob_sha, parser_id],
+                )
+                .unwrap();
+            store
+                .execute(
+                    "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+                     VALUES (1, ?1, ?2)",
+                    params![format!("src/{blob_sha}.fake"), blob_sha],
                 )
                 .unwrap();
         }
