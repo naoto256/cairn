@@ -18,6 +18,7 @@ members = [
     "crates/cairn-lang-go-tier3",
     "crates/cairn-lang-csharp",
     "crates/cairn-lang-kotlin",
+    "crates/cairn-lang-swift",
     "crates/cairn-watch",
 ]
 
@@ -88,6 +89,10 @@ tree-sitter-php = "0.23"
 # same precedent as the swift / c-sharp pins above. Re-evaluate when
 # the workspace upgrades to tree-sitter >= 0.25.
 tree-sitter-kotlin-ng = "=1.1.0"
+# Pinned: tree-sitter-swift 0.7.1+ ships ABI 15 artifacts, which
+# tree-sitter 0.24 (ABI <= 14) rejects at set_language time.
+# Re-evaluate when the workspace moves to tree-sitter >= 0.25.
+tree-sitter-swift = "=0.7.0"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -122,6 +127,7 @@ cairn-lang-go = { version = "0.2.0", path = "crates/cairn-lang-go" }
 cairn-lang-go-tier3 = { version = "0.2.0", path = "crates/cairn-lang-go-tier3" }
 cairn-lang-csharp = { version = "0.2.0", path = "crates/cairn-lang-csharp" }
 cairn-lang-kotlin = { version = "0.2.0", path = "crates/cairn-lang-kotlin" }
+cairn-lang-swift = { version = "0.2.0", path = "crates/cairn-lang-swift" }
 cairn-watch = { version = "0.2.0", path = "crates/cairn-watch" }
 
 [profile.release]
