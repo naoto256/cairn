@@ -14,7 +14,7 @@
 //!   analog to Rust's `impl Trait for Type`. Emitted as an [`ImplFact`]
 //!   with `type_qualified = Dog`, `interface_qualified = Animal`,
 //!   `kind = "inherit"`. Populates the `implementations` table so
-//!   `find_impls trait=Animal` answers "what subclasses Animal".
+//!   `find_subtypes name=Animal` answers "what subclasses Animal".
 //!
 //! - **refs** — call sites (`foo()`, `obj.method()` → `RefKind::Call`)
 //!   and signature type annotations (`def f(p: T) -> R` → `RefKind::Type`
@@ -157,7 +157,7 @@ fn qualify(class_stack: &[String], name: &str) -> String {
 /// `class Dog(Animal, Mixin):` → one [`ImplFact`] per positional base.
 /// Keyword bases (`metaclass=…`) are skipped. The base text is stored
 /// as written (`abc.ABC` stays `abc.ABC`), matching how a user would
-/// query `find_impls trait=…`.
+/// query `find_subtypes name=…`.
 fn emit_base_classes(
     class_node: Node<'_>,
     source: &[u8],

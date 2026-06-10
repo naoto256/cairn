@@ -4,8 +4,10 @@
 //! the full MCP protocol on stdin/stdout, and translates each tool
 //! invocation into the appropriate underlying request on the daemon:
 //!
-//! - data-plane tools (`get_outline`, `find_symbols`, `find_impls`,
-//!   `find_imports`, `list_repos`) → plain JSON-RPC on `cairn.sock`.
+//! - data-plane tools (`get_outline`, `find_symbols`, `find_subtypes`,
+//!   `find_supertypes`, `find_callers`, `find_callees`,
+//!   `find_references`, `find_imports`, `list_repos`) → plain
+//!   JSON-RPC on `cairn.sock`.
 //! - admin tools (`register_repo`, `reindex_repo`) → control
 //!   protocol on `control.sock`.
 //!
@@ -117,8 +119,11 @@ worktrees.\n\
    - `grep` for a definition → `find_symbols`\n\
    - `Read <file>` to scan structure → `get_outline`\n\
    - `Read <file>` to view one fn / struct → `get_symbol_source`\n\
-   - `grep \"impl X for\"` → `find_impls`\n\
-   - `grep <fn>(` for callers → `find_references`\n\
+   - `grep \"impl X for\"` / `grep \"extends X\"` → `find_subtypes`\n\
+   - `grep \"impl .* for X\"` to find X's interfaces → `find_supertypes`\n\
+   - `grep <fn>(` for callers → `find_callers`\n\
+   - tracing what one function calls → `find_callees`\n\
+   - any other reference (type / import / read / write / annotation) → `find_references`\n\
    - `grep \"^use \"` → `find_imports`\n\
 \n\
 3. `grep` / `Read` still belong in your toolbox — for free-form \
@@ -497,7 +502,10 @@ mod tests {
                 "get_outline",
                 "get_symbol_source",
                 "find_symbols",
-                "find_impls",
+                "find_subtypes",
+                "find_supertypes",
+                "find_callers",
+                "find_callees",
                 "find_references",
                 "find_imports",
                 "register_repo",
@@ -528,10 +536,7 @@ mod tests {
         assert!(get_outline.description.contains("file → line order"));
         assert!(get_outline.description.contains("Default limit is 200"));
         assert!(get_outline.description.contains("`cap`"));
-        assert_eq!(
-            get_outline.input_schema["required"],
-            serde_json::json!(["repo"])
-        );
+        assert!(get_outline.input_schema["required"].is_null());
         assert!(get_outline.input_schema["properties"]["path"].is_object());
         assert!(get_outline.input_schema["properties"]["kind"].is_object());
         assert_eq!(
@@ -583,11 +588,28 @@ mod tests {
             assert!(find_symbols.description.contains(reason));
         }
 
-        let find_impls = specs.iter().find(|spec| spec.name == "find_impls").unwrap();
-        assert!(find_impls.description.contains("Omit `repo`"));
-        assert!(find_impls.description.contains("every registered repo"));
-        assert!(find_impls.description.contains("`repo:branch:file:line`"));
-        assert!(find_impls.input_schema["required"].is_null());
+        for (tool_name, q_phrase) in [
+            ("find_subtypes", "who implements / extends / mixes in"),
+            (
+                "find_supertypes",
+                "what does `name` extend / implement / mix in",
+            ),
+            ("find_callers", "who calls `name`"),
+            ("find_callees", "what does `name` call"),
+        ] {
+            let spec = specs.iter().find(|s| s.name == tool_name).unwrap();
+            assert!(
+                spec.description.contains("Omit `repo`"),
+                "{tool_name} should mention Omit `repo`"
+            );
+            assert!(spec.description.contains("every registered repo"));
+            assert!(spec.description.contains("`repo:branch:file:line`"));
+            assert!(
+                spec.description.contains(q_phrase),
+                "{tool_name} should phrase the typical agent question (`{q_phrase}`)"
+            );
+            assert_eq!(spec.input_schema["required"], serde_json::json!(["name"]));
+        }
 
         let find_imports = specs
             .iter()
@@ -622,7 +644,14 @@ mod tests {
             .unwrap();
         assert!(ref_kind_desc.contains("snake_case"));
         assert!(ref_kind_desc.contains("`macro_invoke`"));
-        for name in ["find_impls", "find_references", "find_imports"] {
+        for name in [
+            "find_subtypes",
+            "find_supertypes",
+            "find_callers",
+            "find_callees",
+            "find_references",
+            "find_imports",
+        ] {
             let spec = specs.iter().find(|spec| spec.name == name).unwrap();
             assert!(spec.description.contains("tier3_unavailable"));
             assert!(spec.description.contains("analyzer crashed"));

@@ -11,7 +11,9 @@ mod find_symbols;
 mod get_outline;
 mod get_symbol_source;
 
-pub use find_impls::{FindImplsArgs, ImplHit, find_impls};
+pub use find_impls::{
+    FindSubtypesArgs, FindSupertypesArgs, ImplHit, find_subtypes, find_supertypes,
+};
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};
 pub use find_symbols::{FindSymbolsArgs, SymbolHit, find_symbols};

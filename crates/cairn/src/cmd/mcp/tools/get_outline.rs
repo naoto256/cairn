@@ -19,14 +19,13 @@ impl McpTool for GetOutline {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string"},
+                    "repo": {"type": "string", "description": "Repository alias. Omit to search every registered repo."},
                     "file": {"type": "string", "description": "Path relative to the repo root for single-file outline mode."},
                     "path": {"type": "string", "description": "Repo-root-relative file-path string prefix for directory mode. Include the trailing `/` to scope to a directory."},
                     "kind": {"type": "string", "description": SYMBOL_KIND_DESC},
                     "max_depth": {"type": "integer", "minimum": 1, "description": "Directory-mode cap on directory depth relative to `path`, counted by `/` separators after the prefix. `1` keeps items from files directly under the prefix (module-level summary); `2` adds one nested level. Omit for unlimited depth. Ignored in single-file mode."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Directory-mode cap on items. Defaults to 200; `completeness: partial` with reason `cap` means more items matched."},
                 },
-                "required": ["repo"],
                 "additionalProperties": false,
             }),
         }

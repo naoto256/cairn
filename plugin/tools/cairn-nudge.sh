@@ -61,13 +61,13 @@ case "$cmd" in
     suggest="find_imports"
     hint='returns the dotted module + imported name + alias for every "use" statement, sourced from the syn semantic layer'
     ;;
-  *"impl "*"for "*|*"impl "*"for'"*|*"impl "*'for"'*)
-    suggest="find_impls"
-    hint='returns every "impl Trait for Foo" block in the workspace, including cross-repo'
+  *"impl "*"for "*|*"impl "*"for'"*|*"impl "*'for"'*|*"extends "*|*"implements "*)
+    suggest="find_subtypes / find_supertypes"
+    hint='returns type-relation edges from either side — `find_subtypes` for "who implements / extends `name`" and `find_supertypes` for "what `name` extends / implements / mixes in"'
     ;;
   *"("*)
-    suggest="find_references"
-    hint="returns who calls a symbol (direction=incoming) or what a symbol calls (direction=outgoing), with enclosing function attributed"
+    suggest="find_callers / find_callees"
+    hint='returns who calls a symbol (`find_callers`) or what a symbol calls (`find_callees`), with enclosing function attributed; reach for `find_references` for type / import / read / write / annotation refs'
     ;;
 esac
 

@@ -161,7 +161,7 @@ impl Completeness {
 
     /// Shorthand for "the semantic (Tier-2) layer was not available for
     /// at least one snapshot this query touched". Used by Tier-2
-    /// methods (`find_impls` / `find_references` / `find_imports`) when
+    /// methods (`find_subtypes` / `find_supertypes` / `find_references` / `find_callers` / `find_callees` / `find_imports`) when
     /// they run against a snapshot indexed at the syntactic tier only
     /// (e.g. a language without a Tier-2 analyzer yet, or enrichment
     /// still pending) — as well as by `find_symbols` when
