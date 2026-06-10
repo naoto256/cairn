@@ -336,6 +336,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         clangd_binary_check(),
         typescript_language_server_binary_check(),
         csharp_ls_binary_check(),
+        phpantom_lsp_binary_check(),
         jdtls_binary_check(),
         ruby_lsp_binary_check(),
         sourcekit_lsp_binary_check(),
@@ -393,6 +394,15 @@ fn csharp_ls_binary_check() -> DoctorCheck {
         resolve_csharp_ls(),
         "csharp-ls not discoverable via CSHARP_LS or PATH",
         "Install csharp-ls (`dotnet tool install -g csharp-ls`) and ensure the .NET tools directory is on the daemon's PATH, or set CSHARP_LS; C# Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn phpantom_lsp_binary_check() -> DoctorCheck {
+    binary_check(
+        "phpantom-lsp binary discoverable",
+        resolve_phpantom_lsp(),
+        "PHPantom LSP not discoverable via PHPANTOM_LSP or PATH",
+        "Install PHPantom LSP (`brew install phpantom-lsp` or `cargo install phpantom_lsp --locked`) and ensure `phpantom_lsp` or `phpantom-lsp` is on the daemon's PATH, or set PHPANTOM_LSP; PHP Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -527,6 +537,28 @@ fn resolve_csharp_ls() -> Option<PathBuf> {
         .map(|dir| dir.join("csharp-ls"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_phpantom_lsp() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PHPANTOM_LSP")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    // The Rust crate/editor command is `phpantom_lsp`, while the Homebrew
+    // formula is `phpantom-lsp`; accept either wrapper before asking users to
+    // set PHPANTOM_LSP explicitly.
+    for dir in std::env::split_paths(&paths) {
+        for command in ["phpantom_lsp", "phpantom-lsp"] {
+            let path = dir.join(command);
+            if path.is_file() {
+                return Some(path.canonicalize().unwrap_or(path));
+            }
+        }
+    }
+    None
 }
 
 fn resolve_jdtls() -> Option<PathBuf> {
@@ -797,6 +829,7 @@ mod tests {
             "csharp-ls",
             "gopls-lsp",
             "jdtls-lsp",
+            "phpantom-lsp",
             "pyright-lsp",
             "ruby-lsp",
             "rust-analyzer-lsp",

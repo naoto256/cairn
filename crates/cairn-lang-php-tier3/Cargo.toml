@@ -1,0 +1,25 @@
+[package]
+name = "cairn-lang-php-tier3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "PHP PHPantom LSP Tier-3 workspace analyzer for Cairn."
+
+[dependencies]
+cairn-core.workspace = true
+cairn-lang-api.workspace = true
+cairn-lang-php.workspace = true
+linkme.workspace = true
+serde_json.workspace = true
+tree-sitter.workspace = true
+tree-sitter-php.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

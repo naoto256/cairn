@@ -12,6 +12,7 @@ members = [
     "crates/cairn-lang-python-tier3",
     "crates/cairn-lang-markdown",
     "crates/cairn-lang-php",
+    "crates/cairn-lang-php-tier3",
     "crates/cairn-lang-ruby",
     "crates/cairn-lang-ruby-tier3",
     "crates/cairn-lang-typescript",
@@ -142,6 +143,7 @@ cairn-lang-python = { version = "0.3.0", path = "crates/cairn-lang-python" }
 cairn-lang-python-tier3 = { version = "0.3.0", path = "crates/cairn-lang-python-tier3" }
 cairn-lang-markdown = { version = "0.3.0", path = "crates/cairn-lang-markdown" }
 cairn-lang-php = { version = "0.3.0", path = "crates/cairn-lang-php" }
+cairn-lang-php-tier3 = { version = "0.3.0", path = "crates/cairn-lang-php-tier3" }
 cairn-lang-ruby = { version = "0.3.0", path = "crates/cairn-lang-ruby" }
 cairn-lang-ruby-tier3 = { version = "0.3.0", path = "crates/cairn-lang-ruby-tier3" }
 cairn-lang-typescript = { version = "0.3.0", path = "crates/cairn-lang-typescript" }

@@ -92,6 +92,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
     }
     if crate_name == "cairn-lang-rust-tier3"
         || crate_name == "cairn-lang-python-tier3"
+        || crate_name == "cairn-lang-php-tier3"
         || crate_name == "cairn-lang-go-tier3"
         || crate_name == "cairn-lang-csharp-tier3"
         || crate_name == "cairn-lang-java-tier3"
@@ -104,6 +105,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
             runtime_id: match crate_name {
                 "cairn-lang-rust-tier3" => "rust-analyzer-lsp",
                 "cairn-lang-python-tier3" => "pyright-lsp",
+                "cairn-lang-php-tier3" => "phpantom-lsp",
                 "cairn-lang-go-tier3" => "gopls-lsp",
                 "cairn-lang-csharp-tier3" => "csharp-ls",
                 "cairn-lang-java-tier3" => "jdtls-lsp",

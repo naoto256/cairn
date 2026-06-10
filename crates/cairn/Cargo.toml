@@ -31,6 +31,7 @@ cairn-lang-python.workspace = true
 cairn-lang-python-tier3.workspace = true
 cairn-lang-markdown.workspace = true
 cairn-lang-php.workspace = true
+cairn-lang-php-tier3.workspace = true
 cairn-lang-ruby.workspace = true
 cairn-lang-ruby-tier3.workspace = true
 cairn-lang-typescript.workspace = true
