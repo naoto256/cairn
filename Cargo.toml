@@ -18,6 +18,7 @@ members = [
     "crates/cairn-lang-go-tier3",
     "crates/cairn-lang-c",
     "crates/cairn-lang-csharp",
+    "crates/cairn-lang-java",
     "crates/cairn-lang-kotlin",
     "crates/cairn-lang-swift",
     "crates/cairn-watch",
@@ -95,6 +96,7 @@ tree-sitter-kotlin-ng = "=1.1.0"
 # Re-evaluate when the workspace moves to tree-sitter >= 0.25.
 tree-sitter-c = "0.23"
 tree-sitter-swift = "=0.7.0"
+tree-sitter-java = "0.23"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -129,6 +131,7 @@ cairn-lang-go = { version = "0.2.0", path = "crates/cairn-lang-go" }
 cairn-lang-go-tier3 = { version = "0.2.0", path = "crates/cairn-lang-go-tier3" }
 cairn-lang-c = { version = "0.2.0", path = "crates/cairn-lang-c" }
 cairn-lang-csharp = { version = "0.2.0", path = "crates/cairn-lang-csharp" }
+cairn-lang-java = { version = "0.2.0", path = "crates/cairn-lang-java" }
 cairn-lang-kotlin = { version = "0.2.0", path = "crates/cairn-lang-kotlin" }
 cairn-lang-swift = { version = "0.2.0", path = "crates/cairn-lang-swift" }
 cairn-watch = { version = "0.2.0", path = "crates/cairn-watch" }

@@ -139,7 +139,12 @@ dependencies = [
  "cairn-lang-csharp",
  "cairn-lang-go",
  "cairn-lang-go-tier3",
+<<<<<<< HEAD
  "cairn-lang-kotlin",
+||||||| parent of 850d6e2 (feat: add Java language backend)
+=======
+ "cairn-lang-java",
+>>>>>>> 850d6e2 (feat: add Java language backend)
  "cairn-lang-markdown",
  "cairn-lang-php",
  "cairn-lang-python",
@@ -245,6 +250,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "cairn-lang-kotlin"
 version = "0.2.0"
 dependencies = [
@@ -253,6 +259,17 @@ dependencies = [
  "linkme",
  "tree-sitter",
  "tree-sitter-kotlin-ng",
+||||||| parent of 850d6e2 (feat: add Java language backend)
+=======
+name = "cairn-lang-java"
+version = "0.2.0"
+dependencies = [
+ "cairn-lang-api",
+ "cairn-lang-treesitter-generic",
+ "linkme",
+ "tree-sitter",
+ "tree-sitter-java",
+>>>>>>> 850d6e2 (feat: add Java language backend)
 ]
 
 [[package]]
@@ -1445,6 +1462,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "tree-sitter-javascript"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,6 +1477,13 @@ name = "tree-sitter-kotlin-ng"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e800ebbda938acfbf224f4d2c34947a31994b1295ee6e819b65226c7b51b4450"
+||||||| parent of 850d6e2 (feat: add Java language backend)
+=======
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
+>>>>>>> 850d6e2 (feat: add Java language backend)
 dependencies = [
  "cc",
  "tree-sitter-language",
