@@ -20,14 +20,22 @@
 //! - **call / new refs** — `Foo()` / `obj.Bar()` →
 //!   [`RefKind::Call`]; `new Widget(...)` → [`RefKind::Instantiate`]
 //!   (the Rust analyzer's convention for construction sites). These
-//!   are name-level only: a method call's receiver type is unknown
-//!   without Tier-3, so `target_qualified` stays `None`.
+//!   are name-level: a cross-file callee stays unresolved
+//!   (`target_qualified: None`) and is therefore hidden from
+//!   `find_references`' default outgoing view (visible with
+//!   `include_noise`). A same-file callee — when the bare name matches
+//!   a method or constructor declared in this file — gets its
+//!   qualified name filled in. Partial classes can declare members
+//!   with the same qualified name across multiple files; for a name
+//!   that occurs more than once in the same file the first
+//!   declaration in walk order wins.
 //!
 //! Qualified names are built from namespace + type nesting, matching
 //! the syntactic pass's `NestingTracker` (which pushes namespaces and
 //! type containers but not methods), so `ImplFact.type_qualified`
 //! lines up with the `symbols.qualified` the indexer resolves against.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
@@ -58,8 +66,10 @@ impl Analyzer for CsharpAnalyzer {
             facts: SemanticFacts::default(),
             containers: Vec::new(),
             enclosing: None,
+            local_callables: HashMap::new(),
         };
         walker.walk(tree.root_node(), source);
+        walker.resolve_same_file_callees();
         Ok(walker.facts)
     }
 }
@@ -78,6 +88,13 @@ struct CsSemanticWalker {
     /// Qualified name of the nearest enclosing method / constructor /
     /// property / type, attached to refs as `enclosing_qualified`.
     enclosing: Option<String>,
+    /// Bare-name → qualified-name map of methods and constructors
+    /// declared in this file. Used after the walk to fill in
+    /// `target_qualified` on same-file call / instantiation refs.
+    /// First declaration wins, so a name redeclared by a partial class
+    /// in this same file (rare) keeps the qualified of its earliest
+    /// site in walk order.
+    local_callables: HashMap<String, String>,
 }
 
 impl CsSemanticWalker {
@@ -172,10 +189,38 @@ impl CsSemanticWalker {
             self.walk_children(node, source);
             return;
         };
-        let qualified = self.qualify(node_text(name_node, source));
+        let bare = node_text(name_node, source);
+        let qualified = self.qualify(bare);
+        if matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            self.local_callables
+                .entry(bare.to_string())
+                .or_insert_with(|| qualified.clone());
+        }
         let previous_enclosing = self.enclosing.replace(qualified);
         self.walk_children(node, source);
         self.enclosing = previous_enclosing;
+    }
+
+    /// Post-pass: fill `target_qualified` on Call / Instantiate refs
+    /// whose `target_name` matches a method or constructor declared in
+    /// the same file. Cross-file callees keep `target_qualified: None`
+    /// — hidden from `find_references`' default outgoing view, visible
+    /// with `include_noise`.
+    fn resolve_same_file_callees(&mut self) {
+        for r in self.facts.refs.iter_mut() {
+            if !matches!(r.kind, RefKind::Call | RefKind::Instantiate) {
+                continue;
+            }
+            if r.target_qualified.is_some() {
+                continue;
+            }
+            if let Some(qualified) = self.local_callables.get(&r.target_name) {
+                r.target_qualified = Some(qualified.clone());
+            }
+        }
     }
 
     /// `class C : Base, IFoo` — one edge per base-list entry. A record's
@@ -433,6 +478,8 @@ mod tests {
 
     #[test]
     fn method_call_inside_method_enclosed_by_qualified_method() {
+        // Helper is not declared in this file, so the callee stays
+        // unresolved — it would only be visible under `include_noise`.
         let f = semantic("class W { void Render() { Helper(); } }");
         let hit = calls(&f)
             .into_iter()
@@ -440,6 +487,53 @@ mod tests {
             .expect("Helper call missing");
         assert_eq!(hit.enclosing_qualified.as_deref(), Some("W.Render"));
         assert_eq!(hit.target_qualified, None);
+    }
+
+    #[test]
+    fn same_file_method_call_resolves_target_qualified() {
+        // Render → Helper, with Helper declared on the same class:
+        // the post-walk resolution fills target_qualified so the call
+        // shows up in `find_references`' default outgoing view.
+        let f = semantic("class W { void Render() { Helper(); } void Helper() {} }");
+        let hit = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "Helper")
+            .expect("Helper call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("W.Helper"));
+        assert_eq!(hit.enclosing_qualified.as_deref(), Some("W.Render"));
+    }
+
+    #[test]
+    fn same_file_call_resolves_across_classes_in_namespace() {
+        let f = semantic(
+            "namespace App {\n\
+             class A { void M() { B.Run(); Run(); } }\n\
+             class B { public static void Run() {} }\n\
+             }",
+        );
+        let hit = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "Run")
+            .expect("Run call missing");
+        // Name-level resolution: any same-file method named `Run`
+        // matches. B.Run is the only declaration here.
+        assert_eq!(hit.target_qualified.as_deref(), Some("App.B.Run"));
+    }
+
+    #[test]
+    fn partial_class_duplicate_keeps_first_declaration() {
+        // C# allows the same method to appear under a partial class in
+        // multiple files. Within a single file the resolution is
+        // best-effort: the first declaration in walk order wins.
+        let f = semantic(
+            "partial class P { void Helper() {} }\n\
+             partial class P { void M() { Helper(); } void Helper() {} }\n",
+        );
+        let hit = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "Helper")
+            .expect("Helper call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("P.Helper"));
     }
 
     #[test]
@@ -463,6 +557,8 @@ mod tests {
 
     #[test]
     fn new_emits_instantiate_ref() {
+        // Widget has no declaration in this file, so target_qualified
+        // stays None (cross-file callee — hidden by default view).
         let f = semantic("class C { object M() { return new Widget(1); } }");
         let inst: Vec<&RefFact> = f
             .refs
@@ -473,6 +569,23 @@ mod tests {
         assert_eq!(inst[0].target_name, "Widget");
         assert_eq!(inst[0].target_qualified, None);
         assert_eq!(inst[0].enclosing_qualified.as_deref(), Some("C.M"));
+    }
+
+    #[test]
+    fn same_file_new_resolves_to_constructor_qualified() {
+        // `new Widget(...)` matches the same-file `Widget` constructor
+        // by bare name, so the instantiation ref points at the
+        // constructor's qualified name (`Widget.Widget`).
+        let f = semantic(
+            "class Widget { public Widget(int x) {} } class C { void M() { var w = new Widget(1); } }",
+        );
+        let inst = f
+            .refs
+            .iter()
+            .find(|r| r.kind == RefKind::Instantiate)
+            .expect("instantiate ref missing");
+        assert_eq!(inst.target_name, "Widget");
+        assert_eq!(inst.target_qualified.as_deref(), Some("Widget.Widget"));
     }
 
     #[test]
