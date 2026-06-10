@@ -50,6 +50,15 @@ pub(super) fn persist_resolved_refs(
         };
         let target =
             target_symbol_for_location(&tx, manifest_id, &parser_id, target_path, &r.target)?;
+        // Import refs (e.g. C/C++/ObjC `#include`) commonly resolve to a
+        // file location that sits outside any symbol's byte range — the
+        // top of the header itself, before any declaration. Falling
+        // through to `continue` would drop those edges entirely; instead
+        // synthesize a header-level target from the file path so
+        // `find_imports` and `get_outline` still surface the edge. Other
+        // ref kinds (Call, Type, ...) keep the original "no symbol →
+        // skip" behaviour because a callee with no enclosing definition
+        // is genuinely unresolved.
         let (target_qualified, target_name) = match target {
             Some(target) => target,
             None if r.kind == RefKind::Import => {
