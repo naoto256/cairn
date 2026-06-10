@@ -21,6 +21,7 @@ use cairn_lang_go_tier3 as _;
 use cairn_lang_java as _;
 use cairn_lang_java_tier3 as _;
 use cairn_lang_kotlin as _;
+use cairn_lang_kotlin_tier3 as _;
 use cairn_lang_markdown as _;
 use cairn_lang_objc as _;
 use cairn_lang_php as _;
@@ -142,6 +143,7 @@ mod tests {
                 "csharp-ls",
                 "gopls-lsp",
                 "jdtls-lsp",
+                "kotlin-language-server",
                 "phpantom-lsp",
                 "pyright-lsp",
                 "ruby-lsp",
