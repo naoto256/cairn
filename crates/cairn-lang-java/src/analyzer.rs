@@ -8,17 +8,24 @@
 //! - **inheritance edges** — `class Dog extends Animal` and
 //!   `class Dog implements Pet` are Java's analogs to Rust's
 //!   `impl Trait for Type`. Emitted as [`ImplFact`]s with
-//!   `kind = "extends"` / `"implements"` so `find_impls
+//!   `kind = "inherit"` / `"implement"` so `find_impls
 //!   trait=Animal` answers "what subclasses / implements Animal".
-//!   Interface-to-interface `extends` edges use `"extends"` too.
+//!   Interface-to-interface `extends` edges use `"inherit"` too
+//!   (Java's `extends` between interfaces is still inheritance).
 //!   Generic arguments are stripped from the supertype
 //!   (`Comparable<Point>` → `Comparable`) to match how users query;
 //!   dotted names stay verbatim (`java.lang.Runnable`).
 //! - **refs** — method calls (`render()`, `obj.render()` →
 //!   [`RefKind::Call`]) and instantiations (`new Widget()` →
-//!   [`RefKind::Instantiate`]). Name-level only: a call's receiver
-//!   type is unknown without Tier-3, so `target_qualified` stays
-//!   `None`.
+//!   [`RefKind::Instantiate`]). Name-level by default: a call's
+//!   receiver type is unknown without Tier-3, so `target_qualified`
+//!   normally stays `None`. As a post-processing step we resolve
+//!   call refs whose `target_name` matches a method or constructor
+//!   declared in the same file, setting `target_qualified` to that
+//!   declaration's qualified name. Cross-file callees keep
+//!   `target_qualified: None`, which hides them from
+//!   `find_references`' default outgoing view (visible with
+//!   `include_noise`).
 //!
 //! Imports are already emitted by the syntactic pass (Java import
 //! paths need no resolution), so [`SemanticFacts::imports`] stays
@@ -30,6 +37,7 @@
 //! containers. A local class declared inside a method qualifies under
 //! the enclosing type, not the method.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
@@ -58,8 +66,46 @@ impl Analyzer for JavaAnalyzer {
 
         let mut facts = SemanticFacts::default();
         let mut type_stack: Vec<String> = Vec::new();
-        walk(tree.root_node(), source, &mut type_stack, None, &mut facts);
+        let mut method_qualifieds: HashSet<String> = HashSet::new();
+        walk(
+            tree.root_node(),
+            source,
+            &mut type_stack,
+            None,
+            &mut facts,
+            &mut method_qualifieds,
+        );
+        resolve_same_file_callees(&mut facts, &method_qualifieds);
         Ok(facts)
+    }
+}
+
+/// Post-process call refs: when a call's `target_name` matches a
+/// method or constructor declared in the same file, set
+/// `target_qualified` to that declaration's qualified name. The
+/// receiver type is unknown without Tier-3, so this resolves only by
+/// bare-name match — collisions across distinct same-file qualified
+/// names (e.g. `A.run` and `B.run`) are intentionally left `None`
+/// rather than guessing.  Cross-file callees stay `None`, which
+/// hides them from `find_references`' default outgoing view
+/// (visible with `include_noise`).
+fn resolve_same_file_callees(facts: &mut SemanticFacts, method_qualifieds: &HashSet<String>) {
+    let mut by_name: std::collections::HashMap<&str, Option<&str>> =
+        std::collections::HashMap::new();
+    for q in method_qualifieds {
+        let name = q.rsplit('.').next().unwrap_or(q.as_str());
+        by_name
+            .entry(name)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(q.as_str()));
+    }
+    for r in facts.refs.iter_mut() {
+        if r.kind != RefKind::Call || r.target_qualified.is_some() {
+            continue;
+        }
+        if let Some(Some(q)) = by_name.get(r.target_name.as_str()) {
+            r.target_qualified = Some((*q).to_string());
+        }
     }
 }
 
@@ -78,6 +124,7 @@ fn walk(
     type_stack: &mut Vec<String>,
     enclosing: Option<&str>,
     facts: &mut SemanticFacts,
+    method_qualifieds: &mut HashSet<String>,
 ) {
     match node.kind() {
         "class_declaration"
@@ -92,7 +139,14 @@ fn walk(
             let qualified = qualify(type_stack, &name);
             emit_supertype_edges(node, source, &qualified, facts);
             type_stack.push(name);
-            recurse(node, source, type_stack, Some(&qualified), facts);
+            recurse(
+                node,
+                source,
+                type_stack,
+                Some(&qualified),
+                facts,
+                method_qualifieds,
+            );
             type_stack.pop();
             return;
         }
@@ -102,7 +156,15 @@ fn walk(
             };
             let name = node_text(name_node, source).to_string();
             let qualified = qualify(type_stack, &name);
-            recurse(node, source, type_stack, Some(&qualified), facts);
+            method_qualifieds.insert(qualified.clone());
+            recurse(
+                node,
+                source,
+                type_stack,
+                Some(&qualified),
+                facts,
+                method_qualifieds,
+            );
             return;
         }
         "method_invocation" => {
@@ -116,7 +178,14 @@ fn walk(
         }
         _ => {}
     }
-    recurse(node, source, type_stack, enclosing, facts);
+    recurse(
+        node,
+        source,
+        type_stack,
+        enclosing,
+        facts,
+        method_qualifieds,
+    );
 }
 
 fn recurse(
@@ -125,11 +194,19 @@ fn recurse(
     type_stack: &mut Vec<String>,
     enclosing: Option<&str>,
     facts: &mut SemanticFacts,
+    method_qualifieds: &mut HashSet<String>,
 ) {
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            walk(cursor.node(), source, type_stack, enclosing, facts);
+            walk(
+                cursor.node(),
+                source,
+                type_stack,
+                enclosing,
+                facts,
+                method_qualifieds,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -147,12 +224,15 @@ fn qualify(type_stack: &[String], name: &str) -> String {
     }
 }
 
-/// Inheritance edges for one type declaration:
-/// - class `superclass` field (`extends Base`) → `"extends"`.
+/// Inheritance edges for one type declaration. Kinds use the
+/// cross-backend taxonomy (Python / Ruby / TS / C# / PHP / Kotlin /
+/// Swift) — `"inherit"` for subclass / sub-interface relationships
+/// and `"implement"` for class-to-interface relationships:
+/// - class `superclass` field (`extends Base`) → `"inherit"`.
 /// - `interfaces` field (`implements A, B` on classes / enums /
-///   records) → `"implements"`.
+///   records) → `"implement"`.
 /// - interface `extends_interfaces` child (`interface I extends J, K`)
-///   → `"extends"`.
+///   → `"inherit"` (interface-to-interface `extends` is inheritance).
 fn emit_supertype_edges(
     node: Node<'_>,
     source: &[u8],
@@ -163,23 +243,16 @@ fn emit_supertype_edges(
     if let Some(superclass) = child_by_field(node, "superclass") {
         let mut cursor = superclass.walk();
         for ty in superclass.named_children(&mut cursor) {
-            push_edge(facts, type_qualified, ty, source, "extends", line);
+            push_edge(facts, type_qualified, ty, source, "inherit", line);
         }
     }
     if let Some(interfaces) = child_by_field(node, "interfaces") {
-        emit_type_list_edges(
-            interfaces,
-            source,
-            type_qualified,
-            "implements",
-            line,
-            facts,
-        );
+        emit_type_list_edges(interfaces, source, type_qualified, "implement", line, facts);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "extends_interfaces" {
-            emit_type_list_edges(child, source, type_qualified, "extends", line, facts);
+            emit_type_list_edges(child, source, type_qualified, "inherit", line, facts);
         }
     }
 }
@@ -331,9 +404,9 @@ mod tests {
         assert_eq!(
             edges(&f),
             vec![
-                ("Dog", "Animal", "extends"),
-                ("Dog", "Pet", "implements"),
-                ("Dog", "Comparable", "implements"),
+                ("Dog", "Animal", "inherit"),
+                ("Dog", "Pet", "implement"),
+                ("Dog", "Comparable", "implement"),
             ]
         );
     }
@@ -344,8 +417,8 @@ mod tests {
         assert_eq!(
             edges(&f),
             vec![
-                ("Closer", "AutoCloseable", "extends"),
-                ("Closer", "Flushable", "extends"),
+                ("Closer", "AutoCloseable", "inherit"),
+                ("Closer", "Flushable", "inherit"),
             ]
         );
     }
@@ -358,8 +431,8 @@ mod tests {
         assert_eq!(
             edges(&f),
             vec![
-                ("Color", "Stringer", "implements"),
-                ("Point", "Comparable", "implements"),
+                ("Color", "Stringer", "implement"),
+                ("Point", "Comparable", "implement"),
             ]
         );
     }
@@ -382,7 +455,7 @@ mod tests {
     #[test]
     fn nested_type_qualifies_under_outer() {
         let f = semantic("class Outer { class Inner extends Base {} }\n");
-        assert_eq!(edges(&f), vec![("Outer.Inner", "Base", "extends")]);
+        assert_eq!(edges(&f), vec![("Outer.Inner", "Base", "inherit")]);
     }
 
     #[test]
@@ -390,7 +463,7 @@ mod tests {
         // Methods are not part of the qualified path, matching the
         // syntactic pass's NestingTracker.
         let f = semantic("class Outer { void make() { class Local extends Base {} } }\n");
-        assert_eq!(edges(&f), vec![("Outer.Local", "Base", "extends")]);
+        assert_eq!(edges(&f), vec![("Outer.Local", "Base", "inherit")]);
     }
 
     #[test]
@@ -407,6 +480,10 @@ mod tests {
 
     #[test]
     fn call_inside_method_enclosed_by_qualified_method() {
+        // `helper` is NOT defined in this file, so it stays a
+        // cross-file (`target_qualified: None`) callee — hidden from
+        // `find_references`' default outgoing view but visible with
+        // `include_noise`.
         let f = semantic("class W { void render() { helper(); } }\n");
         let hit = calls(&f)
             .into_iter()
@@ -417,7 +494,26 @@ mod tests {
     }
 
     #[test]
+    fn same_file_method_call_resolves_target_qualified() {
+        // `helper` IS defined in this file, so the call ref's
+        // `target_qualified` is filled in by `resolve_same_file_callees`.
+        // Without it, `find_references symbol=W.render direction=outgoing`
+        // would hide this edge by default (it filters
+        // `target_qualified IS NOT NULL`).
+        let f = semantic("class W { void render() { helper(); } void helper() {} }\n");
+        let hit = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "helper")
+            .expect("helper call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("W.helper"));
+        assert_eq!(hit.enclosing_qualified.as_deref(), Some("W.render"));
+    }
+
+    #[test]
     fn receiver_call_is_name_level_unresolved() {
+        // `render` is not defined in this file (`Widget` lives
+        // elsewhere), so the cross-file rule applies even though we
+        // resolve same-file names.
         let f = semantic("class W { void run(Widget obj) { obj.render(); } }\n");
         let hit = calls(&f)
             .into_iter()
