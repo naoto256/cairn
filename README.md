@@ -228,7 +228,8 @@ store alive while any other label still references it.
 |---|---|---|---|
 | Rust | ✅ | ✅ | ✅ (rust-analyzer) |
 | Python | ✅ | ✅ | ✅ (pyright-langserver) |
-| TypeScript (`.ts` / `.mts` / `.cts`) | ✅ | ✅ | – |
+| TypeScript / TSX (`.ts` / `.mts` / `.cts` / `.tsx`) | ✅ | ✅ | – |
+| JavaScript (`.js` / `.mjs` / `.cjs` / `.jsx`) | ✅ | ✅ | – |
 | Go | ✅ | ✅ | ✅ (gopls) |
 | Markdown | ✅ | – | – |
 
@@ -240,9 +241,11 @@ tree-sitter fallback for additional grammars.
 Tier-2 adds language-specific semantic facts from one file. Rust uses
 `syn`; Python extracts imports, inheritance, and refs; TypeScript emits
 call refs, type-role refs, and class / interface inheritance edges. The
-TypeScript backend covers `*.ts`, `*.mts`, and `*.cts`. `.tsx` uses a
-separate upstream grammar and is intentionally left for a follow-up
-backend. Member-expression calls without a resolved receiver type stay
+TypeScript backend family covers `*.ts` / `*.mts` / `*.cts`, `*.tsx`
+(via the upstream TSX grammar), and plain JavaScript (`*.js` / `*.mjs`
+/ `*.cjs` / `*.jsx`, shebang `node`), sharing one visitor and analyzer;
+JSX component usages are recorded as instantiate refs.
+Member-expression calls without a resolved receiver type stay
 unresolved in Tier-2.
 
 Tier-3 runs local language servers once per snapshot when their
