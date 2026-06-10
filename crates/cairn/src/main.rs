@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use cairn_lang_csharp as _;
 use cairn_lang_go as _;
 use cairn_lang_go_tier3 as _;
+use cairn_lang_kotlin as _;
 use cairn_lang_markdown as _;
 use cairn_lang_php as _;
 use cairn_lang_python as _;
@@ -95,6 +96,7 @@ mod tests {
                 "csharp",
                 "go",
                 "javascript",
+                "kotlin",
                 "markdown",
                 "php",
                 "python",

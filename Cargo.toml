@@ -17,6 +17,7 @@ members = [
     "crates/cairn-lang-go",
     "crates/cairn-lang-go-tier3",
     "crates/cairn-lang-csharp",
+    "crates/cairn-lang-kotlin",
     "crates/cairn-watch",
 ]
 
@@ -82,6 +83,11 @@ tree-sitter-go = "0.23"
 # is the last ABI-14 release.
 tree-sitter-c-sharp = "=0.23.1"
 tree-sitter-php = "0.23"
+# Pinned: tree-sitter-kotlin-ng follows semver but a 1.x bump could ship
+# ABI 15, which the workspace's tree-sitter 0.24 runtime cannot load —
+# same precedent as the swift / c-sharp pins above. Re-evaluate when
+# the workspace upgrades to tree-sitter >= 0.25.
+tree-sitter-kotlin-ng = "=1.1.0"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -115,6 +121,7 @@ cairn-lang-typescript = { version = "0.2.0", path = "crates/cairn-lang-typescrip
 cairn-lang-go = { version = "0.2.0", path = "crates/cairn-lang-go" }
 cairn-lang-go-tier3 = { version = "0.2.0", path = "crates/cairn-lang-go-tier3" }
 cairn-lang-csharp = { version = "0.2.0", path = "crates/cairn-lang-csharp" }
+cairn-lang-kotlin = { version = "0.2.0", path = "crates/cairn-lang-kotlin" }
 cairn-watch = { version = "0.2.0", path = "crates/cairn-watch" }
 
 [profile.release]
