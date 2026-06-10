@@ -5,18 +5,24 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.2.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.3.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
 
-Upgrading from 0.1.x: the Tier-3 rust reference `source` label
-changed from the legacy `tier3-rust-analyzer` alias to the uniform
-`tier3-rust-analyzer-lsp` (matching `tier3-pyright-lsp` and
-`tier3-gopls-lsp`). Clients that match on that string need to update;
-rows under the old label are cleared and re-stamped on the next
-reindex. `list_repos` snapshot `status` also reports `empty` /
-`no_analyzer` / `stale` alongside the previous `ready`, so treat
-new values as informational rather than errors.
+Upgrading from 0.2.x: the `find_impls` MCP tool is gone — use
+`find_subtypes` (who implements / extends X) and `find_supertypes`
+(what X extends / implements / mixes in) instead. The new
+`find_callers` / `find_callees` pair replaces composing
+`find_references` with a direction filter when you just want the
+call graph. The CLI moves with it: `cairn query find` is now `cairn
+query symbols`, `cairn query impls --type/--trait` becomes `cairn
+query supertypes/subtypes`, `cairn query imports --file <path>` and
+`cairn query outline <alias> <file>` take the path positionally, and
+`cairn query source` no longer requires `--repo`. The Java backend's
+inheritance edges now use `inherit` / `implement` (matching every
+other backend) instead of the old `extends` / `implements`; clients
+matching on those strings need to update. Reindex picks up the new
+labels on the next pass.
 
 ## Why
 
@@ -241,41 +247,51 @@ store alive while any other label still references it.
 |---|---|---|---|
 | Rust | ✅ | ✅ | ✅ (rust-analyzer) |
 | Python | ✅ | ✅ | ✅ (pyright-langserver) |
+| Go | ✅ | ✅ | ✅ (gopls) |
 | TypeScript / TSX (`.ts` / `.mts` / `.cts` / `.tsx`) | ✅ | ✅ | – |
 | JavaScript (`.js` / `.mjs` / `.cjs` / `.jsx`) | ✅ | ✅ | – |
-| Go | ✅ | ✅ | ✅ (gopls) |
+| Java (`.java`) | ✅ | ✅ | – |
+| C# (`.cs`) | ✅ | ✅ | – |
+| Kotlin (`.kt` / `.kts`) | ✅ | ✅ | – |
+| Swift (`.swift`) | ✅ | ✅ | – |
+| C (`.c` / `.h`) | ✅ | ✅ | – |
+| C++ (`.cpp` / `.cc` / `.cxx` / `.hpp` / `.hxx` / `.hh` / `.h++` / `.C` / `.H`) | ✅ | ✅ | – |
+| Objective-C (`.m`) | ✅ | ✅ | – |
+| Ruby (`.rb` / `.rake` / `Gemfile` / `Rakefile`) | ✅ | ✅ | – |
+| PHP (`.php`) | ✅ | ✅ | – |
 | Markdown | ✅ | – | – |
 
 Tier-1 is the tree-sitter syntax floor: symbols, outlines, imports,
-and other facts that can be extracted from one file. Rust, Python,
-Markdown, TypeScript, and Go have first-class backends, with a generic
+and other facts that can be extracted from one file. Fourteen
+first-class language backends ship with 0.3.0, plus a generic
 tree-sitter fallback for additional grammars.
 
-Tier-2 adds language-specific semantic facts from one file. Rust uses
-`syn`; Python extracts imports, inheritance, and refs; TypeScript emits
-call refs, type-role refs, and class / interface inheritance edges. The
-TypeScript backend family covers `*.ts` / `*.mts` / `*.cts`, `*.tsx`
-(via the upstream TSX grammar), and plain JavaScript (`*.js` / `*.mjs`
-/ `*.cjs` / `*.jsx`, shebang `node`), sharing one visitor and analyzer;
-JSX component usages are recorded as instantiate refs.
-Member-expression calls without a resolved receiver type stay
-unresolved in Tier-2.
+Tier-2 adds language-specific semantic facts from one file —
+inheritance / interface / mixin / extension edges, call refs (with
+same-file callees resolved so the default `find_callees` and
+`find_references(outgoing)` views show a meaningful call graph
+without `include_noise=true`), and import edges. The four-label
+taxonomy `inherit` / `implement` / `mixin` / `extension` is shared
+across every backend so `find_subtypes` / `find_supertypes` compare
+cleanly across languages.
 
 Tier-3 runs local language servers once per snapshot when their
 binaries are discoverable on the daemon's `PATH`. Rust uses
 `rust-analyzer` (`source = tier3-rust-analyzer-lsp`), Python uses
 `pyright-langserver` (`source = tier3-pyright-lsp`), and Go uses
 `gopls` (`source = tier3-gopls-lsp`). Missing binaries are recorded
-as `Skipped`; Tier-1 / Tier-2 facts remain available.
-
-Go covers `*.go` functions, receiver-qualified methods, named types,
-top-level constants / variables, and imports. Exported visibility
-follows Go's first-letter capitalization convention.
+as `Skipped`; Tier-1 / Tier-2 facts remain available. The 0.4.0
+release will extend Tier-3 to the rest of the 0.3.0 backend
+lineup.
 
 Files are picked by extension first (`*.py`, `*.rs`, `*.md`, `*.ts`,
 `*.go`, ...). Extensionless executables (`bin/foo` with mode `0755+`)
-fall back to shebang detection, including `#!/usr/bin/env python3` and
-`#!/usr/bin/env -S uv run --script` PEP 723 scripts.
+fall back to shebang detection, including `#!/usr/bin/env python3`,
+`#!/usr/bin/env -S uv run --script` PEP 723 scripts, `node` (for
+JavaScript), and `ruby` (for Ruby). For C / C++ / Objective-C, `.h`
+stays with the C backend (Objective-C `.mm` is not yet claimed —
+Objective-C++ headers are ambiguous enough that mis-claiming them
+hurts more than it helps).
 
 ## Architecture
 
