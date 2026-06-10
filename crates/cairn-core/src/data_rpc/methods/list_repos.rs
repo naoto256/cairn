@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use cairn_lang_api::{LanguageBackend, all_backends};
+use cairn_proto::common::LanguageEnrichment;
 use cairn_proto::methods::{ListReposResult, RepoEntry, SnapshotEntry};
 use linkme::distributed_slice;
 use rusqlite::params;
@@ -117,12 +118,14 @@ fn collect_snapshots(
                 |r| r.get(0),
             )
             .unwrap_or(0);
+        let enrichment = collect_enrichment(conn, manifest_id, backends)?;
+        let status = derive_status(file_count, symbol_count, &enrichment);
         entries.push((
             sort_internal,
             SnapshotEntry {
                 branches,
-                status: "ready".into(),
-                enrichment: collect_enrichment(conn, manifest_id, backends)?,
+                status,
+                enrichment,
                 last_accessed: Some(crate::timefmt::ns_to_rfc3339_utc(acc.last_updated_ns)),
                 file_count: u64::try_from(file_count).unwrap_or(0),
                 symbol_count: u64::try_from(symbol_count).unwrap_or(0),
@@ -131,6 +134,28 @@ fn collect_snapshots(
     }
     entries.sort_by_key(|(a, _)| anchor::order_key(a));
     Ok(entries.into_iter().map(|(_, e)| e).collect())
+}
+
+/// Snapshot status derived from manifest + symbol counts.
+///
+/// Distinguishes the three "empty-looking" cases callers used to
+/// conflate: `empty` (no files in the manifest), `no_analyzer` (only
+/// languages without a semantic backend, e.g. all-markdown repo), and
+/// `stale` (analyzer-capable files exist but produced zero symbols —
+/// typically the index hasn't caught up yet and `reindex_repo` is the
+/// fix). `ready` is the steady state.
+fn derive_status(file_count: i64, symbol_count: i64, enrichment: &[LanguageEnrichment]) -> String {
+    if file_count == 0 {
+        return "empty".into();
+    }
+    if symbol_count > 0 {
+        return "ready".into();
+    }
+    if enrichment.iter().any(|e| e.has_analyzer) {
+        "stale".into()
+    } else {
+        "no_analyzer".into()
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +217,27 @@ mod tests {
             .unwrap();
         assert!(!markdown.has_analyzer);
         assert_eq!(markdown.tier, SourceTier::Syntactic);
+    }
+
+    #[test]
+    fn derive_status_distinguishes_empty_stale_and_ready() {
+        let none: Vec<LanguageEnrichment> = vec![];
+        assert_eq!(derive_status(0, 0, &none), "empty");
+
+        let md_only = vec![LanguageEnrichment {
+            language: "markdown".into(),
+            tier: SourceTier::Syntactic,
+            has_analyzer: false,
+        }];
+        assert_eq!(derive_status(3, 0, &md_only), "no_analyzer");
+
+        let rust = vec![LanguageEnrichment {
+            language: "rust".into(),
+            tier: SourceTier::Semantic,
+            has_analyzer: true,
+        }];
+        assert_eq!(derive_status(3, 0, &rust), "stale");
+        assert_eq!(derive_status(3, 7, &rust), "ready");
     }
 
     #[test]
