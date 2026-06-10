@@ -1,0 +1,21 @@
+[package]
+name = "cairn-lang-cpp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "C++ language backend (tree-sitter floor + Tier-2 inheritance and same-file callee resolution; clangd Tier-3 reserved)."
+
+[dependencies]
+cairn-lang-api.workspace = true
+cairn-lang-treesitter-generic.workspace = true
+tree-sitter.workspace = true
+tree-sitter-cpp.workspace = true
+linkme.workspace = true
+
+[lints]
+workspace = true
