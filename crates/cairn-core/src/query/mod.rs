@@ -15,7 +15,7 @@ pub use find_impls::{FindImplsArgs, ImplHit, find_impls};
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};
 pub use find_symbols::{FindSymbolsArgs, SymbolHit, find_symbols};
-pub use get_outline::{OutlineItem, get_outline, get_outline_under_path};
+pub use get_outline::{OutlineFilter, OutlineItem, get_outline, get_outline_under_path};
 pub use get_symbol_source::{SymbolSourceRow, get_symbol_source_row};
 
 #[cfg(test)]
