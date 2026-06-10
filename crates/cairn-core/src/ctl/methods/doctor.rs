@@ -335,6 +335,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         gopls_binary_check(),
         clangd_binary_check(),
         typescript_language_server_binary_check(),
+        jdtls_binary_check(),
     ]
 }
 
@@ -380,6 +381,15 @@ fn typescript_language_server_binary_check() -> DoctorCheck {
         resolve_typescript_language_server(),
         "typescript-language-server not on PATH",
         "Install typescript-language-server (`npm i -g typescript typescript-language-server`) and ensure it's on the daemon's PATH; TypeScript, JavaScript, and TSX Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn jdtls_binary_check() -> DoctorCheck {
+    binary_check(
+        "jdtls binary discoverable",
+        resolve_jdtls(),
+        "jdtls not on PATH",
+        "Install an Eclipse JDT Language Server wrapper script named `jdtls`, or set JDTLS to that wrapper; Java Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -471,6 +481,20 @@ fn resolve_typescript_language_server() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("typescript-language-server"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_jdtls() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("JDTLS")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("jdtls"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -673,6 +697,7 @@ mod tests {
             "clangd-cpp-lsp",
             "clangd-objc-lsp",
             "gopls-lsp",
+            "jdtls-lsp",
             "pyright-lsp",
             "rust-analyzer-lsp",
             "typescript-language-server-js-lsp",
@@ -696,6 +721,7 @@ mod tests {
             "clangd-cpp-lsp",
             "clangd-objc-lsp",
             "gopls-lsp",
+            "jdtls-lsp",
             "pyright-lsp",
             "rust-analyzer-lsp",
             "typescript-language-server-js-lsp",

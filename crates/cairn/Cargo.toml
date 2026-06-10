@@ -39,6 +39,7 @@ cairn-lang-clangd-tier3.workspace = true
 cairn-lang-c.workspace = true
 cairn-lang-cpp.workspace = true
 cairn-lang-java.workspace = true
+cairn-lang-java-tier3.workspace = true
 cairn-lang-kotlin.workspace = true
 cairn-lang-swift.workspace = true
 cairn-lang-objc.workspace = true

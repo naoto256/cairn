@@ -93,6 +93,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
     if crate_name == "cairn-lang-rust-tier3"
         || crate_name == "cairn-lang-python-tier3"
         || crate_name == "cairn-lang-go-tier3"
+        || crate_name == "cairn-lang-java-tier3"
     {
         return vec![Entry {
             crate_name: crate_name.to_string(),
@@ -101,6 +102,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
                 "cairn-lang-rust-tier3" => "rust-analyzer-lsp",
                 "cairn-lang-python-tier3" => "pyright-lsp",
                 "cairn-lang-go-tier3" => "gopls-lsp",
+                "cairn-lang-java-tier3" => "jdtls-lsp",
                 _ => unreachable!(),
             }
             .to_string(),
