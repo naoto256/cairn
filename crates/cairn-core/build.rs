@@ -75,6 +75,21 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
             })
             .collect();
     }
+    if crate_name == "cairn-lang-typescript-tier3" {
+        return [
+            "typescript-language-server-ts-lsp",
+            "typescript-language-server-js-lsp",
+            "typescript-language-server-tsx-lsp",
+        ]
+        .into_iter()
+        .map(|runtime_id| Entry {
+            crate_name: crate_name.to_string(),
+            registry: "WorkspaceAnalyzer",
+            runtime_id: runtime_id.to_string(),
+            import_hint: import_hint.clone(),
+        })
+        .collect();
+    }
     if crate_name == "cairn-lang-rust-tier3"
         || crate_name == "cairn-lang-python-tier3"
         || crate_name == "cairn-lang-go-tier3"
