@@ -16,6 +16,7 @@ use cairn_lang_go_tier3 as _;
 use cairn_lang_markdown as _;
 use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
+use cairn_lang_ruby as _;
 use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
 use cairn_lang_typescript as _;
@@ -88,11 +89,12 @@ mod tests {
 
         assert_eq!(
             backend_names,
-            [
+[
                 "go",
                 "javascript",
                 "markdown",
                 "python",
+                "ruby",
                 "rust",
                 "tsx",
                 "typescript"
