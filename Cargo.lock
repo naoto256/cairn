@@ -148,6 +148,7 @@ dependencies = [
  "cairn-lang-markdown",
  "cairn-lang-objc",
  "cairn-lang-php",
+ "cairn-lang-php-tier3",
  "cairn-lang-python",
  "cairn-lang-python-tier3",
  "cairn-lang-ruby",
@@ -359,6 +360,20 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-php",
+]
+
+[[package]]
+name = "cairn-lang-php-tier3"
+version = "0.3.0"
+dependencies = [
+ "cairn-core",
+ "cairn-lang-api",
+ "cairn-lang-php",
+ "linkme",
+ "serde_json",
+ "tempfile",
  "tree-sitter",
  "tree-sitter-php",
 ]

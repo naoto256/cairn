@@ -24,6 +24,7 @@ use cairn_lang_kotlin as _;
 use cairn_lang_markdown as _;
 use cairn_lang_objc as _;
 use cairn_lang_php as _;
+use cairn_lang_php_tier3 as _;
 use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
 use cairn_lang_ruby as _;
@@ -141,6 +142,7 @@ mod tests {
                 "csharp-ls",
                 "gopls-lsp",
                 "jdtls-lsp",
+                "phpantom-lsp",
                 "pyright-lsp",
                 "ruby-lsp",
                 "rust-analyzer-lsp",
