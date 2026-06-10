@@ -13,9 +13,16 @@
 //!   query `find_impls`.
 //! - **refs** — call sites (`foo()`, `$obj->method()`, `Cls::stat()` →
 //!   [`RefKind::Call`]) and instantiations (`new Widget()` →
-//!   [`RefKind::Instantiate`]). Name-level only: a method call's
-//!   receiver type is unknown without deeper analysis, so
-//!   `target_qualified` stays `None`.
+//!   [`RefKind::Instantiate`]). Name-level: receiver types are unknown
+//!   without deeper analysis. A post-walk pass fills `target_qualified`
+//!   when the callee (function / method / constructor) or instantiated
+//!   class is defined in the same file, expanding the bare
+//!   `target_name` against the call site's namespace and container
+//!   stack (`{ns}\{containers}::{name}`, `{ns}\{name}`, `{name}`). The
+//!   pass runs after the full walk so calls that lexically precede the
+//!   definition still resolve. Cross-file targets stay `None`, which
+//!   hides them from `find_references`' default outgoing view (visible
+//!   with `include_noise`).
 //!
 //! `use` imports are emitted by the Tier-1 pass ([`SyntacticFacts`]'
 //! `imports`), so they are not duplicated here.
@@ -26,6 +33,7 @@
 //! aligned lets the indexer resolve `ImplFact.type_qualified` and
 //! `RefFact.enclosing_qualified` against the symbols table.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
@@ -59,8 +67,11 @@ impl Analyzer for PhpAnalyzer {
             namespace: None,
             containers: Vec::new(),
             enclosing: None,
+            defined: HashSet::new(),
+            ref_sites: Vec::new(),
         };
         walker.walk(tree.root_node(), source);
+        walker.resolve_same_file_callees();
         Ok(walker.facts)
     }
 }
@@ -81,6 +92,20 @@ struct PhpSemanticWalker {
     /// Qualified name of the nearest enclosing function / method /
     /// container, attached to refs as `enclosing_qualified`.
     enclosing: Option<String>,
+    /// Qualified names of every function / method / constructor / class
+    /// declared in this file. Populated as the walk descends so that
+    /// calls preceding the definition still resolve in the post-walk
+    /// pass.
+    defined: HashSet<String>,
+    /// Active namespace + container stack captured at each ref site,
+    /// parallel to `facts.refs`. Used to expand a ref's `target_name`
+    /// into qualified candidates against `defined`.
+    ref_sites: Vec<RefSite>,
+}
+
+struct RefSite {
+    namespace: Option<String>,
+    containers: Vec<String>,
 }
 
 impl PhpSemanticWalker {
@@ -128,6 +153,7 @@ impl PhpSemanticWalker {
                     return;
                 };
                 let qualified = self.qualify(node_text(name_node, source));
+                self.defined.insert(qualified.clone());
                 let previous = self.enclosing.replace(qualified);
                 self.walk_children(node, source);
                 self.enclosing = previous;
@@ -162,6 +188,7 @@ impl PhpSemanticWalker {
     /// `enclosing` (class-level refs attach to the class).
     fn walk_container(&mut self, node: Node<'_>, source: &[u8], name: String) {
         let qualified = self.qualify(&name);
+        self.defined.insert(qualified.clone());
         self.emit_heritage(node, source, &qualified);
 
         let previous_enclosing = self.enclosing.replace(qualified);
@@ -284,6 +311,37 @@ impl PhpSemanticWalker {
             byte_range: name_node.byte_range(),
             line: line_of(name_node),
         });
+        self.ref_sites.push(RefSite {
+            namespace: self.namespace.clone(),
+            containers: self.containers.clone(),
+        });
+    }
+
+    /// Fill `target_qualified` for Call / Instantiate refs whose
+    /// callee is defined in this file. The lookup expands the bare
+    /// `target_name` into qualified candidates using the call site's
+    /// namespace and container stack and picks the first candidate
+    /// that hits `defined`. Cross-file targets stay `None`.
+    fn resolve_same_file_callees(&mut self) {
+        let defined = &self.defined;
+        let sites = &self.ref_sites;
+        for (idx, r) in self.facts.refs.iter_mut().enumerate() {
+            if r.target_qualified.is_some() {
+                continue;
+            }
+            if !matches!(r.kind, RefKind::Call | RefKind::Instantiate) {
+                continue;
+            }
+            let Some(site) = sites.get(idx) else {
+                continue;
+            };
+            for candidate in candidates_for(&r.target_name, &r.kind, site) {
+                if defined.contains(&candidate) {
+                    r.target_qualified = Some(candidate);
+                    break;
+                }
+            }
+        }
     }
 
     /// Qualified name for `name` under the current namespace and
@@ -315,6 +373,39 @@ impl PhpSemanticWalker {
 /// `find_references symbol=Bar` matches name-level.
 fn last_segment(path: &str) -> &str {
     path.rsplit('\\').next().unwrap_or(path)
+}
+
+/// Qualified-name candidates for a ref's `target_name`, given the call
+/// site's namespace + container stack. `Call` expands against an
+/// innermost-container member, a namespace-level function, and the
+/// bare name; `Instantiate` only against namespace-level and bare
+/// (PHP `new` resolves a class, not a member).
+fn candidates_for(name: &str, kind: &RefKind, site: &RefSite) -> Vec<String> {
+    let mut out = Vec::new();
+    let ns = site.namespace.as_deref();
+    match kind {
+        RefKind::Call => {
+            if !site.containers.is_empty() {
+                let containers = site.containers.join("::");
+                out.push(match ns {
+                    Some(n) => format!("{n}\\{containers}::{name}"),
+                    None => format!("{containers}::{name}"),
+                });
+            }
+            if let Some(n) = ns {
+                out.push(format!("{n}\\{name}"));
+            }
+            out.push(name.to_string());
+        }
+        RefKind::Instantiate => {
+            if let Some(n) = ns {
+                out.push(format!("{n}\\{name}"));
+            }
+            out.push(name.to_string());
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -422,14 +513,73 @@ mod tests {
 
     #[test]
     fn new_expression_is_instantiate_ref() {
-        let f = semantic("<?php\nfunction make() {\n    return new Widget();\n}\n");
+        let f =
+            semantic("<?php\nclass Widget {}\nfunction make() {\n    return new Widget();\n}\n");
         let hit = f
             .refs
             .iter()
             .find(|r| r.kind == RefKind::Instantiate)
             .expect("instantiate ref missing");
         assert_eq!(hit.target_name, "Widget");
+        // Class declared in the same file → resolved to its qualified.
+        assert_eq!(hit.target_qualified.as_deref(), Some("Widget"));
         assert_eq!(hit.enclosing_qualified.as_deref(), Some("make"));
+    }
+
+    #[test]
+    fn same_file_callees_resolve_against_namespace_and_container() {
+        let src = "<?php
+namespace App\\Models;
+function helper(): void {}
+class Widget {
+    public function go(): void {
+        helper();
+        $this->render();
+        self::stat();
+        new Widget();
+    }
+    public function render(): void {}
+    public static function stat(): void {}
+}
+class External {
+    public function unrelated(): void {
+        Helper::across_file();
+    }
+}
+";
+        let f = semantic(src);
+        let lookup = |name: &str, kind: RefKind| -> &RefFact {
+            f.refs
+                .iter()
+                .find(|r| r.target_name == name && r.kind == kind)
+                .unwrap_or_else(|| panic!("{name} ref missing"))
+        };
+
+        // Free function in current namespace.
+        assert_eq!(
+            lookup("helper", RefKind::Call).target_qualified.as_deref(),
+            Some("App\\Models\\helper"),
+        );
+        // `$this->render()` — innermost-container member resolution.
+        assert_eq!(
+            lookup("render", RefKind::Call).target_qualified.as_deref(),
+            Some("App\\Models\\Widget::render"),
+        );
+        // `self::stat()` — same container, scoped call.
+        assert_eq!(
+            lookup("stat", RefKind::Call).target_qualified.as_deref(),
+            Some("App\\Models\\Widget::stat"),
+        );
+        // `new Widget()` — class defined in the same file.
+        assert_eq!(
+            lookup("Widget", RefKind::Instantiate)
+                .target_qualified
+                .as_deref(),
+            Some("App\\Models\\Widget"),
+        );
+        // Cross-file callee (target_name has no matching same-file
+        // definition) stays unresolved.
+        assert_eq!(lookup("across_file", RefKind::Call).target_qualified, None,);
     }
 
     #[test]
