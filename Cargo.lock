@@ -135,12 +135,8 @@ dependencies = [
  "async-trait",
  "cairn-core",
  "cairn-lang-api",
-<<<<<<< HEAD
- "cairn-lang-csharp",
-||||||| parent of af8215a (feat: add C language backend)
-=======
  "cairn-lang-c",
->>>>>>> af8215a (feat: add C language backend)
+ "cairn-lang-csharp",
  "cairn-lang-go",
  "cairn-lang-go-tier3",
  "cairn-lang-kotlin",
@@ -200,17 +196,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "cairn-lang-csharp"
-version = "0.2.0"
-dependencies = [
- "cairn-lang-api",
- "cairn-lang-treesitter-generic",
- "linkme",
- "tree-sitter",
- "tree-sitter-c-sharp",
-||||||| parent of af8215a (feat: add C language backend)
-=======
 name = "cairn-lang-c"
 version = "0.2.0"
 dependencies = [
@@ -219,7 +204,17 @@ dependencies = [
  "linkme",
  "tree-sitter",
  "tree-sitter-c",
->>>>>>> af8215a (feat: add C language backend)
+]
+
+[[package]]
+name = "cairn-lang-csharp"
+version = "0.2.0"
+dependencies = [
+ "cairn-lang-api",
+ "cairn-lang-treesitter-generic",
+ "linkme",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
 ]
 
 [[package]]
@@ -1420,18 +1415,20 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "tree-sitter-c-sharp"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67f06accca7b45351758663b8215089e643d53bd9a660ce0349314263737fcb0"
-||||||| parent of af8215a (feat: add C language backend)
-=======
 name = "tree-sitter-c"
 version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afd2b1bf1585dc2ef6d69e87d01db8adb059006649dd5f96f31aa789ee6e9c71"
->>>>>>> af8215a (feat: add C language backend)
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c-sharp"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67f06accca7b45351758663b8215089e643d53bd9a660ce0349314263737fcb0"
 dependencies = [
  "cc",
  "tree-sitter-language",
