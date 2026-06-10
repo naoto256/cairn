@@ -63,6 +63,7 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
         run_lsp_definition_pass(
             LspDefinitionPass {
                 analyzer_id: ANALYZER_ID,
+                pool_analyzer_id: None,
                 language: "rust",
                 ref_kind: RefKind::Call,
                 spawn_spec: LspSpawnSpec {

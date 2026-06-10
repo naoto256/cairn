@@ -59,6 +59,11 @@ pub struct DefinitionRetryPolicy {
 pub struct LspDefinitionPass {
     /// Stable analyzer identifier, e.g. `"gopls-lsp"`.
     pub analyzer_id: &'static str,
+    /// Optional analyzer id used only for pooling. Defaults to
+    /// [`Self::analyzer_id`]. This lets sibling analyzers keep
+    /// distinct run/ref sources while intentionally sharing one LSP
+    /// subprocess.
+    pub pool_analyzer_id: Option<&'static str>,
     /// Pool-key language tag, e.g. `"go"`.
     pub language: &'static str,
     /// Ref kind recorded for every resolved site this pass emits.
@@ -85,7 +90,7 @@ pub fn run_lsp_definition_pass(
     let key = PoolKey::lsp(
         pass.language,
         repo_root,
-        pass.analyzer_id,
+        pass.pool_analyzer_id.unwrap_or(pass.analyzer_id),
         &pass.spawn_spec.binary,
         &pass.spawn_spec.config_hash,
     )
