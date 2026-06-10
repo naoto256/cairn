@@ -7,7 +7,7 @@
 //!
 //! - **inheritance edges** — `class Dog < Animal` becomes an
 //!   [`ImplFact`] with `kind = "inherit"`, so
-//!   `find_impls trait=Animal` answers "what subclasses Animal".
+//!   `find_subtypes name=Animal` answers "what subclasses Animal".
 //! - **mixin edges** — `include M` / `extend M` / `prepend M` inside a
 //!   class or module body become [`ImplFact`]s with `kind` set to the
 //!   mixin verb. These are Ruby's interface-implementation analog.
@@ -237,7 +237,7 @@ fn method_qualify(scope_stack: &[String], name: &str, singleton: bool) -> String
 
 /// `class Dog < Animal` — the `superclass` field wraps the expression
 /// after `<`. The base text is stored as written (`Base::Animal` stays
-/// dotted), matching how a user would query `find_impls trait=…`.
+/// dotted), matching how a user would query `find_subtypes name=…`.
 fn emit_superclass(
     class_node: Node<'_>,
     source: &[u8],

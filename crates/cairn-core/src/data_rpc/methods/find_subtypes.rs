@@ -1,36 +1,33 @@
-//! `find_impls` — trait/impl edges across an indexed repo. Reads the
-//! CAS `implementations` table joined against the requested anchor's
-//! manifest entries.
+//! `find_subtypes` — "who implements / extends / mixes in `name`?"
 
-use cairn_proto::methods::{ImplHit, ImplsArgs, ImplsResult};
+use cairn_proto::methods::{FindSubtypesArgs, FindSubtypesResult, ImplHit};
 use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
-use crate::query::{self, FindImplsArgs as QueryArgs, ImplHit as QueryHit};
+use crate::query::{self, FindSubtypesArgs as QueryArgs, ImplHit as QueryHit};
 use crate::{Error, Result};
 
-pub struct FindImpls;
+pub struct FindSubtypes;
 
 #[async_trait::async_trait]
-impl DataMethod for FindImpls {
+impl DataMethod for FindSubtypes {
     fn name(&self) -> &'static str {
-        "find_impls"
+        "find_subtypes"
     }
 
     async fn dispatch(&self, ctx: &DataCtx, params: Value) -> Result<Value> {
-        let args: ImplsArgs = parse_params(params)?;
-        if args.trait_.is_none() && args.type_.is_none() {
+        let args: FindSubtypesArgs = parse_params(params)?;
+        if args.name.trim().is_empty() {
             return Err(Error::InvalidArgument(
-                "find_impls: one of `trait` / `type` must be supplied".into(),
+                "find_subtypes: `name` must be non-empty".into(),
             ));
         }
 
         let effective_limit = args.limit.unwrap_or(100).max(1);
         let q = QueryArgs {
-            interface_qualified: args.trait_.clone(),
-            type_qualified: args.type_.clone(),
+            name: args.name.clone(),
             limit: Some(limit_with_probe(effective_limit)),
         };
         let anchor_arg = args.anchor.clone();
@@ -40,7 +37,7 @@ impl DataMethod for FindImpls {
         let (items, capped) = with_one_or_all_stores(
             ctx,
             requested_repo,
-            "find_impls",
+            "find_subtypes",
             effective_limit,
             move |entry, conn| {
                 let anchor = crate::anchor::resolve_explicit_or_default(
@@ -49,7 +46,7 @@ impl DataMethod for FindImpls {
                     branch_arg.as_deref(),
                 )?;
                 let anchor_label = anchor.as_str().to_string();
-                let hits = query::find_impls(conn, &anchor, &q)?;
+                let hits = query::find_subtypes(conn, &anchor, &q)?;
                 Ok(hits
                     .into_iter()
                     .map(|hit| into_wire_hit(&entry.alias, &anchor_label, hit))
@@ -59,7 +56,7 @@ impl DataMethod for FindImpls {
         )
         .await?;
 
-        Ok(serde_json::to_value(ImplsResult {
+        Ok(serde_json::to_value(FindSubtypesResult {
             items,
             completeness: completeness_for_cap(capped),
         })
@@ -69,9 +66,9 @@ impl DataMethod for FindImpls {
 
 #[allow(unsafe_code)]
 #[distributed_slice(DATA_METHODS)]
-static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(FindImpls);
+static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(FindSubtypes);
 
-fn into_wire_hit(repo: &str, anchor: &str, h: QueryHit) -> ImplHit {
+pub(super) fn into_wire_hit(repo: &str, anchor: &str, h: QueryHit) -> ImplHit {
     ImplHit {
         type_qualified: h.type_qualified,
         interface_qualified: h.interface_qualified,
@@ -99,9 +96,9 @@ mod tests {
     #[tokio::test]
     async fn exact_limit_is_complete_and_over_limit_is_partial() {
         assert_limit_probe(
-            &FindImpls,
-            json!({"repo": "demo", "trait": "Trait", "limit": 3}),
-            json!({"repo": "demo", "trait": "Trait", "limit": 2}),
+            &FindSubtypes,
+            json!({"repo": "demo", "name": "Trait", "limit": 3}),
+            json!({"repo": "demo", "name": "Trait", "limit": 2}),
         )
         .await;
     }
@@ -110,10 +107,10 @@ mod tests {
     async fn repo_none_searches_all_registered_repos_and_caps_accumulated_total() {
         let fixture = cross_repo_fixture();
 
-        let all = FindImpls
+        let all = FindSubtypes
             .dispatch(
                 &fixture.ctx,
-                json!({"trait": "Trait", "limit": 10, "anchor": "HEAD"}),
+                json!({"name": "Trait", "limit": 10, "anchor": "HEAD"}),
             )
             .await
             .unwrap();
@@ -134,10 +131,10 @@ mod tests {
             Completeness::Complete
         );
 
-        let capped = FindImpls
+        let capped = FindSubtypes
             .dispatch(
                 &fixture.ctx,
-                json!({"trait": "Trait", "limit": 2, "anchor": "HEAD"}),
+                json!({"name": "Trait", "limit": 2, "anchor": "HEAD"}),
             )
             .await
             .unwrap();
@@ -146,6 +143,16 @@ mod tests {
             serde_json::from_value::<Completeness>(capped["completeness"].clone()).unwrap(),
             Completeness::partial_truncated("cap")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_name() {
+        let fixture = cross_repo_fixture();
+        let err = FindSubtypes
+            .dispatch(&fixture.ctx, json!({"name": "", "anchor": "HEAD"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     struct CrossRepoFixture {

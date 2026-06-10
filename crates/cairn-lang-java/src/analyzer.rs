@@ -8,8 +8,8 @@
 //! - **inheritance edges** — `class Dog extends Animal` and
 //!   `class Dog implements Pet` are Java's analogs to Rust's
 //!   `impl Trait for Type`. Emitted as [`ImplFact`]s with
-//!   `kind = "inherit"` / `"implement"` so `find_impls
-//!   trait=Animal` answers "what subclasses / implements Animal".
+//!   `kind = "inherit"` / `"implement"` so `find_subtypes
+//!   name=Animal` answers "what subclasses / implements Animal".
 //!   Interface-to-interface `extends` edges use `"inherit"` too
 //!   (Java's `extends` between interfaces is still inheritance).
 //!   Generic arguments are stripped from the supertype

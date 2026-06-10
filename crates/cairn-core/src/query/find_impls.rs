@@ -1,9 +1,15 @@
+//! Type-relation edge queries — `find_subtypes` (who implements /
+//! extends `name`?) and `find_supertypes` (what does `name` extend
+//! / implement?). Both walk the `implementations` table; they differ
+//! only in which side of the edge they pin.
+
 use rusqlite::{Connection, ToSql};
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
 
-/// One impl-edge hit.
+/// One impl-edge hit. Shared by both directions; only which side the
+/// caller pinned changes between subtypes and supertypes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImplHit {
     pub type_qualified: String,
@@ -13,47 +19,80 @@ pub struct ImplHit {
     pub line: u32,
 }
 
-/// Filters for `find_impls`. Either `interface_qualified` or
-/// `type_qualified` must be set; the other side is the open end of
-/// the query.
+/// Filters for `find_subtypes`.
 #[derive(Debug, Clone, Default)]
-pub struct FindImplsArgs {
-    /// `"What implements Display?"` — matches `interface_qualified`.
-    pub interface_qualified: Option<String>,
-    /// `"What does Foo implement?"` — matches `type_qualified`.
-    pub type_qualified: Option<String>,
+pub struct FindSubtypesArgs {
+    /// The supertype / trait / interface. Match returns rows whose
+    /// `interface_qualified` equals this name — i.e. every type that
+    /// implements / extends / mixes in `name`.
+    pub name: String,
     pub limit: Option<u32>,
 }
 
-/// List impl edges visible from `anchor`, filtered by either the
-/// trait side or the type side.
+/// Filters for `find_supertypes`.
+#[derive(Debug, Clone, Default)]
+pub struct FindSupertypesArgs {
+    /// The subtype. Match returns rows whose `type_qualified` equals
+    /// this name — i.e. every base / trait / interface / mixin
+    /// `name` extends or implements.
+    pub name: String,
+    pub limit: Option<u32>,
+}
+
+/// "Who implements / extends `name`?"
 ///
 /// # Errors
-/// `Error::InvalidArgument` when neither filter is set or the anchor
-/// doesn't resolve. SQLite errors otherwise.
-pub fn find_impls(
+/// `Error::InvalidArgument` when `name` is empty,
+/// `Error::AnchorNotFound` when the anchor doesn't resolve.
+pub fn find_subtypes(
     conn: &Connection,
     anchor: &AnchorName,
-    args: &FindImplsArgs,
+    args: &FindSubtypesArgs,
 ) -> Result<Vec<ImplHit>> {
-    let by_iface = args
-        .interface_qualified
-        .as_deref()
-        .is_some_and(|s| !s.is_empty());
-    let by_type = args
-        .type_qualified
-        .as_deref()
-        .is_some_and(|s| !s.is_empty());
-    if !by_iface && !by_type {
+    if args.name.trim().is_empty() {
         return Err(crate::Error::InvalidArgument(
-            "find_impls: one of `trait` / `type` must be supplied".into(),
+            "find_subtypes: `name` must be non-empty".into(),
         ));
     }
+    run(
+        conn,
+        anchor,
+        "i.interface_qualified",
+        &args.name,
+        args.limit,
+    )
+}
+
+/// "What does `name` extend / implement?"
+///
+/// # Errors
+/// `Error::InvalidArgument` when `name` is empty,
+/// `Error::AnchorNotFound` when the anchor doesn't resolve.
+pub fn find_supertypes(
+    conn: &Connection,
+    anchor: &AnchorName,
+    args: &FindSupertypesArgs,
+) -> Result<Vec<ImplHit>> {
+    if args.name.trim().is_empty() {
+        return Err(crate::Error::InvalidArgument(
+            "find_supertypes: `name` must be non-empty".into(),
+        ));
+    }
+    run(conn, anchor, "i.type_qualified", &args.name, args.limit)
+}
+
+fn run(
+    conn: &Connection,
+    anchor: &AnchorName,
+    where_col: &str,
+    value: &str,
+    limit: Option<u32>,
+) -> Result<Vec<ImplHit>> {
     let manifest_id =
         anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
             name: anchor.as_str().to_string(),
         })?;
-    let limit = args.limit.unwrap_or(100).max(1);
+    let limit = limit.unwrap_or(100).max(1);
 
     let mut sql = String::from(
         "SELECT i.type_qualified, i.interface_qualified, i.kind, me.path, i.line
@@ -61,24 +100,13 @@ pub fn find_impls(
            JOIN manifest_entries me
              ON me.manifest_id = ?1
             AND me.blob_sha = i.blob_sha
-          WHERE 1=1",
+          WHERE ",
     );
-    let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0)];
-    if let Some(name) = args.interface_qualified.as_deref()
-        && !name.is_empty()
-    {
-        sql.push_str(" AND i.interface_qualified = ?");
-        bound.push(Box::new(name.to_string()));
-    }
-    if let Some(name) = args.type_qualified.as_deref()
-        && !name.is_empty()
-    {
-        sql.push_str(" AND i.type_qualified = ?");
-        bound.push(Box::new(name.to_string()));
-    }
-    sql.push_str(" ORDER BY me.path, i.line");
+    sql.push_str(where_col);
+    sql.push_str(" = ?2 ORDER BY me.path, i.line");
     sql.push_str(&format!(" LIMIT {limit}"));
 
+    let bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0), Box::new(value.to_string())];
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
     let rows: rusqlite::Result<Vec<ImplHit>> = stmt

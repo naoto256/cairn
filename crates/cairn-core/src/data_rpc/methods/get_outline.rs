@@ -7,9 +7,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, trim_to_requested_limit, with_repo_conn,
-};
+use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
 
@@ -38,14 +36,15 @@ impl DataMethod for GetOutline {
             max_depth: args.max_depth,
         };
 
-        let (items, capped) = with_repo_conn(
+        let (items, capped) = with_one_or_all_stores(
             ctx,
-            &repo_alias,
+            repo_alias,
             "outline",
-            move |_entry, conn| -> Result<(Vec<OutlineItem>, bool)> {
-                let anchor = crate::anchor::resolve_explicit_or_default(&conn, None, None)?;
-                if let Some(file) = file {
-                    let raw = match query::get_outline(&conn, &anchor, &file, None) {
+            effective_limit,
+            move |_entry, conn| -> Result<Vec<OutlineItem>> {
+                let anchor = crate::anchor::resolve_explicit_or_default(conn, None, None)?;
+                if let Some(file) = file.as_deref() {
+                    let raw = match query::get_outline(conn, &anchor, file, None) {
                         Ok(r) => r,
                         Err(Error::AnchorNotFound { .. }) => Vec::new(),
                         Err(other) => return Err(other),
@@ -55,14 +54,14 @@ impl DataMethod for GetOutline {
                         .filter(|i| filter.kind.as_ref().is_none_or(|k| &i.kind == k))
                         .map(into_wire_item)
                         .collect();
-                    return Ok((filtered, false));
+                    return Ok(filtered);
                 }
 
-                let path = path.expect("validated path when file is absent");
-                let mut raw = match query::get_outline_under_path(
-                    &conn,
+                let path = path.as_deref().expect("validated path when file is absent");
+                let raw = match query::get_outline_under_path(
+                    conn,
                     &anchor,
-                    &path,
+                    path,
                     None,
                     limit_with_probe(effective_limit),
                     &filter,
@@ -71,14 +70,14 @@ impl DataMethod for GetOutline {
                     Err(Error::AnchorNotFound { .. }) => Vec::new(),
                     Err(other) => return Err(other),
                 };
-                let capped = trim_to_requested_limit(&mut raw, effective_limit);
-                Ok((raw.into_iter().map(into_wire_item).collect(), capped))
+                Ok(raw.into_iter().map(into_wire_item).collect())
             },
+            |_out: &mut Vec<OutlineItem>| {},
         )
         .await?;
 
         debug!(
-            repo = %args.repo,
+            repo = ?args.repo,
             file = ?args.file,
             path = ?args.path,
             count = items.len(),

@@ -140,7 +140,12 @@ mod list_repos_tests {
 /// Arguments to `get_outline`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineArgs {
-    pub repo: String,
+    /// Repository alias. `None` searches every registered repo and
+    /// returns matching outlines from each; identical-named paths
+    /// across repos are distinguished by the `file` field on each
+    /// returned item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// File-path string prefix relative to repo root. This is a
@@ -330,30 +335,50 @@ pub struct FindSymbolHit {
     pub source: SourceTier,
 }
 
-// ─── impls / imports (semantic enrichment query surface) ──────────────────
+// ─── type-relation + import queries (semantic enrichment surface) ──────────
 //
-// These return facts the Tier-2 analyzer populates: trait/impl edges
-// from `syn` for Rust, and `use` statements flattened to one row per
-// imported name. Same envelope shape as `find_symbols` — `repo` is
-// optional where cross-repo search is supported; omitting both
-// `branch` and `anchor` resolves to the registered worktree's
+// These return facts the Tier-2 analyzer populates: type-relation
+// edges (`impl Trait for Foo`, `class Dog extends Animal`,
+// `class Foo implements Bar`, ECMAScript mixins) flattened into the
+// `implementations` table, and `use` / `import` statements flattened
+// into the imports table. Same envelope shape as `find_symbols` —
+// `repo` is optional where cross-repo search is supported; omitting
+// both `branch` and `anchor` resolves to the registered worktree's
 // `tentative/<id>` snapshot (= committed HEAD plus uncommitted edits
 // the watcher has picked up), falling back to `HEAD` when no
 // tentative snapshot exists yet. Hits carry their originating branch.
 
+/// Arguments to `find_subtypes`. Asks "who implements / extends /
+/// mixes in `name`?" — every type that names `name` on the
+/// interface/base side of a type-relation edge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImplsArgs {
+pub struct FindSubtypesArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// Match impl edges whose **trait** side equals this name. Use
-    /// when answering "what implements `Display`?". Either `trait_`
-    /// or `type_` must be set.
-    #[serde(default, rename = "trait", skip_serializing_if = "Option::is_none")]
-    pub trait_: Option<String>,
-    /// Match impl edges whose **type** side equals this name. Use
-    /// when answering "what traits does `Foo` implement?".
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub type_: Option<String>,
+    /// The base type or trait/interface. Match returns every type
+    /// that implements / extends / mixes in this name.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Arguments to `find_supertypes`. Asks "what does `name` extend /
+/// implement / mix in?" — every type that appears on the
+/// interface/base side of an edge originating at `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindSupertypesArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The subtype. Match returns every base type / trait / interface
+    /// / mixin this name implements or inherits from.
+    pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -366,28 +391,49 @@ pub struct ImplsArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImplsResult {
+pub struct FindSubtypesResult {
     pub items: Vec<ImplHit>,
-    /// `Partial` when the Tier-2 analyzer (syn for Rust) had not
-    /// finished on every file. Missing tier is `Semantic`. Items
-    /// already extracted are still valid; new ones may arrive once
-    /// indexing settles.
+    /// `Partial` when the Tier-2 analyzer had not finished on every
+    /// file. Missing tier is `Semantic`. Items already extracted are
+    /// still valid; new ones may arrive once indexing settles.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindSupertypesResult {
+    pub items: Vec<ImplHit>,
+    /// `Partial` when the Tier-2 analyzer had not finished on every
+    /// file. Missing tier is `Semantic`. Items already extracted are
+    /// still valid; new ones may arrive once indexing settles.
+    #[serde(default = "Completeness::complete")]
+    pub completeness: Completeness,
+}
+
+/// One type-relation edge — the data shape behind both
+/// `find_subtypes` and `find_supertypes`. The two methods walk the
+/// same `implementations` table from opposite directions, so the
+/// hit shape is the same regardless of which side the caller pinned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplHit {
-    /// Qualified name (or token form) of the type the impl is on.
+    /// Qualified name (or token form) of the subtype the edge is on
+    /// — the `Foo` in `impl Trait for Foo`, the `Dog` in `class Dog
+    /// extends Animal`, the `Mixed` in `class Mixed extends mixin(...)`.
     pub type_qualified: String,
-    /// Qualified name of the trait the impl implements; `null` for
-    /// an inherent impl.
+    /// Qualified name of the supertype the edge points at — the
+    /// `Trait` in `impl Trait for Foo`, the `Animal` in `class Dog
+    /// extends Animal`. `null` for an inherent impl (`impl Foo {}`)
+    /// where there is no supertype side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_qualified: Option<String>,
-    /// `"trait"` for trait impls, `"inherent"` for inherent impls.
+    /// Edge kind — `"trait"` for Rust trait impls, `"inherent"` for
+    /// Rust inherent impls, `"inherit"` for TypeScript `extends` /
+    /// Python base classes, `"implements"` for TypeScript `implements`,
+    /// `"mixin"` for ECMAScript mixin patterns.
     pub kind: String,
     pub branch: String,
-    /// `repo:branch:file:line` pointing at the type-side symbol.
+    /// `repo:branch:file:line` pointing at the subtype-side symbol
+    /// (the impl block or the `class … extends …` declaration).
     pub location: String,
 }
 
@@ -445,7 +491,7 @@ pub struct ImportHit {
 // "Who calls / uses this symbol?" Driven by the Tier-2 `refs` table
 // populated by the syn body-visitor (calls + method calls today; more
 // kinds when the analyzer learns them). Same envelope shape as
-// `find_symbols` / `find_impls`: omitting both `branch` and `anchor`
+// `find_symbols` / `find_subtypes`: omitting both `branch` and `anchor`
 // resolves to the registered worktree's `tentative/<id>` snapshot,
 // falling back to `HEAD` when no tentative snapshot exists yet.
 
@@ -539,6 +585,99 @@ pub struct FindReferenceHit {
     pub snippet: Option<String>,
 }
 
+// ─── find_callers / find_callees ───────────────────────────────────────────
+//
+// Thin shortcuts over `find_references` for the two most-asked questions
+// on the call graph: "who calls X?" and "what does X call?". Both
+// narrow to `kind = call` with a resolved `target_qualified`, mirroring
+// the default `find_references` outgoing semantics — the legacy
+// noise toggle is not exposed here on purpose; for unresolved method
+// calls or type refs reach for `find_references` directly.
+
+/// Arguments to `find_callers`. "Who calls `name`?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCallersArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Callee symbol. Matches `refs.target_qualified` first when the
+    /// name carries `::`, falling back to the bare last segment;
+    /// bare names go straight to the name index.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Arguments to `find_callees`. "What does `name` call?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCalleesArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Caller (enclosing) symbol. Matches `symbols.qualified` via
+    /// the enclosing FK on each ref row.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCallersResult {
+    pub items: Vec<CallHit>,
+    #[serde(default = "Completeness::complete")]
+    pub completeness: Completeness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCalleesResult {
+    pub items: Vec<CallHit>,
+    #[serde(default = "Completeness::complete")]
+    pub completeness: Completeness,
+}
+
+/// One call edge — shared by `find_callers` and `find_callees`.
+///
+/// - For `find_callers`, the queried symbol is the callee:
+///   `target_qualified` mirrors the query, `enclosing_qualified` is
+///   the caller (the function that issues the call), and `location`
+///   points at the call site inside that caller.
+/// - For `find_callees`, the queried symbol is the caller:
+///   `enclosing_qualified` mirrors the query, `target_qualified` is
+///   the callee, and `location` points at the call site inside the
+///   caller's body.
+///
+/// The shape is symmetric on purpose: both directions surface the
+/// same `caller → callee at file:line` edge, only the side the caller
+/// pinned changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallHit {
+    pub target_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_qualified: Option<String>,
+    /// Qualified name of the enclosing function — the caller side of
+    /// the edge. `None` for top-level expressions (rare in Rust).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_qualified: Option<String>,
+    pub branch: String,
+    /// `repo:branch:file:line` of the call site itself.
+    pub location: String,
+    /// Single source line at the call site (trailing newline
+    /// stripped), so the caller can read the call without a follow-up
+    /// `get_symbol_source` round trip. `None` when the indexed blob
+    /// can't be materialised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
 // ─── get_symbol_source ─────────────────────────────────────────────────────
 //
 // Return the indexed source of a symbol — signature plus body for
@@ -550,7 +689,11 @@ pub struct FindReferenceHit {
 /// Arguments to `get_symbol_source`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSymbolSourceArgs {
-    pub repo: String,
+    /// Repository alias. `None` searches every registered repo and
+    /// returns the first match — useful when the qualified name is
+    /// unique across the registry. Pass an alias to restrict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Qualified name of the symbol (matches `qualified` in the
     /// `symbols` table). Use `find_symbols` first if you only have a
     /// bare name and the repo has more than one match.

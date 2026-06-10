@@ -7,9 +7,12 @@
 //! single-file change; the dispatcher picks it up without any local
 //! edits.
 
-mod find_impls;
+mod find_callees;
+mod find_callers;
 mod find_imports;
 mod find_references;
+mod find_subtypes;
+mod find_supertypes;
 mod find_symbols;
 mod get_outline;
 mod get_symbol_source;

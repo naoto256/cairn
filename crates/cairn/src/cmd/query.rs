@@ -11,14 +11,21 @@
 //! newline JSON-RPC reply, renders it human-readably, and exits.
 //! Pass `--json` to get the raw `result` payload — handy for piping
 //! into `jq`.
+//!
+//! Subcommand naming mirrors the MCP tool surface: each subcommand
+//! takes the search target as its first positional argument and the
+//! repo (when relevant) as an optional `--repo` flag. Omitting
+//! `--repo` searches every registered repository — the same default
+//! as `find_symbols`.
 
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
 use cairn_proto::Completeness;
 use cairn_proto::jsonrpc::{JsonRpcVersion, Request, RequestId, Response};
 use cairn_proto::methods::{
-    FindReferencesResult, FindSymbolResult, GetSymbolSourceResult, ImplsResult, ImportsResult,
-    ListReposResult, OutlineResult,
+    FindCalleesResult, FindCallersResult, FindReferencesResult, FindSubtypesResult,
+    FindSupertypesResult, FindSymbolResult, GetSymbolSourceResult, ImportsResult, ListReposResult,
+    OutlineResult,
 };
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -45,15 +52,31 @@ pub struct Args {
 enum QueryCommand {
     /// List registered repositories and their snapshots.
     Repos,
-    /// Outline a single file (what's defined and where).
+    /// Outline a file or directory (what's defined and where).
     Outline {
-        /// Repository alias.
-        repo: String,
-        /// File path relative to repo root.
+        /// File or directory path relative to the repo root.
+        /// Include a trailing `/` to scope to a directory.
         file: String,
+        /// Repository alias. Omit to search every registered repo.
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Restrict outline items to one symbol kind.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Directory-depth cap relative to the path prefix.
+        #[arg(long)]
+        max_depth: Option<u32>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Look up a definition by name (function, struct, method, …).
-    Find {
+    Symbols {
         /// Symbol query — exact name unless `--fuzzy`.
         query: String,
         /// Repository alias. Omit to search every registered repo.
@@ -85,8 +108,10 @@ enum QueryCommand {
         /// Fully-qualified name (`crate::module::name` or just `name`
         /// when unambiguous).
         qualified: String,
+        /// Repository alias. Omit to search every registered repo
+        /// (first matching symbol wins).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -98,17 +123,12 @@ enum QueryCommand {
         #[arg(long)]
         file: Option<String>,
     },
-    /// Trait/impl edges. Supply `--trait` for "what implements X?",
-    /// `--type` for "what does Y implement?", or both.
-    Impls {
+    /// Types that implement / extend / mix in the given name.
+    Subtypes {
+        /// Base type / trait / interface.
+        name: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Trait name to match the impl's trait side.
-        #[arg(long = "trait", value_name = "TRAIT")]
-        trait_: Option<String>,
-        /// Type name to match the impl's type side.
-        #[arg(long = "type", value_name = "TYPE")]
-        type_: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -118,15 +138,60 @@ enum QueryCommand {
         #[arg(long)]
         limit: Option<u32>,
     },
-    /// Import edges (`use` statements).
-    Imports {
+    /// Types that the given name extends / implements / mixes in.
+    Supertypes {
+        /// Subtype name.
+        name: String,
         #[arg(long)]
         repo: Option<String>,
-        /// File to list imports for. Omit to list every import in
-        /// the (filtered) snapshot.
         #[arg(long)]
+        branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Functions that call the given symbol.
+    Callers {
+        /// Callee symbol.
+        name: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Resolved calls made from inside the given symbol.
+    Callees {
+        /// Caller (enclosing) symbol.
+        name: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+        /// `tentative/<id>`). Takes priority over `--branch`.
+        #[arg(long)]
+        anchor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Import edges (`use` statements / ES imports).
+    Imports {
+        /// File path relative to repo root. Omit to list every
+        /// import in the (filtered) snapshot — pass `-` to keep this
+        /// position explicit when wrapping in shell pipelines.
         file: Option<String>,
         #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
         branch: Option<String>,
         /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
         /// `tentative/<id>`). Takes priority over `--branch`.
@@ -135,7 +200,10 @@ enum QueryCommand {
         #[arg(long)]
         limit: Option<u32>,
     },
-    /// Incoming or outgoing references for a symbol.
+    /// Symmetric reference query — incoming or outgoing references.
+    /// Use the dedicated `callers` / `callees` subcommands for the
+    /// common call-graph questions; reach for `refs` when you need
+    /// type refs, imports, reads / writes, or annotations.
     Refs {
         /// Symbol name or qualified path.
         symbol: String,
@@ -185,10 +253,43 @@ pub async fn run(args: Args) -> Result<()> {
 
     let (method, params): (&str, Value) = match &args.command {
         QueryCommand::Repos => ("list_repos", Value::Null),
-        QueryCommand::Outline { repo, file } => {
-            ("get_outline", json!({"repo": repo, "file": file}))
+        QueryCommand::Outline {
+            file,
+            repo,
+            branch,
+            anchor,
+            kind,
+            max_depth,
+            limit,
+        } => {
+            let mut p = serde_json::Map::new();
+            if let Some(r) = repo {
+                p.insert("repo".into(), Value::String(r.clone()));
+            }
+            // Treat trailing `/` as the directory-mode signal.
+            if file.ends_with('/') {
+                p.insert("path".into(), Value::String(file.clone()));
+            } else {
+                p.insert("file".into(), Value::String(file.clone()));
+            }
+            if let Some(b) = branch {
+                p.insert("branch".into(), Value::String(b.clone()));
+            }
+            if let Some(a) = anchor {
+                p.insert("anchor".into(), Value::String(a.clone()));
+            }
+            if let Some(k) = kind {
+                p.insert("kind".into(), Value::String(k.clone()));
+            }
+            if let Some(d) = max_depth {
+                p.insert("max_depth".into(), json!(d));
+            }
+            if let Some(l) = limit {
+                p.insert("limit".into(), json!(l));
+            }
+            ("get_outline", Value::Object(p))
         }
-        QueryCommand::Find {
+        QueryCommand::Symbols {
             query,
             repo,
             branch,
@@ -231,7 +332,9 @@ pub async fn run(args: Args) -> Result<()> {
             file,
         } => {
             let mut p = serde_json::Map::new();
-            p.insert("repo".into(), Value::String(repo.clone()));
+            if let Some(r) = repo {
+                p.insert("repo".into(), Value::String(r.clone()));
+            }
             p.insert("qualified".into(), Value::String(qualified.clone()));
             if let Some(b) = branch {
                 p.insert("branch".into(), Value::String(b.clone()));
@@ -244,38 +347,49 @@ pub async fn run(args: Args) -> Result<()> {
             }
             ("get_symbol_source", Value::Object(p))
         }
-        QueryCommand::Impls {
+        QueryCommand::Subtypes {
+            name,
             repo,
-            trait_,
-            type_,
             branch,
             anchor,
             limit,
-        } => {
-            let mut p = serde_json::Map::new();
-            if let Some(repo) = repo {
-                p.insert("repo".into(), Value::String(repo.clone()));
-            }
-            if let Some(t) = trait_ {
-                p.insert("trait".into(), Value::String(t.clone()));
-            }
-            if let Some(t) = type_ {
-                p.insert("type".into(), Value::String(t.clone()));
-            }
-            if let Some(b) = branch {
-                p.insert("branch".into(), Value::String(b.clone()));
-            }
-            if let Some(a) = anchor {
-                p.insert("anchor".into(), Value::String(a.clone()));
-            }
-            if let Some(l) = limit {
-                p.insert("limit".into(), json!(l));
-            }
-            ("find_impls", Value::Object(p))
-        }
+        } => (
+            "find_subtypes",
+            name_query(name, repo, branch, anchor, *limit),
+        ),
+        QueryCommand::Supertypes {
+            name,
+            repo,
+            branch,
+            anchor,
+            limit,
+        } => (
+            "find_supertypes",
+            name_query(name, repo, branch, anchor, *limit),
+        ),
+        QueryCommand::Callers {
+            name,
+            repo,
+            branch,
+            anchor,
+            limit,
+        } => (
+            "find_callers",
+            name_query(name, repo, branch, anchor, *limit),
+        ),
+        QueryCommand::Callees {
+            name,
+            repo,
+            branch,
+            anchor,
+            limit,
+        } => (
+            "find_callees",
+            name_query(name, repo, branch, anchor, *limit),
+        ),
         QueryCommand::Imports {
-            repo,
             file,
+            repo,
             branch,
             anchor,
             limit,
@@ -284,7 +398,9 @@ pub async fn run(args: Args) -> Result<()> {
             if let Some(repo) = repo {
                 p.insert("repo".into(), Value::String(repo.clone()));
             }
-            if let Some(f) = file {
+            if let Some(f) = file
+                && f != "-"
+            {
                 p.insert("file".into(), Value::String(f.clone()));
             }
             if let Some(b) = branch {
@@ -361,6 +477,30 @@ pub async fn run(args: Args) -> Result<()> {
 
     render(method, &value);
     Ok(())
+}
+
+fn name_query(
+    name: &str,
+    repo: &Option<String>,
+    branch: &Option<String>,
+    anchor: &Option<String>,
+    limit: Option<u32>,
+) -> Value {
+    let mut p = serde_json::Map::new();
+    if let Some(repo) = repo {
+        p.insert("repo".into(), Value::String(repo.clone()));
+    }
+    p.insert("name".into(), Value::String(name.to_string()));
+    if let Some(b) = branch {
+        p.insert("branch".into(), Value::String(b.clone()));
+    }
+    if let Some(a) = anchor {
+        p.insert("anchor".into(), Value::String(a.clone()));
+    }
+    if let Some(l) = limit {
+        p.insert("limit".into(), json!(l));
+    }
+    Value::Object(p)
 }
 
 async fn round_trip(
@@ -454,7 +594,11 @@ fn render(method: &str, value: &Value) {
             if let Ok(r) = serde_json::from_value::<OutlineResult>(value.clone()) {
                 for it in &r.items {
                     let sig = it.signature.as_deref().unwrap_or("");
-                    println!("{}\t{:?}\t{}\t{}", it.line, it.kind, it.qualified, sig);
+                    let file = it.file.as_deref().unwrap_or("-");
+                    println!(
+                        "{}:{}\t{:?}\t{}\t{}",
+                        file, it.line, it.kind, it.qualified, sig
+                    );
                 }
                 note_partial(&r.completeness);
                 return;
@@ -470,14 +614,52 @@ fn render(method: &str, value: &Value) {
                 return;
             }
         }
-        "find_impls" => {
-            if let Ok(r) = serde_json::from_value::<ImplsResult>(value.clone()) {
+        "find_subtypes" => {
+            if let Ok(r) = serde_json::from_value::<FindSubtypesResult>(value.clone()) {
                 for h in &r.items {
                     let iface = h.interface_qualified.as_deref().unwrap_or("-");
                     println!(
-                        "{}\t{}\t{}\timpl({})",
-                        h.location, h.kind, h.type_qualified, iface
+                        "{}\t{}\t{}\t{}({})",
+                        h.location, h.kind, h.type_qualified, h.kind, iface
                     );
+                }
+                note_partial(&r.completeness);
+                return;
+            }
+        }
+        "find_supertypes" => {
+            if let Ok(r) = serde_json::from_value::<FindSupertypesResult>(value.clone()) {
+                for h in &r.items {
+                    let iface = h.interface_qualified.as_deref().unwrap_or("-");
+                    println!(
+                        "{}\t{}\t{} {} {}",
+                        h.location, h.kind, h.type_qualified, h.kind, iface
+                    );
+                }
+                note_partial(&r.completeness);
+                return;
+            }
+        }
+        "find_callers" => {
+            if let Ok(r) = serde_json::from_value::<FindCallersResult>(value.clone()) {
+                for h in &r.items {
+                    let enc = h.enclosing_qualified.as_deref().unwrap_or("-");
+                    let snippet = h.snippet.as_deref().unwrap_or("");
+                    println!("{}\t{} -> {}\t{}", h.location, enc, h.target_name, snippet);
+                }
+                note_partial(&r.completeness);
+                return;
+            }
+        }
+        "find_callees" => {
+            if let Ok(r) = serde_json::from_value::<FindCalleesResult>(value.clone()) {
+                for h in &r.items {
+                    let target = h
+                        .target_qualified
+                        .as_deref()
+                        .unwrap_or(h.target_name.as_str());
+                    let snippet = h.snippet.as_deref().unwrap_or("");
+                    println!("{}\t-> {}\t{}", h.location, target, snippet);
                 }
                 note_partial(&r.completeness);
                 return;

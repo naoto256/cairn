@@ -10,7 +10,8 @@ a cairn-registered repo.
 
 - **MCP server registration** (`.mcp.json`). Adds `cairn` over stdio so
   the host can call `list_repos` / `get_outline` / `find_symbols` /
-  `find_impls` / `find_imports` / `find_references` /
+  `find_subtypes` / `find_supertypes` / `find_callers` /
+  `find_callees` / `find_references` / `find_imports` /
   `get_symbol_source` / `register_repo` / `reindex_repo` without any
   per-project setup.
 - **`grep` nudge hook** (`hooks/hooks.json` →
@@ -18,7 +19,8 @@ a cairn-registered repo.
   starts with `grep` / `rg` / `ag` / `ack` / `egrep` / `fgrep` AND the
   `cwd` is a cairn-registered repo, the hook **lets the call run** and
   emits a `hookSpecificOutput.additionalContext` advisory that names
-  the closest cairn tool (`find_symbols`, `find_impls`,
+  the closest cairn tool (`find_symbols`, `find_subtypes` /
+  `find_supertypes`, `find_callers` / `find_callees`,
   `find_imports`, or `find_references`) with a one-line explanation
   of what it returns. The advisory surfaces in the agent's next-turn
   context so the next call defaults to the index, but the current

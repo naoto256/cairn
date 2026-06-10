@@ -143,50 +143,68 @@ you register:
 - find symbols by exact name, fuzzy query, kind, container, or path
 - read an outline of one file or a directory
 - fetch the source body for a specific qualified symbol
-- ask who references a symbol, or what a function / method references
-- inspect trait / impl relationships and import edges
+- ask who calls a function (`find_callers`) and what it calls
+  (`find_callees`)
+- inspect type-relation edges from either side — subtypes / extenders
+  / implementers (`find_subtypes`) and base types / traits / interfaces
+  / mixins (`find_supertypes`)
+- ask any other reference question (type / import / read / write /
+  annotation) via the symmetric `find_references`
+- list import / `use` edges (`find_imports`)
 
-Agents can omit `repo` for discovery-style tools such as symbol,
-reference, impl, and import search; each hit carries a
-`repo:branch:file:line` location prefix. Reads default to the daemon's
-tentative worktree snapshot, so the agent can see uncommitted edits
-without asking you to commit first.
+Agents can omit `repo` on every read-side tool — `find_symbols`,
+`find_subtypes`, `find_supertypes`, `find_callers`, `find_callees`,
+`find_references`, `find_imports`, plus `get_outline` and
+`get_symbol_source`. Each hit carries a `repo:branch:file:line` location
+prefix. Reads default to the daemon's tentative worktree snapshot, so
+the agent can see uncommitted edits without asking you to commit first.
 
-`find_references` is symmetric. `direction=incoming` answers "who
-references this symbol?" while `direction=outgoing` answers "what does
-this symbol reference?" The default outgoing view returns resolved call
-refs only, which makes it useful as a call-graph edge list. Set
-`include_noise=true` when auditing raw analyzer output or looking for
-unresolved / type / annotation refs.
+`find_callers` / `find_callees` are thin shortcuts over
+`find_references` with `kind=call` and the default "resolved calls
+only" filter — reach for them when you want the call graph, and for
+`find_references` directly when you need type refs, imports, reads /
+writes, annotations, or the noise toggle. `find_subtypes` /
+`find_supertypes` walk the same `implementations` table from opposite
+sides, so they cover Rust `impl`, TypeScript `extends` /
+`implements`, Python inheritance, and ECMAScript mixins under one
+shape.
 
 ### CLI
 
-The `cairn query` commands expose the same read-only surface for shell
-use and debugging:
+The `cairn query` commands mirror the MCP tool surface: each takes the
+search target as its first positional argument, and `--repo` as an
+optional flag (omit it to search every registered repo).
 
 ```sh
-cairn query find <name>             [--repo <alias>]   # symbol by name
-cairn query refs <name>             [--repo <alias>]   # incoming / outgoing refs
-cairn query source <qualified-name> --repo <alias>     # source body
-cairn query outline <alias> <file>                     # per-file outline
-cairn query impls --type <T>        [--repo <alias>]   # what T implements
-cairn query impls --trait <T>       [--repo <alias>]   # what implements T
-cairn query imports --file <path>   [--repo <alias>]   # use / import edges
-cairn query repos                                      # registered repos
+cairn query symbols <name>           [--repo <alias>]   # symbol by name (was: find)
+cairn query outline <file-or-dir/>   [--repo <alias>]   # file or directory outline
+cairn query source  <qualified-name> [--repo <alias>]   # source body for a symbol
+cairn query subtypes   <name>        [--repo <alias>]   # who implements / extends / mixes in <name>
+cairn query supertypes <name>        [--repo <alias>]   # what <name> extends / implements / mixes in
+cairn query callers <name>           [--repo <alias>]   # who calls <name>
+cairn query callees <name>           [--repo <alias>]   # what <name> calls
+cairn query imports <path>           [--repo <alias>]   # use / import edges in <path>
+cairn query refs    <symbol>         [--repo <alias>]   # any reference (type / import / read / write / annotation)
+cairn query repos                                       # registered repos
 ```
 
 For example, these CLI calls mirror common MCP tool calls:
 
 ```sh
-cairn query refs handle
-cairn query refs crate::service::handle --direction outgoing
-cairn query refs crate::service::handle --direction outgoing --include-noise --json
+cairn query callers handle
+cairn query callees crate::service::handle
+cairn query subtypes Display
+cairn query supertypes Dog
+cairn query outline crates/cairn-core/src/
+cairn query refs Widget --kind type
 ```
 
-Omitting `--repo` searches every registered repo for the four
-discovery commands (`find`, `refs`, `impls`, `imports`); each hit
-carries its origin in a `repo:branch:file:line` location prefix.
-`source` and `outline` still target a single repo.
+Omitting `--repo` searches every registered repo; each hit carries its
+origin in a `repo:branch:file:line` location prefix. `source` returns
+the first matching qualified name across the registry, which is usually
+unambiguous; pass `--repo` to pin it. `outline` interprets a trailing
+`/` on the positional path as the directory-mode signal — without it
+the argument is treated as a single file.
 
 `--anchor <name>` selects a specific snapshot: `HEAD` (committed
 only), `branch/<n>`, `tag/<n>`, or `tentative/<id>`. The plain
@@ -194,11 +212,6 @@ only), `branch/<n>`, `tag/<n>`, or `tentative/<id>`. The plain
 When both are omitted, reads default to the registered worktree's
 `tentative/<id>` snapshot. Pass `--anchor HEAD` explicitly to scope
 back to committed-only state.
-
-`outline` takes `<alias>` as positional because it browses a single
-repo. `source` takes `--repo <alias>` as a flag because
-fully-qualified symbol names can collide with file paths if positional.
-This asymmetry is intentional.
 
 ### Daemon
 

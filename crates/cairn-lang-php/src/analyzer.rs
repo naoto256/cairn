@@ -10,7 +10,7 @@
 //!   `kind = "mixin"`. Interface `extends` is `"inherit"`, enum
 //!   `implements` is `"implement"`. Base names are stored as written
 //!   (`\Countable` stays `\Countable`), matching how a user would
-//!   query `find_impls`.
+//!   query `find_subtypes` / `find_supertypes`.
 //! - **refs** — call sites (`foo()`, `$obj->method()`, `Cls::stat()` →
 //!   [`RefKind::Call`]) and instantiations (`new Widget()` →
 //!   [`RefKind::Instantiate`]). Name-level: receiver types are unknown
