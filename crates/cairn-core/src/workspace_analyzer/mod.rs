@@ -24,7 +24,9 @@ use crate::manifest::ManifestId;
 #[cfg(test)]
 use crate::workspace_analyzer::persist::persist_resolved_refs;
 #[cfg(test)]
-use crate::workspace_analyzer::run::run_workspace_analyzers;
+use crate::workspace_analyzer::run::{
+    run_workspace_analyzers, run_workspace_analyzers_with_timeout,
+};
 
 mod lsp_pass;
 mod path;
@@ -222,6 +224,36 @@ mod tests {
                 code: crate::lsp::CONTENT_MODIFIED_ERROR_CODE,
                 message: "content modified".into(),
             }))
+        }
+    }
+
+    struct SlowRustAnalyzer;
+
+    impl WorkspaceAnalyzer for SlowRustAnalyzer {
+        fn id(&self) -> &'static str {
+            "rust-analyzer-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "rust"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-rust"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+        ) -> Result<WorkspaceFacts> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(WorkspaceFacts::default())
         }
     }
 
@@ -627,6 +659,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "skipped");
+    }
+
+    #[test]
+    fn analyzer_timeout_records_failed_run_and_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "source-sha";
+        let manifest_id = ManifestId(1);
+        let entries = vec![ManifestEntry {
+            path: "src/main.rs".into(),
+            blob_sha: source_sha.into(),
+        }];
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/main.rs', ?1)",
+            params![source_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'tree-sitter-rust', 1, 0)",
+            params![source_sha],
+        )
+        .unwrap();
+
+        let inserted = run_workspace_analyzers_with_timeout(
+            &mut conn,
+            &repo_root,
+            manifest_id,
+            &entries,
+            10,
+            vec![Box::new(SlowRustAnalyzer)],
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'rust-analyzer-lsp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "failed");
+        assert!(
+            row.1
+                .as_deref()
+                .is_some_and(|error| error.starts_with("analyzer timed out after "))
+        );
     }
 
     fn tier3_ref_count(conn: &Connection) -> i64 {

@@ -40,7 +40,8 @@ const CPP_ANALYZER_ID: &str = "clangd-cpp-lsp";
 const OBJC_ANALYZER_ID: &str = "clangd-objc-lsp";
 const ANALYZER_REVISION: u32 = 1;
 const POOL_CONFIG_ID: &str = "clangd-lsp-v1";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const WORKSPACE_LOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Copy)]
 struct ClangdLanguage {
@@ -232,19 +233,7 @@ fn run_clangd_pass(
             pool_analyzer_id: Some(CLANGD_POOL_ID),
             language: "clangd",
             ref_kind,
-            spawn_spec: LspSpawnSpec {
-                binary: clangd_binary(),
-                workspace_root: repo_root.to_path_buf(),
-                config_hash: POOL_CONFIG_ID.to_string(),
-                request_timeout: REQUEST_TIMEOUT,
-                availability: AvailabilityStrategy::VersionFlag,
-                readiness: ReadinessStrategy::InitializeResponseOnly,
-                language_id: language.language_id,
-                launch_args: Vec::new(),
-                initialization_options: json!({
-                    "fallbackFlags": language.fallback_flags,
-                }),
-            },
+            spawn_spec: clangd_spawn_spec(language, repo_root),
             retry: DefinitionRetryPolicy {
                 retry_empty_definition: true,
                 retry_file_not_found: true,
@@ -254,6 +243,27 @@ fn run_clangd_pass(
         repo_root,
         files,
     )
+}
+
+fn clangd_spawn_spec(language: ClangdLanguage, repo_root: &Path) -> LspSpawnSpec {
+    LspSpawnSpec {
+        binary: clangd_binary(),
+        workspace_root: repo_root.to_path_buf(),
+        config_hash: POOL_CONFIG_ID.to_string(),
+        request_timeout: REQUEST_TIMEOUT,
+        availability: AvailabilityStrategy::VersionFlag,
+        // clangd indexes compile_commands.json on first document open and emits
+        // LSP progress notifications during indexing; waiting for quiescence
+        // prevents definition() from racing the indexer.
+        readiness: ReadinessStrategy::ProgressQuiescence {
+            timeout: WORKSPACE_LOAD_TIMEOUT,
+        },
+        language_id: language.language_id,
+        launch_args: Vec::new(),
+        initialization_options: json!({
+            "fallbackFlags": language.fallback_flags,
+        }),
+    }
 }
 
 fn call_collector_for(language: ClangdLanguage) -> fn(&[u8]) -> Result<Vec<DefinitionSite>> {
@@ -442,6 +452,19 @@ mod tests {
     use super::*;
     use cairn_core::lsp::Url;
     use std::fs;
+
+    #[test]
+    fn clangd_spawn_spec_waits_for_progress_quiescence() {
+        let spec = clangd_spawn_spec(C_LANGUAGE, Path::new("/tmp/repo"));
+
+        assert_eq!(spec.request_timeout, REQUEST_TIMEOUT);
+        assert!(matches!(
+            spec.readiness,
+            ReadinessStrategy::ProgressQuiescence {
+                timeout: WORKSPACE_LOAD_TIMEOUT
+            }
+        ));
+    }
 
     #[test]
     fn c_collectors_find_calls_and_includes() {
