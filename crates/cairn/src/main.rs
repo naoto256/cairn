@@ -26,6 +26,7 @@ use cairn_lang_php as _;
 use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
 use cairn_lang_ruby as _;
+use cairn_lang_ruby_tier3 as _;
 use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
 use cairn_lang_swift as _;
@@ -138,6 +139,7 @@ mod tests {
                 "gopls-lsp",
                 "jdtls-lsp",
                 "pyright-lsp",
+                "ruby-lsp",
                 "rust-analyzer-lsp",
                 "typescript-language-server-js-lsp",
                 "typescript-language-server-ts-lsp",

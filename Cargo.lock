@@ -150,6 +150,7 @@ dependencies = [
  "cairn-lang-python",
  "cairn-lang-python-tier3",
  "cairn-lang-ruby",
+ "cairn-lang-ruby-tier3",
  "cairn-lang-rust",
  "cairn-lang-rust-tier3",
  "cairn-lang-swift",
@@ -380,6 +381,20 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-ruby",
+]
+
+[[package]]
+name = "cairn-lang-ruby-tier3"
+version = "0.3.0"
+dependencies = [
+ "cairn-core",
+ "linkme",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-ruby",
 ]

@@ -336,6 +336,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         clangd_binary_check(),
         typescript_language_server_binary_check(),
         jdtls_binary_check(),
+        ruby_lsp_binary_check(),
     ]
 }
 
@@ -390,6 +391,15 @@ fn jdtls_binary_check() -> DoctorCheck {
         resolve_jdtls(),
         "jdtls not on PATH",
         "Install an Eclipse JDT Language Server wrapper script named `jdtls`, or set JDTLS to that wrapper; Java Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn ruby_lsp_binary_check() -> DoctorCheck {
+    binary_check(
+        "ruby-lsp binary discoverable",
+        resolve_ruby_lsp(),
+        "ruby-lsp not on PATH",
+        "Install ruby-lsp (`gem install ruby-lsp`) and ensure it's on the daemon's PATH, or set RUBY_LSP; Ruby Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -495,6 +505,20 @@ fn resolve_jdtls() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("jdtls"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_ruby_lsp() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("RUBY_LSP")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("ruby-lsp"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -699,6 +723,7 @@ mod tests {
             "gopls-lsp",
             "jdtls-lsp",
             "pyright-lsp",
+            "ruby-lsp",
             "rust-analyzer-lsp",
             "typescript-language-server-js-lsp",
             "typescript-language-server-ts-lsp",
@@ -723,6 +748,7 @@ mod tests {
             "gopls-lsp",
             "jdtls-lsp",
             "pyright-lsp",
+            "ruby-lsp",
             "rust-analyzer-lsp",
             "typescript-language-server-js-lsp",
             "typescript-language-server-ts-lsp",
