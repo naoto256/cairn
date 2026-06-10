@@ -13,11 +13,19 @@
 //!   mixin verb. These are Ruby's interface-implementation analog.
 //! - **refs** — call sites (`foo()`, `obj.render` → [`RefKind::Call`]),
 //!   name-level only: a method call's receiver type is unknown without
-//!   Tier-3, so `target_qualified` stays `None`. Paren-less zero-arg
-//!   calls are indistinguishable from local-variable reads in the
-//!   grammar (both parse as `identifier`) and are deliberately not
-//!   emitted. Dynamic dispatch (`send(:name)`, `method_missing`) is
-//!   not resolved — `send` itself appears as the call target.
+//!   Tier-3, so `target_qualified` stays `None` for cross-file callees.
+//!   As a same-file best effort, a post-pass fills `target_qualified`
+//!   when the call name matches a method defined in this file — `Foo#m`
+//!   (instance), `Foo.m` (singleton), or the bare top-level name. When
+//!   both instance and singleton variants share a short name, the first
+//!   one seen in source order wins (the call site lacks a receiver type
+//!   to disambiguate). Cross-file callees keep `target_qualified: None`,
+//!   which hides them from `find_references`' default outgoing view
+//!   (visible with `include_noise`). Paren-less zero-arg calls are
+//!   indistinguishable from local-variable reads in the grammar (both
+//!   parse as `identifier`) and are deliberately not emitted. Dynamic
+//!   dispatch (`send(:name)`, `method_missing`) is not resolved — `send`
+//!   itself appears as the call target.
 //!
 //! `require` / `require_relative` imports are emitted by the
 //! **syntactic** pass (like Go), so this analyzer leaves
@@ -29,6 +37,7 @@
 //! and `ImplFact.type_qualified` resolvable against
 //! `symbols.qualified`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
@@ -59,8 +68,34 @@ impl Analyzer for RubyAnalyzer {
 
         let mut facts = SemanticFacts::default();
         let mut scope_stack: Vec<String> = Vec::new();
-        walk(tree.root_node(), source, &mut scope_stack, None, &mut facts);
+        let mut methods: HashMap<String, String> = HashMap::new();
+        walk(
+            tree.root_node(),
+            source,
+            &mut scope_stack,
+            None,
+            &mut methods,
+            &mut facts,
+        );
+        resolve_same_file_callees(&methods, &mut facts);
         Ok(facts)
+    }
+}
+
+/// Fill `target_qualified` for call refs whose callee is a method
+/// defined in the same file. `methods` maps short method name →
+/// qualified name (first definition wins; ties between instance and
+/// singleton variants are unresolvable without a receiver type at the
+/// call site). Cross-file callees keep `target_qualified: None`, which
+/// hides them from `find_references`' default outgoing view (visible
+/// with `include_noise`).
+fn resolve_same_file_callees(methods: &HashMap<String, String>, facts: &mut SemanticFacts) {
+    for r in facts.refs.iter_mut() {
+        if r.kind == RefKind::Call && r.target_qualified.is_none() {
+            if let Some(qualified) = methods.get(r.target_name.as_str()) {
+                r.target_qualified = Some(qualified.clone());
+            }
+        }
     }
 }
 
@@ -95,6 +130,7 @@ fn walk(
     source: &[u8],
     scope_stack: &mut Vec<String>,
     enclosing: Option<&str>,
+    methods: &mut HashMap<String, String>,
     facts: &mut SemanticFacts,
 ) {
     match node.kind() {
@@ -108,7 +144,7 @@ fn walk(
                 emit_superclass(node, source, &qualified, facts);
             }
             scope_stack.push(name);
-            recurse(node, source, scope_stack, Some(&qualified), facts);
+            recurse(node, source, scope_stack, Some(&qualified), methods, facts);
             scope_stack.pop();
             return;
         }
@@ -118,7 +154,10 @@ fn walk(
             };
             let name = node_text(name_node, source);
             let qualified = method_qualify(scope_stack, name, within_singleton_class(node));
-            recurse(node, source, scope_stack, Some(&qualified), facts);
+            methods
+                .entry(name.to_string())
+                .or_insert_with(|| qualified.clone());
+            recurse(node, source, scope_stack, Some(&qualified), methods, facts);
             return;
         }
         "singleton_method" => {
@@ -135,7 +174,10 @@ fn walk(
                 }
                 _ => method_qualify(scope_stack, name, true),
             };
-            recurse(node, source, scope_stack, Some(&qualified), facts);
+            methods
+                .entry(name.to_string())
+                .or_insert_with(|| qualified.clone());
+            recurse(node, source, scope_stack, Some(&qualified), methods, facts);
             return;
         }
         "call" => {
@@ -144,7 +186,7 @@ fn walk(
         }
         _ => {}
     }
-    recurse(node, source, scope_stack, enclosing, facts);
+    recurse(node, source, scope_stack, enclosing, methods, facts);
 }
 
 fn recurse(
@@ -152,12 +194,20 @@ fn recurse(
     source: &[u8],
     scope_stack: &mut Vec<String>,
     enclosing: Option<&str>,
+    methods: &mut HashMap<String, String>,
     facts: &mut SemanticFacts,
 ) {
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            walk(cursor.node(), source, scope_stack, enclosing, facts);
+            walk(
+                cursor.node(),
+                source,
+                scope_stack,
+                enclosing,
+                methods,
+                facts,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -409,13 +459,63 @@ end
 
     #[test]
     fn call_inside_method_enclosed_by_qualified_method() {
-        let src = "class W\n  def render\n    helper(1)\n  end\nend\n";
+        let src = "class W\n  def render\n    helper(1)\n  end\n  def helper(_); end\nend\n";
         let f = semantic(src);
         let hit = calls(&f)
             .into_iter()
             .find(|r| r.target_name == "helper")
             .expect("helper call missing");
         assert_eq!(hit.enclosing_qualified.as_deref(), Some("W#render"));
+        assert_eq!(hit.target_qualified.as_deref(), Some("W#helper"));
+    }
+
+    #[test]
+    fn same_file_callee_resolves_to_qualified_target() {
+        // Definition trails the call site lexically — the post-pass
+        // resolves it regardless of order, mirroring the C backend.
+        let src = "\
+class W
+  def render
+    helper(1)
+    setup()
+  end
+  def helper(_); end
+  def self.setup; end
+end
+";
+        let f = semantic(src);
+        let helper = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "helper")
+            .expect("helper call missing");
+        assert_eq!(helper.target_qualified.as_deref(), Some("W#helper"));
+        let setup = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "setup")
+            .expect("setup call missing");
+        assert_eq!(setup.target_qualified.as_deref(), Some("W.setup"));
+    }
+
+    #[test]
+    fn ambiguous_short_name_takes_first_definition() {
+        // Instance and singleton variants share the short name `run`.
+        // With no receiver type at the call site, the first definition
+        // in source order wins — documented best-effort behavior.
+        let src = "\
+class W
+  def run; end
+  def self.run; end
+  def kick
+    run()
+  end
+end
+";
+        let f = semantic(src);
+        let hit = calls(&f)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("W#run"));
     }
 
     #[test]
