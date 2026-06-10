@@ -20,7 +20,7 @@ fn main() {
         .into_iter()
         .filter(|crate_name| workspace_members.iter().any(|member| member == crate_name))
         .filter(|crate_name| crate_name != "cairn-lang-api")
-        .map(|crate_name| expected_entry(&crate_name))
+        .flat_map(|crate_name| expected_entries(&crate_name))
         .collect::<Vec<_>>();
 
     let mut source = String::from(
@@ -62,13 +62,24 @@ struct Entry {
     import_hint: String,
 }
 
-fn expected_entry(crate_name: &str) -> Entry {
+fn expected_entries(crate_name: &str) -> Vec<Entry> {
     let import_hint = format!("use {} as _;", crate_name.replace('-', "_"));
+    if crate_name == "cairn-lang-clangd-tier3" {
+        return ["clangd-c-lsp", "clangd-cpp-lsp", "clangd-objc-lsp"]
+            .into_iter()
+            .map(|runtime_id| Entry {
+                crate_name: crate_name.to_string(),
+                registry: "WorkspaceAnalyzer",
+                runtime_id: runtime_id.to_string(),
+                import_hint: import_hint.clone(),
+            })
+            .collect();
+    }
     if crate_name == "cairn-lang-rust-tier3"
         || crate_name == "cairn-lang-python-tier3"
         || crate_name == "cairn-lang-go-tier3"
     {
-        return Entry {
+        return vec![Entry {
             crate_name: crate_name.to_string(),
             registry: "WorkspaceAnalyzer",
             runtime_id: match crate_name {
@@ -79,10 +90,10 @@ fn expected_entry(crate_name: &str) -> Entry {
             }
             .to_string(),
             import_hint,
-        };
+        }];
     }
 
-    Entry {
+    vec![Entry {
         crate_name: crate_name.to_string(),
         registry: "LanguageBackend",
         runtime_id: crate_name
@@ -90,7 +101,7 @@ fn expected_entry(crate_name: &str) -> Entry {
             .expect("language crate prefix")
             .to_string(),
         import_hint,
-    }
+    }]
 }
 
 fn language_workspace_members(path: &Path) -> Vec<String> {

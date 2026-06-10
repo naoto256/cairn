@@ -1,3 +1,6 @@
+use std::path::Path;
+
+use cairn_proto::RefKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
@@ -45,10 +48,19 @@ pub(super) fn persist_resolved_refs(
         let Some(target_path) = r.target_path.as_deref() else {
             continue;
         };
-        let Some((target_qualified, target_name)) =
-            target_symbol_for_location(&tx, manifest_id, &parser_id, target_path, &r.target)?
-        else {
-            continue;
+        let target =
+            target_symbol_for_location(&tx, manifest_id, &parser_id, target_path, &r.target)?;
+        let (target_qualified, target_name) = match target {
+            Some(target) => target,
+            None if r.kind == RefKind::Import => {
+                let name = Path::new(target_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(target_path)
+                    .to_string();
+                (target_path.to_string(), name)
+            }
+            None => continue,
         };
         let enclosing_id = enclosing_symbol_for_ref(
             &tx,

@@ -136,6 +136,7 @@ dependencies = [
  "cairn-core",
  "cairn-lang-api",
  "cairn-lang-c",
+ "cairn-lang-clangd-tier3",
  "cairn-lang-cpp",
  "cairn-lang-csharp",
  "cairn-lang-go",
@@ -207,6 +208,22 @@ dependencies = [
  "linkme",
  "tree-sitter",
  "tree-sitter-c",
+]
+
+[[package]]
+name = "cairn-lang-clangd-tier3"
+version = "0.3.0"
+dependencies = [
+ "cairn-core",
+ "linkme",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-cpp",
+ "tree-sitter-objc",
 ]
 
 [[package]]

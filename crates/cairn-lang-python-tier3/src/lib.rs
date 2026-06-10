@@ -62,6 +62,7 @@ impl WorkspaceAnalyzer for PyrightWorkspaceAnalyzer {
         run_lsp_definition_pass(
             LspDefinitionPass {
                 analyzer_id: ANALYZER_ID,
+                pool_analyzer_id: None,
                 language: "python",
                 ref_kind: RefKind::Call,
                 spawn_spec: LspSpawnSpec {
