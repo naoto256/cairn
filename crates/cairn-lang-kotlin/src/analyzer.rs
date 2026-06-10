@@ -3,7 +3,20 @@
 //! Reparses one `.kt` / `.kts` blob with tree-sitter-kotlin-ng and emits
 //! delegation (inheritance / interface-implementation) edges plus
 //! name-level call and constructor refs. Imports stay a Tier-1 surface.
+//!
+//! Same-file callee resolution: bare `identifier` calls (`compute(x)`,
+//! `Service()`) keep their existing name-as-qualified resolution. For
+//! `navigation_expression` callees (`obj.method()`, `pkg.Type()`) the
+//! receiver type is unknown without a workspace pass, so we match the
+//! tail segment (the member name) against the set of callable qualified
+//! names collected from this file; on a hit, `target_qualified` is set
+//! to that qualified name. If multiple callables in the file share the
+//! tail name, the first one encountered during the walk wins. Cross-file
+//! callees keep `target_qualified: None`, which hides them from
+//! `find_references`' default outgoing view (visible with
+//! `include_noise`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
@@ -31,8 +44,10 @@ impl Analyzer for KotlinAnalyzer {
             facts: SemanticFacts::default(),
             containers: Vec::new(),
             enclosing: None,
+            callables: HashMap::new(),
         };
         walker.walk(tree.root_node(), source);
+        walker.resolve_same_file_callees();
         Ok(walker.facts)
     }
 }
@@ -45,6 +60,10 @@ struct KtSemanticWalker {
     facts: SemanticFacts,
     containers: Vec<String>,
     enclosing: Option<String>,
+    /// Map from callable name (last segment) to its qualified name,
+    /// populated as `function_declaration` nodes are walked. First
+    /// encounter wins on collisions — see module docs.
+    callables: HashMap<String, String>,
 }
 
 impl KtSemanticWalker {
@@ -130,10 +149,30 @@ impl KtSemanticWalker {
             self.walk_children(node, source);
             return;
         };
-        let qualified = self.qualify(node_text(name, source));
+        let name_text = node_text(name, source);
+        let qualified = self.qualify(name_text);
+        self.callables
+            .entry(name_text.to_string())
+            .or_insert_with(|| qualified.clone());
         let previous_enclosing = self.enclosing.replace(qualified);
         self.walk_children(node, source);
         self.enclosing = previous_enclosing;
+    }
+
+    /// After the walk, fill `target_qualified` on call refs whose callee
+    /// is a `navigation_expression` (`obj.method()`) when the tail
+    /// segment matches a callable declared in the same file. The
+    /// receiver type is unknown without a workspace pass, so the match
+    /// is by name only. Cross-file callees keep `target_qualified:
+    /// None`.
+    fn resolve_same_file_callees(&mut self) {
+        for r in self.facts.refs.iter_mut() {
+            if r.kind == RefKind::Call && r.target_qualified.is_none() {
+                if let Some(q) = self.callables.get(&r.target_name) {
+                    r.target_qualified = Some(q.clone());
+                }
+            }
+        }
     }
 
     /// A `call_expression` is `callee value_arguments`. A bare
@@ -327,11 +366,57 @@ mod tests {
     }
 
     #[test]
-    fn member_calls_stay_unresolved() {
+    fn cross_file_member_calls_stay_unresolved() {
+        // `fetch` is not declared in this file, so the
+        // navigation_expression callee cannot be name-resolved and stays
+        // None (hidden from the default outgoing view).
         let refs = semantic("fun caller(s: Service) { s.fetch(1) }").refs;
         let call = call_ref(&refs, "fetch");
         assert_eq!(call.target_qualified, None);
         assert_eq!(call.enclosing_qualified.as_deref(), Some("caller"));
+    }
+
+    #[test]
+    fn same_file_member_call_resolves_to_callable_qualified() {
+        let refs = semantic(
+            "class Service {\n\
+                 fun fetch(x: Int) {}\n\
+             }\n\
+             fun caller(s: Service) { s.fetch(1) }\n",
+        )
+        .refs;
+        let call = call_ref(&refs, "fetch");
+        assert_eq!(call.target_qualified.as_deref(), Some("Service.fetch"));
+        assert_eq!(call.enclosing_qualified.as_deref(), Some("caller"));
+    }
+
+    #[test]
+    fn same_file_member_call_with_collision_takes_first_callable() {
+        // Two same-name callables in the file. The walk visits `A.foo`
+        // first, so `a.foo()` resolves to `A.foo`; the receiver type is
+        // unknown without a workspace pass.
+        let src = "class A {\n    fun foo() {}\n}\nclass B {\n    fun foo() {}\n}\nfun caller(a: A) {\n    a.foo()\n}\n";
+        let refs = semantic(src).refs;
+        let call = call_ref(&refs, "foo");
+        assert_eq!(call.target_qualified.as_deref(), Some("A.foo"));
+    }
+
+    #[test]
+    fn companion_member_call_resolves_through_navigation_expression() {
+        let refs = semantic(
+            "class Service {\n\
+                 companion object {\n\
+                     fun build() {}\n\
+                 }\n\
+             }\n\
+             fun caller() { Service.Companion.build() }\n",
+        )
+        .refs;
+        let call = call_ref(&refs, "build");
+        assert_eq!(
+            call.target_qualified.as_deref(),
+            Some("Service.Companion.build")
+        );
     }
 
     #[test]
