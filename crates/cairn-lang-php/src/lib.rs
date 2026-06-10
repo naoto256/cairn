@@ -8,7 +8,9 @@
 //!
 //! Tier-2 (semantic): the [`analyzer`] module re-walks the same grammar
 //! for `extends` / `implements` / trait-`use` edges and name-level
-//! call / instantiation refs.
+//! call / instantiation refs. Calls and `new` expressions whose callee
+//! is defined in the same file have their `target_qualified` filled in
+//! a post-walk pass (cross-file targets stay `None`).
 //!
 //! Qualified names use PHP's native separators: `\` joins namespace
 //! segments, `::` joins a class-like container to its members —
