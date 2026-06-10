@@ -1,7 +1,7 @@
 use super::{language_fixture, registered, source_tier_fixture};
 use crate::anchor::AnchorName;
 use crate::cas::store;
-use crate::query::{FindSymbolsArgs, find_symbols, get_outline_under_path};
+use crate::query::{FindSymbolsArgs, OutlineFilter, find_symbols, get_outline_under_path};
 use crate::register::register_repo;
 use crate::testutil::init_repo;
 use cairn_proto::common::SourceTier;
@@ -165,7 +165,15 @@ fn directory_outline_returns_items_per_file_under_path_prefix_sorted() {
     let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
     register_repo(&mut conn, repo.path(), 0).unwrap();
 
-    let hits = get_outline_under_path(&conn, &AnchorName::head(), "a/", None, 10).unwrap();
+    let hits = get_outline_under_path(
+        &conn,
+        &AnchorName::head(),
+        "a/",
+        None,
+        10,
+        &OutlineFilter::default(),
+    )
+    .unwrap();
     let rows: Vec<(&str, &str, u32)> = hits
         .iter()
         .map(|h| (h.file.as_deref().unwrap(), h.name.as_str(), h.line))

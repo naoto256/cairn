@@ -77,6 +77,16 @@ pub fn get_outline(
     Ok(rows?)
 }
 
+/// Optional filters layered on top of `get_outline_under_path`'s
+/// prefix scan. `kind` is byte-equal against `symbols.kind`;
+/// `max_depth` caps the directory hops the file path may take past
+/// `path_prefix` (depth 1 = files directly under the prefix).
+#[derive(Debug, Clone, Default)]
+pub struct OutlineFilter {
+    pub kind: Option<SymbolKind>,
+    pub max_depth: Option<u32>,
+}
+
 /// Return every symbol from files under `path_prefix`, sorted by
 /// file then line. The prefix is byte-level and repo-root-relative,
 /// matching `find_symbols.path` semantics.
@@ -90,6 +100,7 @@ pub fn get_outline_under_path(
     path_prefix: &str,
     parser_id: Option<&str>,
     limit: u32,
+    filter: &OutlineFilter,
 ) -> Result<Vec<OutlineItem>> {
     let manifest_id =
         anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
@@ -110,6 +121,22 @@ pub fn get_outline_under_path(
     if let Some(pid) = parser_id {
         sql.push_str(" AND s.parser_id = ?");
         bound.push(Box::new(pid.to_string()));
+    }
+    if let Some(kind) = filter.kind.as_ref() {
+        sql.push_str(" AND s.kind = ?");
+        bound.push(Box::new(crate::cas::kind_conv::symbol_kind_to_str(kind)));
+    }
+    if let Some(depth) = filter.max_depth {
+        // Slashes in the file path *after* the prefix must be <= depth - 1.
+        // (depth = 1 → no further slashes; depth = 2 → at most one, etc.)
+        // We compare strings rather than counting in SQL: substring length
+        // minus its '/'-stripped length is the slash count.
+        sql.push_str(
+            " AND length(substr(me.path, length(?2) + 1))
+               - length(replace(substr(me.path, length(?2) + 1), '/', '')) <= ?",
+        );
+        let allowed = depth.saturating_sub(1);
+        bound.push(Box::new(i64::from(allowed)));
     }
     sql.push_str(" ORDER BY me.path, s.line_start");
     sql.push_str(" LIMIT ?");
