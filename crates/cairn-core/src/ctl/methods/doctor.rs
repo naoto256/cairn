@@ -604,7 +604,15 @@ mod tests {
 
     #[test]
     fn backend_registration_coherence_passes_when_expected_entries_are_registered() {
-        let language_backends = ["rust", "python", "markdown", "ruby", "typescript", "go", "csharp"];
+        let language_backends = [
+            "rust",
+            "python",
+            "markdown",
+            "ruby",
+            "typescript",
+            "go",
+            "csharp",
+        ];
         let workspace_analyzers = ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
