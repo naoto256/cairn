@@ -179,7 +179,11 @@ mod tests {
             .iter()
             .map(|i| i["file"].as_str().unwrap())
             .collect();
-        assert!(files.iter().all(|f| !f.trim_start_matches("src/").contains('/')));
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.trim_start_matches("src/").contains('/'))
+        );
         assert!(files.contains(&"src/top.rs"));
 
         let deep = GetOutline
