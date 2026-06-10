@@ -145,6 +145,7 @@ dependencies = [
  "cairn-lang-java",
  "cairn-lang-java-tier3",
  "cairn-lang-kotlin",
+ "cairn-lang-kotlin-tier3",
  "cairn-lang-markdown",
  "cairn-lang-objc",
  "cairn-lang-php",
@@ -327,6 +328,20 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-kotlin-ng",
+]
+
+[[package]]
+name = "cairn-lang-kotlin-tier3"
+version = "0.3.0"
+dependencies = [
+ "cairn-core",
+ "cairn-lang-api",
+ "cairn-lang-kotlin",
+ "linkme",
+ "serde_json",
+ "tempfile",
  "tree-sitter",
  "tree-sitter-kotlin-ng",
 ]

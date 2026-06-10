@@ -338,6 +338,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         csharp_ls_binary_check(),
         phpantom_lsp_binary_check(),
         jdtls_binary_check(),
+        kotlin_language_server_binary_check(),
         ruby_lsp_binary_check(),
         sourcekit_lsp_binary_check(),
     ]
@@ -412,6 +413,15 @@ fn jdtls_binary_check() -> DoctorCheck {
         resolve_jdtls(),
         "jdtls not on PATH",
         "Install an Eclipse JDT Language Server wrapper script named `jdtls`, or set JDTLS to that wrapper; Java Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn kotlin_language_server_binary_check() -> DoctorCheck {
+    binary_check(
+        "kotlin-language-server binary discoverable",
+        resolve_kotlin_language_server(),
+        "kotlin-language-server not discoverable via KOTLIN_LANGUAGE_SERVER or PATH",
+        "Install kotlin-language-server (`brew install kotlin-language-server`, or download a release zip from https://github.com/fwcd/kotlin-language-server/releases) and ensure its wrapper script is on the daemon's PATH, or set KOTLIN_LANGUAGE_SERVER. JVM 11+ is required; Kotlin Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -571,6 +581,20 @@ fn resolve_jdtls() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("jdtls"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_kotlin_language_server() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("KOTLIN_LANGUAGE_SERVER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("kotlin-language-server"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -829,6 +853,7 @@ mod tests {
             "csharp-ls",
             "gopls-lsp",
             "jdtls-lsp",
+            "kotlin-language-server",
             "phpantom-lsp",
             "pyright-lsp",
             "ruby-lsp",

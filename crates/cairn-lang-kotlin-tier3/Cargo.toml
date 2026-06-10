@@ -1,0 +1,26 @@
+[package]
+name = "cairn-lang-kotlin-tier3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Kotlin Tier-3 workspace analyzer backed by kotlin-language-server."
+
+[dependencies]
+cairn-core.workspace = true
+cairn-lang-api.workspace = true
+cairn-lang-kotlin.workspace = true
+linkme.workspace = true
+serde_json.workspace = true
+tree-sitter.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
