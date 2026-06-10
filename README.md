@@ -5,9 +5,18 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.1.1**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.2.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
+
+Upgrading from 0.1.x: the Tier-3 rust reference `source` label
+changed from the legacy `tier3-rust-analyzer` alias to the uniform
+`tier3-rust-analyzer-lsp` (matching `tier3-pyright-lsp` and
+`tier3-gopls-lsp`). Clients that match on that string need to update;
+rows under the old label are cleared and re-stamped on the next
+reindex. `list_repos` snapshot `status` also reports `empty` /
+`no_analyzer` / `stale` alongside the previous `ready`, so treat
+new values as informational rather than errors.
 
 ## Why
 
