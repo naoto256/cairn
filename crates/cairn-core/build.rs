@@ -95,6 +95,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
         || crate_name == "cairn-lang-go-tier3"
         || crate_name == "cairn-lang-java-tier3"
         || crate_name == "cairn-lang-ruby-tier3"
+        || crate_name == "cairn-lang-swift-tier3"
     {
         return vec![Entry {
             crate_name: crate_name.to_string(),
@@ -105,6 +106,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
                 "cairn-lang-go-tier3" => "gopls-lsp",
                 "cairn-lang-java-tier3" => "jdtls-lsp",
                 "cairn-lang-ruby-tier3" => "ruby-lsp",
+                "cairn-lang-swift-tier3" => "sourcekit-lsp",
                 _ => unreachable!(),
             }
             .to_string(),
