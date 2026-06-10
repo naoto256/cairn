@@ -272,8 +272,9 @@ pub fn all_backends() -> Vec<Box<dyn LanguageBackend>> {
 }
 
 /// Match a path against the registered backends' patterns and return
-/// the first match. The matcher implements only the `*.ext` shape
-/// because that is the only pattern cairn currently issues.
+/// the first match. The matcher implements the `*.ext` shape plus
+/// literal basenames (`Gemfile`, `Rakefile`) — the only two pattern
+/// shapes cairn currently issues.
 #[must_use]
 pub fn pick_backend_for_path<'a>(
     backends: &'a [Box<dyn LanguageBackend>],
@@ -310,7 +311,10 @@ fn matches_glob(pattern: &str, path: &str) -> bool {
     if let Some(ext) = pattern.strip_prefix("*.") {
         path.rsplit('.').next() == Some(ext)
     } else {
-        pattern == path
+        // A literal pattern matches the file's basename in any
+        // directory (`Gemfile` claims `sub/dir/Gemfile`). Manifest
+        // paths are git-style, so `/` is the only separator.
+        path.rsplit('/').next() == Some(pattern)
     }
 }
 
@@ -322,6 +326,14 @@ mod tests {
     fn glob_matches_rs() {
         assert!(matches_glob("*.rs", "src/lib.rs"));
         assert!(!matches_glob("*.rs", "src/lib.py"));
+    }
+
+    #[test]
+    fn literal_pattern_matches_basename_anywhere() {
+        assert!(matches_glob("Gemfile", "Gemfile"));
+        assert!(matches_glob("Gemfile", "engines/auth/Gemfile"));
+        assert!(!matches_glob("Gemfile", "Gemfile.lock"));
+        assert!(!matches_glob("Gemfile", "engines/auth/Gemfile.lock"));
     }
 
     #[test]
