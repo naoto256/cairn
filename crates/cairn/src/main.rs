@@ -19,6 +19,7 @@ use cairn_lang_go_tier3 as _;
 use cairn_lang_java as _;
 use cairn_lang_kotlin as _;
 use cairn_lang_markdown as _;
+use cairn_lang_objc as _;
 use cairn_lang_php as _;
 use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
@@ -105,6 +106,7 @@ mod tests {
                 "javascript",
                 "kotlin",
                 "markdown",
+                "objc",
                 "php",
                 "python",
                 "ruby",

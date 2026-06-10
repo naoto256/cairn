@@ -615,6 +615,7 @@ mod tests {
             "php",
             "kotlin",
             "swift",
+            "objc",
             "c",
             "cpp",
             "java",
@@ -629,8 +630,8 @@ mod tests {
     #[test]
     fn backend_registration_coherence_warns_for_missing_runtime_entry() {
         let language_backends = [
-            "rust", "python", "markdown", "ruby", "go", "csharp", "php", "kotlin", "swift", "c",
-            "cpp", "java",
+            "rust", "python", "markdown", "ruby", "go", "csharp", "php", "kotlin", "swift", "objc",
+            "c", "cpp", "java",
         ];
         let workspace_analyzers = ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"];
 

@@ -22,6 +22,7 @@ members = [
     "crates/cairn-lang-java",
     "crates/cairn-lang-kotlin",
     "crates/cairn-lang-swift",
+    "crates/cairn-lang-objc",
     "crates/cairn-watch",
 ]
 
@@ -103,6 +104,9 @@ tree-sitter-c = "0.23"
 # workspace upgrades to tree-sitter >= 0.25.
 tree-sitter-cpp = "=0.23.4"
 tree-sitter-swift = "=0.7.0"
+# tree-sitter-objc 3.0.2 ships ABI 14, matching the workspace's
+# tree-sitter 0.24 runtime. Re-evaluate when bumping tree-sitter.
+tree-sitter-objc = "3.0.2"
 tree-sitter-java = "0.23"
 
 # Serialization
@@ -142,6 +146,7 @@ cairn-lang-csharp = { version = "0.2.0", path = "crates/cairn-lang-csharp" }
 cairn-lang-java = { version = "0.2.0", path = "crates/cairn-lang-java" }
 cairn-lang-kotlin = { version = "0.2.0", path = "crates/cairn-lang-kotlin" }
 cairn-lang-swift = { version = "0.2.0", path = "crates/cairn-lang-swift" }
+cairn-lang-objc = { version = "0.2.0", path = "crates/cairn-lang-objc" }
 cairn-watch = { version = "0.2.0", path = "crates/cairn-watch" }
 
 [profile.release]
