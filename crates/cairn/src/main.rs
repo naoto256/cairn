@@ -89,7 +89,7 @@ mod tests {
 
         assert_eq!(
             backend_names,
-[
+            [
                 "go",
                 "javascript",
                 "markdown",
