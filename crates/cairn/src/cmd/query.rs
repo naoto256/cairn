@@ -76,6 +76,7 @@ enum QueryCommand {
         limit: Option<u32>,
     },
     /// Look up a definition by name (function, struct, method, …).
+    #[command(alias = "find-symbols")]
     Symbols {
         /// Symbol query — exact name unless `--fuzzy`.
         query: String,
@@ -91,6 +92,12 @@ enum QueryCommand {
         /// Restrict to symbols of this kind.
         #[arg(long)]
         kind: Option<String>,
+        /// File-path prefix scope relative to the repo root.
+        #[arg(long)]
+        path: Option<String>,
+        /// Qualified-prefix scope (for example, methods under a type).
+        #[arg(long)]
+        container: Option<String>,
         /// FTS5 match over name, qualified, and doc instead of exact.
         /// Spaces are AND, quotes are phrase, `*` enables prefix matching.
         #[arg(long)]
@@ -295,35 +302,26 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             kind,
+            path,
+            container,
             fuzzy,
             limit,
             signature_only,
-        } => {
-            let mut p = serde_json::Map::new();
-            p.insert("query".into(), Value::String(query.clone()));
-            if let Some(repo) = repo {
-                p.insert("repo".into(), Value::String(repo.clone()));
-            }
-            if let Some(b) = branch {
-                p.insert("branch".into(), Value::String(b.clone()));
-            }
-            if let Some(a) = anchor {
-                p.insert("anchor".into(), Value::String(a.clone()));
-            }
-            if let Some(k) = kind {
-                p.insert("kind".into(), Value::String(k.clone()));
-            }
-            if *fuzzy {
-                p.insert("fuzzy".into(), Value::Bool(true));
-            }
-            if let Some(l) = limit {
-                p.insert("limit".into(), json!(l));
-            }
-            if *signature_only {
-                p.insert("signature_only".into(), Value::Bool(true));
-            }
-            ("find_symbols", Value::Object(p))
-        }
+        } => (
+            "find_symbols",
+            symbols_query(SymbolsQueryArgs {
+                query,
+                repo,
+                branch,
+                anchor,
+                kind,
+                path,
+                container,
+                fuzzy: *fuzzy,
+                limit: *limit,
+                signature_only: *signature_only,
+            }),
+        ),
         QueryCommand::Source {
             qualified,
             repo,
@@ -499,6 +497,52 @@ fn name_query(
     }
     if let Some(l) = limit {
         p.insert("limit".into(), json!(l));
+    }
+    Value::Object(p)
+}
+
+struct SymbolsQueryArgs<'a> {
+    query: &'a str,
+    repo: &'a Option<String>,
+    branch: &'a Option<String>,
+    anchor: &'a Option<String>,
+    kind: &'a Option<String>,
+    path: &'a Option<String>,
+    container: &'a Option<String>,
+    fuzzy: bool,
+    limit: Option<u32>,
+    signature_only: bool,
+}
+
+fn symbols_query(args: SymbolsQueryArgs<'_>) -> Value {
+    let mut p = serde_json::Map::new();
+    p.insert("query".into(), Value::String(args.query.to_string()));
+    if let Some(repo) = args.repo {
+        p.insert("repo".into(), Value::String(repo.clone()));
+    }
+    if let Some(b) = args.branch {
+        p.insert("branch".into(), Value::String(b.clone()));
+    }
+    if let Some(a) = args.anchor {
+        p.insert("anchor".into(), Value::String(a.clone()));
+    }
+    if let Some(k) = args.kind {
+        p.insert("kind".into(), Value::String(k.clone()));
+    }
+    if let Some(path) = args.path {
+        p.insert("path".into(), Value::String(path.clone()));
+    }
+    if let Some(container) = args.container {
+        p.insert("container".into(), Value::String(container.clone()));
+    }
+    if args.fuzzy {
+        p.insert("fuzzy".into(), Value::Bool(true));
+    }
+    if let Some(l) = args.limit {
+        p.insert("limit".into(), json!(l));
+    }
+    if args.signature_only {
+        p.insert("signature_only".into(), Value::Bool(true));
     }
     Value::Object(p)
 }
@@ -708,4 +752,66 @@ fn render(method: &str, value: &Value) {
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbols_query_includes_path_and_container_filters() {
+        let repo = Some("demo".to_string());
+        let branch = None;
+        let anchor = None;
+        let kind = Some("function".to_string());
+        let path = Some("src/api/".to_string());
+        let container = Some("Client".to_string());
+
+        let value = symbols_query(SymbolsQueryArgs {
+            query: "fetchJson",
+            repo: &repo,
+            branch: &branch,
+            anchor: &anchor,
+            kind: &kind,
+            path: &path,
+            container: &container,
+            fuzzy: true,
+            limit: Some(5),
+            signature_only: true,
+        });
+
+        assert_eq!(
+            value,
+            json!({
+                "query": "fetchJson",
+                "repo": "demo",
+                "kind": "function",
+                "path": "src/api/",
+                "container": "Client",
+                "fuzzy": true,
+                "limit": 5,
+                "signature_only": true
+            })
+        );
+    }
+
+    #[test]
+    fn symbols_query_omits_unset_scope_filters() {
+        let none = None;
+
+        let value = symbols_query(SymbolsQueryArgs {
+            query: "fetchJson",
+            repo: &none,
+            branch: &none,
+            anchor: &none,
+            kind: &none,
+            path: &none,
+            container: &none,
+            fuzzy: false,
+            limit: None,
+            signature_only: false,
+        });
+
+        assert_eq!(value, json!({"query": "fetchJson"}));
+    }
 }
