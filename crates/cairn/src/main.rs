@@ -30,6 +30,7 @@ use cairn_lang_ruby_tier3 as _;
 use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
 use cairn_lang_swift as _;
+use cairn_lang_swift_tier3 as _;
 use cairn_lang_typescript as _;
 use cairn_lang_typescript_tier3 as _;
 
@@ -141,6 +142,7 @@ mod tests {
                 "pyright-lsp",
                 "ruby-lsp",
                 "rust-analyzer-lsp",
+                "sourcekit-lsp",
                 "typescript-language-server-js-lsp",
                 "typescript-language-server-ts-lsp",
                 "typescript-language-server-tsx-lsp"

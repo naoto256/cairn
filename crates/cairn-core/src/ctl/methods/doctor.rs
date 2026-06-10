@@ -337,6 +337,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         typescript_language_server_binary_check(),
         jdtls_binary_check(),
         ruby_lsp_binary_check(),
+        sourcekit_lsp_binary_check(),
     ]
 }
 
@@ -400,6 +401,15 @@ fn ruby_lsp_binary_check() -> DoctorCheck {
         resolve_ruby_lsp(),
         "ruby-lsp not on PATH",
         "Install ruby-lsp (`gem install ruby-lsp`) and ensure it's on the daemon's PATH, or set RUBY_LSP; Ruby Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn sourcekit_lsp_binary_check() -> DoctorCheck {
+    binary_check(
+        "sourcekit-lsp binary discoverable",
+        resolve_sourcekit_lsp(),
+        "sourcekit-lsp not discoverable via SOURCEKIT_LSP, xcrun, or PATH",
+        "Install Xcode command line tools (`xcode-select --install`) or a Swift toolchain that provides sourcekit-lsp, then ensure `xcrun --find sourcekit-lsp` or PATH can find it; Swift Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -521,6 +531,46 @@ fn resolve_ruby_lsp() -> Option<PathBuf> {
         .map(|dir| dir.join("ruby-lsp"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_sourcekit_lsp() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SOURCEKIT_LSP")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    if let Some(path) = sourcekit_lsp_from_xcrun() {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("sourcekit-lsp"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn sourcekit_lsp_from_xcrun() -> Option<PathBuf> {
+    // macOS installs sourcekit-lsp inside the selected Xcode/Swift toolchain,
+    // where PATH often does not include it. `xcrun --find` respects
+    // xcode-select, while non-macOS Swift toolchains are handled by PATH below.
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("xcrun")
+            .args(["--find", "sourcekit-lsp"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?;
+        let path = PathBuf::from(path.trim());
+        path.is_file().then_some(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
@@ -725,6 +775,7 @@ mod tests {
             "pyright-lsp",
             "ruby-lsp",
             "rust-analyzer-lsp",
+            "sourcekit-lsp",
             "typescript-language-server-js-lsp",
             "typescript-language-server-ts-lsp",
             "typescript-language-server-tsx-lsp",
@@ -750,6 +801,7 @@ mod tests {
             "pyright-lsp",
             "ruby-lsp",
             "rust-analyzer-lsp",
+            "sourcekit-lsp",
             "typescript-language-server-js-lsp",
             "typescript-language-server-ts-lsp",
             "typescript-language-server-tsx-lsp",
