@@ -29,6 +29,7 @@ use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
 use cairn_lang_swift as _;
 use cairn_lang_typescript as _;
+use cairn_lang_typescript_tier3 as _;
 
 mod cmd;
 
@@ -135,7 +136,10 @@ mod tests {
                 "clangd-objc-lsp",
                 "gopls-lsp",
                 "pyright-lsp",
-                "rust-analyzer-lsp"
+                "rust-analyzer-lsp",
+                "typescript-language-server-js-lsp",
+                "typescript-language-server-ts-lsp",
+                "typescript-language-server-tsx-lsp"
             ]
         );
     }

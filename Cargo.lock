@@ -153,6 +153,7 @@ dependencies = [
  "cairn-lang-rust-tier3",
  "cairn-lang-swift",
  "cairn-lang-typescript",
+ "cairn-lang-typescript-tier3",
  "cairn-proto",
  "clap",
  "linkme",
@@ -420,6 +421,21 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "cairn-lang-typescript-tier3"
+version = "0.3.0"
+dependencies = [
+ "cairn-core",
+ "linkme",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
