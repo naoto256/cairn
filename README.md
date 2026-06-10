@@ -1,5 +1,10 @@
 # cairn
 
+[![CI](https://github.com/naoto256/cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/naoto256/cairn/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/naoto256/cairn?display_name=tag&sort=semver)](https://github.com/naoto256/cairn/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](#license)
+[![Homebrew](https://img.shields.io/badge/homebrew-naoto256%2Fcairn-orange)](https://github.com/naoto256/homebrew-cairn)
+
 Local, symbol-aware code index for AI coding agents. Cairn keeps a
 daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
