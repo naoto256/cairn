@@ -88,7 +88,15 @@ mod tests {
 
         assert_eq!(
             backend_names,
-            ["go", "markdown", "python", "rust", "typescript"]
+            [
+                "go",
+                "javascript",
+                "markdown",
+                "python",
+                "rust",
+                "tsx",
+                "typescript"
+            ]
         );
     }
 

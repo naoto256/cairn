@@ -1,8 +1,11 @@
-//! Blob-scoped TypeScript Tier-2 analyzer.
+//! Blob-scoped TypeScript / TSX / JavaScript Tier-2 analyzer.
 //!
-//! PR1 intentionally stays syntactic: it reparses one `.ts` blob with
+//! PR1 intentionally stays syntactic: it reparses one blob with
 //! tree-sitter and emits call refs, annotation/type refs, and heritage
 //! impl edges. Imports and doc overrides remain Tier-1/follow-up surfaces.
+//! One walker serves all three dialects; JS simply never produces the
+//! type-annotation node kinds, and JSX component usages (TSX / JS) are
+//! emitted as `Instantiate` refs.
 
 use std::sync::Arc;
 
@@ -10,15 +13,30 @@ use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, Semanti
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
-pub struct TypescriptAnalyzer;
+use crate::Dialect;
+
+pub struct TypescriptAnalyzer {
+    dialect: Dialect,
+}
 
 impl Analyzer for TypescriptAnalyzer {
     fn name(&self) -> &'static str {
-        "typescript-treesitter"
+        match self.dialect {
+            Dialect::Typescript => "typescript-treesitter",
+            Dialect::Tsx => "tsx-treesitter",
+            Dialect::Javascript => "javascript-treesitter",
+        }
+    }
+
+    fn revision(&self) -> u32 {
+        // 2: dotted heritage bases (`extends ns.Base`) now resolve to
+        // the full dotted name instead of the first identifier, and
+        // JSX component usages emit `Instantiate` refs.
+        2
     }
 
     fn extract_semantic(&self, source: &[u8]) -> Result<SemanticFacts, ExtractError> {
-        let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let language = self.dialect.language();
         let mut parser = Parser::new();
         if parser.set_language(&language).is_err() {
             return Ok(SemanticFacts::default());
@@ -37,8 +55,8 @@ impl Analyzer for TypescriptAnalyzer {
     }
 }
 
-pub fn analyzer() -> Arc<dyn Analyzer> {
-    Arc::new(TypescriptAnalyzer)
+pub fn analyzer(dialect: Dialect) -> Arc<dyn Analyzer> {
+    Arc::new(TypescriptAnalyzer { dialect })
 }
 
 struct TsSemanticWalker {
@@ -83,6 +101,11 @@ impl TsSemanticWalker {
                 self.emit_type_parameter_bound(node, source);
                 self.walk_children(node, source);
             }
+            // TSX / JSX only — these kinds never occur in plain TS.
+            "jsx_opening_element" | "jsx_self_closing_element" => {
+                self.emit_jsx_component(node, source);
+                self.walk_children(node, source);
+            }
             _ => self.walk_children(node, source),
         }
     }
@@ -112,10 +135,19 @@ impl TsSemanticWalker {
         match node.kind() {
             "class_declaration" => {
                 if let Some(heritage) = find_direct_child(node, "class_heritage") {
-                    for clause in direct_children_by_kind(heritage, "extends_clause") {
+                    let extends = direct_children_by_kind(heritage, "extends_clause");
+                    let implements = direct_children_by_kind(heritage, "implements_clause");
+                    // tree-sitter-javascript flattens `class_heritage`
+                    // to `seq("extends", expression)` — no clause
+                    // wrappers. When neither TS clause kind is present,
+                    // the heritage node itself is the extends clause.
+                    if extends.is_empty() && implements.is_empty() {
+                        self.emit_heritage_clause(heritage, source, type_qualified, "inherit");
+                    }
+                    for clause in extends {
                         self.emit_heritage_clause(clause, source, type_qualified, "inherit");
                     }
-                    for clause in direct_children_by_kind(heritage, "implements_clause") {
+                    for clause in implements {
                         self.emit_heritage_clause(clause, source, type_qualified, "implement");
                     }
                 }
@@ -208,6 +240,30 @@ impl TsSemanticWalker {
             enclosing_qualified: self.enclosing.clone(),
             byte_range: target_node.start_byte()..target_node.end_byte(),
             line: line_of(target_node),
+        });
+    }
+
+    fn emit_jsx_component(&mut self, node: Node<'_>, source: &[u8]) {
+        let Some(name_node) = child_by_field(node, "name") else {
+            return;
+        };
+        let text = normalized_text(name_node, source);
+        // Lowercase tags (`<div>`) are intrinsic elements, not symbol
+        // references. Components are upper-cased by JSX convention;
+        // dotted names (`<Foo.Bar />`) are always component accesses.
+        let target_name = text.rsplit('.').next().unwrap_or(&text).to_string();
+        if !target_name.starts_with(|c: char| c.is_uppercase()) {
+            return;
+        }
+        self.facts.refs.push(RefFact {
+            target_name,
+            target_qualified: (!text.contains('.')).then(|| text.clone()),
+            kind: RefKind::Instantiate,
+            type_role: None,
+            enclosing_idx: None,
+            enclosing_qualified: self.enclosing.clone(),
+            byte_range: name_node.start_byte()..name_node.end_byte(),
+            line: line_of(name_node),
         });
     }
 
@@ -349,7 +405,9 @@ fn normalized_text(node: Node<'_>, source: &[u8]) -> String {
 
 fn heritage_name<'a>(node: Node<'a>, source: &[u8]) -> Option<(String, Node<'a>)> {
     match node.kind() {
-        "identifier" | "type_identifier" | "nested_type_identifier" => {
+        // `member_expression` is the JS-grammar spelling of a dotted
+        // base (`class A extends ns.Base`); TS uses `nested_type_identifier`.
+        "identifier" | "type_identifier" | "nested_type_identifier" | "member_expression" => {
             Some((normalized_text(node, source), node))
         }
         "generic_type" | "expression_with_type_arguments" => {
@@ -443,7 +501,13 @@ mod tests {
     use cairn_lang_api::LanguageBackend;
 
     fn semantic(src: &str) -> SemanticFacts {
-        TypescriptAnalyzer.extract_semantic(src.as_bytes()).unwrap()
+        semantic_for(Dialect::Typescript, src)
+    }
+
+    fn semantic_for(dialect: Dialect, src: &str) -> SemanticFacts {
+        TypescriptAnalyzer { dialect }
+            .extract_semantic(src.as_bytes())
+            .unwrap()
     }
 
     fn refs(src: &str) -> Vec<RefFact> {
@@ -611,11 +675,16 @@ mod tests {
     }
 
     #[test]
-    fn tsx_patterns_remain_out_of_scope() {
-        let backend = crate::TypescriptBackend;
-
-        assert_eq!(backend.file_patterns(), &["*.ts", "*.mts", "*.cts"]);
-        assert!(!backend.file_patterns().contains(&"*.tsx"));
+    fn dialect_patterns_do_not_overlap() {
+        assert_eq!(
+            crate::TypescriptBackend.file_patterns(),
+            &["*.ts", "*.mts", "*.cts"]
+        );
+        assert_eq!(crate::TsxBackend.file_patterns(), &["*.tsx"]);
+        assert_eq!(
+            crate::JavascriptBackend.file_patterns(),
+            &["*.js", "*.mjs", "*.cjs", "*.jsx"]
+        );
     }
 
     #[test]
@@ -772,6 +841,132 @@ mod tests {
     }
 
     #[test]
+    fn preserves_dotted_class_heritage_bases() {
+        let impls = impls("class A extends ns.Base {}");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].interface_qualified.as_deref(), Some("ns.Base"));
+    }
+
+    #[test]
+    fn tsx_component_usages_emit_instantiate_refs() {
+        let facts = semantic_for(
+            Dialect::Tsx,
+            "function App() { return <Card title={fmt()}><Inner /></Card>; }",
+        );
+
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Instantiate
+                && r.target_name == "Card"
+                && r.target_qualified.as_deref() == Some("Card")
+                && r.enclosing_qualified.as_deref() == Some("App")
+        }));
+        assert!(
+            facts
+                .refs
+                .iter()
+                .any(|r| { r.kind == RefKind::Instantiate && r.target_name == "Inner" })
+        );
+        // Expressions nested inside JSX still walk normally.
+        assert!(
+            facts
+                .refs
+                .iter()
+                .any(|r| { r.kind == RefKind::Call && r.target_name == "fmt" })
+        );
+    }
+
+    #[test]
+    fn tsx_intrinsic_elements_are_not_refs() {
+        let facts = semantic_for(Dialect::Tsx, "function App() { return <div id=\"x\" />; }");
+        assert!(
+            !facts.refs.iter().any(|r| r.kind == RefKind::Instantiate),
+            "{:?}",
+            facts.refs
+        );
+    }
+
+    #[test]
+    fn tsx_dotted_component_keeps_member_target_unqualified() {
+        let facts = semantic_for(Dialect::Tsx, "function App() { return <Foo.Bar />; }");
+        let r = facts
+            .refs
+            .iter()
+            .find(|r| r.kind == RefKind::Instantiate)
+            .unwrap();
+        assert_eq!(r.target_name, "Bar");
+        assert_eq!(r.target_qualified, None);
+    }
+
+    #[test]
+    fn tsx_keeps_typescript_surfaces_alive() {
+        let facts = semantic_for(
+            Dialect::Tsx,
+            "interface P { user: User; }\n\
+             class Panel extends Base implements Widget { render(): Node { return helper(); } }",
+        );
+
+        assert!(facts.impls.iter().any(|i| {
+            i.type_qualified == "Panel"
+                && i.interface_qualified.as_deref() == Some("Base")
+                && i.kind == "inherit"
+        }));
+        assert!(facts.impls.iter().any(|i| {
+            i.type_qualified == "Panel"
+                && i.interface_qualified.as_deref() == Some("Widget")
+                && i.kind == "implement"
+        }));
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Type
+                && r.target_name == "User"
+                && r.type_role == Some(TypeRole::Field)
+        }));
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Call
+                && r.target_name == "helper"
+                && r.enclosing_qualified.as_deref() == Some("Panel.render")
+        }));
+    }
+
+    #[test]
+    fn javascript_emits_call_refs_and_class_heritage() {
+        let facts = semantic_for(
+            Dialect::Javascript,
+            "class Dog extends Animal { bark() { howl(); } }\n\
+             class A extends ns.Base {}\n\
+             class C extends Mixin(Base) {}",
+        );
+
+        assert!(facts.impls.iter().any(|i| {
+            i.type_qualified == "Dog"
+                && i.interface_qualified.as_deref() == Some("Animal")
+                && i.kind == "inherit"
+        }));
+        assert!(facts.impls.iter().any(|i| {
+            i.type_qualified == "A" && i.interface_qualified.as_deref() == Some("ns.Base")
+        }));
+        // Mixin / computed bases stay skipped, same as TS.
+        assert!(!facts.impls.iter().any(|i| i.type_qualified == "C"));
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Call
+                && r.target_name == "howl"
+                && r.enclosing_qualified.as_deref() == Some("Dog.bark")
+        }));
+    }
+
+    #[test]
+    fn javascript_jsx_component_usage_emits_instantiate_ref() {
+        let facts = semantic_for(
+            Dialect::Javascript,
+            "function App() { return <Widget onClick={handle} />; }",
+        );
+        assert!(facts.refs.iter().any(|r| {
+            r.kind == RefKind::Instantiate
+                && r.target_name == "Widget"
+                && r.enclosing_qualified.as_deref() == Some("App")
+        }));
+    }
+
+    #[test]
     fn empty_or_malformed_input_is_empty_ok() {
         assert_eq!(semantic("").refs.len(), 0);
         assert_eq!(semantic("function {").refs.len(), 0);
@@ -783,9 +978,11 @@ mod tests {
         // parser setup/tree absence degrade to empty SemanticFacts, and
         // unsupported recovered syntax is skipped node-by-node. PR #48's
         // parse-pipeline preservation is therefore a no-op for TS today.
-        let facts = TypescriptAnalyzer
-            .extract_semantic(b"\0\0\0 function {")
-            .unwrap();
+        let facts = TypescriptAnalyzer {
+            dialect: Dialect::Typescript,
+        }
+        .extract_semantic(b"\0\0\0 function {")
+        .unwrap();
 
         assert!(facts.imports.is_empty());
         assert!(facts.refs.is_empty());

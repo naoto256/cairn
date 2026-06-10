@@ -1,8 +1,12 @@
-//! `cairn-lang-typescript` — TypeScript backend.
+//! `cairn-lang-typescript` — TypeScript / TSX / JavaScript backends.
 //!
-//! Tier-1 (syntactic): walks the tree-sitter-typescript parse tree and emits
-//! symbols for declarations plus import facts. `.tsx` uses a separate grammar
-//! and is intentionally left for a follow-up backend.
+//! Tier-1 (syntactic): walks the parse tree and emits symbols for
+//! declarations plus import facts. Three sibling grammars share one
+//! visitor: tree-sitter-typescript's TypeScript and TSX dialects, and
+//! tree-sitter-javascript (which parses JSX natively, so `.jsx` rides
+//! on the JavaScript backend). Node kinds that only exist in one
+//! dialect (e.g. `interface_declaration`) simply never fire for the
+//! others.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +25,27 @@ use cairn_lang_treesitter_generic::{
 use linkme::distributed_slice;
 use tree_sitter::Node;
 
-/// Backend instance.
+/// Which of the three sibling grammars a backend instance drives.
+/// Tier-1 and Tier-2 walk the same node kinds for all of them; the
+/// dialect only selects the grammar and the identifying strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    Typescript,
+    Tsx,
+    Javascript,
+}
+
+impl Dialect {
+    pub(crate) fn language(self) -> tree_sitter::Language {
+        match self {
+            Self::Typescript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::Javascript => tree_sitter_javascript::LANGUAGE.into(),
+        }
+    }
+}
+
+/// TypeScript backend instance (`.ts` / `.mts` / `.cts`).
 pub struct TypescriptBackend;
 
 impl LanguageBackend for TypescriptBackend {
@@ -38,17 +62,90 @@ impl LanguageBackend for TypescriptBackend {
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
-        let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        extract(source, &language, TypescriptVisitor::new())
+        extract(
+            source,
+            &Dialect::Typescript.language(),
+            TypescriptVisitor::new(),
+        )
     }
 
     fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
-        Some(analyzer::analyzer())
+        Some(analyzer::analyzer(Dialect::Typescript))
     }
 }
 
 #[distributed_slice(LANGUAGE_BACKENDS)]
 static REGISTER_TYPESCRIPT: fn() -> Box<dyn LanguageBackend> = || Box::new(TypescriptBackend);
+
+/// TSX backend instance (`.tsx`). Same visitor as TypeScript over the
+/// upstream TSX grammar (JSX syntax changes how a handful of TS
+/// constructs parse, hence the separate grammar and backend).
+pub struct TsxBackend;
+
+impl LanguageBackend for TsxBackend {
+    fn name(&self) -> &'static str {
+        "tsx"
+    }
+
+    fn file_patterns(&self) -> &'static [&'static str] {
+        &["*.tsx"]
+    }
+
+    fn parser_id(&self) -> &'static str {
+        "tree-sitter-tsx"
+    }
+
+    fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
+        extract(source, &Dialect::Tsx.language(), TypescriptVisitor::new())
+    }
+
+    fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
+        Some(analyzer::analyzer(Dialect::Tsx))
+    }
+}
+
+#[distributed_slice(LANGUAGE_BACKENDS)]
+static REGISTER_TSX: fn() -> Box<dyn LanguageBackend> = || Box::new(TsxBackend);
+
+/// JavaScript backend instance (`.js` / `.mjs` / `.cjs` / `.jsx`).
+/// tree-sitter-javascript parses JSX natively, so `.jsx` needs no
+/// separate grammar.
+pub struct JavascriptBackend;
+
+impl LanguageBackend for JavascriptBackend {
+    fn name(&self) -> &'static str {
+        "javascript"
+    }
+
+    fn file_patterns(&self) -> &'static [&'static str] {
+        &["*.js", "*.mjs", "*.cjs", "*.jsx"]
+    }
+
+    fn shebang_patterns(&self) -> &'static [&'static str] {
+        // Substrings searched in the trimmed first line. Covers both
+        // `#!/usr/bin/node` and `#!/usr/bin/env node`.
+        &["node"]
+    }
+
+    fn parser_id(&self) -> &'static str {
+        "tree-sitter-javascript"
+    }
+
+    fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
+        extract(
+            source,
+            &Dialect::Javascript.language(),
+            TypescriptVisitor::new(),
+        )
+    }
+
+    fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
+        Some(analyzer::analyzer(Dialect::Javascript))
+    }
+}
+
+#[distributed_slice(LANGUAGE_BACKENDS)]
+static REGISTER_JAVASCRIPT: fn() -> Box<dyn LanguageBackend> = || Box::new(JavascriptBackend);
 
 struct TypescriptVisitor {
     nesting: NestingTracker,
@@ -515,5 +612,120 @@ import type { T } from "y";
         let method = symbol_by_name(&facts, "b");
         assert_eq!(method.qualified, "A.b");
         assert_eq!(method.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn tsx_extracts_symbols_and_imports_through_jsx() {
+        let src = br#"
+import React, { useState } from "react";
+import "./card.css";
+
+/** Card component. */
+function Card(props: CardProps): JSX.Element {
+    return <div className="card">{props.title}</div>;
+}
+
+interface CardProps { title: string; }
+
+class Panel extends React.Component {
+    render() { return <Card title="x" />; }
+}
+"#;
+        let facts = TsxBackend.extract_syntactic(src).unwrap();
+
+        let card = symbol_by_name(&facts, "Card");
+        assert_eq!(card.kind, SymbolKind::Function);
+        assert_eq!(card.doc.as_deref(), Some("Card component."));
+        assert_eq!(
+            card.signature.as_deref(),
+            Some("function Card(props: CardProps): JSX.Element")
+        );
+        assert_eq!(
+            symbol_by_name(&facts, "CardProps").kind,
+            SymbolKind::Interface
+        );
+        assert_eq!(symbol_by_name(&facts, "Panel").kind, SymbolKind::Class);
+        let render = symbol_by_name(&facts, "render");
+        assert_eq!(render.qualified, "Panel.render");
+        assert_eq!(render.kind, SymbolKind::Method);
+
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "react"
+                && i.imported.as_deref() == Some("default")
+                && i.alias.as_deref() == Some("React")
+        }));
+        assert!(
+            facts
+                .imports
+                .iter()
+                .any(|i| { i.to_module == "react" && i.imported.as_deref() == Some("useState") })
+        );
+        assert!(
+            facts.imports.iter().any(|i| {
+                i.to_module == "./card.css" && i.imported.is_none() && i.alias.is_none()
+            })
+        );
+    }
+
+    #[test]
+    fn javascript_extracts_symbols_and_imports() {
+        let src = br#"
+import defaultExport, { named as alias } from "./mod";
+
+/** doc on helper */
+function helper(x) { return x; }
+
+class Dog extends Animal {
+    bark() {}
+}
+"#;
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+
+        let helper = symbol_by_name(&facts, "helper");
+        assert_eq!(helper.kind, SymbolKind::Function);
+        assert_eq!(helper.doc.as_deref(), Some("doc on helper"));
+        assert_eq!(helper.signature.as_deref(), Some("function helper(x)"));
+        assert_eq!(symbol_by_name(&facts, "Dog").kind, SymbolKind::Class);
+        let bark = symbol_by_name(&facts, "bark");
+        assert_eq!(bark.qualified, "Dog.bark");
+        assert_eq!(bark.kind, SymbolKind::Method);
+
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "./mod"
+                && i.imported.as_deref() == Some("default")
+                && i.alias.as_deref() == Some("defaultExport")
+        }));
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "./mod"
+                && i.imported.as_deref() == Some("named")
+                && i.alias.as_deref() == Some("alias")
+        }));
+    }
+
+    #[test]
+    fn javascript_jsx_file_extracts_component_function() {
+        let facts = JavascriptBackend
+            .extract_syntactic(b"function App() { return <div><Widget /></div>; }\n")
+            .unwrap();
+        assert_eq!(symbol_by_name(&facts, "App").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn dialect_backends_report_stable_identity() {
+        assert_eq!(TsxBackend.name(), "tsx");
+        assert_eq!(TsxBackend.parser_id(), "tree-sitter-tsx");
+        assert_eq!(JavascriptBackend.name(), "javascript");
+        assert_eq!(JavascriptBackend.parser_id(), "tree-sitter-javascript");
+        assert_eq!(JavascriptBackend.shebang_patterns(), &["node"]);
+    }
+
+    #[test]
+    fn all_three_backends_register() {
+        let mut names = cairn_lang_api::all_backends()
+            .iter()
+            .map(|b| b.name())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["javascript", "tsx", "typescript"]);
     }
 }
