@@ -13,7 +13,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::data_rpc::helpers::with_repo_conn;
+use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -39,52 +39,79 @@ impl DataMethod for GetSymbolSource {
         let signature_only = args.signature_only;
         let anchor_arg = args.anchor.clone();
         let branch_arg = args.branch.clone();
-        let repo_alias = args.repo.clone();
-        let repo_alias_for_error = repo_alias.clone();
+        let requested_repo = args.repo.clone();
+        let cas_data_dir = ctx.cas_data_dir.clone();
 
-        let result = with_repo_conn(ctx, &repo_alias, "get_symbol_source", move |entry, conn| {
-            let worktree_root = PathBuf::from(&entry.root_path);
-            let anchor = crate::anchor::resolve_explicit_or_default(
-                &conn,
-                anchor_arg.as_deref(),
-                branch_arg.as_deref(),
-            )?;
-
-            let row =
-                query::get_symbol_source_row(&conn, &anchor, &qualified, file_filter.as_deref())?
-                    .ok_or_else(|| {
-                    Error::InvalidArgument(format!(
-                        "no symbol matches qualified=`{qualified}` in repo=`{repo_alias_for_error}`"
-                    ))
-                })?;
-
-            let source = if signature_only {
-                String::new()
-            } else {
-                materialise(&worktree_root, &row)?
+        let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {
+            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let aliases = match requested_repo.as_deref() {
+                Some(name) => {
+                    let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
+                        Error::RepoNotFound {
+                            alias: name.to_string(),
+                        }
+                    })?;
+                    vec![entry]
+                }
+                None => cas_registry::list_all(&index)?,
             };
 
-            Ok(GetSymbolSourceResult {
-                qualified: row.qualified,
-                name: row.name,
-                kind: row.kind,
-                branch: anchor.as_str().to_string(),
-                location: format!(
-                    "{}:{}:{}:{}",
-                    entry.alias,
-                    anchor.as_str(),
-                    row.path,
-                    row.line_start
-                ),
-                line_start: row.line_start,
-                line_end: row.line_end,
-                source,
-                signature: row.signature,
-                doc: row.doc,
-                source_tier: SourceTier::Syntactic,
-            })
+            for entry in &aliases {
+                let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
+                let conn = cas_store::open(&store_path)?;
+                let anchor = crate::anchor::resolve_explicit_or_default(
+                    &conn,
+                    anchor_arg.as_deref(),
+                    branch_arg.as_deref(),
+                )?;
+                let row = match query::get_symbol_source_row(
+                    &conn,
+                    &anchor,
+                    &qualified,
+                    file_filter.as_deref(),
+                )? {
+                    Some(row) => row,
+                    None => continue,
+                };
+
+                let worktree_root = PathBuf::from(&entry.root_path);
+                let source = if signature_only {
+                    String::new()
+                } else {
+                    materialise(&worktree_root, &row)?
+                };
+
+                return Ok(GetSymbolSourceResult {
+                    qualified: row.qualified,
+                    name: row.name,
+                    kind: row.kind,
+                    branch: anchor.as_str().to_string(),
+                    location: format!(
+                        "{}:{}:{}:{}",
+                        entry.alias,
+                        anchor.as_str(),
+                        row.path,
+                        row.line_start
+                    ),
+                    line_start: row.line_start,
+                    line_end: row.line_end,
+                    source,
+                    signature: row.signature,
+                    doc: row.doc,
+                    source_tier: SourceTier::Syntactic,
+                });
+            }
+
+            let scope = match requested_repo.as_deref() {
+                Some(name) => format!("repo=`{name}`"),
+                None => format!("any of {} registered repos", aliases.len()),
+            };
+            Err(Error::InvalidArgument(format!(
+                "no symbol matches qualified=`{qualified}` in {scope}"
+            )))
         })
-        .await?;
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("get_symbol_source task panicked: {e}")))??;
 
         Ok(serde_json::to_value(result).unwrap())
     }

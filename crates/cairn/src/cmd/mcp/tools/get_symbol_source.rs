@@ -17,14 +17,14 @@ impl McpTool for GetSymbolSource {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo":      {"type": "string"},
+                    "repo":      {"type": "string", "description": "Repository alias. Omit to search every registered repo; the first symbol whose `qualified` matches wins."},
                     "qualified": {"type": "string", "description": "Fully-qualified name, e.g. `crate::cli::parse_args` or `MyStruct::new`. Use `find_symbols` first if you only have a bare name."},
                     "branch":    {"type": "string", "description": BRANCH_PARAM_DESC},
                     "anchor":    {"type": "string", "description": ANCHOR_PARAM_DESC},
                     "file":      {"type": "string", "description": "Path relative to repo root. Optional; only needed when the same qualified name exists in multiple files."},
                     "signature_only": {"type": "boolean", "description": "Return only the signature + doc string (no body bytes). Cheap API-surface peek; the `source` field is empty when this is set, `signature` and `doc` carry everything."},
                 },
-                "required": ["repo", "qualified"],
+                "required": ["qualified"],
                 "additionalProperties": false,
             }),
         }

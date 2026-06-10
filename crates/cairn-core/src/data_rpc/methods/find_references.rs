@@ -103,7 +103,7 @@ fn into_wire_hit(
 /// result sets cluster hits onto a small number of files (one impl
 /// block, one trait method), so the cache turns N hits into K blob
 /// reads with K ≪ N.
-struct SnippetCache {
+pub(super) struct SnippetCache {
     worktree_root: PathBuf,
     /// `blob_sha → file contents` once materialised. `None` means we
     /// already tried and the blob couldn't be loaded; we won't retry.
@@ -111,14 +111,14 @@ struct SnippetCache {
 }
 
 impl SnippetCache {
-    fn new(worktree_root: PathBuf) -> Self {
+    pub(super) fn new(worktree_root: PathBuf) -> Self {
         Self {
             worktree_root,
             blobs: HashMap::new(),
         }
     }
 
-    fn line_for(&mut self, blob_sha: &str, path: &str, line: u32) -> Option<String> {
+    pub(super) fn line_for(&mut self, blob_sha: &str, path: &str, line: u32) -> Option<String> {
         let bytes = self.load(blob_sha, path);
         bytes
             .and_then(|b| extract_line(b, line))
