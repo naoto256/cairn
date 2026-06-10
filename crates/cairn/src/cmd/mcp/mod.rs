@@ -516,6 +516,8 @@ mod tests {
                 .description
                 .contains("language enrichment matrix")
         );
+        assert!(list_repos.description.contains("`stale`"));
+        assert!(list_repos.description.contains("`reindex_repo`"));
 
         let get_outline = specs
             .iter()
@@ -531,6 +533,11 @@ mod tests {
             serde_json::json!(["repo"])
         );
         assert!(get_outline.input_schema["properties"]["path"].is_object());
+        assert!(get_outline.input_schema["properties"]["kind"].is_object());
+        assert_eq!(
+            get_outline.input_schema["properties"]["max_depth"]["minimum"],
+            1
+        );
         assert_eq!(
             get_outline.input_schema["properties"]["limit"]["maximum"],
             1000

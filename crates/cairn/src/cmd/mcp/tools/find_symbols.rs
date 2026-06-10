@@ -5,9 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool, ToolRoute};
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC};
-
-const SYMBOL_KIND_DESC: &str = "Restrict to one SymbolKind. Use snake_case strings: `function`, `method`, `constructor`, `getter`, `setter`, `class`, `struct`, `enum`, `union`, `trait`, `impl`, `interface`, `type_alias`, `field`, `property`, `constant`, `variable`, `parameter`, `module`, `namespace`, `package`, `macro`, `section`, or `test`. Aliases such as `fn` or `Function` are not valid.";
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, SYMBOL_KIND_DESC};
 
 struct FindSymbols;
 
