@@ -22,6 +22,7 @@ use cairn_lang_python_tier3 as _;
 use cairn_lang_ruby as _;
 use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
+use cairn_lang_swift as _;
 use cairn_lang_typescript as _;
 
 mod cmd;
@@ -102,6 +103,7 @@ mod tests {
                 "python",
                 "ruby",
                 "rust",
+                "swift",
                 "tsx",
                 "typescript"
             ]

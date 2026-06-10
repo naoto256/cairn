@@ -35,6 +35,7 @@ cairn-lang-typescript.workspace = true
 cairn-lang-go.workspace = true
 cairn-lang-go-tier3.workspace = true
 cairn-lang-kotlin.workspace = true
+cairn-lang-swift.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
