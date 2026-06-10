@@ -148,6 +148,19 @@ pub struct OutlineArgs {
     /// semantics: include a trailing slash to scope to a directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Restrict items to a single symbol kind. Mirrors
+    /// `find_symbols.kind`. Useful for "show me only the types under
+    /// this directory" without paging through hundreds of method
+    /// entries first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SymbolKind>,
+    /// Directory-depth cap relative to `path`, counted by `/`
+    /// separators after the prefix. `max_depth = 1` keeps items from
+    /// files directly under the prefix and omits anything nested
+    /// deeper — the canonical "module-level summary" shape for a
+    /// crate or package root. Ignored in single-file mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }

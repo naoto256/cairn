@@ -10,7 +10,7 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
     completeness_for_cap, limit_with_probe, trim_to_requested_limit, with_repo_conn,
 };
-use crate::query::{self, OutlineItem as QueryOutlineItem};
+use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
 
 pub struct GetOutline;
@@ -33,6 +33,10 @@ impl DataMethod for GetOutline {
         let file = args.file.clone();
         let path = args.path.clone();
         let effective_limit = args.limit.unwrap_or(200).clamp(1, 1000);
+        let filter = OutlineFilter {
+            kind: args.kind,
+            max_depth: args.max_depth,
+        };
 
         let (items, capped) = with_repo_conn(
             ctx,
@@ -46,7 +50,12 @@ impl DataMethod for GetOutline {
                         Err(Error::AnchorNotFound { .. }) => Vec::new(),
                         Err(other) => return Err(other),
                     };
-                    return Ok((raw.into_iter().map(into_wire_item).collect(), false));
+                    let filtered: Vec<_> = raw
+                        .into_iter()
+                        .filter(|i| filter.kind.as_ref().is_none_or(|k| &i.kind == k))
+                        .map(into_wire_item)
+                        .collect();
+                    return Ok((filtered, false));
                 }
 
                 let path = path.expect("validated path when file is absent");
@@ -56,6 +65,7 @@ impl DataMethod for GetOutline {
                     &path,
                     None,
                     limit_with_probe(effective_limit),
+                    &filter,
                 ) {
                     Ok(r) => r,
                     Err(Error::AnchorNotFound { .. }) => Vec::new(),
@@ -134,6 +144,100 @@ mod tests {
             serde_json::from_value::<Completeness>(result["completeness"].clone()).unwrap(),
             Completeness::partial_truncated("cap")
         );
+    }
+
+    #[tokio::test]
+    async fn directory_outline_filters_by_kind() {
+        let fixture = outline_fixture();
+        let result = GetOutline
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "path": "a/", "kind": "function"}),
+            )
+            .await
+            .unwrap();
+        let items = result["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        for item in items {
+            assert_eq!(item["kind"], "function");
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_outline_caps_depth() {
+        let fixture = nested_outline_fixture();
+        let shallow = GetOutline
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "path": "src/", "max_depth": 1}),
+            )
+            .await
+            .unwrap();
+        let files: Vec<&str> = shallow["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["file"].as_str().unwrap())
+            .collect();
+        assert!(files.iter().all(|f| !f.trim_start_matches("src/").contains('/')));
+        assert!(files.contains(&"src/top.rs"));
+
+        let deep = GetOutline
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "path": "src/", "max_depth": 2}),
+            )
+            .await
+            .unwrap();
+        let deep_files: Vec<&str> = deep["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["file"].as_str().unwrap())
+            .collect();
+        assert!(deep_files.contains(&"src/nest/inner.rs"));
+    }
+
+    fn nested_outline_fixture() -> OutlineFixture {
+        let (repo, _sha) = init_repo(&[
+            ("src/top.rs", "pub fn top_one() {}\n"),
+            ("src/nest/inner.rs", "pub fn inner_one() {}\n"),
+        ]);
+        let data = tempfile::tempdir().unwrap();
+        let cas = CasDataDir::with_root(data.path().to_path_buf());
+        cas.ensure().unwrap();
+        let canonical = std::fs::canonicalize(repo.path()).unwrap();
+        let repo_hash = path_hash(&canonical);
+        let store_path = cas.store_db_path(&repo_hash);
+        let mut store = cas_store::open(&store_path).unwrap();
+        let now_ns = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        register_repo(&mut store, &canonical, now_ns).unwrap();
+
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(
+            &tx,
+            "demo",
+            &canonical.to_string_lossy(),
+            &repo_hash,
+            now_ns,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        OutlineFixture {
+            _repo: repo,
+            _data: data,
+            ctx: DataCtx {
+                cas_data_dir: Arc::new(cas),
+            },
+        }
     }
 
     #[tokio::test]
