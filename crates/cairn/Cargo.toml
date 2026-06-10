@@ -24,6 +24,7 @@ cairn-proto.workspace = true
 # slice picks up their registration constructors. The crates themselves
 # do not need to be referenced from Rust code.
 cairn-lang-csharp.workspace = true
+cairn-lang-csharp-tier3.workspace = true
 cairn-lang-rust.workspace = true
 cairn-lang-rust-tier3.workspace = true
 cairn-lang-python.workspace = true
