@@ -17,6 +17,7 @@ members = [
     "crates/cairn-lang-go",
     "crates/cairn-lang-go-tier3",
     "crates/cairn-lang-c",
+    "crates/cairn-lang-cpp",
     "crates/cairn-lang-csharp",
     "crates/cairn-lang-java",
     "crates/cairn-lang-kotlin",
@@ -95,6 +96,12 @@ tree-sitter-kotlin-ng = "=1.1.0"
 # tree-sitter 0.24 (ABI <= 14) rejects at set_language time.
 # Re-evaluate when the workspace moves to tree-sitter >= 0.25.
 tree-sitter-c = "0.23"
+# Pinned per workspace policy: tree-sitter 0.24 runtime loads ABI <= 14
+# only, so a future 0.23.x or 0.24.x of tree-sitter-cpp that bumps to
+# ABI 15 (as c-sharp 0.23.5 did) would break set_language. 0.23.4 is the
+# version validated against the current runtime; raise when the
+# workspace upgrades to tree-sitter >= 0.25.
+tree-sitter-cpp = "=0.23.4"
 tree-sitter-swift = "=0.7.0"
 tree-sitter-java = "0.23"
 
@@ -130,6 +137,7 @@ cairn-lang-typescript = { version = "0.2.0", path = "crates/cairn-lang-typescrip
 cairn-lang-go = { version = "0.2.0", path = "crates/cairn-lang-go" }
 cairn-lang-go-tier3 = { version = "0.2.0", path = "crates/cairn-lang-go-tier3" }
 cairn-lang-c = { version = "0.2.0", path = "crates/cairn-lang-c" }
+cairn-lang-cpp = { version = "0.2.0", path = "crates/cairn-lang-cpp" }
 cairn-lang-csharp = { version = "0.2.0", path = "crates/cairn-lang-csharp" }
 cairn-lang-java = { version = "0.2.0", path = "crates/cairn-lang-java" }
 cairn-lang-kotlin = { version = "0.2.0", path = "crates/cairn-lang-kotlin" }
