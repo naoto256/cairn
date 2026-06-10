@@ -11,6 +11,7 @@ members = [
     "crates/cairn-lang-python",
     "crates/cairn-lang-python-tier3",
     "crates/cairn-lang-markdown",
+    "crates/cairn-lang-php",
     "crates/cairn-lang-ruby",
     "crates/cairn-lang-typescript",
     "crates/cairn-lang-go",
@@ -80,6 +81,7 @@ tree-sitter-go = "0.23"
 # which the workspace's tree-sitter 0.24 runtime cannot load. 0.23.1
 # is the last ABI-14 release.
 tree-sitter-c-sharp = "=0.23.1"
+tree-sitter-php = "0.23"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -107,6 +109,7 @@ cairn-lang-rust-tier3 = { version = "0.2.0", path = "crates/cairn-lang-rust-tier
 cairn-lang-python = { version = "0.2.0", path = "crates/cairn-lang-python" }
 cairn-lang-python-tier3 = { version = "0.2.0", path = "crates/cairn-lang-python-tier3" }
 cairn-lang-markdown = { version = "0.2.0", path = "crates/cairn-lang-markdown" }
+cairn-lang-php = { version = "0.2.0", path = "crates/cairn-lang-php" }
 cairn-lang-ruby = { version = "0.2.0", path = "crates/cairn-lang-ruby" }
 cairn-lang-typescript = { version = "0.2.0", path = "crates/cairn-lang-typescript" }
 cairn-lang-go = { version = "0.2.0", path = "crates/cairn-lang-go" }
