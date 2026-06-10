@@ -333,6 +333,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         rust_analyzer_binary_check(),
         pyright_binary_check(),
         gopls_binary_check(),
+        clangd_binary_check(),
     ]
 }
 
@@ -360,6 +361,15 @@ fn gopls_binary_check() -> DoctorCheck {
         resolve_gopls(),
         "gopls not on PATH",
         "Install gopls (`go install golang.org/x/tools/gopls@latest`) and ensure it's on the daemon's PATH; Go Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn clangd_binary_check() -> DoctorCheck {
+    binary_check(
+        "clangd binary discoverable",
+        resolve_clangd(),
+        "clangd not on PATH",
+        "Install clangd (for example through LLVM / Xcode command line tools) and ensure it's on the daemon's PATH; C, C++, and Objective-C Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -423,6 +433,20 @@ fn resolve_gopls() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("gopls"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_clangd() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CLANGD")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("clangd"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -620,7 +644,14 @@ mod tests {
             "cpp",
             "java",
         ];
-        let workspace_analyzers = ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"];
+        let workspace_analyzers = [
+            "clangd-c-lsp",
+            "clangd-cpp-lsp",
+            "clangd-objc-lsp",
+            "gopls-lsp",
+            "pyright-lsp",
+            "rust-analyzer-lsp",
+        ];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 
@@ -633,7 +664,14 @@ mod tests {
             "rust", "python", "markdown", "ruby", "go", "csharp", "php", "kotlin", "swift", "objc",
             "c", "cpp", "java",
         ];
-        let workspace_analyzers = ["gopls-lsp", "pyright-lsp", "rust-analyzer-lsp"];
+        let workspace_analyzers = [
+            "clangd-c-lsp",
+            "clangd-cpp-lsp",
+            "clangd-objc-lsp",
+            "gopls-lsp",
+            "pyright-lsp",
+            "rust-analyzer-lsp",
+        ];
 
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 
