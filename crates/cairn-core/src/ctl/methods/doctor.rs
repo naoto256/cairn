@@ -335,6 +335,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         gopls_binary_check(),
         clangd_binary_check(),
         typescript_language_server_binary_check(),
+        csharp_ls_binary_check(),
         jdtls_binary_check(),
         ruby_lsp_binary_check(),
         sourcekit_lsp_binary_check(),
@@ -383,6 +384,15 @@ fn typescript_language_server_binary_check() -> DoctorCheck {
         resolve_typescript_language_server(),
         "typescript-language-server not on PATH",
         "Install typescript-language-server (`npm i -g typescript typescript-language-server`) and ensure it's on the daemon's PATH; TypeScript, JavaScript, and TSX Tier-3 (LSP) facts will not be available until then.",
+    )
+}
+
+fn csharp_ls_binary_check() -> DoctorCheck {
+    binary_check(
+        "csharp-ls binary discoverable",
+        resolve_csharp_ls(),
+        "csharp-ls not discoverable via CSHARP_LS or PATH",
+        "Install csharp-ls (`dotnet tool install -g csharp-ls`) and ensure the .NET tools directory is on the daemon's PATH, or set CSHARP_LS; C# Tier-3 (LSP) facts will not be available until then.",
     )
 }
 
@@ -501,6 +511,20 @@ fn resolve_typescript_language_server() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join("typescript-language-server"))
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn resolve_csharp_ls() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CSHARP_LS")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("csharp-ls"))
         .find(|path| path.is_file())
         .map(|path| path.canonicalize().unwrap_or(path))
 }
@@ -770,6 +794,7 @@ mod tests {
             "clangd-c-lsp",
             "clangd-cpp-lsp",
             "clangd-objc-lsp",
+            "csharp-ls",
             "gopls-lsp",
             "jdtls-lsp",
             "pyright-lsp",
