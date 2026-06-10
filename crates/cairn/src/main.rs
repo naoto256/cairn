@@ -18,6 +18,7 @@ use cairn_lang_csharp as _;
 use cairn_lang_go as _;
 use cairn_lang_go_tier3 as _;
 use cairn_lang_java as _;
+use cairn_lang_java_tier3 as _;
 use cairn_lang_kotlin as _;
 use cairn_lang_markdown as _;
 use cairn_lang_objc as _;
@@ -135,6 +136,7 @@ mod tests {
                 "clangd-cpp-lsp",
                 "clangd-objc-lsp",
                 "gopls-lsp",
+                "jdtls-lsp",
                 "pyright-lsp",
                 "rust-analyzer-lsp",
                 "typescript-language-server-js-lsp",

@@ -22,6 +22,7 @@ members = [
     "crates/cairn-lang-cpp",
     "crates/cairn-lang-csharp",
     "crates/cairn-lang-java",
+    "crates/cairn-lang-java-tier3",
     "crates/cairn-lang-kotlin",
     "crates/cairn-lang-swift",
     "crates/cairn-lang-objc",
@@ -148,6 +149,7 @@ cairn-lang-c = { version = "0.3.0", path = "crates/cairn-lang-c" }
 cairn-lang-cpp = { version = "0.3.0", path = "crates/cairn-lang-cpp" }
 cairn-lang-csharp = { version = "0.3.0", path = "crates/cairn-lang-csharp" }
 cairn-lang-java = { version = "0.3.0", path = "crates/cairn-lang-java" }
+cairn-lang-java-tier3 = { version = "0.3.0", path = "crates/cairn-lang-java-tier3" }
 cairn-lang-kotlin = { version = "0.3.0", path = "crates/cairn-lang-kotlin" }
 cairn-lang-swift = { version = "0.3.0", path = "crates/cairn-lang-swift" }
 cairn-lang-objc = { version = "0.3.0", path = "crates/cairn-lang-objc" }
