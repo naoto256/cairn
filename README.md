@@ -238,10 +238,10 @@ unresolved in Tier-2.
 
 Tier-3 runs local language servers once per snapshot when their
 binaries are discoverable on the daemon's `PATH`. Rust uses
-`rust-analyzer` (`source = tier3-rust-analyzer`), Python uses
-`pyright-langserver` (`source = pyright-lsp`), and Go uses `gopls`
-(`source = gopls-lsp`). Missing binaries are recorded as `Skipped`;
-Tier-1 / Tier-2 facts remain available.
+`rust-analyzer` (`source = tier3-rust-analyzer-lsp`), Python uses
+`pyright-langserver` (`source = tier3-pyright-lsp`), and Go uses
+`gopls` (`source = tier3-gopls-lsp`). Missing binaries are recorded
+as `Skipped`; Tier-1 / Tier-2 facts remain available.
 
 Go covers `*.go` functions, receiver-qualified methods, named types,
 top-level constants / variables, and imports. Exported visibility
