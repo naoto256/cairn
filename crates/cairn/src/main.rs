@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 // (under `_`, so the binding is unusable) and that suffices to keep
 // the rlib in the final link line. Adding a new language backend
 // means adding one more `use ... as _;` line here.
+use cairn_lang_c as _;
 use cairn_lang_csharp as _;
 use cairn_lang_go as _;
 use cairn_lang_go_tier3 as _;
@@ -94,6 +95,7 @@ mod tests {
         assert_eq!(
             backend_names,
             [
+                "c",
                 "csharp",
                 "go",
                 "javascript",
