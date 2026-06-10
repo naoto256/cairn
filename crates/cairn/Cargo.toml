@@ -39,6 +39,7 @@ cairn-lang-cpp.workspace = true
 cairn-lang-java.workspace = true
 cairn-lang-kotlin.workspace = true
 cairn-lang-swift.workspace = true
+cairn-lang-objc.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

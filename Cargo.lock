@@ -143,6 +143,7 @@ dependencies = [
  "cairn-lang-java",
  "cairn-lang-kotlin",
  "cairn-lang-markdown",
+ "cairn-lang-objc",
  "cairn-lang-php",
  "cairn-lang-python",
  "cairn-lang-python-tier3",
@@ -288,6 +289,17 @@ dependencies = [
  "linkme",
  "tree-sitter",
  "tree-sitter-md",
+]
+
+[[package]]
+name = "cairn-lang-objc"
+version = "0.2.0"
+dependencies = [
+ "cairn-lang-api",
+ "cairn-lang-treesitter-generic",
+ "linkme",
+ "tree-sitter",
+ "tree-sitter-objc",
 ]
 
 [[package]]
@@ -1519,6 +1531,16 @@ name = "tree-sitter-md"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17f968c22a01010b83fc960455ae729db08dbeb6388617d9113897cb9204b030"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-objc"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ca8bb556423fc176f0535e79d525f783a6684d3c9da81bf9d905303c129e1d2"
 dependencies = [
  "cc",
  "tree-sitter-language",
