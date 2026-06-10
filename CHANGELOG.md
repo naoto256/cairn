@@ -5,6 +5,71 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-06-10
+
+### Breaking
+
+- **`find_impls` removed; surface verbs are now in pairs.** The
+  Rust-leaning `find_impls` MCP tool and its `cairn query impls
+  --type T` / `--trait T` CLI flags are replaced by four discoverable
+  tools — `find_subtypes`, `find_supertypes`, `find_callers`,
+  `find_callees` — each taking a qualified `name` plus the standard
+  repo / branch / anchor / limit options. Tool descriptions spell
+  out the agent question ("who calls X", "what X calls", "who
+  implements / extends X", "what X extends / implements / mixes in")
+  so the LLM picks directly instead of composing `find_references`
+  with a direction filter. `find_references` stays as the general
+  multi-kind reference query.
+- **CLI subcommands normalized.** `cairn query find <name>` is now
+  `cairn query symbols <name>`; `query impls --type/--trait` splits
+  into `query supertypes` / `query subtypes`; the new pairs above
+  ship as `query callers` / `query callees`; `query imports --file
+  <path>` takes the path positionally; `query outline` takes
+  `<file>` positionally with `--repo` as an optional flag; `query
+  source` no longer requires `--repo`. Every discovery subcommand
+  now uses the same shape — first positional is the search target,
+  `--repo` is an optional flag, no exceptions.
+- **`OutlineArgs.repo` and `GetSymbolSourceArgs.repo` are optional.**
+  Omitting `repo` aggregates outlines across registered repos or
+  walks them for the first qualified-name match in `source`. The
+  required-`repo` validation is gone.
+- **Java impl-kind taxonomy aligned with the rest of the index.**
+  The Java backend now emits `inherit` / `implement` instead of the
+  Rust/Java-only `extends` / `implements`, matching the four-label
+  vocabulary used by every other backend (`inherit`, `implement`,
+  `mixin`, `extension`). Clients matching on the old strings need to
+  update; the new values are documented in the proto types.
+
+### Added
+
+- **Ten new language backends — Tier-1 plus Tier-2.** TSX +
+  JavaScript (extending the existing TypeScript backend), Ruby, C#,
+  PHP, Kotlin, Swift, C, Java, C++, and Objective-C all ship with
+  symbol/outline extraction, inheritance edges, and name-level
+  call/instantiation refs. Combined with the existing Rust, Python,
+  Go, TypeScript, and Markdown backends, cairn now covers the
+  industry-mainstream lineup at Tier-1 + Tier-2.
+- **Same-file callee resolution across every backend.** Every
+  backend that emits call refs now runs a post-pass that fills in
+  `target_qualified` for callees defined in the same file, so the
+  default `find_references(outgoing)` and the new `find_callees`
+  return a meaningful call graph without requiring agents to set
+  `include_noise=true`. Cross-file callees stay unresolved by
+  design and remain reachable via `include_noise`.
+- **Unified impl-kind taxonomy across backends.** Class/interface/
+  trait/protocol/mixin/extension relationships are reported using a
+  four-label set — `inherit`, `implement`, `mixin`, `extension` —
+  regardless of source language. `find_subtypes` and
+  `find_supertypes` therefore return edges that compare cleanly
+  across languages.
+
+### Internal
+
+- Versions bumped to 0.3.0 across the workspace, plugin manifests,
+  and README. README CLI section, the plugin nudge hints, and the
+  `find_impls` references in language analyzer doc comments are all
+  updated to the new vocabulary.
+
 ## [0.2.0] — 2026-06-10
 
 ### Breaking
@@ -570,6 +635,7 @@ upgrade path. Re-register your repos.
   own manifest-retention mechanism (e.g. an explicit history table
   or a reflog-style pin).
 
+[0.3.0]: https://github.com/naoto256/cairn/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/naoto256/cairn/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/naoto256/cairn/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/naoto256/cairn/compare/v0.1.0-alpha.3...v0.1.0
