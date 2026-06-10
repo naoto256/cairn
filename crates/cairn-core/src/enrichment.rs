@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use cairn_lang_api::LanguageBackend;
 use cairn_proto::{LanguageEnrichment, SourceTier};
 use rusqlite::{Connection, params};
 
 use crate::Result;
+use crate::workspace_analyzer::all_workspace_analyzers;
 
 /// Build the per-language enrichment matrix for one manifest.
 pub(crate) fn collect_enrichment(
@@ -20,6 +23,10 @@ pub(crate) fn collect_enrichment(
     let parser_ids = stmt
         .query_map(params![manifest_id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let workspace_analyzer_ids = all_workspace_analyzers()
+        .into_iter()
+        .map(|a| (a.parser_id(), a.id()))
+        .collect::<HashSet<_>>();
 
     let mut out: Vec<LanguageEnrichment> = Vec::with_capacity(parser_ids.len());
     for parser_id in parser_ids {
@@ -28,7 +35,10 @@ pub(crate) fn collect_enrichment(
             .find(|b| b.parser_id() == parser_id)
             .map(|b| b.as_ref());
         let language = backend.map_or_else(|| short_lang_name(&parser_id), |b| b.name().into());
-        let has_analyzer = backend.is_some_and(|b| b.analyzer().is_some());
+        let has_analyzer = backend.is_some_and(|b| b.analyzer().is_some())
+            || workspace_analyzer_ids
+                .iter()
+                .any(|(workspace_parser_id, _)| *workspace_parser_id == parser_id);
         let analyzer_id = backend.and_then(|b| b.analyzer().map(|a| a.name()));
         let tier = if manifest_has_analyzer_run(conn, manifest_id, &parser_id, analyzer_id)? {
             SourceTier::Semantic
@@ -126,6 +136,32 @@ mod tests {
         assert_eq!(enrichment[0].language, "empty");
         assert_eq!(enrichment[0].tier, SourceTier::Syntactic);
         assert!(enrichment[0].has_analyzer);
+    }
+
+    #[test]
+    fn registered_workspace_analyzer_marks_manifest_as_analyzable() {
+        let (_tmp, conn) = fresh_store();
+        seed_manifest_blob(&conn, "sha-workspace", "fake-parser", None, None);
+        let backends: Vec<Box<dyn LanguageBackend>> = Vec::new();
+
+        let enrichment = collect_enrichment(&conn, 1, &backends).unwrap();
+        assert_eq!(enrichment.len(), 1);
+        assert_eq!(enrichment[0].language, "fake-parser");
+        assert_eq!(enrichment[0].tier, SourceTier::Syntactic);
+        assert!(enrichment[0].has_analyzer);
+    }
+
+    #[test]
+    fn parser_without_tier2_or_workspace_analyzer_is_not_analyzable() {
+        let (_tmp, conn) = fresh_store();
+        seed_manifest_blob(&conn, "sha-plain", "tree-sitter-plain", None, None);
+        let backends: Vec<Box<dyn LanguageBackend>> = Vec::new();
+
+        let enrichment = collect_enrichment(&conn, 1, &backends).unwrap();
+        assert_eq!(enrichment.len(), 1);
+        assert_eq!(enrichment[0].language, "plain");
+        assert_eq!(enrichment[0].tier, SourceTier::Syntactic);
+        assert!(!enrichment[0].has_analyzer);
     }
 
     fn fresh_store() -> (tempfile::TempDir, Connection) {
