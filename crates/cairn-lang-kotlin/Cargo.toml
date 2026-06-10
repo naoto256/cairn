@@ -1,0 +1,21 @@
+[package]
+name = "cairn-lang-kotlin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Kotlin language backend (tree-sitter floor plus blob-scoped Tier-2 analyzer)."
+
+[dependencies]
+cairn-lang-api.workspace = true
+cairn-lang-treesitter-generic.workspace = true
+tree-sitter.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+linkme.workspace = true
+
+[lints]
+workspace = true
