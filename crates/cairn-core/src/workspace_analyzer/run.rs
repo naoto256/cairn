@@ -10,11 +10,13 @@ use crate::manifest::{ManifestEntry, ManifestId};
 use crate::{Error, Result};
 
 use super::persist::persist_resolved_refs;
-use super::{WorkspaceAnalyzer, WorkspaceFile, all_workspace_analyzers};
+use super::{AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFile, all_workspace_analyzers};
 
-// Large LSP-backed workspaces can spend minutes on cold-start indexing. Bound
-// each backend so a stuck analyzer is recorded and the synchronous CLI returns.
-pub(crate) const WORKSPACE_ANALYZER_TIMEOUT: Duration = Duration::from_secs(600);
+// Timeout is a hang detector, not a total work cap. T3 measured nlohmann's
+// C++ pass advancing through 47.4k definition sites with zero request errors
+// beyond the old 600s wall-clock cap, so only stop when the analyzer-side
+// progress beacon itself stalls.
+pub(crate) const ANALYZER_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Run registered workspace analyzers over a manifest and persist
 /// facts that can be mapped back to existing CAS rows.
@@ -39,7 +41,7 @@ pub fn run_registered_workspace_analyzers(
         entries,
         now_ns,
         all_workspace_analyzers(),
-        WORKSPACE_ANALYZER_TIMEOUT,
+        ANALYZER_STALL_TIMEOUT,
     )
 }
 
@@ -59,7 +61,7 @@ pub(super) fn run_workspace_analyzers(
         entries,
         now_ns,
         analyzers,
-        WORKSPACE_ANALYZER_TIMEOUT,
+        ANALYZER_STALL_TIMEOUT,
     )
 }
 
@@ -70,7 +72,7 @@ pub(super) fn run_workspace_analyzers_with_timeout(
     entries: &[ManifestEntry],
     now_ns: i64,
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
-    analyzer_timeout: Duration,
+    analyzer_stall_timeout: Duration,
 ) -> Result<usize> {
     let mut inserted = 0;
 
@@ -100,7 +102,7 @@ pub(super) fn run_workspace_analyzers_with_timeout(
                 manifest_id,
                 entries,
                 now_ns,
-                analyzer_timeout,
+                analyzer_stall_timeout,
                 job_id: None,
             },
         )?;
@@ -116,7 +118,7 @@ pub(crate) struct AnalyzerRunRequest<'a> {
     pub(crate) manifest_id: ManifestId,
     pub(crate) entries: &'a [ManifestEntry],
     pub(crate) now_ns: i64,
-    pub(crate) analyzer_timeout: Duration,
+    pub(crate) analyzer_stall_timeout: Duration,
     pub(crate) job_id: Option<i64>,
 }
 
@@ -137,7 +139,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         manifest_id,
         entries,
         now_ns,
-        analyzer_timeout,
+        analyzer_stall_timeout,
         job_id,
     } = request;
     let analyzer_id = analyzer.id();
@@ -182,8 +184,13 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         },
     )?;
 
-    match analyze_workspace_with_timeout(analyzer, repo_root, manifest_id, &files, analyzer_timeout)
-    {
+    match analyze_workspace_with_timeout(
+        analyzer,
+        repo_root,
+        manifest_id,
+        &files,
+        analyzer_stall_timeout,
+    ) {
         AnalyzerRun::Completed(Ok(facts)) => {
             let inserted_refs =
                 persist_resolved_refs(conn, manifest_id, analyzer_id, parser_id, &facts)?;
@@ -247,11 +254,11 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             })
         }
         AnalyzerRun::TimedOut { timeout } => {
-            let message = format!("analyzer timed out after {}s", timeout.as_secs());
+            let message = format!("analyzer stalled: no progress for {}s", timeout.as_secs());
             warn!(
                 analyzer_id,
                 timeout_secs = timeout.as_secs(),
-                "workspace analyzer timed out"
+                "workspace analyzer stalled"
             );
             mark_run(
                 conn,
@@ -291,17 +298,37 @@ fn analyze_workspace_with_timeout(
     let repo_root = repo_root.to_path_buf();
     let files = files.to_vec();
     let (tx, rx) = mpsc::channel();
+    let progress = AnalyzerProgress::default();
+    let worker_progress = progress.clone();
     std::thread::spawn(move || {
-        let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files);
+        let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files, &worker_progress);
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(timeout) {
-        Ok(result) => AnalyzerRun::Completed(result),
-        Err(mpsc::RecvTimeoutError::Timeout) => AnalyzerRun::TimedOut { timeout },
-        Err(mpsc::RecvTimeoutError::Disconnected) => AnalyzerRun::Completed(Err(
-            Error::InvalidArgument("workspace analyzer worker disconnected".to_string()),
-        )),
+    let mut last_progress = progress.snapshot();
+    loop {
+        match rx.recv_timeout(timeout) {
+            Ok(result) => return AnalyzerRun::Completed(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let current_progress = progress.snapshot();
+                if current_progress != last_progress {
+                    debug!(
+                        progress = current_progress,
+                        previous_progress = last_progress,
+                        stall_window_secs = timeout.as_secs(),
+                        "workspace analyzer still making progress"
+                    );
+                    last_progress = current_progress;
+                    continue;
+                }
+                return AnalyzerRun::TimedOut { timeout };
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return AnalyzerRun::Completed(Err(Error::InvalidArgument(
+                    "workspace analyzer worker disconnected".to_string(),
+                )));
+            }
+        }
     }
 }
 

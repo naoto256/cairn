@@ -31,8 +31,8 @@ use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrateg
 use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
-    WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
+    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
 };
 use cairn_lang_api::LanguageBackend as _;
 use cairn_lang_kotlin::KotlinBackend;
@@ -74,8 +74,9 @@ impl WorkspaceAnalyzer for KotlinLanguageServerWorkspaceAnalyzer {
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_kotlin_language_server_passes(repo_root, files)
+        run_kotlin_language_server_passes(repo_root, files, progress)
     }
 }
 
@@ -97,11 +98,22 @@ fn kotlin_config_paths() -> &'static [&'static str] {
 fn run_kotlin_language_server_passes(
     repo_root: &Path,
     files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
-    let mut facts =
-        run_kotlin_language_server_pass(repo_root, files, RefKind::Call, collect_call_sites)?;
-    let type_facts =
-        run_kotlin_language_server_pass(repo_root, files, RefKind::Type, collect_type_refs)?;
+    let mut facts = run_kotlin_language_server_pass(
+        repo_root,
+        files,
+        RefKind::Call,
+        collect_call_sites,
+        progress,
+    )?;
+    let type_facts = run_kotlin_language_server_pass(
+        repo_root,
+        files,
+        RefKind::Type,
+        collect_type_refs,
+        progress,
+    )?;
     facts.resolved_refs.extend(type_facts.resolved_refs);
     Ok(facts)
 }
@@ -111,6 +123,7 @@ fn run_kotlin_language_server_pass(
     files: &[WorkspaceFile],
     ref_kind: RefKind,
     collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+    progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
     run_lsp_definition_pass(
         LspDefinitionPass {
@@ -148,6 +161,7 @@ fn run_kotlin_language_server_pass(
         },
         repo_root,
         files,
+        progress,
     )
 }
 
@@ -494,6 +508,7 @@ typealias Alias = Result<Widget>
                 blob_sha: "blob".into(),
                 worktree_path: Some(source.to_path_buf()),
             }],
+            &AnalyzerProgress::default(),
         )
         .unwrap()
     }
