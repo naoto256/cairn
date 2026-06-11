@@ -12,7 +12,9 @@ use tracing::info;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::register::register_repo_force_analyzers as cas_register;
+use crate::register::{
+    register_repo_force_analyzers as cas_register, register_repo_force_analyzers_enqueue,
+};
 use crate::{Error, Result};
 
 struct ReindexRepo;
@@ -34,6 +36,7 @@ impl ControlMethod for ReindexRepo {
                 .as_nanos(),
         )
         .unwrap_or(i64::MAX);
+        let job_manager = ctx.job_manager.clone();
 
         let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
@@ -44,7 +47,17 @@ impl ControlMethod for ReindexRepo {
             })?;
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let mut conn = cas_store::open(&store_path)?;
-            cas_register(&mut conn, &PathBuf::from(&entry.root_path), now_ns)
+            match job_manager.as_deref() {
+                Some(manager) => register_repo_force_analyzers_enqueue(
+                    &mut conn,
+                    &alias,
+                    &entry.repo_hash,
+                    &PathBuf::from(&entry.root_path),
+                    now_ns,
+                    manager,
+                ),
+                None => cas_register(&mut conn, &PathBuf::from(&entry.root_path), now_ns),
+            }
         })
         .await
         .map_err(|e| Error::InvalidArgument(format!("reindex_repo task panicked: {e}")))??;
@@ -55,7 +68,14 @@ impl ControlMethod for ReindexRepo {
             blobs_parsed = outcome.blobs_parsed,
             "reindex_repo complete"
         );
-        Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap())
+        let mut value = serde_json::to_value(Ack::with_alias(args.alias)).unwrap();
+        if let serde_json::Value::Object(obj) = &mut value {
+            obj.insert(
+                "jobs".into(),
+                serde_json::to_value(&outcome.analyzer_jobs).unwrap(),
+            );
+        }
+        Ok(value)
     }
 }
 

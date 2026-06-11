@@ -30,6 +30,7 @@ use tokio::sync::Notify;
 use tracing::debug;
 
 use crate::daemon::LineHandler;
+use crate::jobs::JobManager;
 use crate::jsonrpc_errors;
 use crate::paths::CasDataDir;
 use crate::watcher::WatchManager;
@@ -67,6 +68,7 @@ pub struct CtlCtx {
     pub cas_data_dir: Arc<CasDataDir>,
     pub shutdown: Arc<Notify>,
     pub watch_manager: Option<Arc<WatchManager>>,
+    pub job_manager: Option<Arc<JobManager>>,
     pub version: &'static str,
     pub started_at: Instant,
 }
@@ -88,7 +90,7 @@ impl CtlHandler {
         shutdown: Arc<Notify>,
         version: &'static str,
     ) -> Self {
-        Self::with_watch_manager(cas_data_dir, shutdown, version, None)
+        Self::with_watch_manager_and_jobs(cas_data_dir, shutdown, version, None, None)
     }
 
     #[must_use]
@@ -97,6 +99,17 @@ impl CtlHandler {
         shutdown: Arc<Notify>,
         version: &'static str,
         watch_manager: Option<Arc<WatchManager>>,
+    ) -> Self {
+        Self::with_watch_manager_and_jobs(cas_data_dir, shutdown, version, watch_manager, None)
+    }
+
+    #[must_use]
+    pub fn with_watch_manager_and_jobs(
+        cas_data_dir: Arc<CasDataDir>,
+        shutdown: Arc<Notify>,
+        version: &'static str,
+        watch_manager: Option<Arc<WatchManager>>,
+        job_manager: Option<Arc<JobManager>>,
     ) -> Self {
         let mut methods: HashMap<&'static str, Box<dyn ControlMethod>> = HashMap::new();
         for ctor in CONTROL_METHODS {
@@ -108,6 +121,7 @@ impl CtlHandler {
                 cas_data_dir,
                 shutdown,
                 watch_manager,
+                job_manager,
                 version,
                 started_at: Instant::now(),
             },

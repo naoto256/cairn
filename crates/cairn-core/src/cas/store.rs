@@ -27,12 +27,12 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_to_version_4() {
+    fn migrations_run_to_version_5() {
         let (_tmp, c) = fresh();
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_adds_workspace_analysis_runs_from_v3() {
+    fn migrations_run_to_version_5_from_v3() {
         let mut c = Connection::open_in_memory().unwrap();
         crate::migration::apply(&mut c, &crate::cas::schema::MIGRATIONS[..2]).unwrap();
         c.execute_batch("PRAGMA user_version = 3").unwrap();
@@ -151,8 +151,50 @@ mod tests {
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         assert!(table_exists(&c, "workspace_analysis_runs"));
+    }
+
+    #[test]
+    fn v5_migrates_pending_and_timed_out_runs() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::migration::apply(&mut c, &crate::cas::schema::MIGRATIONS[..4]).unwrap();
+        c.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns, error)
+             VALUES
+               (1, 'queued-lsp', 1, 'cfg', 'pending', 10, NULL),
+               (1, 'timeout-lsp', 1, 'cfg', 'failed', 10, 'analyzer timed out after 600s')",
+            [],
+        )
+        .unwrap();
+
+        crate::migration::apply(&mut c, crate::cas::schema::MIGRATIONS).unwrap();
+
+        let rows: Vec<(String, String, Option<i64>, i64)> = c
+            .prepare(
+                "SELECT analyzer_id, status, job_id, cancel_requested
+                 FROM workspace_analysis_runs ORDER BY analyzer_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("queued-lsp".into(), "queued".into(), None, 0),
+                ("timeout-lsp".into(), "timed_out".into(), None, 0),
+            ]
+        );
     }
 
     #[test]
@@ -168,7 +210,7 @@ mod tests {
             "INSERT INTO workspace_analysis_runs
                (manifest_id, analyzer_id, analyzer_revision, config_hash,
                 status, started_at_ns)
-             VALUES (1, 'rust-analyzer-lsp', 1, 'cfg-a', 'pending', 10)",
+             VALUES (1, 'rust-analyzer-lsp', 1, 'cfg-a', 'queued', 10)",
             [],
         )
         .unwrap();
@@ -178,7 +220,7 @@ mod tests {
                 "INSERT INTO workspace_analysis_runs
                    (manifest_id, analyzer_id, analyzer_revision, config_hash,
                     status, started_at_ns)
-                 VALUES (1, 'rust-analyzer-lsp', 2, 'cfg-b', 'pending', 20)",
+                 VALUES (1, 'rust-analyzer-lsp', 2, 'cfg-b', 'queued', 20)",
                 [],
             )
             .unwrap_err();
@@ -195,7 +237,15 @@ mod tests {
         )
         .unwrap();
 
-        for status in ["pending", "running", "succeeded", "failed", "skipped"] {
+        for status in [
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "skipped",
+            "cancelled",
+            "timed_out",
+        ] {
             c.execute(
                 "INSERT INTO workspace_analysis_runs
                    (manifest_id, analyzer_id, analyzer_revision, config_hash,

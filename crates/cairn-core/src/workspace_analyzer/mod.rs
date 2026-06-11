@@ -37,6 +37,10 @@ pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, run_lsp_definition_pass,
 };
 pub use run::run_registered_workspace_analyzers;
+pub(crate) use run::{
+    AnalyzerRunRequest, RunRecord, RunStatus, WORKSPACE_ANALYZER_TIMEOUT, config_hash, mark_run,
+    run_one_workspace_analyzer_with_timeout,
+};
 
 /// Linker-time registry of workspace analyzers.
 ///
@@ -715,7 +719,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row.0, "failed");
+        assert_eq!(row.0, "timed_out");
         assert!(
             row.1
                 .as_deref()

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use cairn_lang_api::{LanguageBackend, all_backends};
 use cairn_proto::common::LanguageEnrichment;
+use cairn_proto::control::JobSnapshot;
 use cairn_proto::methods::{ListReposResult, RepoEntry, SnapshotEntry};
 use linkme::distributed_slice;
 use rusqlite::params;
@@ -36,10 +37,12 @@ impl DataMethod for ListRepos {
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
                 let conn = cas_store::open(&store_path)?;
                 let snapshots = collect_snapshots(&conn, &backends)?;
+                let jobs = collect_jobs(&conn, &entry.alias)?;
                 out.push(RepoEntry {
                     alias: entry.alias,
                     root: entry.root_path,
                     snapshots,
+                    jobs,
                 });
             }
             Ok(out)
@@ -49,6 +52,30 @@ impl DataMethod for ListRepos {
 
         Ok(serde_json::to_value(ListReposResult { repos }).unwrap())
     }
+}
+
+fn collect_jobs(conn: &rusqlite::Connection, alias: &str) -> Result<Vec<JobSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
+         FROM workspace_analysis_runs
+         WHERE job_id IS NOT NULL
+         ORDER BY job_id DESC",
+    )?;
+    let jobs = stmt
+        .query_map([], |r| {
+            Ok(JobSnapshot {
+                job_id: r.get(0)?,
+                alias: alias.to_string(),
+                analyzer_id: r.get(1)?,
+                state: r.get(2)?,
+                created_at: r.get(3)?,
+                started_at: None,
+                finished_at: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(jobs)
 }
 
 #[allow(unsafe_code)]

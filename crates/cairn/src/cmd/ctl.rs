@@ -7,10 +7,13 @@
 
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
-use cairn_proto::control::{DoctorReport, DoctorStatus, PruneResult, StatusReport};
+use cairn_proto::control::{
+    DoctorReport, DoctorStatus, JobsCancelResult, JobsListResult, PruneResult, StatusReport,
+};
 use cairn_proto::jsonrpc::{JsonRpcVersion, Request, RequestId, Response};
 use clap::{Args as ClapArgs, Subcommand};
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -39,7 +42,30 @@ enum CtlCommand {
     /// Show daemon health, registered repos, and snapshot progress.
     Status,
     /// Force a full re-index of `alias`.
-    ReindexRepo { alias: String },
+    ReindexRepo {
+        alias: String,
+        /// Wait until queued analyzer jobs reach terminal states.
+        #[arg(long)]
+        wait: bool,
+        /// Maximum seconds to wait with `--wait`.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// List or cancel background analyzer jobs.
+    Jobs {
+        /// Restrict listing to one repo alias.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Restrict listing to one state.
+        #[arg(long)]
+        state: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Cancel a job by id.
+        #[arg(long)]
+        cancel: Option<i64>,
+    },
     /// Delete cached blobs whose parser IDs no current backend owns.
     Prune {
         /// Restrict pruning to one registered repo alias.
@@ -58,7 +84,7 @@ pub async fn run(args: Args) -> Result<()> {
         None => SocketPaths::from_platform_default()?,
     };
 
-    let (method, params) = match args.command {
+    let (method, params, wait_after, json_output) = match args.command {
         CtlCommand::RegisterRepo { path, alias } => {
             let canon = path
                 .canonicalize()
@@ -66,23 +92,54 @@ pub async fn run(args: Args) -> Result<()> {
             (
                 "register_repo",
                 json!({"path": canon.to_string_lossy(), "alias": alias}),
+                None,
+                false,
             )
         }
-        CtlCommand::RemoveRepo { alias } => ("remove_repo", json!({"alias": alias})),
-        CtlCommand::Status => ("status", Value::Null),
-        CtlCommand::ReindexRepo { alias } => ("reindex_repo", json!({"alias": alias})),
-        CtlCommand::Prune { repo } => ("prune", json!({"repo": repo})),
-        CtlCommand::Doctor => ("doctor", Value::Null),
-        CtlCommand::Shutdown => ("shutdown", Value::Null),
+        CtlCommand::RemoveRepo { alias } => ("remove_repo", json!({"alias": alias}), None, false),
+        CtlCommand::Status => ("status", Value::Null, None, false),
+        CtlCommand::ReindexRepo {
+            alias,
+            wait,
+            timeout,
+        } => (
+            "reindex_repo",
+            json!({"alias": alias.clone()}),
+            wait.then_some((alias, Duration::from_secs(timeout.unwrap_or(u64::MAX)))),
+            false,
+        ),
+        CtlCommand::Jobs {
+            alias,
+            state,
+            json,
+            cancel,
+        } => match cancel {
+            Some(job_id) => ("jobs.cancel", json!({"job_id": job_id}), None, json),
+            None => (
+                "jobs.list",
+                json!({"alias": alias, "state": state}),
+                None,
+                json,
+            ),
+        },
+        CtlCommand::Prune { repo } => ("prune", json!({"repo": repo}), None, false),
+        CtlCommand::Doctor => ("doctor", Value::Null, None, false),
+        CtlCommand::Shutdown => ("shutdown", Value::Null, None, false),
     };
 
     let resp = round_trip(&paths.control, method, params)
         .await
         .with_context(|| format!("talking to {}", paths.control.display()))?;
-    render(method, &resp);
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&resp.result).unwrap());
+    } else {
+        render(method, &resp);
+    }
 
     if let Some(err) = resp.error {
         Err(anyhow!(err.message))
+    } else if let Some((alias, timeout)) = wait_after {
+        wait_for_jobs(&paths.control, &alias, timeout).await
     } else {
         Ok(())
     }
@@ -147,9 +204,94 @@ fn render(method: &str, resp: &Response) {
                 return;
             }
         }
+        "jobs.list" => {
+            if let Ok(report) = serde_json::from_value::<JobsListResult>(value.clone()) {
+                render_jobs(&report);
+                return;
+            }
+        }
+        "jobs.cancel" => {
+            if let Ok(report) = serde_json::from_value::<JobsCancelResult>(value.clone()) {
+                println!("cancelled={} {}", report.cancelled, report.reason);
+                return;
+            }
+        }
         _ => {}
     }
+    if let Some(jobs) = value.get("jobs").and_then(Value::as_array) {
+        println!("queued {} analyzer job(s)", jobs.len());
+        for job in jobs {
+            let id = job
+                .get("job_id")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let analyzer = job
+                .get("analyzer_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let state = job
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            println!("job {id}: {analyzer} -> {state}");
+        }
+        return;
+    }
     println!("ok");
+}
+
+async fn wait_for_jobs(
+    socket_path: &std::path::Path,
+    alias: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let resp = round_trip(socket_path, "jobs.list", json!({"alias": alias})).await?;
+        if let Some(err) = resp.error {
+            return Err(anyhow!(err.message));
+        }
+        let Some(value) = resp.result else {
+            return Err(anyhow!("jobs.list returned no result"));
+        };
+        let report: JobsListResult = serde_json::from_value(value)?;
+        let unfinished = report
+            .jobs
+            .iter()
+            .filter(|job| matches!(job.state.as_str(), "queued" | "running"))
+            .count();
+        if unfinished == 0 {
+            println!("all jobs reached terminal state");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(anyhow!("timeout waiting for {unfinished} job(s)"));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn render_jobs(r: &JobsListResult) {
+    if r.jobs.is_empty() {
+        println!("no jobs");
+        return;
+    }
+    for job in &r.jobs {
+        let finished = job
+            .finished_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into());
+        match &job.error {
+            Some(error) => println!(
+                "job {}: {} {} -> {} finished={} error={}",
+                job.job_id, job.alias, job.analyzer_id, job.state, finished, error
+            ),
+            None => println!(
+                "job {}: {} {} -> {} finished={}",
+                job.job_id, job.alias, job.analyzer_id, job.state, finished
+            ),
+        }
+    }
 }
 
 fn render_prune(r: &PruneResult) {
@@ -183,6 +325,12 @@ fn render_status(r: &StatusReport) {
                 snap.file_count,
                 snap.symbol_count,
                 snap.size_bytes,
+            );
+        }
+        for job in &repo.jobs {
+            println!(
+                "      job {}: {} -> {}",
+                job.job_id, job.analyzer_id, job.state
             );
         }
     }

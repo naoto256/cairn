@@ -27,6 +27,7 @@ impl ControlMethod for Status {
         let uptime = ctx.started_at.elapsed().as_secs();
         let version = ctx.version.to_string();
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let job_manager = ctx.job_manager.clone();
 
         let repos = tokio::task::spawn_blocking(move || -> Result<Vec<RepoStatus>> {
             let backends = all_backends();
@@ -38,10 +39,28 @@ impl ControlMethod for Status {
                 let store_bytes = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
                 let conn = cas_store::open(&store_path)?;
                 let snapshots = collect_anchor_snapshots(&conn, store_bytes, &backends)?;
+                let jobs = match &job_manager {
+                    Some(manager) => manager
+                        .jobs(Some(&entry.alias), None)?
+                        .into_iter()
+                        .map(|job| cairn_proto::control::JobSnapshot {
+                            job_id: job.job_id,
+                            alias: job.alias,
+                            analyzer_id: job.analyzer_id,
+                            state: job.state,
+                            created_at: job.created_at,
+                            started_at: job.started_at,
+                            finished_at: job.finished_at,
+                            error: job.error,
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
                 out.push(RepoStatus {
                     alias: entry.alias,
                     root: entry.root_path,
                     snapshots,
+                    jobs,
                 });
             }
             Ok(out)

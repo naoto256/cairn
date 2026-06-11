@@ -246,6 +246,11 @@ cairn ctl status
 A repo can carry more than one alias; removing one keeps the on-disk
 store alive while any other label still references it.
 
+Tier-3 workspace analyzers run in daemon background jobs. Use
+`cairn ctl jobs --alias my-proj` to inspect queued/running/completed
+analyzer work, or `cairn ctl reindex-repo my-proj --wait` when a
+script needs to block until the current jobs finish.
+
 ## Languages
 
 | Language | Tier-1 (syntax) | Tier-2 (semantic) | Tier-3 (cross-file) |
