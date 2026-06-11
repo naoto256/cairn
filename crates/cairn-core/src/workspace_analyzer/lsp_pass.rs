@@ -13,7 +13,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use cairn_proto::RefKind;
-use tracing::debug;
+use futures::{StreamExt, stream};
+use tracing::{debug, warn};
 
 use crate::lsp::pool::{self as lsp_pool, LspSpawnSpec, PoolKey, PooledLsp};
 use crate::lsp::{Location, Position, Url};
@@ -23,6 +24,7 @@ use super::path::location_to_repo_path;
 use super::{ResolvedRef, WorkspaceFacts, WorkspaceFile};
 
 const MAX_DEFINITION_ATTEMPTS: usize = 3;
+const DEFINITION_PIPELINE_CONCURRENCY: usize = 16;
 const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(100);
 const TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -148,21 +150,22 @@ async fn collect_resolved_refs(
             .sync_document(&uri, &source)
             .await
             .map_err(Error::Lsp)?;
-        for site in sites {
-            let locations = definition_with_retry_from(
-                || client.definition(&uri, site.position),
-                retry,
-                analyzer_id,
-                &uri,
-                site.position,
-            )
-            .await?;
-            for target in locations {
+        let client = &*client;
+        let resolved_sites = collect_definition_site_locations(
+            sites,
+            |site| client.definition(&uri, site.position),
+            retry,
+            analyzer_id,
+            &uri,
+        )
+        .await;
+        for resolved_site in resolved_sites {
+            for target in resolved_site.locations {
                 let target_path = location_to_repo_path(repo_root, &target);
                 facts.resolved_refs.push(ResolvedRef {
                     source_path: file.path.clone(),
-                    source_position: site.position,
-                    source_byte_range: site.byte_start..site.byte_end,
+                    source_position: resolved_site.site.position,
+                    source_byte_range: resolved_site.site.byte_start..resolved_site.site.byte_end,
                     kind: ref_kind,
                     target,
                     target_path,
@@ -171,6 +174,68 @@ async fn collect_resolved_refs(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDefinitionSite {
+    site: DefinitionSite,
+    locations: Vec<Location>,
+}
+
+async fn collect_definition_site_locations<F, Fut>(
+    sites: Vec<DefinitionSite>,
+    definition: F,
+    retry: DefinitionRetryPolicy,
+    analyzer_id: &str,
+    uri: &Url,
+) -> Vec<ResolvedDefinitionSite>
+where
+    F: Fn(DefinitionSite) -> Fut,
+    Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
+{
+    let mut results = stream::iter(sites)
+        .map(|site| {
+            let definition = &definition;
+            async move {
+                let result = definition_with_retry_from(
+                    || definition(site),
+                    retry,
+                    analyzer_id,
+                    uri,
+                    site.position,
+                )
+                .await;
+                (site, result)
+            }
+        })
+        .buffer_unordered(DEFINITION_PIPELINE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_by_key(|(site, _)| {
+        (
+            site.position.line,
+            site.position.character,
+            site.byte_start,
+            site.byte_end,
+        )
+    });
+
+    let mut resolved = Vec::new();
+    for (site, result) in results {
+        match result {
+            Ok(locations) => resolved.push(ResolvedDefinitionSite { site, locations }),
+            Err(err) => {
+                warn!(
+                    analyzer_id,
+                    uri = uri.as_str(),
+                    ?site,
+                    error = %err,
+                    "definition request failed; skipping site"
+                );
+            }
+        }
+    }
+    resolved
 }
 
 async fn definition_with_retry_from<F, Fut>(
@@ -239,6 +304,11 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::future::ready;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Instant;
 
     use crate::lsp::{CONTENT_MODIFIED_ERROR_CODE, Range};
 
@@ -266,6 +336,24 @@ mod tests {
                     character: 7,
                 },
             },
+        }
+    }
+
+    fn test_location_at(line: u32) -> Location {
+        Location {
+            uri: test_uri(),
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 1 },
+            },
+        }
+    }
+
+    fn test_site(line: u32) -> DefinitionSite {
+        DefinitionSite {
+            position: Position { line, character: 0 },
+            byte_start: line as usize,
+            byte_end: line as usize + 1,
         }
     }
 
@@ -425,5 +513,85 @@ mod tests {
 
         assert!(matches!(err, Error::Lsp(_)));
         assert_eq!(attempts.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn definition_sites_are_pipelined_with_bounded_concurrency() {
+        let sites = (0..100).map(test_site).collect::<Vec<_>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Instant::now();
+        let resolved = collect_definition_site_locations(
+            sites,
+            {
+                let calls = Arc::clone(&calls);
+                move |site| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Ok::<_, crate::lsp::Error>(vec![test_location_at(site.position.line)])
+                    }
+                }
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 100);
+        assert_eq!(resolved.len(), 100);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "definition pipeline took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_site_errors_skip_only_the_failed_site() {
+        let sites = (0..5).map(test_site).collect::<Vec<_>>();
+        let resolved = collect_definition_site_locations(
+            sites,
+            |site| async move {
+                if site.position.line == 2 {
+                    Err(crate::lsp::Error::Protocol("boom".into()))
+                } else {
+                    Ok(vec![test_location_at(site.position.line)])
+                }
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+        )
+        .await;
+
+        let lines = resolved
+            .iter()
+            .map(|resolved| resolved.site.position.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![0, 1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn definition_site_results_are_sorted_by_source_position() {
+        let sites = vec![test_site(9), test_site(1), test_site(5)];
+        let resolved = collect_definition_site_locations(
+            sites,
+            |site| async move {
+                tokio::time::sleep(Duration::from_millis(u64::from(10 - site.position.line))).await;
+                Ok::<_, crate::lsp::Error>(vec![test_location_at(site.position.line)])
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+        )
+        .await;
+
+        let lines = resolved
+            .iter()
+            .map(|resolved| resolved.site.position.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![1, 5, 9]);
     }
 }
