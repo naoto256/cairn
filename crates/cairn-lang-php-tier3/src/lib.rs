@@ -116,6 +116,7 @@ fn run_phpantom_lsp_pass(
                 readiness: ReadinessStrategy::InitializeResponseOnly,
                 language_id: "php",
                 launch_args: Vec::new(),
+                env: Vec::new(),
                 initialization_options: json!({}),
             },
             retry: DefinitionRetryPolicy {
@@ -503,6 +504,7 @@ class Declared extends BaseWidget implements IWidget {
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "php",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),

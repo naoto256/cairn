@@ -263,6 +263,7 @@ dependencies = [
  "cairn-core",
  "cairn-lang-api",
  "cairn-lang-csharp",
+ "dirs",
  "linkme",
  "serde_json",
  "tempfile",

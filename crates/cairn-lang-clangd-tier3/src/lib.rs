@@ -282,6 +282,7 @@ fn clangd_spawn_spec(language: ClangdLanguage, repo_root: &Path) -> LspSpawnSpec
         readiness: ReadinessStrategy::InitializeResponseOnly,
         language_id: language.language_id,
         launch_args: Vec::new(),
+        env: Vec::new(),
         initialization_options: json!({
             "fallbackFlags": language.fallback_flags,
         }),
@@ -788,6 +789,7 @@ void f() { normal(); }
                         target_uri,
                         close_log.to_string_lossy().to_string(),
                     ],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),
@@ -867,6 +869,7 @@ void f() { normal(); }
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "c",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),

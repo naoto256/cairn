@@ -333,6 +333,7 @@ time.sleep(0.05)
     let err = match LspClient::start_configured(
         &python,
         vec![script.to_string_lossy().to_string()],
+        Vec::new(),
         tmp.path(),
         json!({}),
         Duration::from_secs(1),
@@ -350,6 +351,80 @@ time.sleep(0.05)
         message.contains("stderr: mock startup failure"),
         "{message}"
     );
+}
+
+#[tokio::test]
+async fn start_configured_passes_env_to_spawned_server() {
+    let Some(python) = python3() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("env_lsp.py");
+    let env_file = tmp.path().join("env.txt");
+    std::fs::write(
+        &script,
+        r#"
+import json
+import os
+import sys
+
+env_file = sys.argv[1]
+with open(env_file, "w", encoding="utf-8") as f:
+    f.write(os.environ.get("CAIRN_TEST_LSP_ENV", ""))
+
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line == b"\r\n":
+            break
+        key, value = line.decode("ascii").rstrip("\r\n").split(": ", 1)
+        headers[key.lower()] = value
+    body = sys.stdin.buffer.read(int(headers["content-length"]))
+    message = json.loads(body)
+    method = message.get("method")
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"capabilities": {}},
+        }
+        encoded = json.dumps(response).encode("utf-8")
+        sys.stdout.buffer.write(
+            b"Content-Length: " + str(len(encoded)).encode("ascii") + b"\r\n\r\n" + encoded
+        )
+        sys.stdout.buffer.flush()
+    elif method == "shutdown":
+        response = {"jsonrpc": "2.0", "id": message["id"], "result": None}
+        encoded = json.dumps(response).encode("utf-8")
+        sys.stdout.buffer.write(
+            b"Content-Length: " + str(len(encoded)).encode("ascii") + b"\r\n\r\n" + encoded
+        )
+        sys.stdout.buffer.flush()
+    elif method == "exit":
+        sys.exit(0)
+"#,
+    )
+    .unwrap();
+
+    let client = LspClient::start_configured(
+        &python,
+        vec![
+            script.to_string_lossy().to_string(),
+            env_file.to_string_lossy().to_string(),
+        ],
+        vec![("CAIRN_TEST_LSP_ENV".to_string(), "expected".to_string())],
+        tmp.path(),
+        json!({}),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "expected");
+    client.shutdown().await.unwrap();
 }
 
 #[test]

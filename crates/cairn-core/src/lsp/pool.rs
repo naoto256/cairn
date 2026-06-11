@@ -84,6 +84,7 @@ pub struct LspSpawnSpec {
     pub readiness: ReadinessStrategy,
     pub language_id: &'static str,
     pub launch_args: Vec<String>,
+    pub env: Vec<(String, String)>,
     pub initialization_options: Value,
 }
 
@@ -329,6 +330,7 @@ impl PoolEntry {
             let client = LspClient::start_configured(
                 &spec.binary,
                 spec.launch_args.clone(),
+                spec.env.clone(),
                 &spec.workspace_root,
                 spec.initialization_options.clone(),
                 spec.request_timeout,
@@ -633,6 +635,7 @@ mod tests {
             },
             language_id: "rust",
             launch_args: Vec::new(),
+            env: Vec::new(),
             initialization_options: serde_json::json!({
                 "experimental": {
                     "serverStatusNotification": true
