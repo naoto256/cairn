@@ -216,7 +216,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                     "transient: LSP content-modified during run"
                 );
                 RunStatus::Skipped
-            } else if is_binary_missing_error(&err) {
+            } else if is_analyzer_unavailable_error(&err) {
                 RunStatus::Skipped
             } else {
                 warn!(
@@ -309,8 +309,12 @@ fn is_content_modified_error(err: &Error) -> bool {
     matches!(err, Error::Lsp(lsp_err) if lsp_err.is_content_modified())
 }
 
-fn is_binary_missing_error(err: &Error) -> bool {
-    matches!(err, Error::Lsp(crate::lsp::Error::BinaryMissing(_)))
+fn is_analyzer_unavailable_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Lsp(crate::lsp::Error::BinaryMissing(_))
+            | Error::Lsp(crate::lsp::Error::WorkspaceUnsuitable(_))
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

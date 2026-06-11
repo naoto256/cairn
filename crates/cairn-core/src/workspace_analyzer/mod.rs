@@ -231,6 +231,37 @@ mod tests {
         }
     }
 
+    struct WorkspaceUnsuitableRustAnalyzer;
+
+    impl WorkspaceAnalyzer for WorkspaceUnsuitableRustAnalyzer {
+        fn id(&self) -> &'static str {
+            "rust-analyzer-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "rust"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-rust"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+        ) -> Result<WorkspaceFacts> {
+            Err(Error::Lsp(crate::lsp::Error::WorkspaceUnsuitable(
+                "Gemfile without Gemfile.lock; run bundle install to enable ruby-lsp".into(),
+            )))
+        }
+    }
+
     struct SlowRustAnalyzer;
 
     impl WorkspaceAnalyzer for SlowRustAnalyzer {
@@ -663,6 +694,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "skipped");
+    }
+
+    #[test]
+    fn workspace_unsuitable_run_is_skipped_with_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "source-sha";
+        let manifest_id = ManifestId(1);
+        let entries = vec![ManifestEntry {
+            path: "src/main.rs".into(),
+            blob_sha: source_sha.into(),
+        }];
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/main.rs', ?1)",
+            params![source_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'tree-sitter-rust', 1, 0)",
+            params![source_sha],
+        )
+        .unwrap();
+
+        let inserted = run_workspace_analyzers(
+            &mut conn,
+            &repo_root,
+            manifest_id,
+            &entries,
+            10,
+            vec![Box::new(WorkspaceUnsuitableRustAnalyzer)],
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        let (status, error): (String, String) = conn
+            .query_row(
+                "SELECT status, error FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'rust-analyzer-lsp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "skipped");
+        assert!(error.contains("Gemfile without Gemfile.lock"));
+        assert!(error.contains("run bundle install to enable ruby-lsp"));
     }
 
     #[test]
