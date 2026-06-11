@@ -143,7 +143,7 @@ async fn definition_times_out_when_server_never_replies() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::Timeout));
+    assert!(matches!(err, Error::RequestTimeout));
 }
 
 #[tokio::test]
@@ -193,7 +193,7 @@ async fn workspace_load_ignores_server_status_without_progress() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::Timeout));
+    assert!(matches!(err, Error::ReadinessTimeout));
 }
 
 #[tokio::test]
@@ -216,7 +216,7 @@ async fn workspace_load_does_not_finish_on_progress_end_without_begin() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::Timeout));
+    assert!(matches!(err, Error::ReadinessTimeout));
 }
 
 #[tokio::test]
@@ -239,7 +239,7 @@ async fn workspace_load_times_out_without_progress_end() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::Timeout));
+    assert!(matches!(err, Error::ReadinessTimeout));
 }
 
 #[tokio::test]
@@ -378,7 +378,7 @@ async fn pending_map_is_cleared_on_timeout() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Timeout));
+    assert!(matches!(err, Error::RequestTimeout));
 
     // Pending must be empty after the timed-out request returns.
     assert!(

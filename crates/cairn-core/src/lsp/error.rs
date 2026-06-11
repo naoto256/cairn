@@ -13,8 +13,10 @@ pub enum Error {
     Spawn(std::io::Error),
     #[error("LSP handshake failed: {0}")]
     Handshake(String),
+    #[error("LSP readiness timed out")]
+    ReadinessTimeout,
     #[error("LSP request timed out")]
-    Timeout,
+    RequestTimeout,
     #[error("LSP server exited{0}")]
     ServerExited(ExitStatusDetail),
     #[error("LSP protocol error: {0}")]
@@ -33,6 +35,11 @@ impl Error {
                 ..
             }
         )
+    }
+
+    #[must_use]
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::ReadinessTimeout | Self::RequestTimeout)
     }
 }
 
