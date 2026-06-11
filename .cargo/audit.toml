@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2024-0384: `instant` is unmaintained. Transitive via
+    # notify-debouncer-full -> notify-types; zero vulnerabilities.
+    # Remove this entry when the notify stack migrates to web-time.
+    "RUSTSEC-2024-0384",
+]
