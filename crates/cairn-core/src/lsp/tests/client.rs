@@ -352,6 +352,34 @@ time.sleep(0.05)
     );
 }
 
+#[test]
+fn stderr_tail_keeps_short_output_without_marker() {
+    let mut stderr = StderrTail::default();
+    stderr.push(b"line 1\nline 2\nline 3\n");
+
+    assert_eq!(stderr.text(), "line 1\nline 2\nline 3");
+}
+
+#[test]
+fn stderr_tail_keeps_head_marker_and_tail_for_long_output() {
+    let mut stderr = StderrTail::default();
+    let lines = (1..=20)
+        .map(|line| format!("line {line}: details"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    stderr.push(lines.as_bytes());
+
+    let text = stderr.text();
+    assert!(text.contains("line 1: details"), "{text}");
+    assert!(text.contains("line 5: details"), "{text}");
+    assert!(text.contains(" ... "), "{text}");
+    assert!(text.contains("line 16: details"), "{text}");
+    assert!(text.contains("line 20: details"), "{text}");
+    assert!(!text.contains("line 6: details"), "{text}");
+    assert!(!text.contains("line 15: details"), "{text}");
+}
+
 #[tokio::test]
 async fn server_work_done_progress_request_is_answered_before_definition() {
     let (client_io, server_io) = tokio::io::duplex(8192);

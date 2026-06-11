@@ -1,4 +1,4 @@
-use super::client::parse_definition_result;
+use super::client::{StderrTail, parse_definition_result};
 use super::reader::{ProgressState, WorkspaceLoadComplete, response_result};
 use super::transport::{MAX_BODY_SIZE, read_lsp_message, write_lsp_message};
 use super::*;
