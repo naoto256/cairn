@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::data_rpc::helpers::compute_tier3_status;
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -64,6 +65,11 @@ impl DataMethod for GetSymbolSource {
                     anchor_arg.as_deref(),
                     branch_arg.as_deref(),
                 )?;
+                let manifest_id = crate::anchor::resolve(&conn, &anchor)?.ok_or_else(|| {
+                    Error::AnchorNotFound {
+                        name: anchor.as_str().to_string(),
+                    }
+                })?;
                 let row = match query::get_symbol_source_row(
                     &conn,
                     &anchor,
@@ -99,6 +105,7 @@ impl DataMethod for GetSymbolSource {
                     signature: row.signature,
                     doc: row.doc,
                     source_tier: SourceTier::Syntactic,
+                    tier3_status: compute_tier3_status(&conn, manifest_id)?,
                 });
             }
 

@@ -12,7 +12,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind};
+use crate::common::{
+    Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind, Tier3Status,
+};
 use crate::control::JobSnapshot;
 
 // ─── list_repos ─────────────────────────────────────────────────────────────
@@ -186,6 +188,8 @@ pub struct OutlineResult {
     /// readable; absence is treated as `Complete`.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +312,8 @@ pub struct FindSymbolResult {
     /// appear in `items` even though the file was discovered.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +408,8 @@ pub struct FindSubtypesResult {
     /// still valid; new ones may arrive once indexing settles.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +420,8 @@ pub struct FindSupertypesResult {
     /// still valid; new ones may arrive once indexing settles.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 /// One type-relation edge — the data shape behind both
@@ -467,6 +477,8 @@ pub struct ImportsResult {
     /// edges come exclusively from semantic enrichment today.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +574,8 @@ pub struct FindReferencesResult {
     /// tag distinguishes the two for consumers that want to know.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +653,8 @@ pub struct FindCallersResult {
     pub items: Vec<CallHit>,
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,6 +662,8 @@ pub struct FindCalleesResult {
     pub items: Vec<CallHit>,
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 /// One call edge — shared by `find_callers` and `find_callees`.
@@ -741,6 +759,8 @@ pub struct GetSymbolSourceResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     pub source_tier: SourceTier,
+    #[serde(default = "Tier3Status::ready")]
+    pub tier3_status: Tier3Status,
 }
 
 // ─── register_repo / reindex ────────────────────────────────────────────────

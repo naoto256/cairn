@@ -7,7 +7,9 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
+use crate::data_rpc::helpers::{
+    completeness_for_cap, limit_with_probe, tier3_status_for_query, with_one_or_all_stores,
+};
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
 
@@ -83,9 +85,12 @@ impl DataMethod for GetOutline {
             count = items.len(),
             "outline served"
         );
+        let tier3_status =
+            tier3_status_for_query(ctx, args.repo.clone(), None, None, "get_outline").await?;
         Ok(serde_json::to_value(OutlineResult {
             items,
             completeness: completeness_for_cap(capped),
+            tier3_status,
         })
         .unwrap())
     }
