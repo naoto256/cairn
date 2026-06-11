@@ -312,6 +312,7 @@ name = "cairn-lang-java-tier3"
 version = "0.3.0"
 dependencies = [
  "cairn-core",
+ "dirs",
  "linkme",
  "serde_json",
  "tempfile",
