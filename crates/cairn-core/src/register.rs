@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas;
+use crate::jobs::{EnqueueReindex, JobManager, QueuedAnalyzerJob};
 use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
 use crate::workspace_analyzer::run_registered_workspace_analyzers;
 
@@ -41,6 +42,7 @@ pub struct RegisterOutcome {
     pub committed_manifest: ManifestId,
     pub tentative_manifest: ManifestId,
     pub analyzers_skipped_due_to_dedup: bool,
+    pub analyzer_jobs: Vec<QueuedAnalyzerJob>,
     /// Number of `(blob, parser)` pairs that were parsed fresh
     /// (= not reused from a prior call).
     pub blobs_parsed: usize,
@@ -64,7 +66,11 @@ pub fn register_repo(
         worktree_path,
         now_ns,
         true,
-        run_registered_workspace_analyzers,
+        |conn, repo_root, manifest_id, entries, now_ns| {
+            let _inserted =
+                run_registered_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns)?;
+            Ok(Vec::new())
+        },
     )
 }
 
@@ -83,7 +89,65 @@ pub(crate) fn register_repo_force_analyzers(
         worktree_path,
         now_ns,
         false,
-        run_registered_workspace_analyzers,
+        |conn, repo_root, manifest_id, entries, now_ns| {
+            let _inserted =
+                run_registered_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns)?;
+            Ok(Vec::new())
+        },
+    )
+}
+
+pub(crate) fn register_repo_enqueue_analyzers(
+    conn: &mut Connection,
+    alias: &str,
+    repo_hash: &str,
+    worktree_path: &Path,
+    now_ns: i64,
+    job_manager: &JobManager,
+) -> Result<RegisterOutcome> {
+    register_repo_inner(
+        conn,
+        worktree_path,
+        now_ns,
+        true,
+        |conn, repo_root, manifest_id, entries, now_ns| {
+            job_manager.enqueue_reindex(EnqueueReindex {
+                conn,
+                alias,
+                repo_hash,
+                repo_root,
+                manifest_id,
+                entries,
+                now_ns,
+            })
+        },
+    )
+}
+
+pub(crate) fn register_repo_force_analyzers_enqueue(
+    conn: &mut Connection,
+    alias: &str,
+    repo_hash: &str,
+    worktree_path: &Path,
+    now_ns: i64,
+    job_manager: &JobManager,
+) -> Result<RegisterOutcome> {
+    register_repo_inner(
+        conn,
+        worktree_path,
+        now_ns,
+        false,
+        |conn, repo_root, manifest_id, entries, now_ns| {
+            job_manager.enqueue_reindex(EnqueueReindex {
+                conn,
+                alias,
+                repo_hash,
+                repo_root,
+                manifest_id,
+                entries,
+                now_ns,
+            })
+        },
     )
 }
 
@@ -95,7 +159,13 @@ fn register_repo_inner<F>(
     mut run_analyzers: F,
 ) -> Result<RegisterOutcome>
 where
-    F: FnMut(&mut Connection, &Path, ManifestId, &[ManifestEntry], i64) -> Result<usize>,
+    F: FnMut(
+        &mut Connection,
+        &Path,
+        ManifestId,
+        &[ManifestEntry],
+        i64,
+    ) -> Result<Vec<QueuedAnalyzerJob>>,
 {
     let backends = all_backends();
     let include = |hint: &PathHint<'_>| {
@@ -167,10 +237,11 @@ where
         &tentative_entries,
         now_ns,
     )?;
-    if !analyzers_skipped_due_to_dedup {
-        let _workspace_refs =
-            run_analyzers(conn, worktree_path, tentative, &tentative_entries, now_ns)?;
-    }
+    let analyzer_jobs = if analyzers_skipped_due_to_dedup {
+        Vec::new()
+    } else {
+        run_analyzers(conn, worktree_path, tentative, &tentative_entries, now_ns)?
+    };
 
     Ok(RegisterOutcome {
         worktree_id,
@@ -179,6 +250,7 @@ where
         committed_manifest: committed,
         tentative_manifest: tentative,
         analyzers_skipped_due_to_dedup,
+        analyzer_jobs,
         blobs_parsed,
     })
 }
@@ -523,12 +595,12 @@ mod tests {
 
         let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
-            Ok(0)
+            Ok(Vec::new())
         })
         .unwrap();
         let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
-            Ok(0)
+            Ok(Vec::new())
         })
         .unwrap();
 
@@ -547,12 +619,12 @@ mod tests {
 
         let first = register_repo_inner(&mut conn, repo.path(), 1, false, |_, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
-            Ok(0)
+            Ok(Vec::new())
         })
         .unwrap();
         let second = register_repo_inner(&mut conn, repo.path(), 2, false, |_, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
-            Ok(0)
+            Ok(Vec::new())
         })
         .unwrap();
 

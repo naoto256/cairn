@@ -36,6 +36,47 @@ pub struct PruneRepoEntry {
     pub deleted_blob_count: u64,
 }
 
+// ─── jobs ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsListArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsCancelArgs {
+    pub job_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsListResult {
+    pub jobs: Vec<JobSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSnapshot {
+    pub job_id: i64,
+    pub alias: String,
+    pub analyzer_id: String,
+    pub state: String,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsCancelResult {
+    pub cancelled: bool,
+    pub reason: String,
+}
+
 // ─── status ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +91,8 @@ pub struct RepoStatus {
     pub alias: String,
     pub root: String,
     pub snapshots: Vec<SnapshotStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobSnapshot>,
 }
 
 impl RepoStatus {
@@ -144,6 +187,7 @@ mod status_tests {
                 symbol_count: 1,
                 size_bytes: 1,
             }],
+            jobs: Vec::new(),
         };
         assert_eq!(
             repo.languages().into_iter().collect::<Vec<_>>(),

@@ -5,11 +5,13 @@
 //! triggers a clean shutdown.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use cairn_core::ctl::CtlHandler;
 use cairn_core::daemon::Daemon;
 use cairn_core::data_rpc::DataRpc;
+use cairn_core::jobs::JobManager;
 use cairn_core::paths::CasDataDir;
 use cairn_core::sockets::SocketPaths;
 use cairn_core::watcher::WatchManager;
@@ -41,7 +43,15 @@ pub async fn run(args: Args) -> Result<()> {
     });
     cas_data_dir.ensure()?;
     info!(root = %cas_data_dir.root().display(), "storage open");
-    let watch_manager = Arc::new(WatchManager::new(cas_data_dir.clone()));
+    let job_manager = JobManager::new(cas_data_dir.clone());
+    if let Err(err) = job_manager.restore_from_db() {
+        tracing::warn!(error = %err, "failed to restore queued analyzer jobs");
+    }
+    job_manager.start_workers();
+    let watch_manager = Arc::new(WatchManager::with_jobs(
+        cas_data_dir.clone(),
+        job_manager.clone(),
+    ));
     spawn_registered_watchers(watch_manager.clone());
 
     let shutdown = Arc::new(Notify::new());
@@ -50,15 +60,17 @@ pub async fn run(args: Args) -> Result<()> {
     let daemon = Daemon {
         paths,
         data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
-        control_handler: Arc::new(CtlHandler::with_watch_manager(
+        control_handler: Arc::new(CtlHandler::with_watch_manager_and_jobs(
             cas_data_dir,
             shutdown.clone(),
             env!("CARGO_PKG_VERSION"),
             Some(watch_manager),
+            Some(job_manager.clone()),
         )),
         shutdown,
     };
     daemon.run().await?;
+    job_manager.shutdown(Duration::from_secs(30)).await;
     Ok(())
 }
 

@@ -723,6 +723,21 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
     }
 
     let detail = tier3_runs_detail(state);
+    if state
+        .tier3_runs
+        .iter()
+        .any(|run| matches!(run.status.as_str(), "queued" | "running"))
+    {
+        return doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!("{detail}; indexing in progress")),
+            Some(format!(
+                "Track progress with `cairn ctl jobs --alias {alias}`."
+            )),
+        );
+    }
+
     if let Some(run) = state.tier3_runs.iter().find(|run| run.status == "failed") {
         return doctor_check(
             format!("repo `{alias}` Tier-3 analyzer status"),
@@ -739,10 +754,25 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
         );
     }
 
+    if let Some(run) = state
+        .tier3_runs
+        .iter()
+        .find(|run| matches!(run.status.as_str(), "timed_out" | "cancelled"))
+    {
+        return doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!("{detail}; {} is {}", run.analyzer_id, run.status)),
+            Some(format!(
+                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` when ready."
+            )),
+        );
+    }
+
     if let Some(run) = state.tier3_runs.iter().find(|run| {
         !matches!(
             run.status.as_str(),
-            "succeeded" | "skipped" | "pending" | "running"
+            "succeeded" | "skipped" | "queued" | "running" | "cancelled" | "timed_out"
         )
     }) {
         return doctor_check(
@@ -822,8 +852,11 @@ fn tier3_status_label(run: &Tier3Run) -> String {
         ("succeeded", _) => "succeeded".into(),
         ("skipped", Some(error)) => format!("skipped ({error})"),
         ("skipped", None) => "skipped".into(),
-        ("pending", _) => "queued".into(),
+        ("queued", _) => "queued".into(),
         ("running", _) => "in progress".into(),
+        ("timed_out", Some(error)) => format!("timed out ({error})"),
+        ("timed_out", None) => "timed out".into(),
+        ("cancelled", _) => "cancelled".into(),
         (status, _) => status.into(),
     }
 }
@@ -1114,13 +1147,13 @@ mod tests {
             },
         );
         let pending = tier3_run_check(
-            "pending",
+            "queued",
             &AliasStoreState {
                 tentative_manifest_id: Some(5),
                 tier3_runs: vec![Tier3Run {
                     analyzer_id: "demo-analyzer".into(),
                     manifest_id: 5,
-                    status: "pending".into(),
+                    status: "queued".into(),
                     error: None,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
@@ -1170,12 +1203,12 @@ mod tests {
                 .unwrap()
                 .contains("ContentModified")
         );
-        assert_eq!(pending.status, DoctorStatus::Pass);
+        assert_eq!(pending.status, DoctorStatus::Warn);
         assert!(pending.detail.as_deref().unwrap().contains("queued"));
-        assert!(pending.remediation.is_none());
-        assert_eq!(running.status, DoctorStatus::Pass);
+        assert!(pending.remediation.as_deref().unwrap().contains("ctl jobs"));
+        assert_eq!(running.status, DoctorStatus::Warn);
         assert!(running.detail.as_deref().unwrap().contains("in progress"));
-        assert!(running.remediation.is_none());
+        assert!(running.remediation.as_deref().unwrap().contains("ctl jobs"));
         assert_eq!(failed.status, DoctorStatus::Warn);
         assert!(
             failed
@@ -1473,6 +1506,7 @@ mod tests {
                 cas_data_dir: self.cas_data_dir.clone(),
                 shutdown: Arc::new(Notify::new()),
                 watch_manager: Some(self.watch_manager.clone()),
+                job_manager: None,
                 version: "test",
                 started_at: Instant::now(),
             };
