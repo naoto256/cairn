@@ -91,6 +91,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerTsAnalyzer {
         ts_config_paths()
     }
 
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(TYPESCRIPT_POOL_ID)
+    }
+
     fn analyze_workspace(
         &self,
         repo_root: &Path,
@@ -122,6 +126,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerJsAnalyzer {
         ts_config_paths()
     }
 
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(TYPESCRIPT_POOL_ID)
+    }
+
     fn analyze_workspace(
         &self,
         repo_root: &Path,
@@ -151,6 +159,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerTsxAnalyzer {
 
     fn config_paths(&self) -> &'static [&'static str] {
         ts_config_paths()
+    }
+
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(TYPESCRIPT_POOL_ID)
     }
 
     fn analyze_workspace(
@@ -469,6 +481,22 @@ mod tests {
             spec.readiness,
             ReadinessStrategy::InitializeResponseOnly
         ));
+    }
+
+    #[test]
+    fn typescript_analyzers_share_pool_group() {
+        assert_eq!(
+            TypescriptLanguageServerTsAnalyzer.pool_group(),
+            Some(TYPESCRIPT_POOL_ID)
+        );
+        assert_eq!(
+            TypescriptLanguageServerJsAnalyzer.pool_group(),
+            Some(TYPESCRIPT_POOL_ID)
+        );
+        assert_eq!(
+            TypescriptLanguageServerTsxAnalyzer.pool_group(),
+            Some(TYPESCRIPT_POOL_ID)
+        );
     }
 
     #[test]
