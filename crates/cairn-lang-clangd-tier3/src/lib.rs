@@ -354,12 +354,16 @@ fn collect_sites_from_node(
 ) {
     match site_kind {
         SiteKind::Call if node.kind() == "call_expression" => {
-            if let Some(identifier) = (language.call_collector)(node) {
+            if !should_skip_preprocessor_call_site(node, source)
+                && let Some(identifier) = (language.call_collector)(node)
+            {
                 out.push(site_from_node(identifier, 0, 0));
             }
         }
         SiteKind::Call if language.language == "objc" && node.kind() == "message_expression" => {
-            if let Some(method) = node.child_by_field_name("method") {
+            if !should_skip_preprocessor_call_site(node, source)
+                && let Some(method) = node.child_by_field_name("method")
+            {
                 out.push(site_from_node(method, 0, 0));
             }
         }
@@ -375,6 +379,72 @@ fn collect_sites_from_node(
     for child in node.children(&mut cursor) {
         collect_sites_from_node(child, source, language, site_kind, out);
     }
+}
+
+fn should_skip_preprocessor_call_site(node: Node<'_>, source: &[u8]) -> bool {
+    let mut current = Some(node);
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "preproc_def" | "preproc_function_def" | "preproc_call" => return true,
+            "preproc_if" | "preproc_ifdef" | "preproc_elif"
+                if starts_on_preprocessor_directive_line_or_continuation(node, source) =>
+            {
+                // nlohmann's Hedley macro blocks showed that asking clangd for
+                // definitions inside preprocessor directive conditions can stall
+                // for 45s per site and exhaust the 600s workspace budget. Keep
+                // real code inside the conditional body, but skip directive-line
+                // pseudo calls such as `#if JSON_HEDLEY_VERSION_CHECK(...)`.
+                return true;
+            }
+            _ => {}
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+fn starts_on_preprocessor_directive_line_or_continuation(node: Node<'_>, source: &[u8]) -> bool {
+    let start = node.start_byte().min(source.len());
+    let mut line_start = source[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |idx| idx + 1);
+    let mut line_end = start;
+
+    loop {
+        if first_non_whitespace(source, line_start, line_end) == Some(b'#') {
+            return true;
+        }
+        if line_start == 0 {
+            return false;
+        }
+        let previous_line_end = line_start - 1;
+        let previous_line_start = source[..previous_line_end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |idx| idx + 1);
+        if !line_ends_with_continuation(source, previous_line_start, previous_line_end) {
+            return false;
+        }
+        line_start = previous_line_start;
+        line_end = previous_line_end;
+    }
+}
+
+fn first_non_whitespace(source: &[u8], start: usize, end: usize) -> Option<u8> {
+    source[start..end]
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+}
+
+fn line_ends_with_continuation(source: &[u8], start: usize, end: usize) -> bool {
+    source[start..end]
+        .iter()
+        .rev()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'\\')
 }
 
 fn c_call_identifier(call: Node<'_>) -> Option<Node<'_>> {
@@ -500,6 +570,76 @@ void f(Widget w) { w.draw(); app::run(); }
     }
 
     #[test]
+    fn cpp_collector_skips_preprocessor_condition_calls() {
+        let source = br#"
+#if FOO_CHECK(1, 2, 3)
+#endif
+void f() { keep(); }
+"#;
+
+        let calls = collect_calls(source, CPP_LANGUAGE).unwrap();
+        let names = site_names(source, &calls);
+
+        assert_eq!(names, vec!["keep"]);
+    }
+
+    #[test]
+    fn cpp_collector_skips_hedley_style_preprocessor_conditions() {
+        let source = br#"
+#if JSON_HEDLEY_TI_VERSION_CHECK(15,12,0) || \
+    (JSON_HEDLEY_TI_ARMCL_VERSION_CHECK(4,8,0) && defined(__TI_GNU_ATTRIBUTE_SUPPORT__)) || \
+    JSON_HEDLEY_TI_CL2000_VERSION_CHECK(5,2,0)
+#define JSON_HEDLEY_DIAGNOSTIC_DISABLE_DEPRECATED _Pragma("diag_suppress 1291,1718")
+#endif
+void f() { keep(); }
+"#;
+
+        let calls = collect_calls(source, CPP_LANGUAGE).unwrap();
+        let names = site_names(source, &calls);
+
+        assert_eq!(names, vec!["keep"]);
+    }
+
+    #[test]
+    fn cpp_collector_keeps_real_calls_inside_preprocessor_blocks() {
+        let source = br#"
+#if FEATURE_ENABLED
+void f() { keep(); }
+#endif
+"#;
+
+        let calls = collect_calls(source, CPP_LANGUAGE).unwrap();
+        let names = site_names(source, &calls);
+
+        assert_eq!(names, vec!["keep"]);
+    }
+
+    #[test]
+    fn cpp_collector_skips_macro_definition_calls() {
+        let source = br#"
+#define M(x) f(x)
+void g() { keep(); }
+"#;
+
+        let calls = collect_calls(source, CPP_LANGUAGE).unwrap();
+        let names = site_names(source, &calls);
+
+        assert_eq!(names, vec!["keep"]);
+    }
+
+    #[test]
+    fn cpp_collector_keeps_normal_calls() {
+        let source = br#"
+void f() { normal(); }
+"#;
+
+        let calls = collect_calls(source, CPP_LANGUAGE).unwrap();
+        let names = site_names(source, &calls);
+
+        assert_eq!(names, vec!["normal"]);
+    }
+
+    #[test]
     fn objc_collector_finds_c_calls_messages_and_imports() {
         let source = br#"#import "Widget.h"
 @implementation Widget
@@ -581,8 +721,69 @@ void f(Widget w) { w.draw(); app::run(); }
         assert_eq!(facts.resolved_refs[0].kind, RefKind::Import);
     }
 
+    #[test]
+    fn lsp_definition_pass_closes_synced_document() {
+        let Some(python) = python3() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("main.c");
+        let target = tmp.path().join("defs.h");
+        let close_log = tmp.path().join("close.log");
+        fs::write(&source, "int main(void) { return add(1, 2); }\n").unwrap();
+        fs::write(&target, "int add(int a, int b);\n").unwrap();
+        let script = tmp.path().join("mock_lsp.py");
+        fs::write(&script, mock_lsp_script()).unwrap();
+        let target_uri = Url::from_file_path(&target).unwrap().as_str().to_string();
+
+        let facts = run_lsp_definition_pass(
+            LspDefinitionPass {
+                analyzer_id: "mock-clangd-c-lsp-close",
+                pool_analyzer_id: Some("mock-clangd-lsp-close"),
+                language: "mock-clangd-close",
+                ref_kind: RefKind::Call,
+                spawn_spec: LspSpawnSpec {
+                    binary: python,
+                    workspace_root: tmp.path().to_path_buf(),
+                    config_hash: target_uri.clone(),
+                    request_timeout: Duration::from_secs(5),
+                    availability: AvailabilityStrategy::VersionFlag,
+                    readiness: ReadinessStrategy::InitializeResponseOnly,
+                    language_id: "c",
+                    launch_args: vec![
+                        script.to_string_lossy().to_string(),
+                        target_uri,
+                        close_log.to_string_lossy().to_string(),
+                    ],
+                    initialization_options: json!({}),
+                },
+                retry: DefinitionRetryPolicy::default(),
+                collect_definition_sites: collect_c_calls,
+            },
+            tmp.path(),
+            &[WorkspaceFile {
+                path: "main.c".into(),
+                blob_sha: "blob".into(),
+                worktree_path: Some(source.to_path_buf()),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(facts.resolved_refs.len(), 1);
+        let closed = read_eventually(&close_log);
+        assert!(closed.contains("file://"));
+        assert!(closed.contains("main.c"));
+    }
+
     fn source_text(source: &[u8], site: DefinitionSite) -> &str {
         std::str::from_utf8(&source[site.byte_start..site.byte_end]).unwrap()
+    }
+
+    fn site_names<'a>(source: &'a [u8], sites: &[DefinitionSite]) -> Vec<&'a str> {
+        sites
+            .iter()
+            .map(|site| source_text(source, *site))
+            .collect()
     }
 
     fn python3() -> Option<PathBuf> {
@@ -592,6 +793,18 @@ void f(Widget w) { w.draw(); app::run(); }
             .ok()
             .filter(|output| output.status.success())
             .map(|_| PathBuf::from("python3"))
+    }
+
+    fn read_eventually(path: &Path) -> String {
+        for _ in 0..20 {
+            if let Ok(text) = fs::read_to_string(path)
+                && !text.is_empty()
+            {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        fs::read_to_string(path).unwrap()
     }
 
     fn run_mock_lsp_pass(
@@ -641,6 +854,7 @@ import json
 import sys
 
 target_uri = sys.argv[1]
+close_log = sys.argv[2] if len(sys.argv) > 2 else None
 
 def read_message():
     header = b""
@@ -668,6 +882,9 @@ while True:
     if msg is None:
         break
     method = msg.get("method")
+    if method == "textDocument/didClose" and close_log:
+        with open(close_log, "a", encoding="utf-8") as fh:
+            fh.write(msg["params"]["textDocument"]["uri"] + "\n")
     if "id" not in msg:
         continue
     if method == "initialize":

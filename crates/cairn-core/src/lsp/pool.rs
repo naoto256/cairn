@@ -109,6 +109,15 @@ impl PooledLsp<'_> {
         }
     }
 
+    /// Close a synced document and clear its local version state.
+    ///
+    /// # Errors
+    /// Returns protocol/server errors from the underlying LSP client.
+    pub async fn close_document(&mut self, uri: &Url) -> Result<()> {
+        self.opened_documents.remove(uri.as_str());
+        self.client.did_close(uri).await
+    }
+
     /// Resolve the definition at `uri` + `position`.
     ///
     /// # Errors
