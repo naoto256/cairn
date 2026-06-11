@@ -14,6 +14,18 @@ mod client;
 mod protocol;
 mod reader;
 
+#[test]
+fn timeout_variants_have_distinct_operator_messages() {
+    assert_eq!(
+        Error::ReadinessTimeout.to_string(),
+        "LSP readiness timed out"
+    );
+    assert_eq!(Error::RequestTimeout.to_string(), "LSP request timed out");
+    assert!(Error::ReadinessTimeout.is_timeout());
+    assert!(Error::RequestTimeout.is_timeout());
+    assert!(!Error::Handshake("boom".to_string()).is_timeout());
+}
+
 enum FakeMode {
     Normal,
     DefinitionTimeout,

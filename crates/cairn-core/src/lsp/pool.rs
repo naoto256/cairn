@@ -254,7 +254,7 @@ async fn check_version_command(
         Command::new(binary_path).args(args).output(),
     )
     .await
-    .map_err(|_| super::Error::Timeout)?
+    .map_err(|_| super::Error::RequestTimeout)?
     .map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             super::Error::BinaryMissing(binary_path.to_path_buf())
