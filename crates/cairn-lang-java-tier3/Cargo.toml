@@ -12,6 +12,7 @@ description = "Java Tier-3 workspace analyzer backed by Eclipse JDT Language Ser
 
 [dependencies]
 cairn-core.workspace = true
+dirs.workspace = true
 linkme.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
