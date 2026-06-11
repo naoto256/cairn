@@ -10,7 +10,7 @@
 
 use std::future::Future;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cairn_proto::RefKind;
 use futures::{StreamExt, stream};
@@ -146,12 +146,15 @@ async fn collect_resolved_refs(
             continue;
         }
         let uri = Url::from_file_path(path).map_err(Error::Lsp)?;
+        let sync_started = Instant::now();
         client
             .sync_document(&uri, &source)
             .await
             .map_err(Error::Lsp)?;
-        let client = &*client;
-        let resolved_sites = collect_definition_site_locations(
+        let sync_elapsed = sync_started.elapsed();
+        let site_count = sites.len();
+        let definition_started = Instant::now();
+        let resolved_batch = collect_definition_site_locations(
             sites,
             |site| client.definition(&uri, site.position),
             retry,
@@ -159,7 +162,18 @@ async fn collect_resolved_refs(
             &uri,
         )
         .await;
-        for resolved_site in resolved_sites {
+        let definition_elapsed = definition_started.elapsed();
+        debug!(
+            analyzer_id,
+            path = %file.path,
+            sites = site_count,
+            resolved_sites = resolved_batch.resolved.len(),
+            site_errors = resolved_batch.error_count,
+            sync_elapsed_ms = sync_elapsed.as_millis(),
+            definition_elapsed_ms = definition_elapsed.as_millis(),
+            "LSP definition pass processed file"
+        );
+        for resolved_site in resolved_batch.resolved {
             for target in resolved_site.locations {
                 let target_path = location_to_repo_path(repo_root, &target);
                 facts.resolved_refs.push(ResolvedRef {
@@ -172,6 +186,14 @@ async fn collect_resolved_refs(
                 });
             }
         }
+        if let Err(err) = client.close_document(&uri).await {
+            warn!(
+                analyzer_id,
+                uri = uri.as_str(),
+                error = %err,
+                "failed to close LSP document after definition pass"
+            );
+        }
     }
     Ok(())
 }
@@ -182,13 +204,19 @@ struct ResolvedDefinitionSite {
     locations: Vec<Location>,
 }
 
+#[derive(Debug, Default)]
+struct DefinitionBatch {
+    resolved: Vec<ResolvedDefinitionSite>,
+    error_count: usize,
+}
+
 async fn collect_definition_site_locations<F, Fut>(
     sites: Vec<DefinitionSite>,
     definition: F,
     retry: DefinitionRetryPolicy,
     analyzer_id: &str,
     uri: &Url,
-) -> Vec<ResolvedDefinitionSite>
+) -> DefinitionBatch
 where
     F: Fn(DefinitionSite) -> Fut,
     Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
@@ -220,11 +248,14 @@ where
         )
     });
 
-    let mut resolved = Vec::new();
+    let mut batch = DefinitionBatch::default();
     for (site, result) in results {
         match result {
-            Ok(locations) => resolved.push(ResolvedDefinitionSite { site, locations }),
+            Ok(locations) => batch
+                .resolved
+                .push(ResolvedDefinitionSite { site, locations }),
             Err(err) => {
+                batch.error_count += 1;
                 warn!(
                     analyzer_id,
                     uri = uri.as_str(),
@@ -235,7 +266,7 @@ where
             }
         }
     }
-    resolved
+    batch
 }
 
 async fn definition_with_retry_from<F, Fut>(
@@ -540,7 +571,8 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 100);
-        assert_eq!(resolved.len(), 100);
+        assert_eq!(resolved.resolved.len(), 100);
+        assert_eq!(resolved.error_count, 0);
         assert!(
             start.elapsed() < Duration::from_millis(200),
             "definition pipeline took {:?}",
@@ -566,7 +598,9 @@ mod tests {
         )
         .await;
 
+        assert_eq!(resolved.error_count, 1);
         let lines = resolved
+            .resolved
             .iter()
             .map(|resolved| resolved.site.position.line)
             .collect::<Vec<_>>();
@@ -589,6 +623,7 @@ mod tests {
         .await;
 
         let lines = resolved
+            .resolved
             .iter()
             .map(|resolved| resolved.site.position.line)
             .collect::<Vec<_>>();
