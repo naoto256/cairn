@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use cairn_core::lsp::Position;
 use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrategy};
+use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
@@ -272,9 +273,11 @@ fn import_collector_for(language: TsLanguage) -> fn(&[u8]) -> Result<Vec<Definit
 }
 
 fn typescript_language_server_binary() -> PathBuf {
-    std::env::var_os("TYPESCRIPT_LANGUAGE_SERVER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("typescript-language-server"))
+    discover_lsp_binary(
+        "typescript-language-server",
+        Some("TYPESCRIPT_LANGUAGE_SERVER"),
+    )
+    .unwrap_or_else(|| PathBuf::from("typescript-language-server"))
 }
 
 fn collect_ts_calls(source: &[u8]) -> Result<Vec<DefinitionSite>> {

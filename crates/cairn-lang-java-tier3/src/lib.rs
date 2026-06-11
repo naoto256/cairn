@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use cairn_core::lsp::Position;
 use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrategy};
+use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::paths::path_hash;
 use cairn_core::workspace_analyzer::{
@@ -130,9 +131,7 @@ fn run_jdtls_pass(
 }
 
 fn jdtls_binary() -> PathBuf {
-    std::env::var_os("JDTLS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("jdtls"))
+    discover_lsp_binary("jdtls", Some("JDTLS")).unwrap_or_else(|| PathBuf::from("jdtls"))
 }
 
 fn jdtls_launch_args(configuration_dir: &Path, data_dir: &Path) -> Vec<String> {
