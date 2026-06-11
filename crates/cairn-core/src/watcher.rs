@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::jobs::JobManager;
 use crate::paths::CasDataDir;
-use crate::register::register_repo as cas_register;
+use crate::register::{register_repo as cas_register, register_repo_enqueue_analyzers};
 use crate::{Error, Result};
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -25,6 +26,7 @@ const REINDEX_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Keeps one live watcher per registered alias.
 pub struct WatchManager {
     cas_data_dir: Arc<CasDataDir>,
+    job_manager: Option<Arc<JobManager>>,
     backend: WatchBackend,
     #[cfg(test)]
     fail_watcher_start: bool,
@@ -45,13 +47,28 @@ impl Drop for RepoWatcher {
 impl WatchManager {
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Self {
-        Self::with_backend(cas_data_dir, WatchBackend::Recommended)
+        Self::with_backend_and_jobs(cas_data_dir, WatchBackend::Recommended, None)
+    }
+
+    #[must_use]
+    pub fn with_jobs(cas_data_dir: Arc<CasDataDir>, job_manager: Arc<JobManager>) -> Self {
+        Self::with_backend_and_jobs(cas_data_dir, WatchBackend::Recommended, Some(job_manager))
     }
 
     #[must_use]
     pub fn with_backend(cas_data_dir: Arc<CasDataDir>, backend: WatchBackend) -> Self {
+        Self::with_backend_and_jobs(cas_data_dir, backend, None)
+    }
+
+    #[must_use]
+    pub fn with_backend_and_jobs(
+        cas_data_dir: Arc<CasDataDir>,
+        backend: WatchBackend,
+        job_manager: Option<Arc<JobManager>>,
+    ) -> Self {
         Self {
             cas_data_dir,
+            job_manager,
             backend,
             #[cfg(test)]
             fail_watcher_start: false,
@@ -65,6 +82,7 @@ impl WatchManager {
         Self {
             cas_data_dir,
             backend: WatchBackend::Poll,
+            job_manager: None,
             fail_watcher_start: true,
             watchers: Mutex::new(HashMap::new()),
         }
@@ -107,6 +125,7 @@ impl WatchManager {
 
         let task = tokio::spawn(reindex_on_events(
             self.cas_data_dir.clone(),
+            self.job_manager.clone(),
             alias.clone(),
             rx,
         ));
@@ -142,6 +161,7 @@ impl WatchManager {
 
 async fn reindex_on_events(
     cas_data_dir: Arc<CasDataDir>,
+    job_manager: Option<Arc<JobManager>>,
     alias: String,
     mut rx: mpsc::UnboundedReceiver<WatchEvent>,
 ) {
@@ -151,14 +171,18 @@ async fn reindex_on_events(
         while let Ok(event) = rx.try_recv() {
             debug!(alias = %alias, ?event, "coalesced repo watcher event");
         }
-        match reindex_alias(cas_data_dir.clone(), alias.clone()).await {
+        match reindex_alias(cas_data_dir.clone(), job_manager.clone(), alias.clone()).await {
             Ok(()) => info!(alias = %alias, "repo watcher reindex complete"),
             Err(err) => warn!(alias = %alias, error = %err, "repo watcher reindex failed"),
         }
     }
 }
 
-async fn reindex_alias(cas_data_dir: Arc<CasDataDir>, alias: String) -> Result<()> {
+async fn reindex_alias(
+    cas_data_dir: Arc<CasDataDir>,
+    job_manager: Option<Arc<JobManager>>,
+    alias: String,
+) -> Result<()> {
     let now_ns = now_ns()?;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
@@ -168,7 +192,21 @@ async fn reindex_alias(cas_data_dir: Arc<CasDataDir>, alias: String) -> Result<(
             })?;
         let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
         let mut conn = cas_store::open(&store_path)?;
-        cas_register(&mut conn, &PathBuf::from(entry.root_path), now_ns)?;
+        match job_manager.as_deref() {
+            Some(manager) => {
+                register_repo_enqueue_analyzers(
+                    &mut conn,
+                    &alias,
+                    &entry.repo_hash,
+                    &PathBuf::from(entry.root_path),
+                    now_ns,
+                    manager,
+                )?;
+            }
+            None => {
+                cas_register(&mut conn, &PathBuf::from(entry.root_path), now_ns)?;
+            }
+        }
         Ok(())
     })
     .await

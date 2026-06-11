@@ -630,6 +630,9 @@ fn render(method: &str, value: &Value) {
                             snap.symbol_count
                         );
                     }
+                    for job in &repo.jobs {
+                        println!("    job {}\t{}\t{}", job.job_id, job.analyzer_id, job.state);
+                    }
                 }
                 return;
             }

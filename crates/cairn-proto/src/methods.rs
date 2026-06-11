@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind};
+use crate::control::JobSnapshot;
 
 // ─── list_repos ─────────────────────────────────────────────────────────────
 
@@ -27,6 +28,8 @@ pub struct RepoEntry {
     pub alias: String,
     pub root: String,
     pub snapshots: Vec<SnapshotEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobSnapshot>,
 }
 
 impl RepoEntry {
@@ -127,6 +130,7 @@ mod list_repos_tests {
                 file_count: 2,
                 symbol_count: 3,
             }],
+            jobs: Vec::new(),
         };
         assert_eq!(
             repo.languages().into_iter().collect::<Vec<_>>(),

@@ -14,7 +14,7 @@ use super::{WorkspaceAnalyzer, WorkspaceFile, all_workspace_analyzers};
 
 // Large LSP-backed workspaces can spend minutes on cold-start indexing. Bound
 // each backend so a stuck analyzer is recorded and the synchronous CLI returns.
-const WORKSPACE_ANALYZER_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const WORKSPACE_ANALYZER_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Run registered workspace analyzers over a manifest and persist
 /// facts that can be mapped back to existing CAS rows.
@@ -77,10 +77,116 @@ pub(super) fn run_workspace_analyzers_with_timeout(
     for analyzer in analyzers {
         let analyzer_id = analyzer.id();
         let analyzer_revision = analyzer.revision();
-        let parser_id = analyzer.parser_id();
         let config_hash = config_hash(repo_root, analyzer.config_paths());
-        let files = workspace_files_for(conn, parser_id, repo_root, entries)?;
-        if files.is_empty() {
+        mark_run(
+            conn,
+            RunRecord {
+                manifest_id,
+                analyzer_id,
+                analyzer_revision,
+                config_hash: &config_hash,
+                status: RunStatus::Queued,
+                started_at_ns: now_ns,
+                finished_at_ns: now_ns,
+                error: None,
+                job_id: None,
+            },
+        )?;
+        let outcome = run_one_workspace_analyzer_with_timeout(
+            conn,
+            AnalyzerRunRequest {
+                analyzer,
+                repo_root,
+                manifest_id,
+                entries,
+                now_ns,
+                analyzer_timeout,
+                job_id: None,
+            },
+        )?;
+        inserted += outcome.inserted_refs;
+    }
+
+    Ok(inserted)
+}
+
+pub(crate) struct AnalyzerRunRequest<'a> {
+    pub(crate) analyzer: Box<dyn WorkspaceAnalyzer>,
+    pub(crate) repo_root: &'a Path,
+    pub(crate) manifest_id: ManifestId,
+    pub(crate) entries: &'a [ManifestEntry],
+    pub(crate) now_ns: i64,
+    pub(crate) analyzer_timeout: Duration,
+    pub(crate) job_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnalyzerExecution {
+    pub status: RunStatus,
+    pub inserted_refs: usize,
+    pub error: Option<String>,
+}
+
+pub(crate) fn run_one_workspace_analyzer_with_timeout(
+    conn: &mut Connection,
+    request: AnalyzerRunRequest<'_>,
+) -> Result<AnalyzerExecution> {
+    let AnalyzerRunRequest {
+        analyzer,
+        repo_root,
+        manifest_id,
+        entries,
+        now_ns,
+        analyzer_timeout,
+        job_id,
+    } = request;
+    let analyzer_id = analyzer.id();
+    let analyzer_revision = analyzer.revision();
+    let parser_id = analyzer.parser_id();
+    let config_hash = config_hash(repo_root, analyzer.config_paths());
+    let files = workspace_files_for(conn, parser_id, repo_root, entries)?;
+    if files.is_empty() {
+        mark_run(
+            conn,
+            RunRecord {
+                manifest_id,
+                analyzer_id,
+                analyzer_revision,
+                config_hash: &config_hash,
+                status: RunStatus::Skipped,
+                started_at_ns: now_ns,
+                finished_at_ns: now_ns,
+                error: Some("no matching files"),
+                job_id,
+            },
+        )?;
+        return Ok(AnalyzerExecution {
+            status: RunStatus::Skipped,
+            inserted_refs: 0,
+            error: Some("no matching files".into()),
+        });
+    }
+
+    mark_run(
+        conn,
+        RunRecord {
+            manifest_id,
+            analyzer_id,
+            analyzer_revision,
+            config_hash: &config_hash,
+            status: RunStatus::Running,
+            started_at_ns: now_ns,
+            finished_at_ns: now_ns,
+            error: None,
+            job_id,
+        },
+    )?;
+
+    match analyze_workspace_with_timeout(analyzer, repo_root, manifest_id, &files, analyzer_timeout)
+    {
+        AnalyzerRun::Completed(Ok(facts)) => {
+            let inserted_refs =
+                persist_resolved_refs(conn, manifest_id, analyzer_id, parser_id, &facts)?;
             mark_run(
                 conn,
                 RunRecord {
@@ -88,124 +194,86 @@ pub(super) fn run_workspace_analyzers_with_timeout(
                     analyzer_id,
                     analyzer_revision,
                     config_hash: &config_hash,
-                    status: RunStatus::Skipped,
+                    status: RunStatus::Succeeded,
                     started_at_ns: now_ns,
                     finished_at_ns: now_ns,
-                    error: Some("no matching files"),
+                    error: None,
+                    job_id,
                 },
             )?;
-            continue;
+            Ok(AnalyzerExecution {
+                status: RunStatus::Succeeded,
+                inserted_refs,
+                error: None,
+            })
         }
-
-        mark_run(
-            conn,
-            RunRecord {
-                manifest_id,
-                analyzer_id,
-                analyzer_revision,
-                config_hash: &config_hash,
-                status: RunStatus::Pending,
-                started_at_ns: now_ns,
-                finished_at_ns: now_ns,
-                error: None,
-            },
-        )?;
-        mark_run(
-            conn,
-            RunRecord {
-                manifest_id,
-                analyzer_id,
-                analyzer_revision,
-                config_hash: &config_hash,
-                status: RunStatus::Running,
-                started_at_ns: now_ns,
-                finished_at_ns: now_ns,
-                error: None,
-            },
-        )?;
-
-        match analyze_workspace_with_timeout(
-            analyzer,
-            repo_root,
-            manifest_id,
-            &files,
-            analyzer_timeout,
-        ) {
-            AnalyzerRun::Completed(Ok(facts)) => {
-                let n = persist_resolved_refs(conn, manifest_id, analyzer_id, parser_id, &facts)?;
-                inserted += n;
-                mark_run(
-                    conn,
-                    RunRecord {
-                        manifest_id,
-                        analyzer_id,
-                        analyzer_revision,
-                        config_hash: &config_hash,
-                        status: RunStatus::Succeeded,
-                        started_at_ns: now_ns,
-                        finished_at_ns: now_ns,
-                        error: None,
-                    },
-                )?;
-            }
-            AnalyzerRun::Completed(Err(err)) => {
-                let message = err.to_string();
-                let status = if is_content_modified_error(&err) {
-                    debug!(
-                        analyzer_id,
-                        error = %message,
-                        "transient: LSP content-modified during run"
-                    );
-                    RunStatus::Skipped
-                } else if is_binary_missing_error(&err) {
-                    RunStatus::Skipped
-                } else {
-                    warn!(
-                        analyzer_id,
-                        error = %message,
-                        "workspace analyzer failed"
-                    );
-                    RunStatus::Failed
-                };
-                mark_run(
-                    conn,
-                    RunRecord {
-                        manifest_id,
-                        analyzer_id,
-                        analyzer_revision,
-                        config_hash: &config_hash,
-                        status,
-                        started_at_ns: now_ns,
-                        finished_at_ns: now_ns,
-                        error: Some(&message),
-                    },
-                )?;
-            }
-            AnalyzerRun::TimedOut { timeout } => {
-                let message = format!("analyzer timed out after {}s", timeout.as_secs());
+        AnalyzerRun::Completed(Err(err)) => {
+            let message = err.to_string();
+            let status = if is_content_modified_error(&err) {
+                debug!(
+                    analyzer_id,
+                    error = %message,
+                    "transient: LSP content-modified during run"
+                );
+                RunStatus::Skipped
+            } else if is_binary_missing_error(&err) {
+                RunStatus::Skipped
+            } else {
                 warn!(
                     analyzer_id,
-                    timeout_secs = timeout.as_secs(),
-                    "workspace analyzer timed out"
+                    error = %message,
+                    "workspace analyzer failed"
                 );
-                mark_run(
-                    conn,
-                    RunRecord {
-                        manifest_id,
-                        analyzer_id,
-                        analyzer_revision,
-                        config_hash: &config_hash,
-                        status: RunStatus::Failed,
-                        started_at_ns: now_ns,
-                        finished_at_ns: now_ns,
-                        error: Some(&message),
-                    },
-                )?;
-            }
+                RunStatus::Failed
+            };
+            mark_run(
+                conn,
+                RunRecord {
+                    manifest_id,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash: &config_hash,
+                    status,
+                    started_at_ns: now_ns,
+                    finished_at_ns: now_ns,
+                    error: Some(&message),
+                    job_id,
+                },
+            )?;
+            Ok(AnalyzerExecution {
+                status,
+                inserted_refs: 0,
+                error: Some(message),
+            })
+        }
+        AnalyzerRun::TimedOut { timeout } => {
+            let message = format!("analyzer timed out after {}s", timeout.as_secs());
+            warn!(
+                analyzer_id,
+                timeout_secs = timeout.as_secs(),
+                "workspace analyzer timed out"
+            );
+            mark_run(
+                conn,
+                RunRecord {
+                    manifest_id,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash: &config_hash,
+                    status: RunStatus::TimedOut,
+                    started_at_ns: now_ns,
+                    finished_at_ns: now_ns,
+                    error: Some(&message),
+                    job_id,
+                },
+            )?;
+            Ok(AnalyzerExecution {
+                status: RunStatus::TimedOut,
+                inserted_refs: 0,
+                error: Some(message),
+            })
         }
     }
-
-    Ok(inserted)
 }
 
 enum AnalyzerRun {
@@ -245,56 +313,86 @@ fn is_binary_missing_error(err: &Error) -> bool {
     matches!(err, Error::Lsp(crate::lsp::Error::BinaryMissing(_)))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RunStatus {
-    Pending,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunStatus {
+    Queued,
     Running,
     Succeeded,
     Failed,
     Skipped,
+    TimedOut,
+    Cancelled,
 }
 
 impl RunStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Pending => "pending",
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Skipped => "skipped",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
         }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "skipped" => Some(Self::Skipped),
+            "timed_out" => Some(Self::TimedOut),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Skipped | Self::TimedOut | Self::Cancelled
+        )
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RunRecord<'a> {
-    manifest_id: ManifestId,
-    analyzer_id: &'a str,
-    analyzer_revision: u32,
-    config_hash: &'a str,
-    status: RunStatus,
-    started_at_ns: i64,
-    finished_at_ns: i64,
-    error: Option<&'a str>,
+pub(crate) struct RunRecord<'a> {
+    pub(crate) manifest_id: ManifestId,
+    pub(crate) analyzer_id: &'a str,
+    pub(crate) analyzer_revision: u32,
+    pub(crate) config_hash: &'a str,
+    pub(crate) status: RunStatus,
+    pub(crate) started_at_ns: i64,
+    pub(crate) finished_at_ns: i64,
+    pub(crate) error: Option<&'a str>,
+    pub(crate) job_id: Option<i64>,
 }
 
-fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
+pub(crate) fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
     let finished = match run.status {
-        RunStatus::Pending | RunStatus::Running => None,
-        RunStatus::Succeeded | RunStatus::Failed | RunStatus::Skipped => Some(run.finished_at_ns),
+        RunStatus::Queued | RunStatus::Running => None,
+        RunStatus::Succeeded
+        | RunStatus::Failed
+        | RunStatus::Skipped
+        | RunStatus::TimedOut
+        | RunStatus::Cancelled => Some(run.finished_at_ns),
     };
     conn.execute(
         "INSERT INTO workspace_analysis_runs
            (manifest_id, analyzer_id, analyzer_revision, config_hash,
-            status, started_at_ns, finished_at_ns, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            status, started_at_ns, finished_at_ns, error, job_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(manifest_id, analyzer_id) DO UPDATE SET
             analyzer_revision = excluded.analyzer_revision,
             config_hash = excluded.config_hash,
             status = excluded.status,
             started_at_ns = excluded.started_at_ns,
             finished_at_ns = excluded.finished_at_ns,
-            error = excluded.error",
+            error = excluded.error,
+            job_id = COALESCE(excluded.job_id, workspace_analysis_runs.job_id)",
         params![
             run.manifest_id.0,
             run.analyzer_id,
@@ -304,6 +402,7 @@ fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
             run.started_at_ns,
             finished,
             run.error,
+            run.job_id,
         ],
     )?;
     Ok(())
@@ -313,7 +412,7 @@ fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
 /// blob was indexed under the analyzer's Tier-1 parser. This reuses
 /// the indexer's backend dispatch (extension and shebang detection)
 /// instead of maintaining a parallel extension table here.
-fn workspace_files_for(
+pub(crate) fn workspace_files_for(
     conn: &Connection,
     parser_id: &str,
     repo_root: &Path,
@@ -339,7 +438,7 @@ fn workspace_files_for(
     Ok(files)
 }
 
-fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
+pub(crate) fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
     let mut hasher = Sha1::new();
     for rel in config_paths {
         let path = repo_root.join(rel);

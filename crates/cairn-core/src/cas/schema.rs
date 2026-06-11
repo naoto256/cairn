@@ -213,4 +213,52 @@ CREATE INDEX idx_workspace_analysis_runs_status
     ON workspace_analysis_runs(status);
 "#,
     },
+    Migration {
+        version: 5,
+        sql: r#"
+CREATE TABLE workspace_analysis_runs_new (
+    manifest_id       INTEGER NOT NULL REFERENCES manifests(manifest_id) ON DELETE CASCADE,
+    analyzer_id       TEXT NOT NULL,
+    analyzer_revision INTEGER NOT NULL,
+    config_hash       TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (
+        status IN ('queued', 'running', 'succeeded', 'failed', 'skipped', 'cancelled', 'timed_out')
+    ),
+    started_at_ns     INTEGER NOT NULL,
+    finished_at_ns    INTEGER,
+    error             TEXT,
+    job_id            INTEGER,
+    cancel_requested  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (manifest_id, analyzer_id)
+);
+
+INSERT INTO workspace_analysis_runs_new
+    (manifest_id, analyzer_id, analyzer_revision, config_hash,
+     status, started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+SELECT
+    manifest_id,
+    analyzer_id,
+    analyzer_revision,
+    config_hash,
+    CASE
+        WHEN status = 'pending' THEN 'queued'
+        WHEN status = 'failed' AND error LIKE 'analyzer timed out%' THEN 'timed_out'
+        ELSE status
+    END,
+    started_at_ns,
+    finished_at_ns,
+    error,
+    NULL,
+    0
+FROM workspace_analysis_runs;
+
+DROP TABLE workspace_analysis_runs;
+ALTER TABLE workspace_analysis_runs_new RENAME TO workspace_analysis_runs;
+
+CREATE INDEX idx_workspace_analysis_runs_status
+    ON workspace_analysis_runs(status);
+CREATE INDEX idx_workspace_analysis_runs_job_id
+    ON workspace_analysis_runs(job_id);
+"#,
+    },
 ];

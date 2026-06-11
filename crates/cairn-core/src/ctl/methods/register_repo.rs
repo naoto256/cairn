@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::paths::path_hash;
-use crate::register::register_repo as cas_register;
+use crate::register::{register_repo as cas_register, register_repo_enqueue_analyzers};
 use crate::{Error, Result};
 
 struct RegisterRepo;
@@ -56,10 +56,21 @@ impl ControlMethod for RegisterRepo {
         let canonical_str = canonical.to_string_lossy().to_string();
         let repo_hash_for_index = repo_hash.clone();
         let index_path = cas_data_dir.index_db_path();
+        let job_manager = ctx.job_manager.clone();
 
         let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut conn = cas_store::open(&store_path)?;
-            let outcome = cas_register(&mut conn, &worktree, now_ns)?;
+            let outcome = match job_manager.as_deref() {
+                Some(manager) => register_repo_enqueue_analyzers(
+                    &mut conn,
+                    &alias,
+                    &repo_hash_for_index,
+                    &worktree,
+                    now_ns,
+                    manager,
+                )?,
+                None => cas_register(&mut conn, &worktree, now_ns)?,
+            };
 
             // Update the top-level alias → repo index so queries can
             // resolve `repo=<alias>`.
@@ -90,7 +101,14 @@ impl ControlMethod for RegisterRepo {
                 ack = Ack::with_alias_and_watcher_failed(args.alias.clone(), err.to_string());
             }
         }
-        Ok(serde_json::to_value(ack).unwrap())
+        let mut value = serde_json::to_value(ack).unwrap();
+        if let serde_json::Value::Object(obj) = &mut value {
+            obj.insert(
+                "jobs".into(),
+                serde_json::to_value(&outcome.analyzer_jobs).unwrap(),
+            );
+        }
+        Ok(value)
     }
 }
 

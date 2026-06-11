@@ -42,6 +42,11 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **Async Tier-3 indexing jobs.** `cairn ctl reindex-repo <alias>`
+  now enqueues workspace analyzer jobs and returns promptly instead
+  of waiting for LSP cold starts. Track progress with
+  `cairn ctl jobs`, cancel queued jobs with `--cancel`, and use
+  `reindex-repo --wait` when a script needs synchronous behavior.
 - **Ten new language backends — Tier-1 plus Tier-2.** TSX +
   JavaScript (extending the existing TypeScript backend), Ruby, C#,
   PHP, Kotlin, Swift, C, Java, C++, and Objective-C all ship with
