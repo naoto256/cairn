@@ -101,7 +101,13 @@ fn run_sourcekit_lsp_pass(
                 workspace_root: repo_root.to_path_buf(),
                 config_hash: POOL_CONFIG_ID.to_string(),
                 request_timeout: REQUEST_TIMEOUT,
-                availability: AvailabilityStrategy::VersionFlag,
+                // sourcekit-lsp does not support `--version` (exits 64 with
+                // "Unknown option '--version'"), and its general usage requires a
+                // subcommand. VersionFlag would therefore reject the probe even
+                // when the binary is fine. The binary we already resolved is
+                // sufficient evidence of availability, so check that the path is
+                // executable instead.
+                availability: AvailabilityStrategy::PathExistsExecutable,
                 readiness: ReadinessStrategy::InitializeResponseOnly,
                 language_id: "swift",
                 launch_args: Vec::new(),
