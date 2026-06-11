@@ -5,16 +5,17 @@
 //! daemon-visible job state and keeps the expensive LSP-backed work out
 //! of short-lived control requests.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::manifest::{self, ManifestEntry, ManifestId};
@@ -67,6 +68,7 @@ pub struct JobManager {
     sender: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     receiver: Arc<AsyncMutex<mpsc::UnboundedReceiver<Job>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
+    pool_group_locks: PoolGroupLocks,
 }
 
 pub struct EnqueueReindex<'a> {
@@ -88,6 +90,7 @@ impl JobManager {
             sender: Mutex::new(Some(sender)),
             receiver: Arc::new(AsyncMutex::new(receiver)),
             workers: Mutex::new(Vec::new()),
+            pool_group_locks: PoolGroupLocks::default(),
         })
     }
 
@@ -367,10 +370,56 @@ impl JobManager {
     }
 
     async fn run_job(&self, job: Job) -> Result<()> {
+        let pool_group = pool_group_for_analyzer_id(&job.analyzer_id)?;
+        let _pool_group_guard = if let Some(group) = pool_group {
+            let wait_started = Instant::now();
+            let guard = self.pool_group_locks.lock(group).await;
+            let wait_elapsed = wait_started.elapsed();
+            if wait_elapsed.as_millis() > 0 {
+                debug!(
+                    alias = %job.alias,
+                    analyzer_id = %job.analyzer_id,
+                    job_id = job.id,
+                    pool_group = group,
+                    wait_elapsed_ms = wait_elapsed.as_millis(),
+                    "analyzer job waited for pool group"
+                );
+            }
+            Some(guard)
+        } else {
+            None
+        };
         tokio::task::spawn_blocking(move || run_job_blocking(job))
             .await
             .map_err(|e| Error::InvalidArgument(format!("analyzer job task panicked: {e}")))?
     }
+}
+
+#[derive(Default)]
+struct PoolGroupLocks {
+    groups: AsyncMutex<HashMap<&'static str, Arc<AsyncMutex<()>>>>,
+}
+
+impl PoolGroupLocks {
+    async fn lock(&self, group: &'static str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut groups = self.groups.lock().await;
+            Arc::clone(
+                groups
+                    .entry(group)
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
+}
+
+fn pool_group_for_analyzer_id(analyzer_id: &str) -> Result<Option<&'static str>> {
+    all_workspace_analyzers()
+        .into_iter()
+        .find(|a| a.id() == analyzer_id)
+        .map(|a| a.pool_group())
+        .ok_or_else(|| Error::InvalidArgument(format!("unknown analyzer: {analyzer_id}")))
 }
 
 fn run_job_blocking(job: Job) -> Result<()> {
@@ -465,4 +514,53 @@ fn worker_concurrency() -> usize {
         .map(usize::from)
         .map(|n| (n / 2).clamp(1, 8))
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
+    use super::PoolGroupLocks;
+
+    #[tokio::test]
+    async fn same_pool_group_locks_serialize() {
+        let locks = Arc::new(PoolGroupLocks::default());
+        let first_guard = locks.lock("shared-lsp").await;
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let waiting_locks = Arc::clone(&locks);
+        let waiter = tokio::spawn(async move {
+            let _guard = waiting_locks.lock("shared-lsp").await;
+            let _ = acquired_tx.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), acquired_rx)
+                .await
+                .is_err(),
+            "second same-group lock acquired while the first guard was held"
+        );
+        drop(first_guard);
+        waiter.await.expect("same-group waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn different_pool_groups_do_not_block_each_other() {
+        let locks = Arc::new(PoolGroupLocks::default());
+        let _first_guard = locks.lock("clangd-lsp").await;
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let waiting_locks = Arc::clone(&locks);
+        let waiter = tokio::spawn(async move {
+            let _guard = waiting_locks.lock("typescript-language-server-lsp").await;
+            let _ = acquired_tx.send(());
+        });
+
+        tokio::time::timeout(Duration::from_millis(25), acquired_rx)
+            .await
+            .expect("different-group lock was blocked")
+            .expect("different-group waiter dropped before signaling");
+        waiter.await.expect("different-group waiter task panicked");
+    }
 }
