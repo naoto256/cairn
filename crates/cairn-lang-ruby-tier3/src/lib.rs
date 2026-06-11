@@ -136,6 +136,7 @@ fn run_ruby_lsp_pass(
                 // pool owns a single executable path today. Prefer the standalone
                 // wrapper now; project-local Bundler launch can be layered later.
                 launch_args: Vec::new(),
+                env: Vec::new(),
                 initialization_options: json!({}),
             },
             retry: DefinitionRetryPolicy {
@@ -409,6 +410,7 @@ end
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "ruby",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),

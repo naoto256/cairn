@@ -365,6 +365,7 @@ fn tier3_binary_checks() -> Vec<DoctorCheck> {
         clangd_binary_check(),
         typescript_language_server_binary_check(),
         csharp_ls_binary_check(),
+        csharp_dotnet_sdk_check(),
         phpantom_lsp_binary_check(),
         jdtls_binary_check(),
         kotlin_language_server_binary_check(),
@@ -425,6 +426,48 @@ fn csharp_ls_binary_check() -> DoctorCheck {
         "csharp-ls not discoverable via CSHARP_LS or PATH",
         "Install csharp-ls (`dotnet tool install -g csharp-ls`) and ensure the .NET tools directory is on the daemon's PATH, or set CSHARP_LS; C# Tier-3 (LSP) facts will not be available until then.",
     )
+}
+
+fn csharp_dotnet_sdk_check() -> DoctorCheck {
+    match dotnet_sdk_root(
+        std::env::var_os("DOTNET_ROOT").map(PathBuf::from),
+        standard_dotnet_roots(),
+    ) {
+        Some(root) => doctor_check(
+            ".NET SDK root discoverable for csharp-ls",
+            DoctorStatus::Pass,
+            Some(root.display().to_string()),
+            None,
+        ),
+        None => doctor_check(
+            ".NET SDK root discoverable for csharp-ls",
+            DoctorStatus::Warn,
+            Some("DOTNET_ROOT unset and no SDK found in standard dotnet roots".into()),
+            Some("Install the .NET SDK or set DOTNET_ROOT so csharp-ls can locate MSBuild under daemon launch environments.".into()),
+        ),
+    }
+}
+
+fn dotnet_sdk_root(
+    dotnet_root: Option<PathBuf>,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = dotnet_root {
+        return Some(root);
+    }
+    roots.into_iter().find(|root| root.join("sdk").is_dir())
+}
+
+fn standard_dotnet_roots() -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/usr/local/share/dotnet"),
+        PathBuf::from("/opt/homebrew/share/dotnet"),
+        PathBuf::from("/opt/homebrew/opt/dotnet/libexec"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".dotnet"));
+    }
+    roots
 }
 
 fn phpantom_lsp_binary_check() -> DoctorCheck {
@@ -834,6 +877,40 @@ mod tests {
         let check = backend_registration_coherence_check(&language_backends, &workspace_analyzers);
 
         assert_eq!(check.status, DoctorStatus::Pass);
+    }
+
+    #[test]
+    fn dotnet_sdk_root_respects_existing_dotnet_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dotnet");
+
+        assert_eq!(
+            dotnet_sdk_root(Some(root.clone()), std::iter::empty()),
+            Some(root)
+        );
+    }
+
+    #[test]
+    fn dotnet_sdk_root_finds_first_standard_root_with_sdk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let without_sdk = tmp.path().join("without-sdk");
+        let with_sdk = tmp.path().join("with-sdk");
+        std::fs::create_dir_all(&without_sdk).unwrap();
+        std::fs::create_dir_all(with_sdk.join("sdk")).unwrap();
+
+        assert_eq!(
+            dotnet_sdk_root(None, [without_sdk, with_sdk.clone()]),
+            Some(with_sdk)
+        );
+    }
+
+    #[test]
+    fn dotnet_sdk_root_is_none_without_env_or_standard_sdk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dotnet");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(dotnet_sdk_root(None, [root]), None);
     }
 
     #[test]

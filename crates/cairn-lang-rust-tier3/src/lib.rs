@@ -79,6 +79,7 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
                     },
                     language_id: "rust",
                     launch_args: Vec::new(),
+                    env: Vec::new(),
                     initialization_options: rust_analyzer_initialization_options(POOL_CONFIG_ID),
                 },
                 retry: DefinitionRetryPolicy {

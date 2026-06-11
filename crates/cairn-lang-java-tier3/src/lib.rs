@@ -129,6 +129,7 @@ fn run_jdtls_pass(
                 // never dirties the worktree, and derive them from the canonical
                 // path to isolate sibling checkouts while preserving warm caches.
                 launch_args: jdtls_launch_args(&dirs.configuration, &dirs.data),
+                env: Vec::new(),
                 initialization_options: json!({}),
             },
             retry: DefinitionRetryPolicy {
@@ -509,6 +510,7 @@ class Main extends Base implements Runnable {
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "java",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),

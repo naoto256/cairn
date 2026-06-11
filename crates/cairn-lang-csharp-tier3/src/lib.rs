@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -121,6 +122,7 @@ fn run_csharp_ls_pass(
                 readiness: ReadinessStrategy::InitializeResponseOnly,
                 language_id: "csharp",
                 launch_args: Vec::new(),
+                env: dotnet_env(),
                 initialization_options: json!({}),
             },
             retry: DefinitionRetryPolicy {
@@ -138,6 +140,61 @@ fn run_csharp_ls_pass(
 fn csharp_ls_binary() -> PathBuf {
     discover_lsp_binary("csharp-ls", Some("CSHARP_LS"))
         .unwrap_or_else(|| PathBuf::from("csharp-ls"))
+}
+
+fn dotnet_env() -> Vec<(String, String)> {
+    // T4 showed launchd's minimal environment can make csharp-ls see zero
+    // MSBuild instances: MSBuildLocator.QueryVisualStudioInstances returns an
+    // empty sequence, then csharp-ls fails initializeMSBuild with
+    // InvalidOperationException. Supplying DOTNET_ROOT for the standard SDK
+    // install fixes the same binary/workspace without changing PATH globally.
+    dotnet_env_with(
+        std::env::var_os("DOTNET_ROOT"),
+        std::env::var_os("PATH"),
+        standard_dotnet_roots(),
+    )
+}
+
+fn dotnet_env_with(
+    dotnet_root: Option<OsString>,
+    current_path: Option<OsString>,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Vec<(String, String)> {
+    if dotnet_root.is_some() {
+        return Vec::new();
+    }
+    let Some(root) = roots.into_iter().find(|root| root.join("sdk").is_dir()) else {
+        return Vec::new();
+    };
+    vec![
+        ("DOTNET_ROOT".into(), root.to_string_lossy().into_owned()),
+        ("PATH".into(), prepend_path(&root, current_path)),
+    ]
+}
+
+fn standard_dotnet_roots() -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/usr/local/share/dotnet"),
+        PathBuf::from("/opt/homebrew/share/dotnet"),
+        PathBuf::from("/opt/homebrew/opt/dotnet/libexec"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".dotnet"));
+    }
+    roots
+}
+
+fn prepend_path(root: &Path, current_path: Option<OsString>) -> String {
+    let paths = std::iter::once(root.to_path_buf()).chain(
+        current_path
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths),
+    );
+    std::env::join_paths(paths)
+        .unwrap_or_else(|_| root.as_os_str().to_os_string())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn collect_method_calls(source: &[u8]) -> Result<Vec<DefinitionSite>> {
@@ -445,6 +502,58 @@ class Declared : BaseWidget, IWidget {
         assert_eq!(resolved.target_path.as_deref(), Some("Widget.cs"));
     }
 
+    #[test]
+    fn dotnet_env_respects_existing_dotnet_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dotnet");
+        std::fs::create_dir_all(root.join("sdk")).unwrap();
+
+        let env = dotnet_env_with(
+            Some(OsString::from("/already/set")),
+            Some(OsString::from("/usr/bin")),
+            [root],
+        );
+
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn dotnet_env_sets_root_and_prepends_path_for_existing_sdk_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dotnet");
+        std::fs::create_dir_all(root.join("sdk")).unwrap();
+
+        let env = dotnet_env_with(None, Some(OsString::from("/usr/bin")), [root.clone()]);
+
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "DOTNET_ROOT".to_string(),
+                    root.to_string_lossy().into_owned(),
+                ),
+                (
+                    "PATH".to_string(),
+                    std::env::join_paths([root.as_path(), Path::new("/usr/bin")])
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotnet_env_is_empty_when_no_sdk_root_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dotnet");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let env = dotnet_env_with(None, Some(OsString::from("/usr/bin")), [root]);
+
+        assert!(env.is_empty());
+    }
+
     fn source_text<'a>(source: &'a [u8], site: &DefinitionSite) -> &'a str {
         std::str::from_utf8(&source[site.byte_start..site.byte_end]).unwrap()
     }
@@ -485,6 +594,7 @@ class Declared : BaseWidget, IWidget {
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "csharp",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),
