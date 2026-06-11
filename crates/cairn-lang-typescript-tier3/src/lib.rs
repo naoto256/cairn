@@ -31,7 +31,6 @@ const TSX_ANALYZER_ID: &str = "typescript-language-server-tsx-lsp";
 const ANALYZER_REVISION: u32 = 1;
 const POOL_CONFIG_ID: &str = "typescript-language-server-lsp-v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const WORKSPACE_LOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Copy)]
 struct TsLanguage {
@@ -237,12 +236,14 @@ fn typescript_spawn_spec(language: TsLanguage, repo_root: &Path) -> LspSpawnSpec
         config_hash: POOL_CONFIG_ID.to_string(),
         request_timeout: REQUEST_TIMEOUT,
         availability: AvailabilityStrategy::VersionFlag,
-        // typescript-language-server loads tsconfig and node_modules on first
-        // document open and can spend tens of seconds indexing large projects;
-        // quiescence lets definition() use a settled index.
-        readiness: ReadinessStrategy::ProgressQuiescence {
-            timeout: WORKSPACE_LOAD_TIMEOUT,
-        },
+        // typescript-language-server emits `$/typescriptVersion` and
+        // `window/logMessage` but does not emit `$/progress` notifications, so
+        // ProgressQuiescence would wait forever for a begin that never arrives.
+        // Standalone measurement showed `textDocument/definition` returns in
+        // ~2ms post-initialize, so we treat the initialize response as the
+        // readiness signal and rely on request_timeout to bound any genuinely
+        // slow request.
+        readiness: ReadinessStrategy::InitializeResponseOnly,
         language_id: language.language_id,
         // Unlike clangd/pyright/gopls, this server requires an explicit stdio
         // transport flag. The env/PATH binary discovery stays separate so doctor
@@ -457,15 +458,13 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn typescript_spawn_spec_waits_for_progress_quiescence() {
+    fn typescript_spawn_spec_uses_initialize_response_only() {
         let spec = typescript_spawn_spec(TS_LANGUAGE, Path::new("/tmp/repo"));
 
         assert_eq!(spec.request_timeout, REQUEST_TIMEOUT);
         assert!(matches!(
             spec.readiness,
-            ReadinessStrategy::ProgressQuiescence {
-                timeout: WORKSPACE_LOAD_TIMEOUT
-            }
+            ReadinessStrategy::InitializeResponseOnly
         ));
     }
 
