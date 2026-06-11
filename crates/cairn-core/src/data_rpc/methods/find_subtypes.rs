@@ -5,7 +5,9 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
+use crate::data_rpc::helpers::{
+    completeness_for_cap, limit_with_probe, tier3_status_for_query, with_one_or_all_stores,
+};
 use crate::query::{self, FindSubtypesArgs as QueryArgs, ImplHit as QueryHit};
 use crate::{Error, Result};
 
@@ -55,10 +57,19 @@ impl DataMethod for FindSubtypes {
             |_out: &mut Vec<ImplHit>| {},
         )
         .await?;
+        let tier3_status = tier3_status_for_query(
+            ctx,
+            args.repo.clone(),
+            args.anchor.clone(),
+            args.branch.clone(),
+            "find_subtypes",
+        )
+        .await?;
 
         Ok(serde_json::to_value(FindSubtypesResult {
             items,
             completeness: completeness_for_cap(capped),
+            tier3_status,
         })
         .unwrap())
     }
