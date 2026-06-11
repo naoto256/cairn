@@ -9,6 +9,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("LSP binary not available: {0}")]
     BinaryMissing(PathBuf),
+    #[error("LSP workspace unsuitable: {0}")]
+    WorkspaceUnsuitable(String),
     #[error("failed to spawn LSP server: {0}")]
     Spawn(std::io::Error),
     #[error("LSP handshake failed: {0}")]
@@ -19,6 +21,11 @@ pub enum Error {
     RequestTimeout,
     #[error("LSP server exited{0}")]
     ServerExited(ExitStatusDetail),
+    #[error("LSP server exited{status}; stderr: {stderr}")]
+    ServerExitedWithStderr {
+        status: ExitStatusDetail,
+        stderr: String,
+    },
     #[error("LSP protocol error: {0}")]
     Protocol(String),
     #[error("LSP protocol error: {message}")]
