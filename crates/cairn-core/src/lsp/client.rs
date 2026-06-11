@@ -22,8 +22,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKSPACE_LOAD_QUIET_PERIOD: Duration = Duration::from_secs(5);
 const MAX_RESTARTS: usize = 3;
-const STDERR_TAIL_BYTES: usize = 2048;
-const STDERR_TAIL_LINES: usize = 10;
+const STDERR_SECTION_BYTES: usize = 1024;
+const STDERR_HEAD_LINES: usize = 5;
+const STDERR_TAIL_LINES: usize = 5;
+const STDERR_OMISSION_MARKER: &str = " ... ";
 
 pub struct LspClient {
     binary_path: Option<PathBuf>,
@@ -509,23 +511,55 @@ async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -
 }
 
 #[derive(Default)]
-struct StderrTail {
-    text: String,
+pub(super) struct StderrTail {
+    head: String,
+    tail: String,
+    truncated: bool,
 }
 
 impl StderrTail {
-    fn clear(&mut self) {
-        self.text.clear();
+    pub(super) fn clear(&mut self) {
+        self.head.clear();
+        self.tail.clear();
+        self.truncated = false;
     }
 
-    fn push(&mut self, chunk: &[u8]) {
-        self.text.push_str(&String::from_utf8_lossy(chunk));
-        trim_to_last_bytes(&mut self.text, STDERR_TAIL_BYTES);
-        trim_to_last_lines(&mut self.text, STDERR_TAIL_LINES);
+    pub(super) fn push(&mut self, chunk: &[u8]) {
+        let chunk = String::from_utf8_lossy(chunk);
+        if !self.truncated {
+            self.head.push_str(&chunk);
+            let line_count = self.head.lines().count();
+            if line_count <= STDERR_HEAD_LINES + STDERR_TAIL_LINES {
+                return;
+            }
+
+            self.truncated = true;
+            self.tail = self.head.clone();
+            trim_to_first_lines(&mut self.head, STDERR_HEAD_LINES);
+            trim_to_first_bytes(&mut self.head, STDERR_SECTION_BYTES);
+            trim_to_last_bytes(&mut self.tail, STDERR_SECTION_BYTES);
+            trim_to_last_lines(&mut self.tail, STDERR_TAIL_LINES);
+            return;
+        }
+
+        self.tail.push_str(&chunk);
+        trim_to_last_bytes(&mut self.tail, STDERR_SECTION_BYTES);
+        trim_to_last_lines(&mut self.tail, STDERR_TAIL_LINES);
     }
 
-    fn text(&self) -> String {
-        self.text.trim().to_string()
+    pub(super) fn text(&self) -> String {
+        if self.truncated {
+            format!(
+                "{}\n{}\n{}",
+                self.head.trim_end(),
+                STDERR_OMISSION_MARKER,
+                self.tail.trim_start()
+            )
+            .trim()
+            .to_string()
+        } else {
+            self.head.trim().to_string()
+        }
     }
 }
 
@@ -551,6 +585,36 @@ fn trim_to_last_bytes(text: &mut String, max_bytes: usize) {
         start += 1;
     }
     text.drain(..start);
+}
+
+fn trim_to_first_bytes(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn trim_to_first_lines(text: &mut String, max_lines: usize) {
+    let line_count = text.lines().count();
+    if line_count <= max_lines {
+        return;
+    }
+    let mut keep_lines = max_lines;
+    let mut end = text.len();
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            keep_lines -= 1;
+            if keep_lines == 0 {
+                end = idx;
+                break;
+            }
+        }
+    }
+    text.truncate(end);
 }
 
 fn trim_to_last_lines(text: &mut String, max_lines: usize) {
