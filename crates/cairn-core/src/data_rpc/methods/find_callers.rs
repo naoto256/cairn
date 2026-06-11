@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_references::SnippetCache;
-use crate::data_rpc::helpers::{completeness_for_cap, limit_with_probe, with_one_or_all_stores};
+use crate::data_rpc::helpers::{
+    completeness_for_cap, limit_with_probe, tier3_status_for_query, with_one_or_all_stores,
+};
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::{Error, Result};
 
@@ -65,10 +67,19 @@ impl DataMethod for FindCallers {
             |_out: &mut Vec<CallHit>| {},
         )
         .await?;
+        let tier3_status = tier3_status_for_query(
+            ctx,
+            args.repo.clone(),
+            args.anchor.clone(),
+            args.branch.clone(),
+            "find_callers",
+        )
+        .await?;
 
         Ok(serde_json::to_value(FindCallersResult {
             items,
             completeness: completeness_for_cap(capped),
+            tier3_status,
         })
         .unwrap())
     }

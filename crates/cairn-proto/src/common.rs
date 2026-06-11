@@ -108,6 +108,31 @@ pub enum RefKind {
     Annotation,
 }
 
+/// Tier-3 workspace analyzer readiness for the snapshots a query touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier3Status {
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_analyzers: Vec<PendingAnalyzer>,
+}
+
+impl Tier3Status {
+    #[must_use]
+    pub fn ready() -> Self {
+        Self {
+            ready: true,
+            pending_analyzers: Vec::new(),
+        }
+    }
+}
+
+/// One Tier-3 analyzer that has not reached a positive terminal state.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PendingAnalyzer {
+    pub analyzer_id: String,
+    pub state: String,
+}
+
 /// How complete a query's answer is at the moment it was produced.
 ///
 /// Cairn is a **shortcut**, not a last resort — when a query arrives,

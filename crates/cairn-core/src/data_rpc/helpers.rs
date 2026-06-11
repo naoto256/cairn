@@ -1,8 +1,14 @@
 //! Shared blocking helpers for data-RPC methods.
 
-use cairn_proto::{Completeness, PartialReason};
+use std::collections::{BTreeSet, HashSet};
 
+use cairn_proto::{Completeness, PartialReason, PendingAnalyzer, Tier3Status};
+use rusqlite::{OptionalExtension, params};
+
+use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::manifest::ManifestId;
+use crate::workspace_analyzer::{WorkspaceAnalyzer, all_workspace_analyzers};
 use crate::{Error, Result};
 
 use super::DataCtx;
@@ -79,6 +85,114 @@ pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
     } else {
         Completeness::complete()
     }
+}
+
+pub(crate) async fn tier3_status_for_query(
+    ctx: &DataCtx,
+    requested_repo: Option<String>,
+    anchor_arg: Option<String>,
+    branch_arg: Option<String>,
+    method_name: &'static str,
+) -> Result<Tier3Status> {
+    let cas_data_dir = ctx.cas_data_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<Tier3Status> {
+        let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+        let aliases = match requested_repo.as_deref() {
+            Some(name) => {
+                let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
+                    Error::RepoNotFound {
+                        alias: name.to_string(),
+                    }
+                })?;
+                vec![entry]
+            }
+            None => cas_registry::list_all(&index)?,
+        };
+
+        let mut pending = BTreeSet::new();
+        for entry in aliases {
+            let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
+            let conn = cas_store::open(&store_path)?;
+            let anchor = anchor::resolve_explicit_or_default(
+                &conn,
+                anchor_arg.as_deref(),
+                branch_arg.as_deref(),
+            )?;
+            let Some(manifest_id) = anchor::resolve(&conn, &anchor)? else {
+                continue;
+            };
+            pending.extend(compute_tier3_status(&conn, manifest_id)?.pending_analyzers);
+        }
+        Ok(Tier3Status {
+            ready: pending.is_empty(),
+            pending_analyzers: pending.into_iter().collect(),
+        })
+    })
+    .await
+    .map_err(|e| Error::InvalidArgument(format!("{method_name} tier3 status task panicked: {e}")))?
+}
+
+pub(crate) fn compute_tier3_status(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+) -> Result<Tier3Status> {
+    compute_tier3_status_with_analyzers(conn, manifest_id, all_workspace_analyzers())
+}
+
+fn compute_tier3_status_with_analyzers(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+    analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
+) -> Result<Tier3Status> {
+    let parser_ids = manifest_parser_ids(conn, manifest_id)?;
+    let mut expected_ids = analyzers
+        .into_iter()
+        .filter(|analyzer| parser_ids.contains(analyzer.parser_id()))
+        .map(|analyzer| analyzer.id().to_string())
+        .collect::<Vec<_>>();
+    expected_ids.sort();
+    expected_ids.dedup();
+
+    if expected_ids.is_empty() {
+        return Ok(Tier3Status::ready());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT status FROM workspace_analysis_runs
+         WHERE manifest_id = ?1 AND analyzer_id = ?2",
+    )?;
+    let mut pending = Vec::new();
+    for analyzer_id in expected_ids {
+        let state = stmt
+            .query_row(params![manifest_id.0, analyzer_id.as_str()], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .unwrap_or_else(|| "missing".to_string());
+        if !matches!(state.as_str(), "succeeded" | "skipped") {
+            pending.push(PendingAnalyzer { analyzer_id, state });
+        }
+    }
+    Ok(Tier3Status {
+        ready: pending.is_empty(),
+        pending_analyzers: pending,
+    })
+}
+
+fn manifest_parser_ids(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT b.parser_id
+           FROM blobs b
+           JOIN manifest_entries me ON me.blob_sha = b.blob_sha
+          WHERE me.manifest_id = ?1",
+    )?;
+    let parser_ids = stmt
+        .query_map(params![manifest_id.0], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(parser_ids)
 }
 
 #[cfg(test)]
@@ -184,6 +298,41 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    use crate::workspace_analyzer::{WorkspaceFacts, WorkspaceFile};
+
+    struct TestAnalyzer {
+        id: &'static str,
+        parser_id: &'static str,
+    }
+
+    impl WorkspaceAnalyzer for TestAnalyzer {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "test"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            self.parser_id
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+        ) -> Result<WorkspaceFacts> {
+            Ok(WorkspaceFacts::default())
+        }
+    }
 
     #[test]
     fn exact_limit_rows_are_complete() {
@@ -214,5 +363,99 @@ mod tests {
                 reason: Some(PartialReason::Cap),
             }
         );
+    }
+
+    #[test]
+    fn tier3_status_is_ready_when_all_expected_analyzers_succeeded() {
+        let fixture = test_support::registered_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_run(&conn, manifest_id, "demo-lsp", "succeeded");
+
+        let status = compute_tier3_status_with_analyzers(
+            &conn,
+            manifest_id,
+            vec![Box::new(TestAnalyzer {
+                id: "demo-lsp",
+                parser_id: "tree-sitter-rust",
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(status, Tier3Status::ready());
+    }
+
+    #[test]
+    fn tier3_status_reports_running_pending_analyzer() {
+        let fixture = test_support::registered_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_run(&conn, manifest_id, "demo-lsp", "running");
+
+        let status = compute_tier3_status_with_analyzers(
+            &conn,
+            manifest_id,
+            vec![Box::new(TestAnalyzer {
+                id: "demo-lsp",
+                parser_id: "tree-sitter-rust",
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            Tier3Status {
+                ready: false,
+                pending_analyzers: vec![PendingAnalyzer {
+                    analyzer_id: "demo-lsp".into(),
+                    state: "running".into(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn tier3_status_is_ready_when_no_analyzers_match_manifest() {
+        let fixture = test_support::registered_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+
+        let status = compute_tier3_status_with_analyzers(
+            &conn,
+            manifest_id,
+            vec![Box::new(TestAnalyzer {
+                id: "demo-lsp",
+                parser_id: "not-present",
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(status, Tier3Status::ready());
+    }
+
+    fn demo_store(fixture: &test_support::DataRpcFixture) -> (rusqlite::Connection, ManifestId) {
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        let conn =
+            cas_store::open(&fixture.ctx.cas_data_dir.store_db_path(&entry.repo_hash)).unwrap();
+        let manifest_id = anchor::resolve(&conn, &anchor::AnchorName::head())
+            .unwrap()
+            .unwrap();
+        (conn, manifest_id)
+    }
+
+    fn insert_run(
+        conn: &rusqlite::Connection,
+        manifest_id: ManifestId,
+        analyzer_id: &str,
+        status: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+             VALUES (?1, ?2, 1, 'cfg', ?3, 0, 0, NULL, NULL, 0)",
+            params![manifest_id.0, analyzer_id, status],
+        )
+        .unwrap();
     }
 }
