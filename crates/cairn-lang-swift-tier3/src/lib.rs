@@ -7,12 +7,11 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::time::Duration;
 
 use cairn_core::lsp::Position;
 use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrategy};
+use cairn_core::lsp_discovery::discover_sourcekit_lsp;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
@@ -120,33 +119,7 @@ fn run_sourcekit_lsp_pass(
 }
 
 fn sourcekit_lsp_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("SOURCEKIT_LSP").map(PathBuf::from) {
-        return path;
-    }
-    sourcekit_lsp_from_xcrun().unwrap_or_else(|| PathBuf::from("sourcekit-lsp"))
-}
-
-fn sourcekit_lsp_from_xcrun() -> Option<PathBuf> {
-    // On macOS, sourcekit-lsp commonly lives inside the active Xcode toolchain
-    // and is not guaranteed to be on PATH. `xcrun --find` follows xcode-select,
-    // which keeps Cairn aligned with the developer's selected toolchain.
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("xcrun")
-            .args(["--find", "sourcekit-lsp"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let path = String::from_utf8(output.stdout).ok()?;
-        let path = PathBuf::from(path.trim());
-        path.is_file().then_some(path)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    discover_sourcekit_lsp().unwrap_or_else(|| PathBuf::from("sourcekit-lsp"))
 }
 
 fn collect_call_sites(source: &[u8]) -> Result<Vec<DefinitionSite>> {

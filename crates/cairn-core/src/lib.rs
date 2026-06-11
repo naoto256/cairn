@@ -23,6 +23,7 @@ pub(crate) mod enrichment;
 pub mod jobs;
 pub(crate) mod jsonrpc_errors;
 pub mod lsp;
+pub mod lsp_discovery;
 pub mod manifest;
 pub mod migration;
 pub mod paths;
