@@ -7,6 +7,8 @@
 //! boundary and persists facts emitted by registered workspace analyzers.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Re-exported so language crates can declare their pass's ref kind
 // without depending on cairn-proto directly.
@@ -38,7 +40,7 @@ pub use lsp_pass::{
 };
 pub use run::run_registered_workspace_analyzers;
 pub(crate) use run::{
-    AnalyzerRunRequest, RunRecord, RunStatus, WORKSPACE_ANALYZER_TIMEOUT, config_hash, mark_run,
+    ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, config_hash, mark_run,
     run_one_workspace_analyzer_with_timeout,
 };
 
@@ -55,6 +57,24 @@ pub static WORKSPACE_ANALYZERS: [fn() -> Box<dyn WorkspaceAnalyzer>] = [..];
 #[must_use]
 pub fn all_workspace_analyzers() -> Vec<Box<dyn WorkspaceAnalyzer>> {
     WORKSPACE_ANALYZERS.iter().map(|ctor| ctor()).collect()
+}
+
+/// Shared progress beacon for one analyzer run. The runner watches it to
+/// distinguish "still working" from "hung": the analyzer-side pass touches it
+/// as work completes, and the stall detector only fires when it stops
+/// advancing.
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzerProgress(Arc<AtomicU64>);
+
+impl AnalyzerProgress {
+    pub fn tick(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// Analyzer that can derive facts from a repository snapshot.
@@ -99,6 +119,7 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         repo_root: &Path,
         manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts>;
 }
 
@@ -166,6 +187,7 @@ mod tests {
             _repo_root: &Path,
             _manifest_id: ManifestId,
             _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
         ) -> Result<WorkspaceFacts> {
             Ok(WorkspaceFacts::default())
         }
@@ -202,6 +224,7 @@ mod tests {
             _repo_root: &Path,
             _manifest_id: ManifestId,
             _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
         ) -> Result<WorkspaceFacts> {
             Ok(self.facts.clone())
         }
@@ -231,6 +254,7 @@ mod tests {
             _repo_root: &Path,
             _manifest_id: ManifestId,
             _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
         ) -> Result<WorkspaceFacts> {
             Err(Error::Lsp(crate::lsp::Error::ResponseError {
                 code: crate::lsp::CONTENT_MODIFIED_ERROR_CODE,
@@ -263,6 +287,7 @@ mod tests {
             _repo_root: &Path,
             _manifest_id: ManifestId,
             _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
         ) -> Result<WorkspaceFacts> {
             Err(Error::Lsp(crate::lsp::Error::WorkspaceUnsuitable(
                 "Gemfile without Gemfile.lock; run bundle install to enable ruby-lsp".into(),
@@ -294,8 +319,43 @@ mod tests {
             _repo_root: &Path,
             _manifest_id: ManifestId,
             _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
         ) -> Result<WorkspaceFacts> {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    struct ProgressingSlowRustAnalyzer;
+
+    impl WorkspaceAnalyzer for ProgressingSlowRustAnalyzer {
+        fn id(&self) -> &'static str {
+            "rust-analyzer-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "rust"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-rust"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            for _ in 0..6 {
+                progress.tick();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
             Ok(WorkspaceFacts::default())
         }
     }
@@ -322,7 +382,12 @@ mod tests {
         }];
 
         let facts = analyzer
-            .analyze_workspace(Path::new("/tmp/repo"), ManifestId(42), &files)
+            .analyze_workspace(
+                Path::new("/tmp/repo"),
+                ManifestId(42),
+                &files,
+                &AnalyzerProgress::default(),
+            )
             .unwrap();
 
         assert_eq!(facts, WorkspaceFacts::default());
@@ -763,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_timeout_records_failed_run_and_continues() {
+    fn analyzer_stall_records_timed_out_run_and_continues() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(repo_root.join("src")).unwrap();
@@ -820,8 +885,66 @@ mod tests {
         assert!(
             row.1
                 .as_deref()
-                .is_some_and(|error| error.starts_with("analyzer timed out after "))
+                .is_some_and(|error| error.contains("analyzer stalled"))
         );
+    }
+
+    #[test]
+    fn analyzer_that_keeps_ticking_past_stall_window_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "source-sha";
+        let manifest_id = ManifestId(1);
+        let entries = vec![ManifestEntry {
+            path: "src/main.rs".into(),
+            blob_sha: source_sha.into(),
+        }];
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/main.rs', ?1)",
+            params![source_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'tree-sitter-rust', 1, 0)",
+            params![source_sha],
+        )
+        .unwrap();
+
+        let inserted = run_workspace_analyzers_with_timeout(
+            &mut conn,
+            &repo_root,
+            manifest_id,
+            &entries,
+            10,
+            vec![Box::new(ProgressingSlowRustAnalyzer)],
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'rust-analyzer-lsp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "succeeded");
+        assert_eq!(row.1, None);
     }
 
     fn tier3_ref_count(conn: &Connection) -> i64 {

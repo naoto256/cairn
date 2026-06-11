@@ -300,7 +300,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use crate::workspace_analyzer::{WorkspaceFacts, WorkspaceFile};
+    use crate::workspace_analyzer::{AnalyzerProgress, WorkspaceFacts, WorkspaceFile};
 
     struct TestAnalyzer {
         id: &'static str,
@@ -329,6 +329,7 @@ mod tests {
             _repo_root: &Path,
             _manifest_id: ManifestId,
             _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
         ) -> Result<WorkspaceFacts> {
             Ok(WorkspaceFacts::default())
         }

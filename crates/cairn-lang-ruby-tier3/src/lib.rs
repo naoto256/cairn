@@ -14,8 +14,8 @@ use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrateg
 use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
-    WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
+    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -57,8 +57,9 @@ impl WorkspaceAnalyzer for RubyLspWorkspaceAnalyzer {
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_ruby_lsp_passes(repo_root, files)
+        run_ruby_lsp_passes(repo_root, files, progress)
     }
 }
 
@@ -76,10 +77,26 @@ fn ruby_config_paths() -> &'static [&'static str] {
     ]
 }
 
-fn run_ruby_lsp_passes(repo_root: &Path, files: &[WorkspaceFile]) -> Result<WorkspaceFacts> {
+fn run_ruby_lsp_passes(
+    repo_root: &Path,
+    files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
+) -> Result<WorkspaceFacts> {
     preflight_workspace(repo_root)?;
-    let mut facts = run_ruby_lsp_pass(repo_root, files, RefKind::Call, collect_method_calls)?;
-    let type_facts = run_ruby_lsp_pass(repo_root, files, RefKind::Type, collect_constant_refs)?;
+    let mut facts = run_ruby_lsp_pass(
+        repo_root,
+        files,
+        RefKind::Call,
+        collect_method_calls,
+        progress,
+    )?;
+    let type_facts = run_ruby_lsp_pass(
+        repo_root,
+        files,
+        RefKind::Type,
+        collect_constant_refs,
+        progress,
+    )?;
     facts.resolved_refs.extend(type_facts.resolved_refs);
     Ok(facts)
 }
@@ -99,6 +116,7 @@ fn run_ruby_lsp_pass(
     files: &[WorkspaceFile],
     ref_kind: RefKind,
     collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+    progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
     run_lsp_definition_pass(
         LspDefinitionPass {
@@ -128,6 +146,7 @@ fn run_ruby_lsp_pass(
         },
         repo_root,
         files,
+        progress,
     )
 }
 
@@ -401,6 +420,7 @@ end
                 blob_sha: "blob".into(),
                 worktree_path: Some(source.to_path_buf()),
             }],
+            &AnalyzerProgress::default(),
         )
         .unwrap()
     }

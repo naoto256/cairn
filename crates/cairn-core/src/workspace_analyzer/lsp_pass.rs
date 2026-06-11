@@ -21,7 +21,7 @@ use crate::lsp::{Location, Position, Url};
 use crate::{Error, Result};
 
 use super::path::location_to_repo_path;
-use super::{ResolvedRef, WorkspaceFacts, WorkspaceFile};
+use super::{AnalyzerProgress, ResolvedRef, WorkspaceFacts, WorkspaceFile};
 
 const MAX_DEFINITION_ATTEMPTS: usize = 3;
 const DEFINITION_PIPELINE_CONCURRENCY: usize = 16;
@@ -88,6 +88,7 @@ pub fn run_lsp_definition_pass(
     pass: LspDefinitionPass,
     repo_root: &Path,
     files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
     let key = PoolKey::lsp(
         pass.language,
@@ -104,6 +105,7 @@ pub fn run_lsp_definition_pass(
     let ref_kind = pass.ref_kind;
     let retry = pass.retry;
     let collect = pass.collect_definition_sites;
+    let progress = progress.clone();
     pool.with_lsp(key, pass.spawn_spec, move |client| {
         Box::pin(async move {
             let mut facts = WorkspaceFacts::default();
@@ -115,6 +117,7 @@ pub fn run_lsp_definition_pass(
                 ref_kind,
                 retry,
                 collect,
+                progress,
                 &mut facts,
             )
             .await
@@ -134,6 +137,7 @@ async fn collect_resolved_refs(
     ref_kind: RefKind,
     retry: DefinitionRetryPolicy,
     collect_definition_sites: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+    progress: AnalyzerProgress,
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
     for file in files {
@@ -143,6 +147,7 @@ async fn collect_resolved_refs(
         let source = std::fs::read_to_string(path)?;
         let sites = collect_definition_sites(source.as_bytes())?;
         if sites.is_empty() {
+            progress.tick();
             continue;
         }
         let uri = Url::from_file_path(path).map_err(Error::Lsp)?;
@@ -160,6 +165,7 @@ async fn collect_resolved_refs(
             retry,
             analyzer_id,
             &uri,
+            progress.clone(),
         )
         .await;
         let definition_elapsed = definition_started.elapsed();
@@ -194,6 +200,7 @@ async fn collect_resolved_refs(
                 "failed to close LSP document after definition pass"
             );
         }
+        progress.tick();
     }
     Ok(())
 }
@@ -216,6 +223,7 @@ async fn collect_definition_site_locations<F, Fut>(
     retry: DefinitionRetryPolicy,
     analyzer_id: &str,
     uri: &Url,
+    progress: AnalyzerProgress,
 ) -> DefinitionBatch
 where
     F: Fn(DefinitionSite) -> Fut,
@@ -224,6 +232,7 @@ where
     let mut results = stream::iter(sites)
         .map(|site| {
             let definition = &definition;
+            let progress = progress.clone();
             async move {
                 let result = definition_with_retry_from(
                     || definition(site),
@@ -233,6 +242,7 @@ where
                     site.position,
                 )
                 .await;
+                progress.tick();
                 (site, result)
             }
         })
@@ -550,6 +560,7 @@ mod tests {
     async fn definition_sites_are_pipelined_with_bounded_concurrency() {
         let sites = (0..100).map(test_site).collect::<Vec<_>>();
         let calls = Arc::new(AtomicUsize::new(0));
+        let progress = AnalyzerProgress::default();
         let start = Instant::now();
         let resolved = collect_definition_site_locations(
             sites,
@@ -567,10 +578,12 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            progress.clone(),
         )
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 100);
+        assert_eq!(progress.snapshot(), 100);
         assert_eq!(resolved.resolved.len(), 100);
         assert_eq!(resolved.error_count, 0);
         assert!(
@@ -583,6 +596,7 @@ mod tests {
     #[tokio::test]
     async fn definition_site_errors_skip_only_the_failed_site() {
         let sites = (0..5).map(test_site).collect::<Vec<_>>();
+        let progress = AnalyzerProgress::default();
         let resolved = collect_definition_site_locations(
             sites,
             |site| async move {
@@ -595,9 +609,11 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            progress.clone(),
         )
         .await;
 
+        assert_eq!(progress.snapshot(), 5);
         assert_eq!(resolved.error_count, 1);
         let lines = resolved
             .resolved
@@ -619,6 +635,7 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            AnalyzerProgress::default(),
         )
         .await;
 

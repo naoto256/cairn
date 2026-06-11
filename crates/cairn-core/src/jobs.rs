@@ -21,7 +21,7 @@ use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::manifest::{self, ManifestEntry, ManifestId};
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::{
-    AnalyzerRunRequest, RunRecord, RunStatus, WORKSPACE_ANALYZER_TIMEOUT, all_workspace_analyzers,
+    ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, all_workspace_analyzers,
     config_hash, mark_run, run_one_workspace_analyzer_with_timeout,
 };
 use crate::{Error, Result};
@@ -471,7 +471,7 @@ fn run_job_blocking(job: Job) -> Result<()> {
             manifest_id: job.manifest_id,
             entries: &entries,
             now_ns: now,
-            analyzer_timeout: WORKSPACE_ANALYZER_TIMEOUT,
+            analyzer_stall_timeout: ANALYZER_STALL_TIMEOUT,
             job_id: Some(job.id),
         },
     )?;

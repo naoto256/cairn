@@ -18,8 +18,8 @@ use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrateg
 use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
-    WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
+    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -59,6 +59,7 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
         run_lsp_definition_pass(
             LspDefinitionPass {
@@ -85,6 +86,7 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
             },
             repo_root,
             files,
+            progress,
         )
     }
 }
