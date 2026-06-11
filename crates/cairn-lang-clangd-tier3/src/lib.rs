@@ -109,6 +109,10 @@ impl WorkspaceAnalyzer for ClangdCWorkspaceAnalyzer {
         clangd_config_paths()
     }
 
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(CLANGD_POOL_ID)
+    }
+
     fn analyze_workspace(
         &self,
         repo_root: &Path,
@@ -140,6 +144,10 @@ impl WorkspaceAnalyzer for ClangdCppWorkspaceAnalyzer {
         clangd_config_paths()
     }
 
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(CLANGD_POOL_ID)
+    }
+
     fn analyze_workspace(
         &self,
         repo_root: &Path,
@@ -169,6 +177,10 @@ impl WorkspaceAnalyzer for ClangdObjcWorkspaceAnalyzer {
 
     fn config_paths(&self) -> &'static [&'static str] {
         clangd_config_paths()
+    }
+
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(CLANGD_POOL_ID)
     }
 
     fn analyze_workspace(
@@ -532,6 +544,19 @@ mod tests {
             spec.readiness,
             ReadinessStrategy::InitializeResponseOnly
         ));
+    }
+
+    #[test]
+    fn clangd_analyzers_share_pool_group() {
+        assert_eq!(ClangdCWorkspaceAnalyzer.pool_group(), Some(CLANGD_POOL_ID));
+        assert_eq!(
+            ClangdCppWorkspaceAnalyzer.pool_group(),
+            Some(CLANGD_POOL_ID)
+        );
+        assert_eq!(
+            ClangdObjcWorkspaceAnalyzer.pool_group(),
+            Some(CLANGD_POOL_ID)
+        );
     }
 
     #[test]

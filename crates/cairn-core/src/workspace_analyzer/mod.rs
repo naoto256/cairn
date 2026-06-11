@@ -85,6 +85,14 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         &[]
     }
 
+    /// Analyzers that share one pooled LSP process return the same group id so
+    /// the job scheduler never runs two of them concurrently. The shared pool
+    /// serializes them anyway, and the waiter's analyzer timeout must not tick
+    /// while it waits.
+    fn pool_group(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Analyze one manifest worth of files rooted at `repo_root`.
     fn analyze_workspace(
         &self,
