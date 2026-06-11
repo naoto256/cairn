@@ -269,7 +269,7 @@ impl LspClient {
     /// completed via LSP `$/progress` notifications.
     ///
     /// # Errors
-    /// Returns [`Error::Timeout`] when no completed progress sequence
+    /// Returns [`Error::ReadinessTimeout`] when no completed progress sequence
     /// is observed before `wait_timeout` elapses.
     pub async fn wait_for_workspace_load(&self, wait_timeout: Duration) -> Result<()> {
         self.wait_for_workspace_load_with_quiescence(wait_timeout, WORKSPACE_LOAD_QUIET_PERIOD)
@@ -287,7 +287,7 @@ impl LspClient {
             self.progress.wait_for_quiescence(quiet_period),
         )
         .await
-        .map_err(|_| Error::Timeout)?;
+        .map_err(|_| Error::ReadinessTimeout)?;
         info!(?completed_via, "workspace load complete");
         Ok(())
     }
@@ -423,7 +423,7 @@ impl LspClient {
             Ok(received) => received,
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                return Err(Error::Timeout);
+                return Err(Error::RequestTimeout);
             }
         };
         let response = response.map_err(|_| Error::ServerExited(None.into()))??;
@@ -463,7 +463,7 @@ async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -
         Command::new(binary_path).arg("--version").output(),
     )
     .await
-    .map_err(|_| Error::Timeout)?
+    .map_err(|_| Error::RequestTimeout)?
     .map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinaryMissing(binary_path.to_path_buf())
