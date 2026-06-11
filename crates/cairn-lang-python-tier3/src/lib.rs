@@ -76,6 +76,7 @@ impl WorkspaceAnalyzer for PyrightWorkspaceAnalyzer {
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "python",
                     launch_args: vec!["--stdio".to_string()],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy {

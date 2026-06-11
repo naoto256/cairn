@@ -124,6 +124,7 @@ fn run_sourcekit_lsp_pass(
                 readiness: ReadinessStrategy::InitializeResponseOnly,
                 language_id: "swift",
                 launch_args: Vec::new(),
+                env: Vec::new(),
                 initialization_options: json!({}),
             },
             retry: DefinitionRetryPolicy {
@@ -416,6 +417,7 @@ extension Main: Codable {}
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "swift",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),

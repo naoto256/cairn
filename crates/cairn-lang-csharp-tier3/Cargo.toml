@@ -13,6 +13,7 @@ description = "C# csharp-ls Tier-3 workspace analyzer for Cairn."
 cairn-core.workspace = true
 cairn-lang-api.workspace = true
 cairn-lang-csharp.workspace = true
+dirs.workspace = true
 linkme.workspace = true
 serde_json.workspace = true
 tree-sitter.workspace = true

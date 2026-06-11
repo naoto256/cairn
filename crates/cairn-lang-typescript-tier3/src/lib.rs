@@ -270,6 +270,7 @@ fn typescript_spawn_spec(language: TsLanguage, repo_root: &Path) -> LspSpawnSpec
         // transport flag. The env/PATH binary discovery stays separate so doctor
         // and runtime use the same executable rule.
         launch_args: vec!["--stdio".to_string()],
+        env: Vec::new(),
         initialization_options: json!({}),
     }
 }
@@ -653,6 +654,7 @@ export function View() { return <button onClick={() => helper()} />; }
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "typescript",
                     launch_args: vec![script.to_string_lossy().to_string(), target_uri],
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),

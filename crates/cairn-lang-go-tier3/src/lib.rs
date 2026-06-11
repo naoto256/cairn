@@ -76,6 +76,7 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
                     readiness: ReadinessStrategy::InitializeResponseOnly,
                     language_id: "go",
                     launch_args: Vec::new(),
+                    env: Vec::new(),
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy {

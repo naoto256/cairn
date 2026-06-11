@@ -30,6 +30,7 @@ const STDERR_OMISSION_MARKER: &str = " ... ";
 pub struct LspClient {
     binary_path: Option<PathBuf>,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     workspace_root: PathBuf,
     initialization_options: Value,
     timeout: Duration,
@@ -72,6 +73,7 @@ impl LspClient {
         let client = Self::new(
             Some(binary_path.to_path_buf()),
             Vec::new(),
+            Vec::new(),
             workspace_root.to_path_buf(),
             rust_analyzer_initialization_options(config_hash),
             request_timeout,
@@ -89,6 +91,7 @@ impl LspClient {
     pub async fn start_configured(
         binary_path: &Path,
         args: Vec<String>,
+        env: Vec<(String, String)>,
         workspace_root: &Path,
         initialization_options: Value,
         request_timeout: Duration,
@@ -96,6 +99,7 @@ impl LspClient {
         let client = Self::new(
             Some(binary_path.to_path_buf()),
             args,
+            env,
             workspace_root.to_path_buf(),
             initialization_options,
             request_timeout,
@@ -108,6 +112,7 @@ impl LspClient {
     fn new(
         binary_path: Option<PathBuf>,
         args: Vec<String>,
+        env: Vec<(String, String)>,
         workspace_root: PathBuf,
         initialization_options: Value,
         request_timeout: Duration,
@@ -116,6 +121,7 @@ impl LspClient {
         Self {
             binary_path,
             args,
+            env,
             workspace_root,
             initialization_options,
             timeout: request_timeout,
@@ -146,6 +152,7 @@ impl LspClient {
         let client = Self::new(
             None,
             Vec::new(),
+            Vec::new(),
             workspace_root.to_path_buf(),
             rust_analyzer_initialization_options(config_hash),
             request_timeout,
@@ -172,6 +179,7 @@ impl LspClient {
 
         let mut child = Command::new(binary_path)
             .args(&self.args)
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
             .current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
