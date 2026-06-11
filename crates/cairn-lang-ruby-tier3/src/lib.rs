@@ -26,6 +26,8 @@ const ANALYZER_ID: &str = "ruby-lsp";
 const ANALYZER_REVISION: u32 = 1;
 const POOL_CONFIG_ID: &str = "ruby-lsp-v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const GEMFILE_WITHOUT_LOCK_REASON: &str =
+    "Gemfile without Gemfile.lock; run bundle install to enable ruby-lsp";
 
 pub struct RubyLspWorkspaceAnalyzer;
 
@@ -75,10 +77,21 @@ fn ruby_config_paths() -> &'static [&'static str] {
 }
 
 fn run_ruby_lsp_passes(repo_root: &Path, files: &[WorkspaceFile]) -> Result<WorkspaceFacts> {
+    preflight_workspace(repo_root)?;
     let mut facts = run_ruby_lsp_pass(repo_root, files, RefKind::Call, collect_method_calls)?;
     let type_facts = run_ruby_lsp_pass(repo_root, files, RefKind::Type, collect_constant_refs)?;
     facts.resolved_refs.extend(type_facts.resolved_refs);
     Ok(facts)
+}
+
+fn preflight_workspace(repo_root: &Path) -> Result<()> {
+    if repo_root.join("Gemfile").is_file() && !repo_root.join("Gemfile.lock").is_file() {
+        return Err(cairn_core::lsp::Error::WorkspaceUnsuitable(
+            GEMFILE_WITHOUT_LOCK_REASON.into(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn run_ruby_lsp_pass(
@@ -305,6 +318,37 @@ end
             Some("service.rb")
         );
         assert_eq!(facts.resolved_refs[0].kind, RefKind::Type);
+    }
+
+    #[test]
+    fn preflight_rejects_gemfile_without_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Gemfile"),
+            "source 'https://rubygems.org'\n",
+        )
+        .unwrap();
+
+        let err = preflight_workspace(tmp.path()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Lsp(cairn_core::lsp::Error::WorkspaceUnsuitable(reason))
+                if reason == GEMFILE_WITHOUT_LOCK_REASON
+        ));
+    }
+
+    #[test]
+    fn preflight_accepts_gemfile_with_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Gemfile"),
+            "source 'https://rubygems.org'\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("Gemfile.lock"), "GEM\n").unwrap();
+
+        preflight_workspace(tmp.path()).unwrap();
     }
 
     fn source_text(source: &[u8], site: DefinitionSite) -> &str {

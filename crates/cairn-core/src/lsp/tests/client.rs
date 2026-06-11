@@ -311,6 +311,48 @@ async fn early_server_exit_surfaces_as_server_exited() {
 }
 
 #[tokio::test]
+async fn handshake_failure_includes_stderr_tail() {
+    let Some(python) = python3() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("stderr_lsp.py");
+    std::fs::write(
+        &script,
+        r#"
+import sys
+import time
+
+sys.stderr.write("mock startup failure\n")
+sys.stderr.flush()
+time.sleep(0.05)
+"#,
+    )
+    .unwrap();
+
+    let err = match LspClient::start_configured(
+        &python,
+        vec![script.to_string_lossy().to_string()],
+        tmp.path(),
+        json!({}),
+        Duration::from_secs(1),
+    )
+    .await
+    {
+        Ok(_) => panic!("mock LSP unexpectedly initialized"),
+        Err(err) => err,
+    };
+
+    let message = err.to_string();
+    assert!(message.contains("LSP handshake failed"), "{message}");
+    assert!(message.contains("LSP server exited"), "{message}");
+    assert!(
+        message.contains("stderr: mock startup failure"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn server_work_done_progress_request_is_answered_before_definition() {
     let (client_io, server_io) = tokio::io::duplex(8192);
     let server = tokio::spawn(fake_server(
@@ -385,4 +427,13 @@ async fn pending_map_is_cleared_on_timeout() {
         client.pending.lock().await.is_empty(),
         "pending map leaked entries on timeout"
     );
+}
+
+fn python3() -> Option<std::path::PathBuf> {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|_| std::path::PathBuf::from("python3"))
 }
