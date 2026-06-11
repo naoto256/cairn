@@ -123,7 +123,13 @@ fn run_kotlin_language_server_pass(
                 workspace_root: repo_root.to_path_buf(),
                 config_hash: POOL_CONFIG_ID.to_string(),
                 request_timeout: REQUEST_TIMEOUT,
-                availability: AvailabilityStrategy::VersionFlag,
+                // kotlin-language-server has no `--version` (or `--help`)
+                // flag: jcommander throws ParameterException for any unknown
+                // main parameter and the wrapper still exits 0, leaving stderr
+                // noise that VersionFlag rejects. The binary we already
+                // resolved is sufficient evidence of availability, so check
+                // that the path is executable instead.
+                availability: AvailabilityStrategy::PathExistsExecutable,
                 // kotlin-language-server is JVM-backed like jdtls and can keep
                 // importing Gradle/Maven projects after initialize. Waiting for
                 // progress quiescence gives definition queries a settled index.
