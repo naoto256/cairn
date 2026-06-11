@@ -27,8 +27,8 @@ use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrateg
 use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
-    WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
+    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -118,8 +118,9 @@ impl WorkspaceAnalyzer for ClangdCWorkspaceAnalyzer {
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_clangd_passes(C_LANGUAGE, repo_root, files)
+        run_clangd_passes(C_LANGUAGE, repo_root, files, progress)
     }
 }
 
@@ -153,8 +154,9 @@ impl WorkspaceAnalyzer for ClangdCppWorkspaceAnalyzer {
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_clangd_passes(CPP_LANGUAGE, repo_root, files)
+        run_clangd_passes(CPP_LANGUAGE, repo_root, files, progress)
     }
 }
 
@@ -188,8 +190,9 @@ impl WorkspaceAnalyzer for ClangdObjcWorkspaceAnalyzer {
         repo_root: &Path,
         _manifest_id: ManifestId,
         files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_clangd_passes(OBJC_LANGUAGE, repo_root, files)
+        run_clangd_passes(OBJC_LANGUAGE, repo_root, files, progress)
     }
 }
 
@@ -213,6 +216,7 @@ fn run_clangd_passes(
     language: ClangdLanguage,
     repo_root: &Path,
     files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
     let mut facts = run_clangd_pass(
         language,
@@ -220,6 +224,7 @@ fn run_clangd_passes(
         files,
         RefKind::Call,
         call_collector_for(language),
+        progress,
     )?;
     let include_facts = run_clangd_pass(
         language,
@@ -227,6 +232,7 @@ fn run_clangd_passes(
         files,
         RefKind::Import,
         include_collector_for(language),
+        progress,
     )?;
     facts.resolved_refs.extend(include_facts.resolved_refs);
     Ok(facts)
@@ -238,6 +244,7 @@ fn run_clangd_pass(
     files: &[WorkspaceFile],
     ref_kind: RefKind,
     collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+    progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
     run_lsp_definition_pass(
         LspDefinitionPass {
@@ -254,6 +261,7 @@ fn run_clangd_pass(
         },
         repo_root,
         files,
+        progress,
     )
 }
 
@@ -791,6 +799,7 @@ void f() { normal(); }
                 blob_sha: "blob".into(),
                 worktree_path: Some(source.to_path_buf()),
             }],
+            &AnalyzerProgress::default(),
         )
         .unwrap();
 
@@ -869,6 +878,7 @@ void f() { normal(); }
                 blob_sha: "blob".into(),
                 worktree_path: Some(source.to_path_buf()),
             }],
+            &AnalyzerProgress::default(),
         )
         .unwrap()
     }
