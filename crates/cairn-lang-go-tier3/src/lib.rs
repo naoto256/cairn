@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use cairn_core::lsp::Position;
 use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrategy};
+use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WORKSPACE_ANALYZERS,
@@ -93,9 +94,7 @@ static REGISTER_GO_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(GoplsWorkspaceAnalyzer);
 
 fn gopls_binary() -> PathBuf {
-    std::env::var_os("GOPLS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("gopls"))
+    discover_lsp_binary("gopls", Some("GOPLS")).unwrap_or_else(|| PathBuf::from("gopls"))
 }
 
 fn collect_method_calls(source: &[u8]) -> Result<Vec<DefinitionSite>> {

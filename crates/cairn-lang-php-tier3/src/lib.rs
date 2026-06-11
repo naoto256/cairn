@@ -9,6 +9,7 @@ use cairn_core::Result;
 use cairn_core::lsp::Position;
 #[cfg(test)]
 use cairn_core::lsp::Url;
+use cairn_core::lsp_discovery::discover_lsp_binary_candidates;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WorkspaceAnalyzer,
@@ -121,29 +122,8 @@ fn run_phpantom_lsp_pass(
 }
 
 fn phpantom_lsp_binary() -> PathBuf {
-    phpantom_lsp_path().unwrap_or_else(|| PathBuf::from("phpantom_lsp"))
-}
-
-fn phpantom_lsp_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PHPANTOM_LSP")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path);
-    }
-    let paths = std::env::var_os("PATH")?;
-    // The Rust crate and editor docs expose `phpantom_lsp`, while the
-    // Homebrew formula is named `phpantom-lsp`; try both command spellings so
-    // package-manager wrappers work without users setting PHPANTOM_LSP.
-    for dir in std::env::split_paths(&paths) {
-        for command in ["phpantom_lsp", "phpantom-lsp"] {
-            let path = dir.join(command);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-    None
+    discover_lsp_binary_candidates(&["phpantom_lsp", "phpantom-lsp"], Some("PHPANTOM_LSP"))
+        .unwrap_or_else(|| PathBuf::from("phpantom_lsp"))
 }
 
 fn collect_calls(source: &[u8]) -> Result<Vec<DefinitionSite>> {

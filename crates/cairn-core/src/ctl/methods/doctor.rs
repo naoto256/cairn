@@ -11,6 +11,9 @@ use serde_json::Value;
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx};
 use crate::Result;
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::lsp_discovery::{
+    discover_lsp_binary, discover_lsp_binary_candidates, discover_sourcekit_lsp,
+};
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::all_workspace_analyzers;
 
@@ -492,191 +495,50 @@ fn binary_check(
 }
 
 fn resolve_rust_analyzer() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("RUST_ANALYZER")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("rust-analyzer"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("rust-analyzer", Some("RUST_ANALYZER"))
 }
 
 fn resolve_pyright() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PYRIGHT")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("pyright-langserver"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("pyright-langserver", Some("PYRIGHT"))
 }
 
 fn resolve_gopls() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("GOPLS")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("gopls"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("gopls", Some("GOPLS"))
 }
 
 fn resolve_clangd() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CLANGD")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("clangd"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("clangd", Some("CLANGD"))
 }
 
 fn resolve_typescript_language_server() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("TYPESCRIPT_LANGUAGE_SERVER")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("typescript-language-server"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary(
+        "typescript-language-server",
+        Some("TYPESCRIPT_LANGUAGE_SERVER"),
+    )
 }
 
 fn resolve_csharp_ls() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CSHARP_LS")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("csharp-ls"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("csharp-ls", Some("CSHARP_LS"))
 }
 
 fn resolve_phpantom_lsp() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PHPANTOM_LSP")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    // The Rust crate/editor command is `phpantom_lsp`, while the Homebrew
-    // formula is `phpantom-lsp`; accept either wrapper before asking users to
-    // set PHPANTOM_LSP explicitly.
-    for dir in std::env::split_paths(&paths) {
-        for command in ["phpantom_lsp", "phpantom-lsp"] {
-            let path = dir.join(command);
-            if path.is_file() {
-                return Some(path.canonicalize().unwrap_or(path));
-            }
-        }
-    }
-    None
+    discover_lsp_binary_candidates(&["phpantom_lsp", "phpantom-lsp"], Some("PHPANTOM_LSP"))
 }
 
 fn resolve_jdtls() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("JDTLS")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("jdtls"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("jdtls", Some("JDTLS"))
 }
 
 fn resolve_kotlin_language_server() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("KOTLIN_LANGUAGE_SERVER")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("kotlin-language-server"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("kotlin-language-server", Some("KOTLIN_LANGUAGE_SERVER"))
 }
 
 fn resolve_ruby_lsp() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("RUBY_LSP")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("ruby-lsp"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
+    discover_lsp_binary("ruby-lsp", Some("RUBY_LSP"))
 }
 
 fn resolve_sourcekit_lsp() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("SOURCEKIT_LSP")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    if let Some(path) = sourcekit_lsp_from_xcrun() {
-        return Some(path.canonicalize().unwrap_or(path));
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("sourcekit-lsp"))
-        .find(|path| path.is_file())
-        .map(|path| path.canonicalize().unwrap_or(path))
-}
-
-fn sourcekit_lsp_from_xcrun() -> Option<PathBuf> {
-    // macOS installs sourcekit-lsp inside the selected Xcode/Swift toolchain,
-    // where PATH often does not include it. `xcrun --find` respects
-    // xcode-select, while non-macOS Swift toolchains are handled by PATH below.
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("xcrun")
-            .args(["--find", "sourcekit-lsp"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let path = String::from_utf8(output.stdout).ok()?;
-        let path = PathBuf::from(path.trim());
-        path.is_file().then_some(path)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    discover_sourcekit_lsp()
 }
 
 fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {

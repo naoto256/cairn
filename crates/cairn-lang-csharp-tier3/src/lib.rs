@@ -9,6 +9,7 @@ use cairn_core::Result;
 use cairn_core::lsp::Position;
 #[cfg(test)]
 use cairn_core::lsp::Url;
+use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind, WorkspaceAnalyzer,
@@ -121,8 +122,7 @@ fn run_csharp_ls_pass(
 }
 
 fn csharp_ls_binary() -> PathBuf {
-    std::env::var_os("CSHARP_LS")
-        .map(PathBuf::from)
+    discover_lsp_binary("csharp-ls", Some("CSHARP_LS"))
         .unwrap_or_else(|| PathBuf::from("csharp-ls"))
 }
 
