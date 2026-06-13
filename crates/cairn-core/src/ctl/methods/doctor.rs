@@ -85,7 +85,7 @@ impl ControlMethod for Doctor {
                 cas_registry::list_all(&index)
             })
             .await
-            .map_err(|e| crate::Error::InvalidArgument(format!("doctor task panicked: {e}")))?;
+            .map_err(|e| crate::Error::internal_task_panic("doctor", e))?;
 
         match aliases_result {
             Ok(entries) if entries.is_empty() => checks.push(doctor_check(
@@ -108,7 +108,7 @@ impl ControlMethod for Doctor {
                     probe_alias_stores(&store_data_dir, &store_entries)
                 })
                 .await
-                .map_err(|e| crate::Error::InvalidArgument(format!("doctor task panicked: {e}")))?;
+                .map_err(|e| crate::Error::internal_task_panic("doctor", e))?;
                 checks.extend(tentative_snapshot_checks(&store_probes));
                 checks.extend(tier3_run_checks(&store_probes));
             }

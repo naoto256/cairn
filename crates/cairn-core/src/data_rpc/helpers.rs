@@ -62,7 +62,7 @@ where
         Ok((out, capped))
     })
     .await
-    .map_err(|e| Error::InvalidArgument(format!("{method_name} task panicked: {e}")))?
+    .map_err(|e| Error::internal_task_panic(method_name, e))?
 }
 
 pub(crate) fn limit_with_probe(effective_limit: u32) -> u32 {
@@ -129,7 +129,7 @@ pub(crate) async fn tier3_status_for_query(
         })
     })
     .await
-    .map_err(|e| Error::InvalidArgument(format!("{method_name} tier3 status task panicked: {e}")))?
+    .map_err(|e| Error::internal_task_panic(format!("{method_name} tier3 status"), e))?
 }
 
 pub(crate) fn compute_tier3_status(

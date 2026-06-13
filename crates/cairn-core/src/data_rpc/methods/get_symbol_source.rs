@@ -118,7 +118,7 @@ impl DataMethod for GetSymbolSource {
             )))
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("get_symbol_source task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("get_symbol_source", e))??;
 
         Ok(serde_json::to_value(result).unwrap())
     }

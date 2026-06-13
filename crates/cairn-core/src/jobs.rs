@@ -393,7 +393,7 @@ impl JobManager {
         };
         tokio::task::spawn_blocking(move || run_job_blocking(job))
             .await
-            .map_err(|e| Error::InvalidArgument(format!("analyzer job task panicked: {e}")))?
+            .map_err(|e| Error::internal_task_panic("analyzer job", e))?
     }
 }
 
