@@ -48,7 +48,7 @@ impl DataMethod for ListRepos {
             Ok(out)
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("list_repos task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("list_repos", e))??;
 
         Ok(serde_json::to_value(ListReposResult { repos }).unwrap())
     }

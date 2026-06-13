@@ -56,10 +56,25 @@ pub enum Error {
     AnchorNotFound { name: String },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error(transparent)]
     Lsp(#[from] lsp::Error),
     #[error("schema corruption: {0}")]
     SchemaCorruption(String),
+}
+
+impl Error {
+    /// Convert a blocking task join failure into a server-side error.
+    ///
+    /// The detail is logged for diagnosis, but callers only see the sanitized
+    /// JSON-RPC `Internal` message so panic payloads cannot leak repo paths or
+    /// in-memory state over the wire.
+    pub fn internal_task_panic(context: impl Into<String>, err: tokio::task::JoinError) -> Self {
+        let context = context.into();
+        tracing::error!(context = %context, error = %err, "blocking task failed to join");
+        Self::Internal(format!("{context} task panicked: {err}"))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -88,5 +103,19 @@ mod tests {
             .to_string(),
             "anchor not found: `HEAD`"
         );
+        assert_eq!(
+            Error::Internal("task panicked: secret-path".into()).to_string(),
+            "internal error: task panicked: secret-path"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_task_panic_maps_to_internal() {
+        let err = tokio::task::spawn_blocking(|| panic!("secret panic payload"))
+            .await
+            .unwrap_err();
+        let err = Error::internal_task_panic("test", err);
+
+        assert!(matches!(err, Error::Internal(message) if message.contains("test task panicked")));
     }
 }

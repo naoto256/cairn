@@ -57,7 +57,7 @@ impl ControlMethod for Prune {
             })
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("prune task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("prune", e))??;
 
         Ok(serde_json::to_value(result).unwrap())
     }

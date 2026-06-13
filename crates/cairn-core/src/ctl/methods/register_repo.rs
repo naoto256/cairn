@@ -81,7 +81,7 @@ impl ControlMethod for RegisterRepo {
             Ok(outcome)
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("register_repo task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("register_repo", e))??;
 
         info!(
             alias = %args.alias,

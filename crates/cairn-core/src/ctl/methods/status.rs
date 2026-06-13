@@ -66,7 +66,7 @@ impl ControlMethod for Status {
             Ok(out)
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("status task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("status", e))??;
 
         Ok(serde_json::to_value(StatusReport {
             daemon_version: version,

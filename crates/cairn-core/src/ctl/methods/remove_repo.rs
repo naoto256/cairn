@@ -47,7 +47,7 @@ impl ControlMethod for RemoveRepo {
             Ok(true)
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("remove_repo task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("remove_repo", e))??;
 
         if !removed {
             return Err(Error::RepoNotFound {
