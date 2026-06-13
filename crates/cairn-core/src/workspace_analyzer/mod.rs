@@ -528,7 +528,7 @@ mod tests {
                 kind: RefKind::Call,
                 target: Location {
                     uri: crate::lsp::Url::from(
-                        "file:///home/u/.cargo/registry/src/index/dep-1.0/src/lib.rs",
+                        "file:///tmp/.cargo/registry/src/index/dep-1.0/src/lib.rs",
                     ),
                     range: crate::lsp::Range {
                         start: Position {
