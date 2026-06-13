@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -471,8 +471,8 @@ pub(crate) fn workspace_files_for(
 
 pub(crate) fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
     let mut hasher = Sha1::new();
-    for rel in config_paths {
-        let path = repo_root.join(rel);
+    for rel in expanded_config_paths(repo_root, config_paths) {
+        let path = repo_root.join(&rel);
         if let Ok(bytes) = std::fs::read(&path) {
             hasher.update(rel.as_bytes());
             hasher.update([0]);
@@ -481,4 +481,109 @@ pub(crate) fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
         }
     }
     hex::encode(hasher.finalize())
+}
+
+fn expanded_config_paths(repo_root: &Path, config_paths: &[&str]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for rel in config_paths {
+        if has_glob_meta(rel) {
+            // Project-shaped LSPs often key their state off discovered files
+            // such as `*.csproj`; hashing the literal pattern would miss added
+            // projects and leave stale Tier-3 facts behind.
+            expanded.extend(expand_config_glob(repo_root, rel));
+        } else {
+            expanded.push((*rel).to_string());
+        }
+    }
+    expanded
+}
+
+fn expand_config_glob(repo_root: &Path, rel: &str) -> Vec<String> {
+    let pattern_path = Path::new(rel);
+    let Some(file_pattern) = pattern_path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let parent = pattern_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(""));
+    if has_glob_meta(&parent.to_string_lossy()) {
+        return Vec::new();
+    }
+
+    let dir = repo_root.join(parent);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut matches = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            wildcard_matches(file_pattern, file_name).then(|| {
+                let path = PathBuf::from(parent).join(file_name);
+                path.to_string_lossy().replace('\\', "/")
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+}
+
+fn has_glob_meta(pattern: &str) -> bool {
+    pattern.contains(['*', '?'])
+}
+
+fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
+    wildcard_matches_bytes(pattern.as_bytes(), candidate.as_bytes())
+}
+
+fn wildcard_matches_bytes(pattern: &[u8], candidate: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => candidate.is_empty(),
+        Some((&b'*', rest)) => {
+            wildcard_matches_bytes(rest, candidate)
+                || candidate.split_first().is_some_and(|(_, candidate_rest)| {
+                    wildcard_matches_bytes(pattern, candidate_rest)
+                })
+        }
+        Some((&b'?', rest)) => candidate
+            .split_first()
+            .is_some_and(|(_, candidate_rest)| wildcard_matches_bytes(rest, candidate_rest)),
+        Some((&expected, rest)) => {
+            candidate
+                .split_first()
+                .is_some_and(|(&actual, candidate_rest)| {
+                    expected == actual && wildcard_matches_bytes(rest, candidate_rest)
+                })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn config_hash_changes_when_globbed_config_file_is_added() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = config_hash(tmp.path(), &["*.csproj"]);
+
+        fs::write(tmp.path().join("App.csproj"), "<Project />\n").unwrap();
+        let after = config_hash(tmp.path(), &["*.csproj"]);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn expanded_config_paths_sorts_glob_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("B.csproj"), "<Project />\n").unwrap();
+        fs::write(tmp.path().join("A.csproj"), "<Project />\n").unwrap();
+
+        let paths = expanded_config_paths(tmp.path(), &["*.csproj"]);
+
+        assert_eq!(paths, vec!["A.csproj", "B.csproj"]);
+    }
 }
