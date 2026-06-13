@@ -10,10 +10,9 @@
 //! receiver type is unknown without a workspace pass, so we match the
 //! tail segment (the member name) against the set of callable qualified
 //! names collected from this file; on a hit, `target_qualified` is set
-//! to that qualified name. If multiple callables in the file share the
-//! tail name, the first one encountered during the walk wins. Cross-file
-//! callees keep `target_qualified: None`, which hides them from
-//! `find_references`' default outgoing view (visible with
+//! to that qualified name only when the match is unique. Cross-file and
+//! ambiguous callees keep `target_qualified: None`, which hides them
+//! from `find_references`' default outgoing view (visible with
 //! `include_noise`).
 
 use std::collections::HashMap;
@@ -61,9 +60,8 @@ struct KtSemanticWalker {
     containers: Vec<String>,
     enclosing: Option<String>,
     /// Map from callable name (last segment) to its qualified name,
-    /// populated as `function_declaration` nodes are walked. First
-    /// encounter wins on collisions — see module docs.
-    callables: HashMap<String, String>,
+    /// populated as `function_declaration` nodes are walked.
+    callables: HashMap<String, Vec<String>>,
 }
 
 impl KtSemanticWalker {
@@ -151,9 +149,10 @@ impl KtSemanticWalker {
         };
         let name_text = node_text(name, source);
         let qualified = self.qualify(name_text);
-        self.callables
-            .entry(name_text.to_string())
-            .or_insert_with(|| qualified.clone());
+        let candidates = self.callables.entry(name_text.to_string()).or_default();
+        if !candidates.contains(&qualified) {
+            candidates.push(qualified.clone());
+        }
         let previous_enclosing = self.enclosing.replace(qualified);
         self.walk_children(node, source);
         self.enclosing = previous_enclosing;
@@ -168,8 +167,11 @@ impl KtSemanticWalker {
     fn resolve_same_file_callees(&mut self) {
         for r in self.facts.refs.iter_mut() {
             if r.kind == RefKind::Call && r.target_qualified.is_none() {
-                if let Some(q) = self.callables.get(&r.target_name) {
-                    r.target_qualified = Some(q.clone());
+                if let Some(candidates) = self.callables.get(&r.target_name) {
+                    // A Tier-1 name-only match is evidence-based only when unique; collisions stay unresolved.
+                    if let [qualified] = candidates.as_slice() {
+                        r.target_qualified = Some(qualified.clone());
+                    }
                 }
             }
         }
@@ -391,14 +393,14 @@ mod tests {
     }
 
     #[test]
-    fn same_file_member_call_with_collision_takes_first_callable() {
-        // Two same-name callables in the file. The walk visits `A.foo`
-        // first, so `a.foo()` resolves to `A.foo`; the receiver type is
-        // unknown without a workspace pass.
+    fn same_file_member_call_with_collision_stays_unresolved() {
+        // Two same-name callables in the file. The receiver type is
+        // unknown in Tier-1, so `a.foo()` stays unresolved instead of
+        // resolving by traversal order.
         let src = "class A {\n    fun foo() {}\n}\nclass B {\n    fun foo() {}\n}\nfun caller(a: A) {\n    a.foo()\n}\n";
         let refs = semantic(src).refs;
         let call = call_ref(&refs, "foo");
-        assert_eq!(call.target_qualified.as_deref(), Some("A.foo"));
+        assert_eq!(call.target_qualified, None);
     }
 
     #[test]

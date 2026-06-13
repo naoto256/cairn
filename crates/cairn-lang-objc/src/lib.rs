@@ -567,29 +567,30 @@ fn emit_macro(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
 /// join container and member (`Foo.bar`); message-send refs key on the
 /// bare selector head and match against the suffix after the last `.`
 /// in any same-file method's qualified name. Same-file C-style calls
-/// resolve against bare function names, the same way the C backend
-/// does. Cross-file callees keep `target_qualified: None`.
+/// resolve against bare function names when that name is unique, the
+/// same way the C backend does. Cross-file and ambiguous callees keep
+/// `target_qualified: None`.
 fn resolve_same_file_callees(facts: &mut SyntacticFacts) {
     let SyntacticFacts { symbols, refs, .. } = facts;
-    let mut by_short: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut by_short: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for s in symbols.iter() {
         match s.kind {
             SymbolKind::Function | SymbolKind::Method => {
-                // First-wins on bare-name collisions: receiver resolution
-                // is grammatically impossible from the call site, so two
-                // same-name methods on different classes share one
-                // resolution target. Tests document this trade-off.
-                by_short
-                    .entry(s.name.as_str())
-                    .or_insert(s.qualified.as_str());
+                let candidates = by_short.entry(s.name.as_str()).or_default();
+                if !candidates.contains(&s.qualified.as_str()) {
+                    candidates.push(s.qualified.as_str());
+                }
             }
             _ => {}
         }
     }
     for r in refs.iter_mut() {
         if r.kind == RefKind::Call && r.target_qualified.is_none() {
-            if let Some(qualified) = by_short.get(r.target_name.as_str()) {
-                r.target_qualified = Some((*qualified).to_string());
+            if let Some(candidates) = by_short.get(r.target_name.as_str()) {
+                // A Tier-1 name-only match is evidence-based only when unique; collisions stay unresolved.
+                if let [qualified] = candidates.as_slice() {
+                    r.target_qualified = Some((*qualified).to_string());
+                }
             }
         }
     }
@@ -1211,12 +1212,11 @@ int global = 0;
     }
 
     #[test]
-    fn same_name_method_collisions_pick_the_first_walked() {
-        // Two same-file classes both define `find`. Receiver
-        // resolution is grammatically impossible from a message-send,
-        // so a `[anything find]` call resolves to whichever `find` the
-        // walker reached first (file order). Tests document the
-        // trade-off so callers know not to depend on it.
+    fn same_name_method_collisions_stay_unresolved() {
+        // Two same-file classes both define `find`. Receiver resolution
+        // is grammatically impossible from a message-send in Tier-1, so
+        // the ref must stay unresolved instead of picking a candidate by
+        // traversal order.
         let src = br#"
 @implementation A
 - (void)find { return; }
@@ -1233,8 +1233,7 @@ int global = 0;
             .iter()
             .find(|r| r.target_name == "find")
             .expect("find call");
-        // A.find was walked first.
-        assert_eq!(call.target_qualified.as_deref(), Some("A.find"));
+        assert_eq!(call.target_qualified, None);
     }
 
     #[test]

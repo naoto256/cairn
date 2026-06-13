@@ -20,8 +20,6 @@
 //! Known best-effort limits (deliberate for a syntactic floor):
 //! - `define_method(:name)` with a literal symbol/string is emitted as
 //!   a [`SymbolKind::Method`]; computed names are not.
-//! - Bare `private` / `protected` section markers are not tracked;
-//!   only the inline `private def foo` form adjusts visibility.
 
 #![forbid(unsafe_code)]
 
@@ -98,13 +96,93 @@ pub(crate) fn method_separator(singleton: bool) -> &'static str {
 
 struct RubyVisitor {
     nesting: NestingTracker,
+    root_visibility: Visibility,
+    visibility_scopes: Vec<(usize, Visibility)>,
 }
 
 impl RubyVisitor {
     fn new() -> Self {
         Self {
             nesting: NestingTracker::new("::"),
+            root_visibility: Visibility::Public,
+            visibility_scopes: Vec::new(),
         }
+    }
+
+    fn pop_visibility_scopes(&mut self, byte_start: usize) {
+        while self
+            .visibility_scopes
+            .last()
+            .is_some_and(|(end, _)| byte_start >= *end)
+        {
+            self.visibility_scopes.pop();
+        }
+    }
+
+    fn current_visibility(&self) -> Visibility {
+        self.visibility_scopes
+            .last()
+            .map_or(self.root_visibility, |(_, visibility)| *visibility)
+    }
+
+    fn set_current_visibility(&mut self, visibility: Visibility) {
+        if let Some((_, current)) = self.visibility_scopes.last_mut() {
+            *current = visibility;
+        } else {
+            self.root_visibility = visibility;
+        }
+    }
+
+    fn symbol_visibility(&self, kind: &SymbolKind, node: Node<'_>, source: &[u8]) -> Visibility {
+        if let Some(visibility) = modifier_visibility(node, source) {
+            return visibility;
+        }
+        match kind {
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test | SymbolKind::Property => {
+                self.current_visibility()
+            }
+            _ => Visibility::Public,
+        }
+    }
+
+    fn update_visibility_section(&mut self, node: Node<'_>, source: &[u8]) -> bool {
+        if child_by_field(node, "receiver").is_some() {
+            return false;
+        }
+        let Some(method) = child_by_field(node, "method") else {
+            return false;
+        };
+        if method.kind() != "identifier" {
+            return false;
+        }
+        let visibility = match node_text(method, source) {
+            "public" => Visibility::Public,
+            "private" => Visibility::Private,
+            "protected" => Visibility::Crate,
+            _ => return false,
+        };
+        if child_by_field(node, "arguments").is_some_and(|args| args.named_child_count() > 0) {
+            return false;
+        }
+        self.set_current_visibility(visibility);
+        true
+    }
+
+    fn update_bare_visibility_section(&mut self, node: Node<'_>, source: &[u8]) -> bool {
+        if node
+            .parent()
+            .is_none_or(|parent| parent.kind() != "body_statement")
+        {
+            return false;
+        }
+        let visibility = match node_text(node, source) {
+            "public" => Visibility::Public,
+            "private" => Visibility::Private,
+            "protected" => Visibility::Crate,
+            _ => return false,
+        };
+        self.set_current_visibility(visibility);
+        true
     }
 
     /// Qualified name for a method-like symbol under the current
@@ -135,7 +213,7 @@ impl RubyVisitor {
             body_start,
         } = spec;
         let signature = signature_slice(node, source, body_start.or(Some(node.end_byte())));
-        let visibility = modifier_visibility(node, source).or(Some(Visibility::Public));
+        let visibility = Some(self.symbol_visibility(&kind, node, source));
         let doc = extract_doc(node, source);
         let parent_idx = self.nesting.current_parent();
 
@@ -180,6 +258,8 @@ impl RubyVisitor {
             },
         );
         self.nesting.push(idx, node.end_byte());
+        self.visibility_scopes
+            .push((node.end_byte(), Visibility::Public));
     }
 
     fn emit_method(&mut self, node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
@@ -308,7 +388,7 @@ impl RubyVisitor {
                 kind: SymbolKind::Property,
                 signature: signature.clone(),
                 doc: None,
-                visibility: Some(Visibility::Public),
+                visibility: Some(self.current_visibility()),
                 byte_range: arg.byte_range(),
                 line_range: line_of(arg)..end_line_of(arg),
                 body_start: None,
@@ -362,13 +442,21 @@ struct EmitSpec {
 impl Visitor for RubyVisitor {
     fn visit_node(&mut self, node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
         self.nesting.pop_outside(node.start_byte());
+        self.pop_visibility_scopes(node.start_byte());
 
         match node.kind() {
             "module" | "class" => self.emit_container(node, source, facts),
             "method" => self.emit_method(node, source, facts),
             "singleton_method" => self.emit_singleton_method(node, source, facts),
             "assignment" => self.emit_constant(node, source, facts),
-            "call" => self.handle_call(node, source, facts),
+            "call" => {
+                if !self.update_visibility_section(node, source) {
+                    self.handle_call(node, source, facts);
+                }
+            }
+            "identifier" => {
+                self.update_bare_visibility_section(node, source);
+            }
             _ => {}
         }
     }
@@ -408,7 +496,7 @@ fn method_body_start(node: Node<'_>) -> Option<usize> {
 /// Visibility from the inline-modifier form: `private def foo … end`
 /// parses as `call(method: "private", arguments: (argument_list
 /// (method …)))`, so a method whose grandparent call is named
-/// `private` / `protected` adjusts visibility. Ruby's `protected` is
+/// `public` / `private` / `protected` adjusts visibility. Ruby's `protected` is
 /// closer to "visible to sibling instances" than Rust's crate scope,
 /// but [`Visibility::Crate`] is the nearest of the three buckets.
 fn modifier_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
@@ -422,6 +510,7 @@ fn modifier_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
     }
     let method = child_by_field(call, "method")?;
     match node_text(method, source) {
+        "public" => Some(Visibility::Public),
         "private" => Some(Visibility::Private),
         "protected" => Some(Visibility::Crate),
         _ => None,
@@ -706,15 +795,12 @@ end
     }
 
     #[test]
-    fn bare_private_marker_not_tracked() {
-        // Documented best-effort limit: the sectioning form does not
-        // flip visibility — methods after a bare `private` still
-        // report Public.
+    fn bare_private_marker_sets_section_visibility() {
         let src = "class S\n  private\n\n  def hidden; end\nend\n";
         let facts = syntactic(src);
         assert_eq!(
             symbol(&facts, "hidden").visibility,
-            Some(Visibility::Public)
+            Some(Visibility::Private)
         );
     }
 
