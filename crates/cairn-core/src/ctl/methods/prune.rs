@@ -64,16 +64,19 @@ impl ControlMethod for Prune {
 }
 
 fn prune_store(conn: &mut Connection, current_parser_ids: &BTreeSet<String>) -> Result<u64> {
+    if current_parser_ids.is_empty() {
+        // Prune requires at least one backend so a misconfigured daemon cannot erase every blob.
+        return Err(Error::InvalidArgument(
+            "no language backends are registered; check daemon configuration".into(),
+        ));
+    }
+
     let tx = conn.transaction()?;
-    let deleted = if current_parser_ids.is_empty() {
-        tx.execute("DELETE FROM blobs", [])?
-    } else {
-        let placeholders = std::iter::repeat_n("?", current_parser_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("DELETE FROM blobs WHERE parser_id NOT IN ({placeholders})");
-        tx.execute(&sql, params_from_iter(current_parser_ids.iter()))?
-    };
+    let placeholders = std::iter::repeat_n("?", current_parser_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("DELETE FROM blobs WHERE parser_id NOT IN ({placeholders})");
+    let deleted = tx.execute(&sql, params_from_iter(current_parser_ids.iter()))?;
     tx.commit()?;
     Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
 }
@@ -86,6 +89,28 @@ static REGISTER: fn() -> Box<dyn ControlMethod> = || Box::new(Prune);
 mod tests {
     use super::*;
     use crate::cas::store;
+
+    #[test]
+    fn prune_store_rejects_empty_parser_ids_without_deleting_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('rust', 'tree-sitter-rust', 1, 0),
+                    ('python', 'tree-sitter-python', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let empty = BTreeSet::new();
+
+        let err = prune_store(&mut conn, &empty).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
+    }
 
     #[test]
     fn prune_store_removes_only_unknown_parser_ids() {
