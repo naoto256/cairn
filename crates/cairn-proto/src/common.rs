@@ -7,14 +7,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// offsets within the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
+    /// 1-based line number in the source file, matching `file:line`
+    /// locations emitted by query hits.
     pub line: u32,
+    /// 0-based UTF-8 byte offset within [`Self::line`].
     pub column: u32,
 }
 
 /// A half-open range `[start, end)` inside a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
+    /// Inclusive start position of the span.
     pub start: Position,
+    /// Exclusive end position of the span.
     pub end: Position,
 }
 
@@ -57,29 +62,50 @@ pub struct LanguageEnrichment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
+    /// Free function or top-level callable.
     Function,
+    /// Method owned by a class, trait, impl, or equivalent container.
     Method,
+    /// Constructor or initializer callable.
     Constructor,
+    /// Property getter accessor.
     Getter,
+    /// Property setter accessor.
     Setter,
+    /// Class-like nominal type.
     Class,
+    /// Rust `struct` or equivalent record type.
     Struct,
+    /// Enum type or tagged union.
     Enum,
+    /// Union type.
     Union,
+    /// Trait, protocol, or interface-like behavior contract.
     Trait,
     /// `impl <Trait> for <Type> { ... }` block in Rust. Acts as a
     /// container for the methods declared inside.
     Impl,
+    /// Interface type in languages that distinguish interfaces from classes.
     Interface,
+    /// Type alias declaration.
     TypeAlias,
+    /// Field declared on a struct, class, enum variant, or record.
     Field,
+    /// Named property exposed by a type.
     Property,
+    /// Compile-time or module-level constant.
     Constant,
+    /// Local, module-level, or member variable.
     Variable,
+    /// Function, method, or closure parameter.
     Parameter,
+    /// Module declaration or file-backed module.
     Module,
+    /// Namespace declaration.
     Namespace,
+    /// Package-level symbol.
     Package,
+    /// Macro definition.
     Macro,
     /// Documentation section. Produced by the markdown backend for an
     /// H1-H6 heading; the heading hierarchy maps to parent/child
@@ -97,26 +123,40 @@ pub enum SymbolKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefKind {
+    /// Function, method, constructor, or macro-like callable invocation.
     Call,
+    /// Type name use, further classified by [`TypeRole`] when available.
     Type,
+    /// Import or `use` edge.
     Import,
+    /// Constructor or class instantiation site.
     Instantiate,
+    /// Value read site.
     Read,
+    /// Value write or assignment site.
     Write,
+    /// Override relationship for methods or members.
     Override,
+    /// Macro invocation distinct from a normal function call.
     MacroInvoke,
+    /// Annotation, attribute, decorator, or type-hint metadata use.
     Annotation,
 }
 
 /// Tier-3 workspace analyzer readiness for the snapshots a query touched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier3Status {
+    /// True when every Tier-3 analyzer relevant to the query reached a
+    /// positive terminal state.
     pub ready: bool,
+    /// Analyzer runs that kept [`Self::ready`] false. Omitted on the wire
+    /// when there is nothing pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_analyzers: Vec<PendingAnalyzer>,
 }
 
 impl Tier3Status {
+    /// Build the default "Tier-3 was ready or not required" status.
     #[must_use]
     pub fn ready() -> Self {
         Self {
@@ -129,7 +169,10 @@ impl Tier3Status {
 /// One Tier-3 analyzer that has not reached a positive terminal state.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PendingAnalyzer {
+    /// Stable analyzer identifier, e.g. a workspace analyzer name.
     pub analyzer_id: String,
+    /// Current analyzer state as stored by the daemon. Consumers should
+    /// treat unknown values as non-ready.
     pub state: String,
 }
 
@@ -222,6 +265,7 @@ pub enum PartialReason {
 }
 
 impl PartialReason {
+    /// Return the canonical snake_case wire string for this reason.
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
@@ -291,13 +335,21 @@ pub enum MissingTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeRole {
+    /// Type appears in a parameter position.
     Param,
+    /// Type appears in a return position.
     Return,
+    /// Type appears in a field declaration.
     Field,
+    /// Type appears in a local binding or local annotation.
     Local,
+    /// Type appears as a trait/type bound.
     Bound,
+    /// Type appears as a generic argument.
     GenericArg,
+    /// Type appears on the right-hand side of a type alias.
     Alias,
+    /// Type appears in a cast or conversion annotation.
     Cast,
 }
 

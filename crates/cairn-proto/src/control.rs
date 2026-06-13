@@ -18,84 +18,129 @@ use crate::common::LanguageEnrichment;
 
 // ─── prune ────────────────────────────────────────────────────────────────
 
+/// Arguments to the `prune` control method.
+///
+/// `repo = None` prunes every registered repo; a value restricts the
+/// operation to one alias.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneArgs {
+    /// Repository alias to prune, or `None` for all repos. Omitted on the
+    /// wire when pruning globally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
 }
 
+/// Result of `prune`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneResult {
+    /// Per-repository deletion counts. Empty when no registered repo matched.
     pub repos: Vec<PruneRepoEntry>,
+    /// Sum of [`PruneRepoEntry::deleted_blob_count`] across all entries.
     pub total_deleted: u64,
 }
 
+/// Deletion summary for one repository store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneRepoEntry {
+    /// Repository alias that was pruned.
     pub alias: String,
+    /// Number of unreachable blobs removed from that repo's CAS store.
     pub deleted_blob_count: u64,
 }
 
 // ─── jobs ─────────────────────────────────────────────────────────────────
 
+/// Arguments to the `jobs.list` control method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsListArgs {
+    /// Optional repository alias filter. `None` lists jobs across repos.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Optional job-state filter, using the daemon's stored state strings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 }
 
+/// Arguments to the `jobs.cancel` control method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsCancelArgs {
+    /// Numeric job id returned by [`JobSnapshot::job_id`].
     pub job_id: i64,
 }
 
+/// Result of `jobs.list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsListResult {
+    /// Matching jobs ordered by the daemon-side query.
     pub jobs: Vec<JobSnapshot>,
 }
 
+/// Snapshot of one analyzer job as stored by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSnapshot {
+    /// Daemon-assigned job id. Stable enough to pass to `jobs.cancel`.
     pub job_id: i64,
+    /// Repository alias the analyzer job belongs to.
     pub alias: String,
+    /// Analyzer backend id that owns this job.
     pub analyzer_id: String,
+    /// Current job state string. Consumers should treat unknown states as
+    /// non-terminal unless the daemon documents them otherwise.
     pub state: String,
+    /// Creation timestamp in nanoseconds since the Unix epoch.
     pub created_at: i64,
+    /// Start timestamp in nanoseconds since the Unix epoch. `None` means the
+    /// job has not started or the source row does not record a start time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
+    /// Finish timestamp in nanoseconds since the Unix epoch. `None` means the
+    /// job is still running, queued, or has not recorded a terminal time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+    /// Terminal error text. `None` means no error has been recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+/// Result of `jobs.cancel`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsCancelResult {
+    /// True when the daemon accepted the cancellation for the requested job.
     pub cancelled: bool,
+    /// Human-readable outcome, including why no cancellation happened.
     pub reason: String,
 }
 
 // ─── status ────────────────────────────────────────────────────────────────
 
+/// Result of the `status` control method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
+    /// Daemon version string reported by the running process.
     pub daemon_version: String,
+    /// Daemon uptime in whole seconds.
     pub uptime_secs: u64,
+    /// Registered repositories known to the daemon.
     pub repos: Vec<RepoStatus>,
 }
 
+/// Runtime status for one registered repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatus {
+    /// Repository alias.
     pub alias: String,
+    /// Repository root path as registered with the daemon.
     pub root: String,
+    /// Snapshot manifests reachable through this repo's anchors.
     pub snapshots: Vec<SnapshotStatus>,
+    /// Analyzer jobs for this repo. Empty lists are omitted to keep status
+    /// output compact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobSnapshot>,
 }
 
 impl RepoStatus {
+    /// Distinct language tags present in this repo's snapshot enrichment.
     #[must_use]
     pub fn languages(&self) -> BTreeSet<&str> {
         self.snapshots
@@ -105,13 +150,23 @@ impl RepoStatus {
     }
 }
 
+/// Runtime status for one snapshot manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatus {
+    /// User-facing anchor labels pointing at this manifest. `branch/<name>`
+    /// anchors are rendered as `<name>`; `HEAD` and `tentative/<id>` remain
+    /// explicit.
     pub branches: Vec<String>,
+    /// Snapshot readiness string emitted by the daemon, e.g. `ready` or a
+    /// non-ready indexing status.
     pub status: String,
+    /// Per-language analyzer tier matrix for this snapshot.
     pub enrichment: Vec<LanguageEnrichment>,
+    /// Number of files in the snapshot manifest.
     pub file_count: u64,
+    /// Number of symbols indexed for the snapshot.
     pub symbol_count: u64,
+    /// Approximate on-disk size in bytes for this snapshot's indexed data.
     pub size_bytes: u64,
 }
 
@@ -198,26 +253,39 @@ mod status_tests {
 
 // ─── doctor ────────────────────────────────────────────────────────────────
 
+/// Result of the `doctor` control method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorReport {
+    /// Ordered health checks evaluated by the daemon.
     pub checks: Vec<DoctorCheck>,
 }
 
+/// One daemon health check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorCheck {
+    /// Stable, human-readable check name.
     pub name: String,
+    /// Outcome severity.
     pub status: DoctorStatus,
+    /// Optional observed value or diagnostic context. Omitted when the check
+    /// has nothing useful to add.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Optional action the operator can take. Omitted for passing checks or
+    /// warnings with no concrete fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
 }
 
+/// Severity for one [`DoctorCheck`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DoctorStatus {
+    /// Check passed.
     Pass,
+    /// Check found a degraded but non-fatal condition.
     Warn,
+    /// Check found a condition that prevents normal operation.
     Fail,
 }
 
@@ -254,8 +322,10 @@ mod doctor_tests {
 
 // ─── remove_repo ──────────────────────────────────────────────────────────
 
+/// Arguments to `remove_repo`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveRepoArgs {
+    /// Alias to remove from the daemon's registry.
     pub alias: String,
 }
 
@@ -266,7 +336,10 @@ pub struct RemoveRepoArgs {
 /// JSON-RPC `result` vs `error` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ack {
+    /// Always true for successful JSON-RPC results using this payload.
     pub ok: bool,
+    /// Alias affected by the operation. `None` for operations such as
+    /// `shutdown` that are not scoped to a single repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
     /// Mutating requests can succeed while a best-effort side effect
@@ -278,6 +351,7 @@ pub struct Ack {
 }
 
 impl Ack {
+    /// Build a successful acknowledgement with no repo alias.
     #[must_use]
     pub fn ok() -> Self {
         Self {
@@ -287,6 +361,7 @@ impl Ack {
         }
     }
 
+    /// Build a successful acknowledgement for a repo-scoped operation.
     #[must_use]
     pub fn with_alias(alias: impl Into<String>) -> Self {
         Self {
@@ -296,6 +371,8 @@ impl Ack {
         }
     }
 
+    /// Build a successful `register_repo` acknowledgement when the repo was
+    /// registered but the live watcher could not be installed.
     #[must_use]
     pub fn with_alias_and_watcher_failed(alias: impl Into<String>, reason: String) -> Self {
         Self {
