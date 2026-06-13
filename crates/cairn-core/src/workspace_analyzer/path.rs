@@ -96,7 +96,7 @@ mod tests {
         // own `src/lib.rs`).
         let rel = location_to_repo_path(
             Path::new("/tmp/repo"),
-            &location("file:///home/u/.cargo/registry/src/index/foo-1.0/src/lib.rs"),
+            &location("file:///tmp/.cargo/registry/src/index/foo-1.0/src/lib.rs"),
         );
         assert_eq!(rel, None);
     }

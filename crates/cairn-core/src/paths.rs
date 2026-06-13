@@ -228,15 +228,15 @@ mod tests {
 
     #[test]
     fn path_hash_is_stable() {
-        let a = path_hash(Path::new("/Users/foo/proj"));
-        let b = path_hash(Path::new("/Users/foo/proj"));
+        let a = path_hash(Path::new("/tmp/proj"));
+        let b = path_hash(Path::new("/tmp/proj"));
         assert_eq!(a, b);
     }
 
     #[test]
     fn path_hash_distinguishes_different_paths() {
-        let a = path_hash(Path::new("/Users/foo/proj"));
-        let b = path_hash(Path::new("/Users/foo/other"));
+        let a = path_hash(Path::new("/tmp/proj"));
+        let b = path_hash(Path::new("/tmp/other"));
         assert_ne!(a, b);
     }
 
