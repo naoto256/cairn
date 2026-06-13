@@ -269,7 +269,7 @@ fn clangd_spawn_spec(language: ClangdLanguage, repo_root: &Path) -> LspSpawnSpec
     LspSpawnSpec {
         binary: clangd_binary(),
         workspace_root: repo_root.to_path_buf(),
-        config_hash: POOL_CONFIG_ID.to_string(),
+        config_hash: clangd_pool_config_hash(language),
         request_timeout: REQUEST_TIMEOUT,
         availability: AvailabilityStrategy::VersionFlag,
         // clangd does not emit `$/progress` notifications when run in cairn's
@@ -287,6 +287,16 @@ fn clangd_spawn_spec(language: ClangdLanguage, repo_root: &Path) -> LspSpawnSpec
             "fallbackFlags": language.fallback_flags,
         }),
     }
+}
+
+fn clangd_pool_config_hash(language: ClangdLanguage) -> String {
+    // clangd reads fallbackFlags only at initialize time; they therefore have
+    // to participate in the pool key or a C/C++/ObjC shared pool can keep the
+    // first dialect's parsing mode for later languages without compile DBs.
+    format!(
+        "{POOL_CONFIG_ID}:fallbackFlags={}",
+        language.fallback_flags.join(" ")
+    )
 }
 
 fn call_collector_for(language: ClangdLanguage) -> fn(&[u8]) -> Result<Vec<DefinitionSite>> {
@@ -566,6 +576,14 @@ mod tests {
             ClangdObjcWorkspaceAnalyzer.pool_group(),
             Some(CLANGD_POOL_ID)
         );
+    }
+
+    #[test]
+    fn clangd_pool_config_hash_distinguishes_c_and_cpp_fallback_flags() {
+        let c = clangd_spawn_spec(C_LANGUAGE, Path::new("/tmp/repo"));
+        let cpp = clangd_spawn_spec(CPP_LANGUAGE, Path::new("/tmp/repo"));
+
+        assert_ne!(c.config_hash, cpp.config_hash);
     }
 
     #[test]
