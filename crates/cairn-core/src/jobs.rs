@@ -28,6 +28,8 @@ use crate::{Error, Result};
 
 pub type JobId = i64;
 
+const MAX_WORKER_CONCURRENCY: usize = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueuedAnalyzerJob {
     pub job_id: JobId,
@@ -505,25 +507,201 @@ fn now_ns() -> i64 {
 }
 
 fn worker_concurrency() -> usize {
-    if let Ok(value) = std::env::var("CAIRN_WORKER_CONCURRENCY")
-        && let Ok(parsed) = value.parse::<usize>()
-    {
-        return parsed.max(1);
+    let env_value = std::env::var("CAIRN_WORKER_CONCURRENCY").ok();
+    worker_concurrency_from_env_value(env_value.as_deref(), fallback_worker_concurrency)
+}
+
+fn worker_concurrency_from_env_value(
+    env_value: Option<&str>,
+    fallback: impl FnOnce() -> usize,
+) -> usize {
+    if let Some(value) = env_value {
+        match value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => {
+                // Keep env overrides within the same ceiling as automatic sizing to bound worker fan-out.
+                let clamped = parsed.clamp(1, MAX_WORKER_CONCURRENCY);
+                if clamped != parsed {
+                    warn!(
+                        requested = parsed,
+                        clamped, "CAIRN_WORKER_CONCURRENCY clamped"
+                    );
+                }
+                return clamped;
+            }
+            _ => {}
+        }
     }
+    fallback()
+}
+
+fn fallback_worker_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
-        .map(|n| (n / 2).clamp(1, 8))
+        .map(|n| (n / 2).clamp(1, MAX_WORKER_CONCURRENCY))
         .unwrap_or(1)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     use tokio::sync::oneshot;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Level, Metadata, Subscriber};
 
-    use super::PoolGroupLocks;
+    use super::{MAX_WORKER_CONCURRENCY, PoolGroupLocks, worker_concurrency_from_env_value};
+
+    #[derive(Default)]
+    struct WarnCapture {
+        fields: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    impl WarnCapture {
+        fn fields(&self) -> Vec<Vec<(String, String)>> {
+            self.fields.lock().expect("warn capture poisoned").clone()
+        }
+    }
+
+    struct WarnSubscriber(Arc<WarnCapture>);
+
+    impl Subscriber for WarnSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= &Level::WARN
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if event.metadata().level() != &Level::WARN {
+                return;
+            }
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.0
+                .fields
+                .lock()
+                .expect("warn capture poisoned")
+                .push(visitor.fields);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+
+        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+            if self.enabled(metadata) {
+                Interest::always()
+            } else {
+                Interest::never()
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: Vec<(String, String)>,
+    }
+
+    impl FieldVisitor {
+        fn push(&mut self, field: &Field, value: impl ToString) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.push(field, format!("{value:?}"));
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.push(field, value);
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.push(field, value);
+        }
+    }
+
+    fn assert_no_worker_concurrency_warn(capture: &WarnCapture) {
+        assert!(
+            capture.fields().is_empty(),
+            "unexpected worker concurrency warn"
+        );
+    }
+
+    fn assert_worker_concurrency_warn(capture: &WarnCapture, requested: usize, clamped: usize) {
+        let events = capture.fields();
+        assert_eq!(events.len(), 1, "expected one worker concurrency warn");
+        assert!(
+            events[0]
+                .iter()
+                .any(|(name, value)| name == "requested" && value == &requested.to_string()),
+            "warn did not include requested={requested}: {:?}",
+            events[0]
+        );
+        assert!(
+            events[0]
+                .iter()
+                .any(|(name, value)| name == "clamped" && value == &clamped.to_string()),
+            "warn did not include clamped={clamped}: {:?}",
+            events[0]
+        );
+    }
+
+    fn with_warn_capture(f: impl FnOnce(&WarnCapture)) {
+        static DISPATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        let _guard = DISPATCH_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("tracing dispatch lock poisoned");
+        let capture = Arc::new(WarnCapture::default());
+        tracing::dispatcher::with_default(
+            &tracing::Dispatch::new(WarnSubscriber(Arc::clone(&capture))),
+            || {
+                f(&capture);
+            },
+        );
+    }
+
+    #[test]
+    fn worker_concurrency_uses_env_value_within_bounds() {
+        with_warn_capture(|capture| {
+            assert_eq!(worker_concurrency_from_env_value(Some("4"), || 2), 4);
+            assert_no_worker_concurrency_warn(capture);
+        });
+    }
+
+    #[test]
+    fn worker_concurrency_clamps_env_value_above_ceiling_and_warns() {
+        with_warn_capture(|capture| {
+            assert_eq!(
+                worker_concurrency_from_env_value(Some("128"), || 2),
+                MAX_WORKER_CONCURRENCY
+            );
+            assert_worker_concurrency_warn(capture, 128, MAX_WORKER_CONCURRENCY);
+        });
+    }
+
+    #[test]
+    fn worker_concurrency_falls_back_for_zero_negative_or_invalid_env() {
+        for value in ["0", "-4", "not-a-number"] {
+            with_warn_capture(|capture| {
+                assert_eq!(worker_concurrency_from_env_value(Some(value), || 3), 3);
+                assert_no_worker_concurrency_warn(capture);
+            });
+        }
+    }
 
     #[tokio::test]
     async fn same_pool_group_locks_serialize() {
