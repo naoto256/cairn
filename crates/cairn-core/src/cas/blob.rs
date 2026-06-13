@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use cairn_lang_api::{ImplFact, ImportFact, RefFact, SemanticFacts, SymbolFact, SyntacticFacts};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::Result;
 use crate::cas::kind_conv::{
@@ -203,15 +203,19 @@ pub fn reuse_or_compute<F>(
 where
     F: FnOnce() -> Result<ParsedData>,
 {
-    if let Some(meta) = lookup(conn, blob_sha, parser_id)?
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Hold the write reservation across the re-check and compute so
+    // two writers cannot both observe a miss and race into the UNIQUE
+    // key on `(blob_sha, parser_id)`.
+    if let Some(meta) = lookup(&tx, blob_sha, parser_id)?
         && meta.parser_revision == expected_revision
         && analyzer_matches(&meta, expected_analyzer)
     {
+        tx.commit()?;
         return Ok(false);
     }
 
     let data = compute()?;
-    let tx = conn.transaction()?;
     // If a stale row exists (different revision), drop it first.
     delete(&tx, blob_sha, parser_id)?;
     insert(
@@ -804,5 +808,47 @@ mod tests {
         let meta = lookup(&c, "shaJ", "rust").unwrap().unwrap();
         assert_eq!(meta.analyzer_id, None);
         assert_eq!(meta.analyzer_revision, None);
+    }
+
+    #[test]
+    fn reuse_or_compute_serializes_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("store.db");
+        let mut first_conn = store::open(&db).unwrap();
+        first_conn.busy_timeout(Duration::from_secs(5)).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let second_barrier = Arc::clone(&barrier);
+        let second_count = Arc::clone(&compute_count);
+        let second_db = db.clone();
+
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            let mut conn = store::open(&second_db).unwrap();
+            conn.busy_timeout(Duration::from_secs(5)).unwrap();
+            reuse_or_compute(&mut conn, "shaK", "rust", 1, None, 20, || {
+                second_count.fetch_add(1, Ordering::SeqCst);
+                Ok(ParsedData::default())
+            })
+            .unwrap()
+        });
+
+        let first_fresh = reuse_or_compute(&mut first_conn, "shaK", "rust", 1, None, 10, || {
+            compute_count.fetch_add(1, Ordering::SeqCst);
+            barrier.wait();
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(ParsedData::default())
+        })
+        .unwrap();
+        let second_fresh = second.join().unwrap();
+
+        assert!(first_fresh);
+        assert!(!second_fresh);
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
     }
 }
