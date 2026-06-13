@@ -24,7 +24,7 @@ use cairn_lang_api::{
     LanguageBackend, all_backends, pick_backend_for_path, pick_backend_for_shebang,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
@@ -464,7 +464,7 @@ fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
         .map_err(|e| crate::Error::InvalidArgument(format!("git invocation failed: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        warn!(args = ?args, stderr = %stderr.trim(), "git command non-zero");
+        debug!(args = ?args, stderr = %stderr.trim(), "git command non-zero");
         return Err(crate::Error::InvalidArgument(format!(
             "git {args:?}: {}",
             stderr.trim()
@@ -473,16 +473,33 @@ fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub(crate) fn git_cat_file(repo_root: &Path, blob_sha: &str) -> std::io::Result<Vec<u8>> {
+fn is_git_sha1(blob_sha: &str) -> bool {
+    blob_sha.len() == 40
+        && blob_sha
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(crate) fn git_cat_file(repo_root: &Path, blob_sha: &str) -> Result<Vec<u8>> {
+    if !is_git_sha1(blob_sha) {
+        // Manifest blob IDs are process input at the RPC/register
+        // boundary. An allowlist keeps future git invocation changes
+        // from turning object names into argument syntax.
+        return Err(crate::Error::InvalidArgument(
+            "invalid git blob sha: expected 40 hex characters".into(),
+        ));
+    }
     let out = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["cat-file", "-p", blob_sha])
-        .output()?;
+        .args(["cat-file", "-p", "--", blob_sha])
+        .output()
+        .map_err(crate::Error::Io)?;
     if !out.status.success() {
-        return Err(std::io::Error::other(format!(
-            "git cat-file {blob_sha}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        debug!(blob_sha, stderr = %stderr.trim(), "git cat-file non-zero");
+        return Err(crate::Error::InvalidArgument(format!(
+            "git cat-file failed for blob {blob_sha}"
         )));
     }
     Ok(out.stdout)
@@ -503,7 +520,15 @@ pub(crate) fn load_blob_or_worktree(
     blob_sha: &str,
     path: &str,
 ) -> std::io::Result<Vec<u8>> {
-    git_cat_file(worktree_root, blob_sha).or_else(|_| std::fs::read(worktree_root.join(path)))
+    if !is_git_sha1(blob_sha) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid git blob sha: expected 40 hex characters",
+        ));
+    }
+    git_cat_file(worktree_root, blob_sha)
+        .map_err(|e| std::io::Error::other(e.to_string()))
+        .or_else(|_| std::fs::read(worktree_root.join(path)))
 }
 
 #[cfg(test)]
@@ -727,6 +752,50 @@ mod tests {
             })
             .unwrap();
         assert!(count >= 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn register_skips_worktree_symlink_to_outside_file() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("leak.rs"), "pub fn leaked() {}\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("leak.rs"),
+            repo.path().join("src/leak.rs"),
+        )
+        .unwrap();
+
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        let tentative = manifest::get_entries(&conn, outcome.tentative_manifest).unwrap();
+        assert!(
+            !tentative.iter().any(|e| e.path == "src/leak.rs"),
+            "worktree symlink must not become a tentative blob"
+        );
+        let leaked_symbols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name = 'leaked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_symbols, 0);
+    }
+
+    #[test]
+    fn git_cat_file_rejects_invalid_blob_sha_before_invoking_git() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        for sha in [
+            "; rm -rf",
+            "abc123",
+            "01234567890123456789012345678901234567zz",
+        ] {
+            let err = git_cat_file(repo.path(), sha).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidArgument(_)));
+        }
     }
 
     #[test]

@@ -136,6 +136,16 @@ where
 
     let entries: Vec<ManifestEntry> = cairn_watch::scan::walk_repo(worktree_path)
         .filter_map(|sf| {
+            if std::fs::symlink_metadata(&sf.path)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                // Tentative manifests are a trust boundary for later
+                // blob reads; skipping symlinks keeps registration
+                // scoped to files physically inside the worktree.
+                return None;
+            }
             let rel = sf.path.strip_prefix(worktree_path).ok()?.to_owned();
             let rel_str = rel.to_string_lossy().into_owned();
             if !include(&PathHint {
@@ -430,6 +440,28 @@ mod tests {
         assert_eq!(entries.len(), 2);
         let a_entry = entries.iter().find(|e| e.path == "a.rs").unwrap();
         assert_eq!(a_entry.blob_sha, git_blob_sha(b"fn a() {}\n"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_from_worktree_skips_symlink_to_outside_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("repo");
+        fs::create_dir(&wt).unwrap();
+        let outside = tmp.path().join("outside.rs");
+        fs::write(&outside, "fn leaked() {}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("linked.rs")).unwrap();
+
+        let (_db_tmp, mut c) = fresh_db();
+        let tx = c.transaction().unwrap();
+        let id = build_from_worktree(&tx, &wt, 0, |hint| hint.path.ends_with(".rs")).unwrap();
+        tx.commit().unwrap();
+
+        let entries = get_entries(&c, id).unwrap();
+        assert!(
+            entries.is_empty(),
+            "symlink target outside worktree must not be blobbed: {entries:?}"
+        );
     }
 
     #[test]
