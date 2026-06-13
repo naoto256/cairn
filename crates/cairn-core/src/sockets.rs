@@ -212,7 +212,7 @@ struct UmaskGuard {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl UmaskGuard {
-    fn set(mask: u16) -> Self {
+    fn set(mask: u32) -> Self {
         let lock = UMASK_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
