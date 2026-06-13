@@ -13,9 +13,14 @@ use serde_json::Value;
 /// JSON-RPC 2.0 request envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
+    /// Protocol version. Cairn only accepts `"2.0"`.
     pub jsonrpc: JsonRpcVersion,
+    /// Caller-supplied correlation id. Responses echo this value unchanged.
     pub id: RequestId,
+    /// Method name, such as `get_outline`, `find_symbols`, or a control verb.
     pub method: String,
+    /// Method-specific argument object. `None` serializes as an omitted
+    /// `params` field and is accepted by no-argument methods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
@@ -23,18 +28,32 @@ pub struct Request {
 /// JSON-RPC 2.0 response envelope. Either `result` or `error` is present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
+    /// Protocol version. Always `"2.0"` for responses constructed here.
     pub jsonrpc: JsonRpcVersion,
+    /// Request id being answered, or [`RequestId::Null`] when no valid id
+    /// could be recovered from the request.
     pub id: RequestId,
+    /// Successful method result. Omitted when [`Self::error`] is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Failure payload. Omitted when [`Self::result`] is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
 }
 
+/// JSON-RPC error object.
+///
+/// Standard codes and Cairn's implementation-defined codes live in
+/// [`error_code`]. Producers use `data` only when a caller can act on
+/// structured details beyond the message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseError {
+    /// Numeric JSON-RPC error code. See [`error_code`] for the canonical
+    /// values emitted by Cairn.
     pub code: i32,
+    /// Human-readable diagnostic message.
     pub message: String,
+    /// Optional structured error details. `None` is omitted on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
@@ -43,6 +62,7 @@ pub struct ResponseError {
 /// fail to deserialize loudly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JsonRpcVersion {
+    /// JSON-RPC version string `"2.0"`.
     #[serde(rename = "2.0")]
     V2,
 }
@@ -52,21 +72,34 @@ pub enum JsonRpcVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
+    /// Numeric request id. Cairn accepts and echoes signed integers.
     Number(i64),
+    /// String request id. Used when clients need opaque correlation tokens.
     String(String),
+    /// Null id. Used for invalid-request responses where no valid id is
+    /// available; Cairn does not model notifications separately today.
     Null,
 }
 
-/// Standard JSON-RPC error codes plus cairn extensions.
+/// Standard JSON-RPC error codes plus Cairn extensions.
+///
+/// `-32700..=-32603` are the JSON-RPC 2.0 standard codes. Cairn-specific
+/// failures use the implementation-defined `-32000..=-32099` range.
 pub mod error_code {
+    /// Invalid JSON text.
     pub const PARSE_ERROR: i32 = -32700;
+    /// JSON text is valid but does not have the request-envelope shape.
     pub const INVALID_REQUEST: i32 = -32600;
+    /// The request names a method that the selected socket does not serve.
     pub const METHOD_NOT_FOUND: i32 = -32601;
+    /// Method parameters failed deserialization or semantic validation.
     pub const INVALID_PARAMS: i32 = -32602;
+    /// Unexpected server-side failure not represented by a narrower code.
     pub const INTERNAL_ERROR: i32 = -32603;
 
-    // Cairn-specific (-32000 .. -32099 is the implementation-defined range).
+    /// Requested repository alias is not registered.
     pub const REPO_NOT_FOUND: i32 = -32001;
+    /// Requested file is not present in the selected snapshot's index.
     pub const FILE_NOT_INDEXED: i32 = -32002;
 }
 

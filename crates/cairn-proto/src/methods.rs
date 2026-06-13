@@ -22,19 +22,28 @@ use crate::control::JobSnapshot;
 /// Result of `list_repos`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListReposResult {
+    /// Registered repositories visible to the daemon. Empty when the
+    /// registry has no entries.
     pub repos: Vec<RepoEntry>,
 }
 
+/// One repository returned by `list_repos`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoEntry {
+    /// Short alias used by query arguments.
     pub alias: String,
+    /// Registered repository root path.
     pub root: String,
+    /// Snapshot manifests reachable through this repository's anchors.
     pub snapshots: Vec<SnapshotEntry>,
+    /// Analyzer jobs associated with this repo. Empty lists are omitted on
+    /// the wire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobSnapshot>,
 }
 
 impl RepoEntry {
+    /// Distinct language tags present in this repo's snapshots.
     #[must_use]
     pub fn languages(&self) -> BTreeSet<&str> {
         self.snapshots
@@ -44,13 +53,23 @@ impl RepoEntry {
     }
 }
 
+/// Snapshot entry returned by `list_repos`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEntry {
+    /// User-facing anchor labels pointing at this manifest. `branch/<name>`
+    /// anchors are rendered as `<name>`; `HEAD` and `tentative/<id>` remain
+    /// explicit.
     pub branches: Vec<String>,
+    /// Snapshot readiness string reported by the daemon.
     pub status: String,
+    /// Per-language analyzer tier matrix for this snapshot.
     pub enrichment: Vec<LanguageEnrichment>,
+    /// Last anchor access/update timestamp formatted by the daemon. `None`
+    /// means no timestamp was recorded for the snapshot.
     pub last_accessed: Option<String>,
+    /// Number of files in the snapshot manifest.
     pub file_count: u64,
+    /// Number of symbols indexed for the snapshot.
     pub symbol_count: u64,
 }
 
@@ -152,6 +171,8 @@ pub struct OutlineArgs {
     /// returned item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Single file to outline, relative to the repo root. Required when
+    /// `path` is absent; omitted in directory mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// File-path string prefix relative to repo root. This is a
@@ -172,6 +193,8 @@ pub struct OutlineArgs {
     /// crate or package root. Ignored in single-file mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<u32>,
+    /// Maximum number of items to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -180,6 +203,8 @@ pub struct OutlineArgs {
 /// wire to keep token usage tight.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineResult {
+    /// Outline entries. Empty means the file/path matched no indexed symbols,
+    /// or the selected anchor was not indexed.
     pub items: Vec<OutlineItem>,
     /// Completeness of this outline. `Partial` when the file's
     /// Tier-2 enrichment (doc overrides, semantic signatures) had
@@ -188,10 +213,12 @@ pub struct OutlineResult {
     /// readable; absence is treated as `Complete`.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
 
+/// One symbol-like entry returned by `get_outline`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineItem {
     /// Present in directory mode to attribute each item to a file.
@@ -199,14 +226,21 @@ pub struct OutlineItem {
     /// the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Kind tag for the outlined item.
     pub kind: SymbolKind,
+    /// Display name as indexed by the backend.
     pub name: String,
+    /// Qualified name suitable for follow-up `get_symbol_source` calls.
     pub qualified: String,
+    /// Signature text when the backend captured one. `None` is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// 1-based source line for the item.
     pub line: u32,
+    /// Docstring or heading text captured for the item. `None` is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Index tier that produced this item.
     pub source: SourceTier,
 }
 
@@ -247,6 +281,7 @@ pub struct FindSymbolArgs {
     /// restrict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -254,6 +289,7 @@ pub struct FindSymbolArgs {
     /// supplying only the bare branch name still works via `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Restrict matches to one symbol kind. `None` allows all kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SymbolKind>,
     /// Qualified-prefix scope. `container = "Foo"` returns symbols
@@ -292,6 +328,8 @@ pub struct FindSymbolArgs {
     /// order, and prefix matching requires an explicit trailing `*`.
     #[serde(default)]
     pub fuzzy: bool,
+    /// Maximum number of hits to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     /// When true, hits omit the `signature` field. Use for broad
@@ -304,23 +342,31 @@ pub struct FindSymbolArgs {
     pub signature_only: bool,
 }
 
+/// Result of `find_symbols`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSymbolResult {
+    /// Matching symbols, sorted for stable scanning across languages/files.
     pub items: Vec<FindSymbolHit>,
     /// `Partial` when the FTS index or a snapshot DB had not yet
     /// reached steady state — a name that exists on disk may not
     /// appear in `items` even though the file was discovered.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
 
+/// One symbol returned by `find_symbols`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSymbolHit {
+    /// Internal symbol row id in the selected snapshot database.
     pub id: i64,
+    /// Qualified symbol name, used by `get_symbol_source`.
     pub qualified: String,
+    /// Display name or last segment of the symbol.
     pub name: String,
+    /// Symbol kind tag.
     pub kind: SymbolKind,
     /// Repository alias the hit came from. Lets a cross-repo query
     /// distinguish identically-qualified symbols across registered
@@ -340,8 +386,11 @@ pub struct FindSymbolHit {
     /// analyzer has enriched the blob. Omitted for syntactic-only hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Signature text when present and `signature_only` did not request
+    /// omission. `None` is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Index tier that produced this hit.
     pub source: SourceTier,
 }
 
@@ -363,11 +412,13 @@ pub struct FindSymbolHit {
 /// interface/base side of a type-relation edge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSubtypesArgs {
+    /// Repository alias. `None` searches every registered repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// The base type or trait/interface. Match returns every type
     /// that implements / extends / mixes in this name.
     pub name: String,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -375,6 +426,8 @@ pub struct FindSubtypesArgs {
     /// supplying only the bare branch name still works via `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Maximum number of hits to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -384,11 +437,13 @@ pub struct FindSubtypesArgs {
 /// interface/base side of an edge originating at `name`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSupertypesArgs {
+    /// Repository alias. `None` searches every registered repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// The subtype. Match returns every base type / trait / interface
     /// / mixin this name implements or inherits from.
     pub name: String,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -396,30 +451,40 @@ pub struct FindSupertypesArgs {
     /// supplying only the bare branch name still works via `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Maximum number of hits to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
+/// Result of `find_subtypes`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSubtypesResult {
+    /// Matching type-relation edges. Empty means no edge matched or the
+    /// semantic tier has not produced any matching facts yet.
     pub items: Vec<ImplHit>,
     /// `Partial` when the Tier-2 analyzer had not finished on every
     /// file. Missing tier is `Semantic`. Items already extracted are
     /// still valid; new ones may arrive once indexing settles.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
 
+/// Result of `find_supertypes`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSupertypesResult {
+    /// Matching type-relation edges. Empty means no edge matched or the
+    /// semantic tier has not produced any matching facts yet.
     pub items: Vec<ImplHit>,
     /// `Partial` when the Tier-2 analyzer had not finished on every
     /// file. Missing tier is `Semantic`. Items already extracted are
     /// still valid; new ones may arrive once indexing settles.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
@@ -445,20 +510,24 @@ pub struct ImplHit {
     /// Python base classes, `"implements"` for TypeScript `implements`,
     /// `"mixin"` for ECMAScript mixin patterns.
     pub kind: String,
+    /// Anchor label the edge came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the subtype-side symbol
     /// (the impl block or the `class … extends …` declaration).
     pub location: String,
 }
 
+/// Arguments to `find_imports`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportsArgs {
+    /// Repository alias. `None` searches every registered repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// File whose imports to list (path relative to repo root). When
     /// omitted, every import in the (filtered) snapshot is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -466,21 +535,27 @@ pub struct ImportsArgs {
     /// supplying only the bare branch name still works via `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Maximum number of imports to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
+/// Result of `find_imports`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportsResult {
+    /// Matching import edges.
     pub items: Vec<ImportHit>,
     /// `Partial` when the Tier-2 analyzer had not finished — `use`
     /// edges come exclusively from semantic enrichment today.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
 
+/// One import edge returned by `find_imports`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportHit {
     /// Path of the file the `use` lives in, relative to repo root.
@@ -495,10 +570,12 @@ pub struct ImportHit {
     pub alias: Option<String>,
     /// True when this is a `pub use` re-export.
     pub is_reexport: bool,
+    /// Anchor label the import came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the import statement.
     #[serde(default)]
     pub location: String,
+    /// 1-based line number of the import statement.
     pub line: u32,
 }
 
@@ -528,6 +605,7 @@ pub enum ReferenceDirection {
 /// Arguments to `find_references`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindReferencesArgs {
+    /// Repository alias. `None` searches every registered repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Name or qualified path of the **anchor** symbol. In the default
@@ -553,6 +631,7 @@ pub struct FindReferencesArgs {
     /// true to return the legacy full ref set for debugging.
     #[serde(default)]
     pub include_noise: bool,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -560,12 +639,17 @@ pub struct FindReferencesArgs {
     /// supplying only the bare branch name still works via `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Maximum number of references to return. `None` uses the daemon
+    /// default; reaching the effective limit marks the result as partial
+    /// with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
+/// Result of `find_references`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindReferencesResult {
+    /// Matching reference sites.
     pub items: Vec<FindReferenceHit>,
     /// `Partial` carries two separate concerns for references:
     /// missing tiers (Tier-2 not yet run on every file) **and**
@@ -574,20 +658,27 @@ pub struct FindReferencesResult {
     /// tag distinguishes the two for consumers that want to know.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
 
+/// One reference site returned by `find_references`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindReferenceHit {
+    /// Bare target token recorded at the reference site.
     pub target_name: String,
+    /// Resolved target qualified name. `None` means the analyzer captured
+    /// the token but could not resolve it to a symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_qualified: Option<String>,
+    /// Reference kind.
     pub kind: RefKind,
     /// Qualified name of the function / impl block the reference sits
     /// inside. `None` for top-level expressions (rare in Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enclosing_qualified: Option<String>,
+    /// Anchor label the reference came from.
     pub branch: String,
     /// `repo:branch:file:line` string, clickable in editors that
     /// recognise the format.
@@ -615,12 +706,14 @@ pub struct FindReferenceHit {
 /// Arguments to `find_callers`. "Who calls `name`?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindCallersArgs {
+    /// Repository alias. `None` searches every registered repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Callee symbol. Matches `refs.target_qualified` first when the
     /// name carries `::`, falling back to the bare last segment;
     /// bare names go straight to the name index.
     pub name: String,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -628,6 +721,8 @@ pub struct FindCallersArgs {
     /// supplying only the bare branch name still works via `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Maximum number of callers to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -635,33 +730,49 @@ pub struct FindCallersArgs {
 /// Arguments to `find_callees`. "What does `name` call?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindCalleesArgs {
+    /// Repository alias. `None` searches every registered repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Caller (enclosing) symbol. Matches `symbols.qualified` via
     /// the enclosing FK on each ref row.
     pub name: String,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Maximum number of callees to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
+/// Result of `find_callers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindCallersResult {
+    /// Matching call edges where the queried symbol is the callee.
     pub items: Vec<CallHit>,
+    /// `Partial` when the Tier-2 refs table was not ready or the result was
+    /// capped. Items already returned are still valid.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
 
+/// Result of `find_callees`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindCalleesResult {
+    /// Matching call edges where the queried symbol is the caller.
     pub items: Vec<CallHit>,
+    /// `Partial` when the Tier-2 refs table was not ready or the result was
+    /// capped. Items already returned are still valid.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
@@ -682,13 +793,17 @@ pub struct FindCalleesResult {
 /// pinned changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallHit {
+    /// Bare callee token recorded at the call site.
     pub target_name: String,
+    /// Resolved callee qualified name. `None` means the analyzer captured
+    /// the call token but could not resolve it to a symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_qualified: Option<String>,
     /// Qualified name of the enclosing function — the caller side of
     /// the edge. `None` for top-level expressions (rare in Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enclosing_qualified: Option<String>,
+    /// Anchor label the call came from.
     pub branch: String,
     /// `repo:branch:file:line` of the call site itself.
     pub location: String,
@@ -720,6 +835,7 @@ pub struct GetSymbolSourceArgs {
     /// `symbols` table). Use `find_symbols` first if you only have a
     /// bare name and the repo has more than one match.
     pub qualified: String,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
@@ -740,25 +856,38 @@ pub struct GetSymbolSourceArgs {
     pub signature_only: bool,
 }
 
+/// Result of `get_symbol_source`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSymbolSourceResult {
+    /// Qualified name of the symbol that was found.
     pub qualified: String,
+    /// Display name or last segment of the symbol.
     pub name: String,
+    /// Symbol kind tag.
     pub kind: SymbolKind,
+    /// Anchor label the source came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the first line of the
     /// returned source.
     pub location: String,
+    /// 1-based first line covered by [`Self::source`].
     pub line_start: u32,
+    /// 1-based last line covered by [`Self::source`].
     pub line_end: u32,
     /// Source text of the symbol, exactly as it appears in the file
     /// (no re-indentation or stripping).
     pub source: String,
+    /// Signature text when the backend captured one. In `signature_only`
+    /// mode this remains populated while [`Self::source`] may be empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Docstring or documentation comment captured for the symbol. `None`
+    /// is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Index tier that produced the returned source metadata.
     pub source_tier: SourceTier,
+    /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
 }
@@ -782,6 +911,7 @@ pub struct RegisterRepoArgs {
 /// Arguments to `reindex`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReindexArgs {
+    /// Repository alias to reindex.
     pub alias: String,
 }
 
@@ -789,10 +919,15 @@ pub struct ReindexArgs {
 /// the agent can confirm the index produced something.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexResult {
+    /// Repository alias that was indexed.
     pub alias: String,
+    /// Branch or anchor label indexed by the operation.
     pub branch: String,
+    /// Number of files parsed or refreshed.
     pub files_indexed: u64,
+    /// Number of files skipped because they were ignored or unchanged.
     pub files_skipped: u64,
+    /// Number of symbols inserted into the snapshot index.
     pub symbols_inserted: u64,
 }
 
