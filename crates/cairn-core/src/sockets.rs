@@ -12,10 +12,18 @@
 //! launched the daemon.
 
 use std::path::{Path, PathBuf};
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::sync::{Mutex, MutexGuard};
+
+use tokio::net::UnixListener;
 
 use crate::{Error, Result};
 
 const APP_NAME: &str = "cairn";
+const RUNTIME_DIR_MODE: u32 = 0o700;
+const SOCKET_FILE_MODE: u32 = 0o600;
+#[cfg(all(unix, not(target_os = "macos")))]
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Resolved location of the two daemon sockets.
 #[derive(Debug, Clone)]
@@ -50,19 +58,29 @@ impl SocketPaths {
         }
     }
 
-    /// Create the runtime directory if missing and tighten its
-    /// permissions to 0700. Stale socket files from a previous run
-    /// are removed.
+    /// Create the runtime directory if missing and verify that it is
+    /// owned by the current uid with permissions 0700. Stale socket
+    /// files from a previous run are removed.
     ///
     /// # Errors
     /// Filesystem failures.
     pub fn ensure(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.runtime_dir)?;
-        tighten_dir_permissions(&self.runtime_dir)?;
+        create_secure_runtime_dir(&self.runtime_dir)?;
         remove_if_exists(&self.cairn)?;
         remove_if_exists(&self.control)?;
         Ok(())
     }
+}
+
+/// Bind a Unix listener and force the socket node to 0600.
+///
+/// The runtime directory is the primary same-UID boundary; setting the
+/// socket node immediately after bind adds defense in depth if an
+/// ancestor's permissions are later weakened.
+pub fn bind_socket_with_mode(path: &Path) -> Result<UnixListener> {
+    let listener = bind_socket_private(path)?;
+    set_socket_file_permissions(path)?;
+    Ok(listener)
 }
 
 fn runtime_base() -> Result<PathBuf> {
@@ -80,18 +98,136 @@ fn runtime_base() -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn tighten_dir_permissions(p: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o700);
-    std::fs::set_permissions(p, perms)?;
+fn create_secure_runtime_dir(p: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    // The directory gates access in lieu of per-connection peer-UID
+    // checks, so create it private from the first observable moment
+    // and never "repair" an already-existing insecure directory.
+    match std::fs::DirBuilder::new().mode(RUNTIME_DIR_MODE).create(p) {
+        Ok(()) => {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(RUNTIME_DIR_MODE))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    validate_runtime_dir_security(p, rustix::process::geteuid().as_raw())
+}
+
+#[cfg(unix)]
+fn validate_runtime_dir_security(p: &Path, expected_uid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(p)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::InvalidArgument(format!(
+            "runtime socket path {} must be a directory",
+            p.display()
+        )));
+    }
+
+    let owner = metadata.uid();
+    if owner != expected_uid {
+        return Err(Error::InvalidArgument(format!(
+            "runtime socket directory {} is owned by uid {owner}, expected uid {expected_uid}",
+            p.display()
+        )));
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != RUNTIME_DIR_MODE {
+        return Err(Error::InvalidArgument(format!(
+            "runtime socket directory {} has mode {mode:o}, expected {RUNTIME_DIR_MODE:o}",
+            p.display()
+        )));
+    }
+
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn tighten_dir_permissions(_p: &Path) -> Result<()> {
+fn create_secure_runtime_dir(p: &Path) -> Result<()> {
     // Non-Unix targets are out of scope for 0.1.0; UDS is Unix-only
     // anyway, so the daemon would not start on Windows.
+    std::fs::create_dir_all(p)?;
     Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn bind_socket_private(path: &Path) -> Result<UnixListener> {
+    let guard = UmaskGuard::set(0o177);
+    // UDS nodes inherit process umask at bind time; create them private
+    // before any client can observe the path.
+    let listener = UnixListener::bind(path)?;
+    drop(guard);
+    Ok(listener)
+}
+
+#[cfg(target_os = "macos")]
+fn bind_socket_private(path: &Path) -> Result<UnixListener> {
+    Ok(UnixListener::bind(path)?)
+}
+
+#[cfg(not(unix))]
+fn bind_socket_private(path: &Path) -> Result<UnixListener> {
+    Ok(UnixListener::bind(path)?)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_socket_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_socket_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE)) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) =>
+        {
+            // Darwin reports EPERM for chmod on socket nodes. The
+            // enforced 0700 runtime directory remains the effective
+            // same-UID boundary on this platform.
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_socket_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+struct UmaskGuard {
+    previous: rustix::fs::Mode,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl UmaskGuard {
+    fn set(mask: u16) -> Self {
+        let lock = UMASK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self {
+            previous: rustix::process::umask(rustix::fs::Mode::from(mask)),
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        let _ = rustix::process::umask(self.previous);
+    }
 }
 
 fn remove_if_exists(p: &Path) -> Result<()> {
@@ -112,7 +248,12 @@ mod tests {
         let dir = tmp.path().join("cc");
         let paths = SocketPaths::with_runtime_dir(dir.clone());
         // Plant a fake stale socket file.
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::write(&paths.cairn, b"stale").unwrap();
         assert!(paths.cairn.exists());
 
@@ -123,7 +264,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ensure_tightens_permissions() {
+    fn ensure_creates_dir_with_secure_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("cc");
@@ -131,6 +272,64 @@ mod tests {
         paths.ensure().unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_rejects_runtime_dir_with_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cc");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let paths = SocketPaths::with_runtime_dir(dir);
+        let err = paths.ensure().expect_err("loose runtime dir must fail");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_runtime_dir_security_rejects_other_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let actual_uid = std::fs::metadata(tmp.path()).unwrap().uid();
+        let other_uid = actual_uid.wrapping_add(1);
+
+        let err = validate_runtime_dir_security(tmp.path(), other_uid)
+            .expect_err("other-owner runtime dir must fail");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[tokio::test]
+    async fn bind_socket_with_mode_sets_socket_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("cairn.sock");
+        let listener = bind_socket_with_mode(&socket).unwrap();
+
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bind_socket_with_mode_tolerates_macos_socket_chmod_limitation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("cairn.sock");
+        let listener = bind_socket_with_mode(&socket).unwrap();
+
+        assert!(socket.exists());
+
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
     }
 
     #[test]

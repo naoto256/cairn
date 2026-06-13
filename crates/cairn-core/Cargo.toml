@@ -26,6 +26,7 @@ async-trait = "0.1"
 linkme.workspace = true
 sha1.workspace = true
 hex.workspace = true
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3"
