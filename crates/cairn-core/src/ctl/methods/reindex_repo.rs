@@ -60,7 +60,7 @@ impl ControlMethod for ReindexRepo {
             }
         })
         .await
-        .map_err(|e| Error::InvalidArgument(format!("reindex_repo task panicked: {e}")))??;
+        .map_err(|e| Error::internal_task_panic("reindex_repo", e))??;
 
         info!(
             alias = %args.alias,

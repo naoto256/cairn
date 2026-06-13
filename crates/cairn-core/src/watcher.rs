@@ -233,7 +233,7 @@ async fn reindex_alias(
         Ok(())
     })
     .await
-    .map_err(|e| Error::InvalidArgument(format!("watcher reindex task panicked: {e}")))?
+    .map_err(|e| Error::internal_task_panic("watcher reindex", e))?
 }
 
 fn now_ns() -> Result<i64> {

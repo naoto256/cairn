@@ -7,10 +7,16 @@ use cairn_proto::jsonrpc::{
 use crate::Error;
 
 pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
-    let msg = err.to_string();
+    let msg = match err {
+        Error::Internal(_) => "internal error".to_string(),
+        _ => err.to_string(),
+    };
     let code = match err {
-        Error::InvalidParams(_) | Error::AnchorNotFound { .. } => error_code::INVALID_PARAMS,
+        Error::InvalidParams(_) | Error::InvalidArgument(_) | Error::AnchorNotFound { .. } => {
+            error_code::INVALID_PARAMS
+        }
         Error::RepoNotFound { .. } => error_code::REPO_NOT_FOUND,
+        Error::Internal(_) => error_code::INTERNAL_ERROR,
         _ => error_code::INTERNAL_ERROR,
     };
     jsonrpc_error_response(id, code, msg)
@@ -27,10 +33,21 @@ mod tests {
         error_from(RequestId::Number(1), &err).error.unwrap().code
     }
 
+    fn message_for(err: Error) -> String {
+        error_from(RequestId::Number(1), &err)
+            .error
+            .unwrap()
+            .message
+    }
+
     #[test]
     fn maps_typed_caller_errors_to_jsonrpc_codes() {
         assert_eq!(
             code_for(Error::InvalidParams("bad shape".into())),
+            error_code::INVALID_PARAMS
+        );
+        assert_eq!(
+            code_for(Error::InvalidArgument("bad argument".into())),
             error_code::INVALID_PARAMS
         );
         assert_eq!(
@@ -44,6 +61,27 @@ mod tests {
                 alias: "demo".into()
             }),
             error_code::REPO_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn maps_internal_errors_to_sanitized_jsonrpc_response() {
+        let resp = error_from(
+            RequestId::Number(1),
+            &Error::Internal("task panicked: /private/repo secret".into()),
+        );
+        let error = resp.error.unwrap();
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "internal error");
+        assert!(!error.message.contains("/private/repo"));
+    }
+
+    #[test]
+    fn preserves_invalid_argument_message_for_client_errors() {
+        assert_eq!(
+            message_for(Error::InvalidArgument("missing `repo`".into())),
+            "invalid argument: missing `repo`"
         );
     }
 }
