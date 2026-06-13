@@ -188,6 +188,7 @@ dependencies = [
  "hex",
  "linkme",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",
