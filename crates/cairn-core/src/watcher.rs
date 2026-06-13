@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,16 +32,22 @@ pub struct WatchManager {
     backend: WatchBackend,
     #[cfg(test)]
     fail_watcher_start: bool,
+    #[cfg(test)]
+    dropped_watchers: Arc<AtomicUsize>,
     watchers: Mutex<HashMap<String, RepoWatcher>>,
 }
 
 struct RepoWatcher {
     _handle: WatcherHandle,
     task: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    drop_counter: Arc<AtomicUsize>,
 }
 
 impl Drop for RepoWatcher {
     fn drop(&mut self) {
+        #[cfg(test)]
+        self.drop_counter.fetch_add(1, Ordering::SeqCst);
         self.task.abort();
     }
 }
@@ -72,6 +80,8 @@ impl WatchManager {
             backend,
             #[cfg(test)]
             fail_watcher_start: false,
+            #[cfg(test)]
+            dropped_watchers: Arc::new(AtomicUsize::new(0)),
             watchers: Mutex::new(HashMap::new()),
         }
     }
@@ -84,6 +94,7 @@ impl WatchManager {
             backend: WatchBackend::Poll,
             job_manager: None,
             fail_watcher_start: true,
+            dropped_watchers: Arc::new(AtomicUsize::new(0)),
             watchers: Mutex::new(HashMap::new()),
         }
     }
@@ -109,7 +120,6 @@ impl WatchManager {
 
     /// Start or replace the watcher for one alias.
     pub fn watch_alias(&self, alias: String, root_path: PathBuf) -> Result<()> {
-        self.unwatch_alias(&alias);
         #[cfg(test)]
         if self.fail_watcher_start {
             return Err(Error::InvalidArgument(
@@ -130,11 +140,14 @@ impl WatchManager {
             rx,
         ));
 
+        // Only swap after setup succeeds; a start failure must not blind an existing alias.
         self.lock_recovering().insert(
             alias.clone(),
             RepoWatcher {
                 _handle: handle,
                 task,
+                #[cfg(test)]
+                drop_counter: self.dropped_watchers.clone(),
             },
         );
         info!(alias = %alias, path = %root_path.display(), "repo watcher started");
@@ -149,6 +162,16 @@ impl WatchManager {
 
     pub fn is_watching_alias(&self, alias: &str) -> bool {
         self.lock_recovering().contains_key(alias)
+    }
+
+    #[cfg(test)]
+    pub fn set_fail_watcher_start(&mut self, fail: bool) {
+        self.fail_watcher_start = fail;
+    }
+
+    #[cfg(test)]
+    fn dropped_watcher_count(&self) -> usize {
+        self.dropped_watchers.load(Ordering::SeqCst)
     }
 
     fn lock_recovering(&self) -> MutexGuard<'_, HashMap<String, RepoWatcher>> {
@@ -226,6 +249,54 @@ fn now_ns() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn watch_alias_replaces_existing_watcher_after_new_start_succeeds() {
+        let old_root = tempfile::tempdir().unwrap();
+        let new_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let manager = WatchManager::with_backend(
+            Arc::new(CasDataDir::with_root(data_root.path().to_path_buf())),
+            WatchBackend::Poll,
+        );
+
+        manager
+            .watch_alias("demo".into(), old_root.path().to_path_buf())
+            .unwrap();
+        assert!(manager.is_watching_alias("demo"));
+        assert_eq!(manager.dropped_watcher_count(), 0);
+
+        manager
+            .watch_alias("demo".into(), new_root.path().to_path_buf())
+            .unwrap();
+
+        assert!(manager.is_watching_alias("demo"));
+        assert_eq!(manager.dropped_watcher_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn watch_alias_keeps_existing_watcher_when_new_start_fails() {
+        let old_root = tempfile::tempdir().unwrap();
+        let new_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let mut manager = WatchManager::with_backend(
+            Arc::new(CasDataDir::with_root(data_root.path().to_path_buf())),
+            WatchBackend::Poll,
+        );
+
+        manager
+            .watch_alias("demo".into(), old_root.path().to_path_buf())
+            .unwrap();
+        manager.set_fail_watcher_start(true);
+
+        let err = manager
+            .watch_alias("demo".into(), new_root.path().to_path_buf())
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected watcher start failure"));
+        assert!(manager.is_watching_alias("demo"));
+        assert_eq!(manager.dropped_watcher_count(), 0);
+    }
 
     #[test]
     fn watcher_registry_recovers_after_mutex_poison() {
