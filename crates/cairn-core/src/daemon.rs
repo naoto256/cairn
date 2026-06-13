@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use crate::Result;
-use crate::sockets::SocketPaths;
+use crate::sockets::{SocketPaths, bind_socket_with_mode};
 
 /// Implementations receive one newline-delimited request line at a
 /// time and return one response line.
@@ -53,8 +53,8 @@ impl Daemon {
     /// Bind / accept failures propagate.
     pub async fn run(self) -> Result<()> {
         self.paths.ensure()?;
-        let cairn = UnixListener::bind(&self.paths.cairn)?;
-        let ctrl = UnixListener::bind(&self.paths.control)?;
+        let cairn = bind_socket_with_mode(&self.paths.cairn)?;
+        let ctrl = bind_socket_with_mode(&self.paths.control)?;
         info!(cairn = %self.paths.cairn.display(), control = %self.paths.control.display(), "daemon listening");
 
         let cairn_task = spawn_accept_loop(
@@ -224,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn round_trip_one_request() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
         let shutdown = Arc::new(Notify::new());
 
         let daemon_task = tokio::spawn({
@@ -289,7 +289,7 @@ mod tests {
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
         let runtime_tmp = tempfile::tempdir().unwrap();
         let data_tmp = tempfile::tempdir().unwrap();
-        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().to_path_buf());
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
         let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
         cas_data_dir.ensure().unwrap();
         let watch_manager = Arc::new(WatchManager::with_backend(
@@ -357,7 +357,7 @@ mod tests {
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
         let runtime_tmp = tempfile::tempdir().unwrap();
         let data_tmp = tempfile::tempdir().unwrap();
-        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().to_path_buf());
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
         let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
         cas_data_dir.ensure().unwrap();
         let watch_manager = Arc::new(WatchManager::with_failing_watcher(cas_data_dir.clone()));
