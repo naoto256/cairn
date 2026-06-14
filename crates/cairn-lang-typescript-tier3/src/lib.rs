@@ -66,8 +66,19 @@ const TSX_LANGUAGE: TsLanguage = TsLanguage {
     tree_sitter_language: tsx_language,
 };
 
+/// TypeScript Tier-3 workspace analyzer backed by typescript-language-server.
+/// It reuses the shared LSP pool and only consumes files parsed by the
+/// TypeScript Tier-1 backend.
 pub struct TypescriptLanguageServerTsAnalyzer;
+
+/// JavaScript Tier-3 workspace analyzer backed by typescript-language-server.
+/// It shares the TypeScript language service pool while preserving the
+/// JavaScript parser id for input selection.
 pub struct TypescriptLanguageServerJsAnalyzer;
+
+/// TSX Tier-3 workspace analyzer backed by typescript-language-server.
+/// It uses the TypeScript React LSP language id while keeping a separate
+/// analyzer id for run staleness and provenance.
 pub struct TypescriptLanguageServerTsxAnalyzer;
 
 impl WorkspaceAnalyzer for TypescriptLanguageServerTsAnalyzer {
