@@ -5,6 +5,44 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-06-14
+
+### Added
+
+- **Tier-3 cross-file resolution across every supported language.**
+  Eight new LSP backends join the existing `rust-analyzer`,
+  `pyright-langserver`, and `gopls` analyzers: `clangd` is shared
+  across C, C++, and Objective-C; `typescript-language-server` is
+  shared across TypeScript, JavaScript, and TSX; `jdtls`,
+  `kotlin-language-server`, `sourcekit-lsp`, `csharp-ls`,
+  `ruby-lsp`, and `phpantom-lsp` cover Java, Kotlin, Swift, C#,
+  Ruby, and PHP. Tier-3 now resolves calls and type references to
+  their cross-file definitions across the supported language set.
+- **Async indexing.** `cairn ctl reindex-repo <alias>` now returns
+  immediately instead of blocking on LSP cold starts. Per-analyzer
+  work is tracked as jobs via `cairn ctl jobs --alias <alias>`,
+  `--state`, `--json`, and `--cancel`; scripts that need
+  synchronous behavior can use `reindex-repo --wait --timeout`.
+  Query result envelopes carry `tier3_status`, so clients can
+  distinguish a confident-empty answer from one that is still
+  indexing. The async job state is persisted by CAS schema migration
+  v5.
+
+### Fixed
+
+- **Tier-3 reliability hardening.** `clangd` and
+  `typescript-language-server` now use initialize-response readiness
+  for servers that emit no progress notifications; `jdtls`,
+  `kotlin-language-server`, `sourcekit-lsp`, and `csharp-ls` use an
+  executable availability probe instead of rejected `--version`
+  flags; `csharp-ls` receives a dotnet environment so MSBuild
+  discovery works under launchd. LSP discovery also searches
+  standard per-user bin directories, analyzers sharing a pooled LSP
+  are serialized, total analyzer timeout is replaced by
+  progress-based stall detection, per-site definition requests are
+  pipelined, `clangd` skips preprocessor pseudo-call-sites, and LSP
+  stderr head + tail is surfaced in handshake and exit errors.
+
 ## [0.3.0] — 2026-06-10
 
 ### Breaking
