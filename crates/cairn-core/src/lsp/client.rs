@@ -19,9 +19,17 @@ use super::transport::write_lsp_message;
 use super::types::{Location, LocationLink, Position, Url};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+// Shutdown is short by design: after the graceful request times out,
+// the client still sends `exit` and lets process cleanup finish.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// Wait for an LSP server's initial index chatter to quiet down before
+// treating startup as ready; this avoids racing early definition calls.
 const WORKSPACE_LOAD_QUIET_PERIOD: Duration = Duration::from_secs(5);
+// Bound automatic restarts so a crashing server cannot loop forever in
+// a daemon process.
 const MAX_RESTARTS: usize = 3;
+// Keep enough stderr to diagnose startup failures without surfacing an
+// unbounded server log in user-facing errors.
 const STDERR_SECTION_BYTES: usize = 1024;
 const STDERR_HEAD_LINES: usize = 5;
 const STDERR_TAIL_LINES: usize = 5;

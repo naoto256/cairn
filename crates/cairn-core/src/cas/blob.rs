@@ -22,6 +22,9 @@ use crate::cas::kind_conv::{
 #[derive(Debug, Clone, Default)]
 pub struct ParsedData {
     pub syntactic: SyntacticFacts,
+    /// `None` means there is no semantic layer for this parse. Callers
+    /// that need to distinguish "not available" from "failed" must
+    /// carry the extraction error outside this storage DTO.
     pub semantic: Option<SemanticFacts>,
 }
 
