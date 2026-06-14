@@ -140,9 +140,9 @@ impl NestingTracker {
 
 // ─── small utilities ───────────────────────────────────────────────────────
 
-/// Borrow the UTF-8 slice covered by a node, falling back to lossy
-/// decoding when the source is not valid UTF-8 (tree-sitter itself
-/// handles bytes fine, but consumers want a `&str`).
+/// Borrow the UTF-8 slice covered by a node. Invalid UTF-8 currently
+/// returns an empty string because this API borrows from `source`; use
+/// a future `Cow<'a, str>` helper if lossy text retention is needed.
 #[must_use]
 pub fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
     std::str::from_utf8(&source[node.byte_range()]).unwrap_or("")

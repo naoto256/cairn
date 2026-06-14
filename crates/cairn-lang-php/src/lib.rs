@@ -47,8 +47,7 @@ impl LanguageBackend for PhpBackend {
     }
 
     fn file_patterns(&self) -> &'static [&'static str] {
-        // `.phtml` is intentionally out of scope for v1.
-        &["*.php"]
+        &["*.php", "*.phtml"]
     }
 
     fn shebang_patterns(&self) -> &'static [&'static str] {
@@ -709,6 +708,11 @@ use App\Traits\{Timestamps, SoftDeletes as SD};
 "#;
         let facts = PhpBackend.extract_syntactic(src).unwrap();
         assert_eq!(symbol(&facts, "render_header").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn claims_phtml_templates() {
+        assert!(PhpBackend.file_patterns().contains(&"*.phtml"));
     }
 
     #[test]

@@ -12,7 +12,8 @@ use super::WorkspaceFacts;
 
 /// 0.1.x persisted rust-analyzer refs under this alias instead of the
 /// uniform `tier3-<analyzer_id>` scheme. Cleared alongside the current
-/// source so reindexing does not leave duplicate rows behind.
+/// source so reindexing does not leave duplicate rows behind. Remove
+/// this compatibility path after the 0.5.0 migration window closes.
 const LEGACY_RUST_REF_SOURCE: &str = "tier3-rust-analyzer";
 
 pub(super) fn persist_resolved_refs(

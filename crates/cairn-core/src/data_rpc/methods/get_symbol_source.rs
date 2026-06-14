@@ -104,6 +104,10 @@ impl DataMethod for GetSymbolSource {
                     source,
                     signature: row.signature,
                     doc: row.doc,
+                    // `get_symbol_source` reads source bytes from the
+                    // manifest blob rather than a specific analyzer row.
+                    // Until rows carry their originating analyzer tier,
+                    // report the source text itself as syntactic.
                     source_tier: SourceTier::Syntactic,
                     tier3_status: compute_tier3_status(&conn, manifest_id)?,
                 });
