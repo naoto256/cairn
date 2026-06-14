@@ -5,7 +5,7 @@
 //! daemon-visible job state and keeps the expensive LSP-backed work out
 //! of short-lived control requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -47,6 +47,12 @@ pub struct JobSnapshot {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct JobListOptions {
+    pub(crate) include_all: bool,
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +236,7 @@ impl JobManager {
         &self,
         alias_filter: Option<&str>,
         state_filter: Option<RunStatus>,
+        options: JobListOptions,
     ) -> Result<Vec<JobSnapshot>> {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
         let mut out = Vec::new();
@@ -241,36 +248,24 @@ impl JobManager {
             }
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
             let conn = cas_store::open(&store_path)?;
-            let mut stmt = conn.prepare(
-                "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
-                 FROM workspace_analysis_runs
-                 WHERE job_id IS NOT NULL
-                 ORDER BY job_id DESC",
-            )?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(JobSnapshot {
-                        job_id: r.get(0)?,
-                        alias: entry.alias.clone(),
-                        analyzer_id: r.get(1)?,
-                        state: r.get(2)?,
-                        created_at: r.get(3)?,
-                        started_at: None,
-                        finished_at: r.get(4)?,
-                        error: r.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for row in rows {
-                if let Some(filter) = state_filter
-                    && row.state != filter.as_str()
-                {
-                    continue;
-                }
-                out.push(row);
+            let mut rows = if options.include_all {
+                collect_all_job_rows(&conn, &entry.alias)?
+            } else {
+                collect_current_job_rows(&conn, &entry.alias)?
+            };
+            if !options.include_all {
+                rows = latest_default_job_rows(rows);
             }
+            out.extend(rows.into_iter().filter(|row| {
+                state_filter
+                    .map(|filter| row.state == filter.as_str())
+                    .unwrap_or(true)
+            }));
         }
         out.sort_by_key(|job| std::cmp::Reverse(job.job_id));
+        if let Some(limit) = options.limit {
+            out.truncate(limit);
+        }
         Ok(out)
     }
 
@@ -396,6 +391,62 @@ impl JobManager {
             .await
             .map_err(|e| Error::internal_task_panic("analyzer job", e))?
     }
+}
+
+fn collect_all_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
+         FROM workspace_analysis_runs
+         WHERE job_id IS NOT NULL
+         ORDER BY job_id DESC",
+    )?;
+    collect_job_rows(&mut stmt, alias)
+}
+
+fn collect_current_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
+         FROM workspace_analysis_runs
+         WHERE job_id IS NOT NULL
+           AND manifest_id IN (SELECT DISTINCT manifest_id FROM anchors)
+         ORDER BY job_id DESC",
+    )?;
+    collect_job_rows(&mut stmt, alias)
+}
+
+fn collect_job_rows(stmt: &mut rusqlite::Statement<'_>, alias: &str) -> Result<Vec<JobSnapshot>> {
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(JobSnapshot {
+                job_id: r.get(0)?,
+                alias: alias.to_string(),
+                analyzer_id: r.get(1)?,
+                state: r.get(2)?,
+                created_at: r.get(3)?,
+                started_at: None,
+                finished_at: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn latest_default_job_rows(rows: Vec<JobSnapshot>) -> Vec<JobSnapshot> {
+    let mut seen_terminal = HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        match RunStatus::from_str(&row.state) {
+            Some(RunStatus::Queued | RunStatus::Running) => out.push(row),
+            Some(state) if state.is_terminal() => {
+                if seen_terminal.insert(row.analyzer_id.clone()) {
+                    out.push(row);
+                }
+            }
+            _ => out.push(row),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -571,7 +622,10 @@ mod tests {
     use tracing::subscriber::Interest;
     use tracing::{Event, Level, Metadata, Subscriber};
 
-    use super::{MAX_WORKER_CONCURRENCY, PoolGroupLocks, worker_concurrency_from_env_value};
+    use super::{
+        JobSnapshot, MAX_WORKER_CONCURRENCY, PoolGroupLocks, latest_default_job_rows,
+        worker_concurrency_from_env_value,
+    };
 
     #[derive(Default)]
     struct WarnCapture {
@@ -722,6 +776,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_job_rows_keep_active_and_latest_terminal_per_analyzer() {
+        let rows = vec![
+            job(7, "rust-analyzer", "running"),
+            job(6, "pyright", "succeeded"),
+            job(5, "pyright", "failed"),
+            job(4, "gopls", "queued"),
+            job(3, "gopls", "succeeded"),
+            job(2, "rust-analyzer", "succeeded"),
+            job(1, "unknown", "mystery"),
+        ];
+
+        let filtered = latest_default_job_rows(rows);
+        let ids = filtered.iter().map(|job| job.job_id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![7, 6, 4, 3, 2, 1]);
+    }
+
     #[tokio::test]
     async fn same_pool_group_locks_serialize() {
         let locks = Arc::new(PoolGroupLocks::default());
@@ -759,5 +831,18 @@ mod tests {
             .expect("different-group lock was blocked")
             .expect("different-group waiter dropped before signaling");
         waiter.await.expect("different-group waiter task panicked");
+    }
+
+    fn job(job_id: i64, analyzer_id: &str, state: &str) -> JobSnapshot {
+        JobSnapshot {
+            job_id,
+            alias: "repo".into(),
+            analyzer_id: analyzer_id.into(),
+            state: state.into(),
+            created_at: job_id,
+            started_at: None,
+            finished_at: None,
+            error: None,
+        }
     }
 }

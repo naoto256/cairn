@@ -161,6 +161,8 @@ enum QueryCommand {
         limit: Option<u32>,
     },
     /// Functions that call the given symbol.
+    ///
+    /// For React/JSX component usage, prefer `refs --kind instantiate`.
     Callers {
         /// Callee symbol.
         name: String,
@@ -210,7 +212,8 @@ enum QueryCommand {
     /// Symmetric reference query — incoming or outgoing references.
     /// Use the dedicated `callers` / `callees` subcommands for the
     /// common call-graph questions; reach for `refs` when you need
-    /// type refs, imports, reads / writes, or annotations.
+    /// type refs, imports, reads / writes, annotations, or JSX
+    /// component instantiations (`--kind instantiate`).
     Refs {
         /// Symbol name or qualified path.
         symbol: String,

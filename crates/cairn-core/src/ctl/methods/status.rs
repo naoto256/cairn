@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use cairn_lang_api::{LanguageBackend, all_backends};
-use cairn_proto::control::{RepoStatus, SnapshotStatus as ProtoSnapshotStatus, StatusReport};
+use cairn_proto::control::{
+    JobSummary, RepoStatus, SnapshotStatus as ProtoSnapshotStatus, StatusReport,
+};
 use linkme::distributed_slice;
 use rusqlite::params;
 use serde_json::Value;
@@ -27,7 +29,6 @@ impl ControlMethod for Status {
         let uptime = ctx.started_at.elapsed().as_secs();
         let version = ctx.version.to_string();
         let cas_data_dir = ctx.cas_data_dir.clone();
-        let job_manager = ctx.job_manager.clone();
 
         let repos = tokio::task::spawn_blocking(move || -> Result<Vec<RepoStatus>> {
             let backends = all_backends();
@@ -39,28 +40,13 @@ impl ControlMethod for Status {
                 let store_bytes = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
                 let conn = cas_store::open(&store_path)?;
                 let snapshots = collect_anchor_snapshots(&conn, store_bytes, &backends)?;
-                let jobs = match &job_manager {
-                    Some(manager) => manager
-                        .jobs(Some(&entry.alias), None)?
-                        .into_iter()
-                        .map(|job| cairn_proto::control::JobSnapshot {
-                            job_id: job.job_id,
-                            alias: job.alias,
-                            analyzer_id: job.analyzer_id,
-                            state: job.state,
-                            created_at: job.created_at,
-                            started_at: job.started_at,
-                            finished_at: job.finished_at,
-                            error: job.error,
-                        })
-                        .collect(),
-                    None => Vec::new(),
-                };
+                let job_summary = collect_job_summary(&conn)?;
                 out.push(RepoStatus {
                     alias: entry.alias,
                     root: entry.root_path,
                     snapshots,
-                    jobs,
+                    job_summary,
+                    jobs: Vec::new(),
                 });
             }
             Ok(out)
@@ -152,6 +138,34 @@ fn collect_anchor_snapshots(
     }
     entries.sort_by_key(|(a, _)| anchor::order_key(a));
     Ok(entries.into_iter().map(|(_, e)| e).collect())
+}
+
+fn collect_job_summary(conn: &rusqlite::Connection) -> Result<JobSummary> {
+    let mut stmt = conn.prepare(
+        "SELECT status, COUNT(*)
+         FROM workspace_analysis_runs
+         WHERE job_id IS NOT NULL
+           AND manifest_id IN (SELECT DISTINCT manifest_id FROM anchors)
+         GROUP BY status",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut summary = JobSummary::default();
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(0)?;
+        let count: u64 = row.get::<_, i64>(1).unwrap_or(0).try_into().unwrap_or(0);
+        match state.as_str() {
+            "queued" => summary.queued += count,
+            "running" => summary.running += count,
+            "succeeded" => summary.succeeded += count,
+            "skipped" => summary.skipped += count,
+            "failed" => summary.failed += count,
+            "timed_out" => summary.timed_out += count,
+            "cancelled" => summary.cancelled += count,
+            _ => summary.other += count,
+        }
+        summary.total += count;
+    }
+    Ok(summary)
 }
 
 #[cfg(test)]

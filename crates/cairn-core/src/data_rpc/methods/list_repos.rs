@@ -6,12 +6,12 @@ use std::collections::BTreeMap;
 use cairn_lang_api::{LanguageBackend, all_backends};
 use cairn_proto::common::LanguageEnrichment;
 use cairn_proto::control::JobSnapshot;
-use cairn_proto::methods::{ListReposResult, RepoEntry, SnapshotEntry};
+use cairn_proto::methods::{ListReposArgs, ListReposResult, RepoEntry, SnapshotEntry};
 use linkme::distributed_slice;
 use rusqlite::params;
 use serde_json::Value;
 
-use super::super::{DATA_METHODS, DataCtx, DataMethod};
+use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::enrichment::collect_enrichment;
@@ -25,7 +25,12 @@ impl DataMethod for ListRepos {
         "list_repos"
     }
 
-    async fn dispatch(&self, ctx: &DataCtx, _params: Value) -> Result<Value> {
+    async fn dispatch(&self, ctx: &DataCtx, params: Value) -> Result<Value> {
+        let args: ListReposArgs = if params.is_null() {
+            ListReposArgs::default()
+        } else {
+            parse_params(params)?
+        };
         let cas_data_dir = ctx.cas_data_dir.clone();
 
         let repos = tokio::task::spawn_blocking(move || -> Result<Vec<RepoEntry>> {
@@ -37,7 +42,11 @@ impl DataMethod for ListRepos {
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
                 let conn = cas_store::open(&store_path)?;
                 let snapshots = collect_snapshots(&conn, &backends)?;
-                let jobs = collect_jobs(&conn, &entry.alias)?;
+                let jobs = if args.include_jobs {
+                    collect_jobs(&conn, &entry.alias)?
+                } else {
+                    Vec::new()
+                };
                 out.push(RepoEntry {
                     alias: entry.alias,
                     root: entry.root_path,

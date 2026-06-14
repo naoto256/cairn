@@ -19,6 +19,15 @@ use crate::control::JobSnapshot;
 
 // ─── list_repos ─────────────────────────────────────────────────────────────
 
+/// Arguments to `list_repos`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListReposArgs {
+    /// Include analyzer job details. Defaults to false because job history can
+    /// be much larger than the repository inventory.
+    #[serde(default)]
+    pub include_jobs: bool,
+}
+
 /// Result of `list_repos`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListReposResult {
