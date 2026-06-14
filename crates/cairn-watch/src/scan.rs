@@ -88,7 +88,9 @@ fn is_executable(meta: &std::fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(_meta: &std::fs::Metadata) -> bool {
-    // TODO: Decide how Windows should surface executable script candidates.
+    // Windows does not expose a Unix-style executable bit. Until cairn has a
+    // Windows-specific script policy, extensionless shebang fallback stays
+    // disabled on non-Unix scans.
     false
 }
 

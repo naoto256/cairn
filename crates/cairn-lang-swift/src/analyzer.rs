@@ -29,6 +29,8 @@ use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, Semanti
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
+/// Swift Tier-2 analyzer backed by tree-sitter. It requires no external Swift
+/// toolchain and intentionally limits resolution to same-file facts.
 pub struct SwiftAnalyzer;
 
 impl Analyzer for SwiftAnalyzer {
@@ -58,6 +60,8 @@ impl Analyzer for SwiftAnalyzer {
     }
 }
 
+/// Constructs the blob-scoped Swift semantic analyzer registered by the Swift
+/// language backend.
 pub fn analyzer() -> Arc<dyn Analyzer> {
     Arc::new(SwiftAnalyzer)
 }

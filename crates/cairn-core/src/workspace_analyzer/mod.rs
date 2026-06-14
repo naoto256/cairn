@@ -70,14 +70,20 @@ struct AnalyzerProgressState {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Cloneable progress and cancellation handle shared between the runner and
+/// one workspace analyzer invocation. Ticks are monotonic liveness beacons, not
+/// a file count contract.
 pub struct AnalyzerProgress(Arc<AnalyzerProgressState>);
 
 impl AnalyzerProgress {
+    /// Marks forward progress for stall detection. An analyzer should call this
+    /// after bounded units of work such as a file, request, or retry completes.
     pub fn tick(&self) {
         self.0.ticks.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
+    /// Returns the current liveness tick value observed by the runner.
     pub fn snapshot(&self) -> u64 {
         self.0.ticks.load(Ordering::Relaxed)
     }
@@ -87,6 +93,9 @@ impl AnalyzerProgress {
     }
 
     #[must_use]
+    /// Reports whether the runner has asked this invocation to stop work.
+    /// Implementations should check this between expensive operations and
+    /// return promptly when it becomes true.
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Relaxed)
     }
@@ -95,12 +104,18 @@ impl AnalyzerProgress {
 /// Analyzer that can derive facts from a repository snapshot.
 pub trait WorkspaceAnalyzer: Send + Sync {
     /// Stable analyzer identifier, e.g. `"rust-analyzer-lsp"`.
+    /// This value keys run records, pool groups, and persisted provenance, so
+    /// it must only change when the old output should be abandoned.
     fn id(&self) -> &'static str;
 
     /// Monotonic revision for this analyzer's output.
+    /// Bump it when persisted facts need to be recomputed even if inputs and
+    /// config files have not changed.
     fn revision(&self) -> u32;
 
     /// Short language tag this analyzer enriches, e.g. `"rust"`.
+    /// The tag is user-facing metadata; input selection is governed by
+    /// [`Self::parser_id`].
     fn language(&self) -> &'static str;
 
     /// Parser id whose Tier-1 symbols/refs this analyzer enriches.
@@ -129,6 +144,9 @@ pub trait WorkspaceAnalyzer: Send + Sync {
     }
 
     /// Analyze one manifest worth of files rooted at `repo_root`.
+    /// The runner calls this once per selected manifest/analyzer pair and only
+    /// persists facts returned in `Ok`; errors leave prior successful output
+    /// untouched for that run key.
     fn analyze_workspace(
         &self,
         repo_root: &Path,
@@ -150,6 +168,10 @@ pub struct WorkspaceFile {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Facts emitted by a workspace analyzer for later CAS persistence.
+/// Fields should stay optional-by-absence: an empty vector means the analyzer
+/// found no facts of that kind, not that downstream persistence should infer
+/// defaults.
 pub struct WorkspaceFacts {
     pub resolved_refs: Vec<ResolvedRef>,
 }
