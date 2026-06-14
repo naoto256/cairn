@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use super::version_guard::{VersionGuardMode, check_daemon_version};
+
 #[derive(ClapArgs, Debug)]
 pub struct Args {
     #[command(subcommand)]
@@ -91,6 +93,7 @@ pub async fn run(args: Args) -> Result<()> {
         None => SocketPaths::from_platform_default()?,
     };
 
+    let check_version = !matches!(&args.command, CtlCommand::Shutdown);
     let (method, params, wait_after, json_output) = match args.command {
         CtlCommand::RegisterRepo { path, alias } => {
             let canon = path
@@ -135,6 +138,10 @@ pub async fn run(args: Args) -> Result<()> {
         CtlCommand::Doctor => ("doctor", Value::Null, None, false),
         CtlCommand::Shutdown => ("shutdown", Value::Null, None, false),
     };
+
+    if check_version {
+        check_daemon_version(&paths.control, VersionGuardMode::Cli).await?;
+    }
 
     let resp = round_trip(&paths.control, method, params)
         .await
@@ -381,5 +388,41 @@ fn render_doctor(r: &DoctorReport) {
         if let Some(remediation) = &c.remediation {
             println!("      fix: {remediation}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_proto::jsonrpc::ok_response;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn shutdown_skips_version_guard_and_reaches_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let req: Request = serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(req.method, "shutdown");
+            let mut line =
+                serde_json::to_string(&ok_response(req.id, serde_json::json!(null))).unwrap();
+            line.push('\n');
+            write.write_all(line.as_bytes()).await.unwrap();
+            write.flush().await.unwrap();
+        });
+
+        run(Args {
+            command: CtlCommand::Shutdown,
+            runtime_dir: Some(dir.path().to_path_buf()),
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
     }
 }

@@ -32,6 +32,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use super::version_guard::{VersionGuardMode, check_daemon_version};
+
 #[derive(ClapArgs, Debug)]
 pub struct Args {
     #[command(subcommand)]
@@ -454,6 +456,8 @@ pub async fn run(args: Args) -> Result<()> {
             ("find_references", Value::Object(p))
         }
     };
+
+    check_daemon_version(&paths.control, VersionGuardMode::Cli).await?;
 
     let resp = round_trip(&paths.cairn, method, params)
         .await
