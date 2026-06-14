@@ -155,7 +155,10 @@ fn create_secure_runtime_dir(p: &Path) -> Result<()> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn bind_socket_private(path: &Path) -> Result<UnixListener> {
-    let guard = UmaskGuard::set(0o177);
+    // 0o077 — not 0o177 — so directories temporarily created by parallel
+    // tests under this process-wide guard still get owner-execute and can
+    // be entered; both values render the socket node 0o600.
+    let guard = UmaskGuard::set(0o077);
     // UDS nodes inherit process umask at bind time; create them private
     // before any client can observe the path.
     let listener = UnixListener::bind(path)?;
