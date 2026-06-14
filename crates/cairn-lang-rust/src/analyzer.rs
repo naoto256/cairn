@@ -33,6 +33,8 @@ use cairn_lang_api::{
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+/// Rust Tier-2 analyzer backed by `syn`. It runs in-process and deliberately
+/// records syntactic semantic facts without invoking rustc or rust-analyzer.
 pub struct RustAnalyzer;
 
 impl Analyzer for RustAnalyzer {

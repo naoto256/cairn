@@ -20,6 +20,9 @@ use cairn_proto::common::{RefKind, SymbolKind, TypeRole};
 // ─── SymbolKind ────────────────────────────────────────────────────────────
 
 #[must_use]
+/// Converts a proto symbol kind into the TEXT value stored in CAS rows.
+/// `Other` keeps its payload so older or extension-produced tags can
+/// round-trip without expanding this crate's enum mapping first.
 pub fn symbol_kind_to_str(kind: &SymbolKind) -> String {
     match kind {
         SymbolKind::Function => "function".into(),
@@ -51,6 +54,9 @@ pub fn symbol_kind_to_str(kind: &SymbolKind) -> String {
 }
 
 #[must_use]
+/// Rehydrates a CAS symbol-kind tag. Unknown tags become
+/// [`SymbolKind::Other`] instead of failing so historical rows remain
+/// queryable after parser revisions.
 pub fn symbol_kind_from_str(s: &str) -> SymbolKind {
     match s {
         "function" => SymbolKind::Function,
@@ -84,6 +90,9 @@ pub fn symbol_kind_from_str(s: &str) -> SymbolKind {
 // ─── Visibility ───────────────────────────────────────────────────────────
 
 #[must_use]
+/// Converts visibility into the compact CAS TEXT tag used by symbol rows.
+/// The mapping is intentionally stable because visibility is read by query
+/// code long after the original analyzer run has finished.
 pub fn visibility_to_str(v: Visibility) -> &'static str {
     match v {
         Visibility::Public => "public",
@@ -92,9 +101,9 @@ pub fn visibility_to_str(v: Visibility) -> &'static str {
     }
 }
 
-/// Unknown visibility strings collapse to `Private` (the most
-/// restrictive choice — a rendering hint, not a security boundary).
 #[must_use]
+/// Rehydrates a CAS visibility tag. Unknown strings collapse to `Private`,
+/// the most restrictive rendering hint; this is not a security boundary.
 pub fn visibility_from_str(s: &str) -> Visibility {
     match s {
         "public" => Visibility::Public,
@@ -106,6 +115,8 @@ pub fn visibility_from_str(s: &str) -> Visibility {
 // ─── RefKind ──────────────────────────────────────────────────────────────
 
 #[must_use]
+/// Converts a proto reference kind into the CAS TEXT tag shared by
+/// persistence and query filtering.
 pub fn ref_kind_to_str(k: RefKind) -> &'static str {
     match k {
         RefKind::Call => "call",
@@ -120,10 +131,10 @@ pub fn ref_kind_to_str(k: RefKind) -> &'static str {
     }
 }
 
-/// Unknown `RefKind` strings collapse to `Call` — the most common
-/// kind and a safe default if a future parser revision drops a
-/// variant we no longer recognise.
 #[must_use]
+/// Rehydrates a CAS reference-kind tag. Unknown strings collapse to
+/// [`RefKind::Call`], the legacy default used when older callers cannot
+/// distinguish a newer parser-emitted kind.
 pub fn ref_kind_from_str(s: &str) -> RefKind {
     match s {
         "call" => RefKind::Call,
@@ -142,6 +153,8 @@ pub fn ref_kind_from_str(s: &str) -> RefKind {
 // ─── TypeRole ─────────────────────────────────────────────────────────────
 
 #[must_use]
+/// Converts a type-reference role into its CAS TEXT tag. These tags are
+/// optional metadata on refs, so the forward mapping is total.
 pub fn type_role_to_str(r: TypeRole) -> &'static str {
     match r {
         TypeRole::Param => "param",
@@ -156,6 +169,9 @@ pub fn type_role_to_str(r: TypeRole) -> &'static str {
 }
 
 #[must_use]
+/// Rehydrates an optional type-reference role from CAS. Unknown tags return
+/// `None` because callers can still use the underlying ref without role
+/// metadata.
 pub fn type_role_from_str(s: &str) -> Option<TypeRole> {
     Some(match s {
         "param" => TypeRole::Param,
