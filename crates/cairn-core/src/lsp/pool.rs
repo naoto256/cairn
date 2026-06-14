@@ -189,6 +189,36 @@ impl LspClientPool {
         })
     }
 
+    /// Evict all live clients from the registry and give each entry a
+    /// bounded grace period to shut down. This is used after analyzer stall
+    /// detection so the next analyzer run does not inherit a wedged pool key.
+    ///
+    /// # Errors
+    /// Returns the first LSP shutdown error observed before a timeout.
+    pub fn force_shutdown_all(&self, entry_timeout: Duration) -> Result<()> {
+        let entries = {
+            let mut registry = self
+                .entries
+                .write()
+                .map_err(|_| super::Error::Protocol("lsp pool registry poisoned".into()))?;
+            registry.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
+        };
+        self.runtime.block_on(async move {
+            for entry in entries {
+                match timeout(entry_timeout, entry.shutdown()).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_ms = entry_timeout.as_millis(),
+                            "timed out shutting down stalled LSP pool entry"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn entry(&self, key: PoolKey) -> Result<Arc<PoolEntry>> {
         {
             let registry = self
@@ -417,6 +447,17 @@ pub async fn shutdown_global_if_initialized() -> Result<()> {
         tokio::task::spawn_blocking(move || pool.shutdown_all())
             .await
             .map_err(|e| super::Error::Protocol(format!("lsp pool shutdown task: {e}")))??;
+    }
+    Ok(())
+}
+
+/// Evict and shut down the daemon-global pool after a stalled analyzer.
+///
+/// # Errors
+/// Returns the first LSP shutdown error observed before a timeout.
+pub fn force_shutdown_global_if_initialized(entry_timeout: Duration) -> Result<()> {
+    if let Some(pool) = GLOBAL_POOL.get() {
+        pool.force_shutdown_all(entry_timeout)?;
     }
     Ok(())
 }

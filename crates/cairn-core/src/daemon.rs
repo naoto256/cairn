@@ -16,13 +16,16 @@
 //! without speaking MCP at all.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::Result;
+use crate::jobs::JobManager;
 use crate::sockets::{SocketPaths, bind_socket_with_mode};
 
 /// Implementations receive one newline-delimited request line at a
@@ -42,7 +45,15 @@ pub struct Daemon {
     pub data_handler: Arc<dyn LineHandler>,
     pub control_handler: Arc<dyn LineHandler>,
     pub shutdown: Arc<Notify>,
+    /// Shutdown is ordered by ownership boundaries: stop accepting first so no
+    /// new request can enter, drain in-flight connections so active replies are
+    /// not cut off, stop analyzer jobs before the shared LSP pool so workers
+    /// cannot race pool teardown, and finally reap LSP child processes.
+    pub job_manager: Option<Arc<JobManager>>,
 }
+
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const JOB_MANAGER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Daemon {
     /// Bind both sockets, run accept loops until `shutdown` is
@@ -70,9 +81,13 @@ impl Daemon {
             self.shutdown.clone(),
         );
 
-        // Wait for either accept loop to complete (which happens when
-        // shutdown fires) and then drop everything.
+        // Wait for both accept loops to stop accepting and drain their
+        // in-flight connection tasks before subsystem teardown begins.
         let _ = tokio::join!(cairn_task, ctrl_task);
+        if let Some(job_manager) = &self.job_manager {
+            job_manager.shutdown(JOB_MANAGER_DRAIN_TIMEOUT).await;
+        }
+        test_observe_lsp_pool_shutdown();
         if let Err(err) = crate::lsp::pool::shutdown_global_if_initialized().await {
             warn!(error = %err, "lsp pool shutdown failed");
         }
@@ -93,6 +108,7 @@ fn spawn_accept_loop(
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 () = shutdown.notified() => {
@@ -102,7 +118,7 @@ fn spawn_accept_loop(
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _addr)) => {
                         let h = handler.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(e) = serve_one(stream, h).await {
                                 warn!(error = %e, "{name} connection ended with error", name = name);
                             }
@@ -116,8 +132,49 @@ fn spawn_accept_loop(
                 }
             }
         }
+        drain_connections(name, connections).await;
     })
 }
+
+async fn drain_connections(name: &'static str, mut connections: JoinSet<()>) {
+    let drained = tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, async {
+        while let Some(result) = connections.join_next().await {
+            if let Err(err) = result {
+                warn!(error = %err, socket = name, "connection task failed during shutdown");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        let remaining = connections.len();
+        connections.abort_all();
+        warn!(
+            socket = name,
+            remaining,
+            timeout_secs = CONNECTION_DRAIN_TIMEOUT.as_secs(),
+            "timed out draining connection tasks"
+        );
+        while connections.join_next().await.is_some() {}
+    }
+}
+
+#[cfg(test)]
+fn test_observe_lsp_pool_shutdown() {
+    if let Some(observer) = LSP_POOL_SHUTDOWN_OBSERVER
+        .lock()
+        .expect("lsp pool shutdown observer poisoned")
+        .as_ref()
+    {
+        observer();
+    }
+}
+
+#[cfg(not(test))]
+fn test_observe_lsp_pool_shutdown() {}
+
+#[cfg(test)]
+static LSP_POOL_SHUTDOWN_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 
 /// Per-line byte cap on the UDS framing. JSON-RPC requests in practice
 /// stay well under 1 MiB; the cap is a guard against a misbehaving (or
@@ -209,6 +266,7 @@ mod tests {
     use cairn_watch::WatchBackend;
     use serde_json::json;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
@@ -221,9 +279,27 @@ mod tests {
         }
     }
 
+    struct BlockingHandler {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LineHandler for BlockingHandler {
+        async fn handle(&self, _line: &str) -> Option<String> {
+            self.entered.notify_waiters();
+            self.release.notified().await;
+            Some("released".into())
+        }
+    }
+
+    fn runtime_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     #[tokio::test]
     async fn round_trip_one_request() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = runtime_tempdir();
         let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
         let shutdown = Arc::new(Notify::new());
 
@@ -236,6 +312,7 @@ mod tests {
                     data_handler: Arc::new(EchoHandler),
                     control_handler: Arc::new(EchoHandler),
                     shutdown,
+                    job_manager: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -255,6 +332,120 @@ mod tests {
 
         shutdown.notify_waiters();
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon_task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_connection_tasks() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let mut daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                let daemon = Daemon {
+                    paths,
+                    data_handler: Arc::new(BlockingHandler { entered, release }),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: None,
+                };
+                daemon.run().await.unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut conn = UnixStream::connect(&paths.cairn).await.unwrap();
+        conn.write_all(b"hold\n").await.unwrap();
+        conn.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("blocking handler was not entered");
+
+        shutdown.notify_waiters();
+        tokio::select! {
+            result = &mut daemon_task => panic!("daemon stopped before draining connection: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        release.notify_waiters();
+        let mut buf = vec![0u8; 64];
+        let n = conn.read(&mut buf).await.unwrap();
+        let resp = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp.contains("released"), "got: {resp:?}");
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(1), daemon_task)
+            .await
+            .expect("daemon did not finish after connection released")
+            .expect("daemon task panicked");
+    }
+
+    #[tokio::test]
+    async fn daemon_shuts_down_jobs_before_lsp_pool() {
+        let tmp = runtime_tempdir();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas_data_dir.ensure().unwrap();
+        let job_manager = crate::jobs::JobManager::new(cas_data_dir);
+        let shutdown = Arc::new(Notify::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let events = events.clone();
+            *crate::jobs::JOB_MANAGER_SHUTDOWN_OBSERVER
+                .lock()
+                .expect("job observer poisoned") = Some(Box::new(move || {
+                events.lock().expect("events poisoned").push("jobs");
+            }));
+        }
+        {
+            let events = events.clone();
+            *LSP_POOL_SHUTDOWN_OBSERVER
+                .lock()
+                .expect("lsp observer poisoned") = Some(Box::new(move || {
+                events.lock().expect("events poisoned").push("lsp");
+            }));
+        }
+
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            let job_manager = job_manager.clone();
+            async move {
+                let daemon = Daemon {
+                    paths,
+                    data_handler: Arc::new(EchoHandler),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: Some(job_manager),
+                };
+                daemon.run().await.unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), daemon_task)
+            .await
+            .expect("daemon did not stop")
+            .expect("daemon task panicked");
+
+        *crate::jobs::JOB_MANAGER_SHUTDOWN_OBSERVER
+            .lock()
+            .expect("job observer poisoned") = None;
+        *LSP_POOL_SHUTDOWN_OBSERVER
+            .lock()
+            .expect("lsp observer poisoned") = None;
+
+        assert_eq!(
+            events.lock().expect("events poisoned").as_slice(),
+            ["jobs", "lsp"]
+        );
     }
 
     #[tokio::test]
@@ -287,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn watcher_reindexes_repo_registered_via_daemon_control() {
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
-        let runtime_tmp = tempfile::tempdir().unwrap();
+        let runtime_tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
         let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
@@ -314,6 +505,7 @@ mod tests {
                         Some(watch_manager),
                     )),
                     shutdown,
+                    job_manager: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -355,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn watcher_register_reports_degraded_when_watcher_start_fails() {
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
-        let runtime_tmp = tempfile::tempdir().unwrap();
+        let runtime_tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
         let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
@@ -379,6 +571,7 @@ mod tests {
                         Some(watch_manager),
                     )),
                     shutdown,
+                    job_manager: None,
                 };
                 daemon.run().await.unwrap();
             }

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Re-exported so language crates can declare their pass's ref kind
 // without depending on cairn-proto directly.
@@ -63,17 +63,32 @@ pub fn all_workspace_analyzers() -> Vec<Box<dyn WorkspaceAnalyzer>> {
 /// distinguish "still working" from "hung": the analyzer-side pass touches it
 /// as work completes, and the stall detector only fires when it stops
 /// advancing.
+#[derive(Debug, Default)]
+struct AnalyzerProgressState {
+    ticks: AtomicU64,
+    cancelled: AtomicBool,
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct AnalyzerProgress(Arc<AtomicU64>);
+pub struct AnalyzerProgress(Arc<AnalyzerProgressState>);
 
 impl AnalyzerProgress {
     pub fn tick(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.0.ticks.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
     pub fn snapshot(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.0.ticks.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Relaxed)
     }
 }
 

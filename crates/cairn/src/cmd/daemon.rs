@@ -5,7 +5,6 @@
 //! triggers a clean shutdown.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use cairn_core::ctl::CtlHandler;
@@ -68,9 +67,9 @@ pub async fn run(args: Args) -> Result<()> {
             Some(job_manager.clone()),
         )),
         shutdown,
+        job_manager: Some(job_manager),
     };
     daemon.run().await?;
-    job_manager.shutdown(Duration::from_secs(30)).await;
     Ok(())
 }
 

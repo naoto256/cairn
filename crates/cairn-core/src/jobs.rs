@@ -328,6 +328,7 @@ impl JobManager {
     }
 
     pub async fn shutdown(&self, drain_timeout: Duration) {
+        test_observe_job_manager_shutdown();
         {
             let mut sender = self.sender.lock().expect("job sender lock poisoned");
             sender.take();
@@ -396,6 +397,24 @@ impl JobManager {
             .map_err(|e| Error::internal_task_panic("analyzer job", e))?
     }
 }
+
+#[cfg(test)]
+fn test_observe_job_manager_shutdown() {
+    if let Some(observer) = JOB_MANAGER_SHUTDOWN_OBSERVER
+        .lock()
+        .expect("job manager shutdown observer poisoned")
+        .as_ref()
+    {
+        observer();
+    }
+}
+
+#[cfg(not(test))]
+fn test_observe_job_manager_shutdown() {}
+
+#[cfg(test)]
+pub(crate) static JOB_MANAGER_SHUTDOWN_OBSERVER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    Mutex::new(None);
 
 #[derive(Default)]
 struct PoolGroupLocks {
