@@ -17,6 +17,8 @@ use super::{AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFile, all_workspace_an
 // beyond the old 600s wall-clock cap, so only stop when the analyzer-side
 // progress beacon itself stalls.
 pub(crate) const ANALYZER_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+const ANALYZER_STALL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const ANALYZER_STALL_LSP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run registered workspace analyzers over a manifest and persist
 /// facts that can be mapped back to existing CAS rows.
@@ -300,7 +302,7 @@ fn analyze_workspace_with_timeout(
     let (tx, rx) = mpsc::channel();
     let progress = AnalyzerProgress::default();
     let worker_progress = progress.clone();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files, &worker_progress);
         let _ = tx.send(result);
     });
@@ -321,6 +323,9 @@ fn analyze_workspace_with_timeout(
                     last_progress = current_progress;
                     continue;
                 }
+                progress.cancel();
+                let _ = cleanup_stalled_analyzer_worker(worker, &rx);
+                cleanup_stalled_analyzer_resources();
                 return AnalyzerRun::TimedOut { timeout };
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -331,6 +336,43 @@ fn analyze_workspace_with_timeout(
         }
     }
 }
+
+fn cleanup_stalled_analyzer_worker(
+    worker: std::thread::JoinHandle<()>,
+    rx: &mpsc::Receiver<Result<super::WorkspaceFacts>>,
+) -> std::thread::Result<()> {
+    match rx.recv_timeout(ANALYZER_STALL_JOIN_TIMEOUT) {
+        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => worker.join(),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+    }
+}
+
+fn cleanup_stalled_analyzer_resources() {
+    test_observe_stalled_analyzer_cleanup();
+    if let Err(err) =
+        crate::lsp::pool::force_shutdown_global_if_initialized(ANALYZER_STALL_LSP_SHUTDOWN_TIMEOUT)
+    {
+        warn!(error = %err, "failed to clean up stalled analyzer LSP pool");
+    }
+}
+
+#[cfg(test)]
+fn test_observe_stalled_analyzer_cleanup() {
+    if let Some(observer) = STALLED_ANALYZER_CLEANUP_OBSERVER
+        .lock()
+        .expect("stalled analyzer cleanup observer poisoned")
+        .as_ref()
+    {
+        observer();
+    }
+}
+
+#[cfg(not(test))]
+fn test_observe_stalled_analyzer_cleanup() {}
+
+#[cfg(test)]
+static STALLED_ANALYZER_CLEANUP_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 
 fn is_content_modified_error(err: &Error) -> bool {
     matches!(err, Error::Lsp(lsp_err) if lsp_err.is_content_modified())
@@ -563,7 +605,44 @@ fn wildcard_matches_bytes(pattern: &[u8], candidate: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_analyzer::WorkspaceFacts;
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    struct CancelAwareAnalyzer;
+
+    impl WorkspaceAnalyzer for CancelAwareAnalyzer {
+        fn id(&self) -> &'static str {
+            "cancel-aware"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            while !progress.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(WorkspaceFacts::default())
+        }
+    }
 
     #[test]
     fn config_hash_changes_when_globbed_config_file_is_added() {
@@ -585,5 +664,48 @@ mod tests {
         let paths = expanded_config_paths(tmp.path(), &["*.csproj"]);
 
         assert_eq!(paths, vec!["A.csproj", "B.csproj"]);
+    }
+
+    #[test]
+    fn stalled_analyzer_cancels_worker_and_cleans_lsp_pool() {
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        {
+            let cleanup_called = cleanup_called.clone();
+            *STALLED_ANALYZER_CLEANUP_OBSERVER
+                .lock()
+                .expect("stalled cleanup observer poisoned") = Some(Box::new(move || {
+                cleanup_called.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        let started = Instant::now();
+        let run = analyze_workspace_with_timeout(
+            Box::new(CancelAwareAnalyzer),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[WorkspaceFile {
+                path: "src/lib.rs".into(),
+                blob_sha: "sha".into(),
+                worktree_path: None,
+            }],
+            Duration::from_millis(10),
+        );
+
+        *STALLED_ANALYZER_CLEANUP_OBSERVER
+            .lock()
+            .expect("stalled cleanup observer poisoned") = None;
+
+        assert!(matches!(
+            run,
+            AnalyzerRun::TimedOut {
+                timeout
+            } if timeout == Duration::from_millis(10)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "stalled analyzer cleanup took {:?}",
+            started.elapsed()
+        );
+        assert!(cleanup_called.load(Ordering::SeqCst));
     }
 }
