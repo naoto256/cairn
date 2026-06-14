@@ -80,12 +80,23 @@ fn run_find_references(
                FROM (
                  SELECT r.target_name, r.target_qualified, r.kind,
                         enc.qualified AS enclosing,
-                        me.path, r.line, r.blob_sha, r.byte_start,
+                        me.path, r.line, r.blob_sha, r.byte_start, r.byte_end,
                         CASE
                           WHEN r.source LIKE 'tier3-%' THEN 0
                           WHEN r.source = 'rust-syn' THEN 1
                           ELSE 2
                         END AS source_rank,
+                        EXISTS (
+                          SELECT 1
+                            FROM refs t
+                           WHERE t.blob_sha = r.blob_sha
+                             AND t.source LIKE 'tier3-%'
+                             AND t.line = r.line
+                             AND t.kind = r.kind
+                             AND t.target_name = r.target_name
+                             AND t.target_qualified IS r.target_qualified
+                             AND t.enclosing_id IS r.enclosing_id
+                        ) AS has_tier3_same_line,
                         ROW_NUMBER() OVER (
                           PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
                           ORDER BY
@@ -126,6 +137,14 @@ fn run_find_references(
         sql.push(')');
         if !args.include_noise {
             sql.push_str(" WHERE dedup_rank = 1");
+            sql.push_str(
+                " AND NOT (
+                    source_rank > 0
+                    AND byte_start = 0
+                    AND byte_end = 0
+                    AND has_tier3_same_line
+                )",
+            );
         }
         sql.push_str(" ORDER BY path, line, byte_start, source_rank");
         sql.push_str(&format!(" LIMIT {limit}"));

@@ -212,6 +212,51 @@ fn references_tier3_suppresses_tier2_same_call_site() {
 }
 
 #[test]
+fn references_tier3_suppresses_zero_range_semantic_same_line() {
+    let (_db, conn) = refs_dedup_fixture(true, None);
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES
+               ('sha-ref', 'tree-sitter-rust', 1, 'render', 'crate::Widget::render', 'call',
+                0, 0, 5, 'semantic')",
+        [],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "crate::Widget::render".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(
+        hits[0].target_qualified.as_deref(),
+        Some("crate::Widget::render")
+    );
+
+    let noisy = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "crate::Widget::render".into(),
+            direction: ReferenceDirection::Incoming,
+            include_noise: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(noisy.len(), 2, "{noisy:?}");
+}
+
+#[test]
 fn references_tier3_failed_run_falls_back_to_tier2_refs() {
     let (_db, conn) = refs_dedup_fixture(false, Some("failed"));
 
