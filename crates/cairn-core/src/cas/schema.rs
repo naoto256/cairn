@@ -96,6 +96,8 @@ CREATE TABLE implementations (
     id                  INTEGER PRIMARY KEY,
     blob_sha            TEXT NOT NULL,
     parser_id           TEXT NOT NULL,
+    -- Implementations are semantic facts today; there is no query path
+    -- that needs to distinguish syntactic vs semantic sources here.
     type_qualified      TEXT NOT NULL,
     interface_qualified TEXT,
     kind                TEXT NOT NULL,
@@ -187,8 +189,8 @@ ALTER TABLE blobs ADD COLUMN analyzer_revision INTEGER;
 -- Drop parser IDs that encoded the crate version
 -- (`tree-sitter-X@<version>`). Stable parser IDs plus
 -- LanguageBackend::parser_revision() now drive invalidation, so these
--- rows are guaranteed orphans after upgrade. Dependent rows cascade
--- through the blobs foreign key.
+-- rows are guaranteed orphans after upgrade. CAS stores enable foreign
+-- keys on open, so dependent rows cascade through the blobs foreign key.
 DELETE FROM blobs WHERE parser_id LIKE '%@%';
 "#,
     },

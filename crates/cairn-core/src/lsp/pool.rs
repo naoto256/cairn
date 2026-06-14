@@ -331,6 +331,8 @@ fn resolve_executable(binary_path: &Path) -> Option<PathBuf> {
 }
 
 fn has_path_separator(path: &Path) -> bool {
+    // Paths with separators are explicit filesystem references; only
+    // bare names should be resolved through PATH.
     path.components().count() > 1
 }
 

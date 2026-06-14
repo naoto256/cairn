@@ -82,6 +82,9 @@ pub struct WatcherHandle {
 
 #[allow(clippy::large_enum_variant)]
 enum WatcherDebouncer {
+    // This enum is intentionally concrete: the production and test
+    // backends both rely on Drop side effects from notify-debouncer,
+    // and the extra enum size is paid once per watched repo.
     Recommended(Debouncer<RecommendedWatcher, RecommendedCache>),
     Poll(Debouncer<PollWatcher, RecommendedCache>),
 }
@@ -102,9 +105,9 @@ pub enum WatchBackend {
 /// alive; dropping it stops the watcher.
 ///
 /// gitignore filtering is best-effort using the repo's root
-/// `.gitignore`. Per-directory `.gitignore` files are not yet
-/// honored (planned for 0.2.0); the consumer is expected to filter
-/// noisy paths anyway.
+/// `.gitignore`. Per-directory `.gitignore` files are not yet honored
+/// here; the manifest scanner applies the full ignore stack, so the
+/// consumer is expected to filter noisy paths during reconciliation.
 ///
 /// # Errors
 /// Setup-time errors from `notify` or the filesystem.
