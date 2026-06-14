@@ -10,7 +10,7 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.3.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.4.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
 
@@ -41,8 +41,8 @@ The long-lived daemon keeps registered repos indexed as they change.
 The query surface is JSON-RPC over a Unix domain socket, and the same
 binary ships a stdio MCP front-end so Claude Code, Codex, and other
 agents can use those structural facts directly. Tier-3 enrichment can
-call local language servers such as `rust-analyzer`, `pyright`, and
-`gopls`; Cairn does not require a hosted index or cloud service.
+call each language's local LSP listed in the Languages table; Cairn
+does not require a hosted index or cloud service.
 
 ## Installation
 
@@ -85,10 +85,10 @@ install cairn-v<version>-<target>/cairn ~/.local/bin/
 cargo install --git https://github.com/naoto256/cairn cairn
 ```
 
-Optional runtime dependencies for Tier-3 cross-file resolution:
-`rust-analyzer`, `pyright-langserver`, `gopls` (see Languages
-section). Make sure they are visible on the daemon's `PATH`; `cairn ctl
-doctor` reports which Tier-3 analyzers are discoverable.
+Optional runtime dependencies for Tier-3 cross-file resolution are the
+local LSP binaries listed in the Languages table. Make sure they are
+visible to the daemon; `cairn ctl doctor` reports which Tier-3
+analyzers are discoverable and how to fix missing tools.
 
 ### Daemon
 
@@ -258,22 +258,22 @@ script needs to block until the current jobs finish.
 | Rust | ✅ | ✅ | ✅ (rust-analyzer) |
 | Python | ✅ | ✅ | ✅ (pyright-langserver) |
 | Go | ✅ | ✅ | ✅ (gopls) |
-| TypeScript / TSX (`.ts` / `.mts` / `.cts` / `.tsx`) | ✅ | ✅ | – |
-| JavaScript (`.js` / `.mjs` / `.cjs` / `.jsx`) | ✅ | ✅ | – |
-| Java (`.java`) | ✅ | ✅ | – |
-| C# (`.cs`) | ✅ | ✅ | – |
-| Kotlin (`.kt` / `.kts`) | ✅ | ✅ | – |
-| Swift (`.swift`) | ✅ | ✅ | – |
-| C (`.c` / `.h`) | ✅ | ✅ | – |
-| C++ (`.cpp` / `.cc` / `.cxx` / `.hpp` / `.hxx` / `.hh` / `.h++` / `.C` / `.H`) | ✅ | ✅ | – |
-| Objective-C (`.m`) | ✅ | ✅ | – |
-| Ruby (`.rb` / `.rake` / `Gemfile` / `Rakefile`) | ✅ | ✅ | – |
-| PHP (`.php`) | ✅ | ✅ | – |
+| TypeScript / TSX (`.ts` / `.mts` / `.cts` / `.tsx`) | ✅ | ✅ | ✅ (typescript-language-server) |
+| JavaScript (`.js` / `.mjs` / `.cjs` / `.jsx`) | ✅ | ✅ | ✅ (typescript-language-server) |
+| Java (`.java`) | ✅ | ✅ | ✅ (jdtls) |
+| C# (`.cs`) | ✅ | ✅ | ✅ (csharp-ls) |
+| Kotlin (`.kt` / `.kts`) | ✅ | ✅ | ✅ (kotlin-language-server) |
+| Swift (`.swift`) | ✅ | ✅ | ✅ (sourcekit-lsp) |
+| C (`.c` / `.h`) | ✅ | ✅ | ✅ (clangd) |
+| C++ (`.cpp` / `.cc` / `.cxx` / `.hpp` / `.hxx` / `.hh` / `.h++` / `.C` / `.H`) | ✅ | ✅ | ✅ (clangd) |
+| Objective-C (`.m`) | ✅ | ✅ | ✅ (clangd) |
+| Ruby (`.rb` / `.rake` / `Gemfile` / `Rakefile`) | ✅ | ✅ | ✅ (ruby-lsp) |
+| PHP (`.php`) | ✅ | ✅ | ✅ (phpantom-lsp) |
 | Markdown | ✅ | – | – |
 
 Tier-1 is the tree-sitter syntax floor: symbols, outlines, imports,
 and other facts that can be extracted from one file. Fourteen
-first-class language backends ship with 0.3.0, plus a generic
+first-class language backends ship with 0.4.0, plus a generic
 tree-sitter fallback for additional grammars.
 
 Tier-2 adds language-specific semantic facts from one file —
@@ -286,13 +286,13 @@ across every backend so `find_subtypes` / `find_supertypes` compare
 cleanly across languages.
 
 Tier-3 runs local language servers once per snapshot when their
-binaries are discoverable on the daemon's `PATH`. Rust uses
+binaries are discoverable by the daemon. Every supported language
+except Markdown now has a Tier-3 analyzer: Rust uses
 `rust-analyzer` (`source = tier3-rust-analyzer-lsp`), Python uses
-`pyright-langserver` (`source = tier3-pyright-lsp`), and Go uses
-`gopls` (`source = tier3-gopls-lsp`). Missing binaries are recorded
-as `Skipped`; Tier-1 / Tier-2 facts remain available. The 0.4.0
-release will extend Tier-3 to the rest of the 0.3.0 backend
-lineup.
+`pyright-langserver` (`source = tier3-pyright-lsp`), Go uses `gopls`
+(`source = tier3-gopls-lsp`), and the remaining LSPs are listed in
+the table above. Missing binaries or unsuitable workspaces are
+recorded as `Skipped`; Tier-1 / Tier-2 facts remain available.
 
 Files are picked by extension first (`*.py`, `*.rs`, `*.md`, `*.ts`,
 `*.go`, ...). Extensionless executables (`bin/foo` with mode `0755+`)
