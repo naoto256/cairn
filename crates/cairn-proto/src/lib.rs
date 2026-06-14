@@ -27,6 +27,7 @@ pub mod common;
 pub mod control;
 pub mod jsonrpc;
 pub mod methods;
+pub mod version;
 
 pub use common::{
     Completeness, LanguageEnrichment, MissingTier, PartialReason, PendingAnalyzer, Position, Range,

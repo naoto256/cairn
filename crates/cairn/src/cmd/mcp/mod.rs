@@ -43,7 +43,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 use tracing::error;
+
+use super::version_guard::{VersionGuardMode, check_daemon_version};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "cairn";
@@ -187,6 +190,7 @@ struct Dispatcher {
     tools: HashMap<String, Box<dyn McpTool>>,
     /// Sorted tool list for `tools/list` responses (display order).
     ordered: Vec<&'static str>,
+    version_checked: Mutex<bool>,
 }
 
 impl Dispatcher {
@@ -204,6 +208,7 @@ impl Dispatcher {
             paths,
             tools,
             ordered,
+            version_checked: Mutex::new(false),
         }
     }
 
@@ -234,6 +239,8 @@ impl Dispatcher {
                 )));
             }
         };
+
+        self.check_daemon_version_once().await;
 
         let id = req.id.clone();
         let resp = match req.method.as_str() {
@@ -285,6 +292,17 @@ impl Dispatcher {
             ),
         };
         Some(serialize(&resp))
+    }
+
+    async fn check_daemon_version_once(&self) {
+        let mut checked = self.version_checked.lock().await;
+        if *checked {
+            return;
+        }
+        *checked = true;
+        // MCP initialize must keep the JSON-RPC session alive; surface
+        // daemon/client drift on stderr instead of aborting the server.
+        let _ = check_daemon_version(&self.paths.control, VersionGuardMode::Mcp).await;
     }
 
     /// Resolve the tool, ask it for a [`ToolRoute`], run the route,
