@@ -5,6 +5,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
+use crate::jobs::JobListOptions;
 use crate::workspace_analyzer::RunStatus;
 use crate::{Error, Result};
 
@@ -29,7 +30,14 @@ impl ControlMethod for JobsList {
             ),
             None => None,
         };
-        let jobs = manager.jobs(args.alias.as_deref(), state)?;
+        let jobs = manager.jobs(
+            args.alias.as_deref(),
+            state,
+            JobListOptions {
+                include_all: args.all,
+                limit: args.limit.map(|value| value as usize),
+            },
+        )?;
         Ok(serde_json::to_value(JobsListResult {
             jobs: jobs
                 .into_iter()
