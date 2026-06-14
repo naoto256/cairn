@@ -43,6 +43,50 @@ versions follow [SemVer](https://semver.org/).
   pipelined, `clangd` skips preprocessor pseudo-call-sites, and LSP
   stderr head + tail is surfaced in handshake and exit errors.
 
+- **Workspace quality review.** Reviewed the entire workspace
+  (four parallel sessions, 190 findings) and shipped 13 PRs
+  (#129–#142) plus two hotfixes addressing every Critical and High
+  finding plus 23 mechanical Medium / Low improvements.
+  - Critical: `prune` no longer wipes every blob when no language
+    backend is registered (#129); test fixtures no longer carry
+    developer-shaped absolute paths (#130).
+  - High: panic payloads from `spawn_blocking` joins are sanitized
+    behind a typed `Error::Internal` instead of leaking through
+    `INVALID_PARAMS` (#136); daemon shutdown now stops accepting,
+    drains in-flight connections, halts the job manager, and shuts
+    the LSP pool down in that order (#139); CAS `reuse_or_compute`
+    holds an `IMMEDIATE` transaction across re-check and insert,
+    manifest walks skip symlinks, and `git cat-file` argument
+    handling rejects non-40-hex SHAs (#137); the socket runtime
+    directory is atomically created at `0o700` with owner and mode
+    validated on reuse, and UDS sockets land at `0o600` via a
+    process-wide umask guard (#138, #141); watcher swaps are atomic
+    so a failed restart cannot silently unwatch an alias (#134);
+    Tier-1 same-name resolution leaves Ruby, Objective-C, and
+    Kotlin collisions unresolved instead of picking by walk order,
+    and Ruby grows a real visibility-section stack (#135); Tier-3
+    LSP pool `config_hash` now folds in `clangd` fallback flags and
+    expands `*.csproj` and `*.sln` globs so dialect drift and
+    project edits invalidate stale facts (#132);
+    `CAIRN_WORKER_CONCURRENCY` is clamped to the same ceiling as
+    automatic sizing with a warn on clamp (#131); the four
+    `cairn-proto` public type families gained rustdoc covering wire
+    invariants and Cairn-specific error codes (#133).
+  - Medium / Low: 23 docstring and comment improvements explaining
+    liveness beacons, CAS conversion invariants, LSP timing
+    constants, and PHP `.phtml` template inclusion (#140, #142).
+
+### Changed
+
+- **JSON-RPC error code semantics.** Server-side panics in blocking
+  tasks now return `INTERNAL_ERROR` (-32603) with a sanitized
+  `"internal error"` message instead of being misclassified as
+  `INVALID_PARAMS` (-32602) and leaking the raw panic payload onto
+  the wire; client argument validation failures correspondingly
+  map to `INVALID_PARAMS` rather than falling through to the
+  default. Server-side `tracing::error!` still records the full
+  context for diagnosis.
+
 ## [0.3.0] — 2026-06-10
 
 ### Breaking
