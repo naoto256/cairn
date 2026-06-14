@@ -5,6 +5,38 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.4.1] — 2026-06-14
+
+### Fixed
+
+- **Post-0.4.0 dogfood follow-ups.** A v0.4.0 evaluation pass found
+  four follow-ups that landed together for 0.4.1.
+  - `cairn ctl status` no longer inlines per-repo job history; a
+    compact `JobSummary` of analyzer-job state counts replaces the
+    previous list. The legacy `RepoStatus.jobs` field stays on the
+    wire but is left empty so older clients keep parsing. Detailed
+    history remains available through `cairn ctl jobs`, which now
+    defaults to active jobs plus the latest terminal row per `(repo,
+    analyzer)` for current anchors; `--all` restores full history,
+    `--limit` caps row count, and `--json` prints a JSON array
+    directly. `list_repos` similarly omits jobs unless
+    `include_jobs=true` is set, with matching MCP schema (#146).
+  - `cairn ctl doctor` reindex remediations now use the actual
+    positional `cairn ctl reindex-repo <alias>` instead of the stale
+    `--alias <ALIAS>` form (#146).
+  - `find_references` and `find_callers` no longer return duplicate
+    rows for the same logical call site when both a Tier-2 semantic
+    row (zero byte range) and a Tier-3 row exist. Default view
+    suppresses the zero-range non-Tier-3 row when a Tier-3 row covers
+    the same blob, line, kind, target, and enclosing symbol;
+    `include_noise=true` continues to return both rows (#147).
+  - MCP `find_symbols` description now ends with a zero-hit recovery
+    hint (try exact `fuzzy=false`, prefix wildcard, relax
+    container/path/kind, broaden repo/anchor). MCP `find_callers` and
+    `find_references` descriptions and the `cairn query callers /
+    refs` CLI help point React/JSX component usage to
+    `find_references kind=instantiate` (#146).
+
 ## [0.4.0] — 2026-06-14
 
 ### Added
