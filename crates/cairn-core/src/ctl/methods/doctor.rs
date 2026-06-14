@@ -338,7 +338,7 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                     DoctorStatus::Warn,
                     Some("no tentative anchor yet (reads will fall back to HEAD)".into()),
                     Some(format!(
-                        "Run `cairn ctl reindex-repo --alias {}` to build the tentative snapshot.",
+                        "Run `cairn ctl reindex-repo {}` to build the tentative snapshot.",
                         probe.alias
                     )),
                 ),
@@ -612,7 +612,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
                 DoctorStatus::Warn,
                 Some(tier3_runs_detail(state)),
                 Some(format!(
-                    "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` to record the current workspace analyzer set."
+                    "Trigger a reindex with `cairn ctl reindex-repo {alias}` to record the current workspace analyzer set."
                 )),
             );
         }
@@ -622,7 +622,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some("no Tier-3 run recorded for this alias".into()),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` or wait for the next file edit to drive a watcher tick."
+                "Trigger a reindex with `cairn ctl reindex-repo {alias}` or wait for the next file edit to drive a watcher tick."
             )),
         );
     }
@@ -653,7 +653,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
                 run.error.as_deref().unwrap_or("unknown error")
             )),
             Some(format!(
-                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl reindex-repo --alias {alias}`.",
+                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl reindex-repo {alias}`.",
                 run.manifest_id
             )),
         );
@@ -669,7 +669,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some(format!("{detail}; {} is {}", run.analyzer_id, run.status)),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` when ready."
+                "Trigger a reindex with `cairn ctl reindex-repo {alias}` when ready."
             )),
         );
     }
@@ -688,7 +688,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
                 run.analyzer_id, run.status, run.manifest_id
             )),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` and check daemon logs if the status persists."
+                "Trigger a reindex with `cairn ctl reindex-repo {alias}` and check daemon logs if the status persists."
             )),
         );
     }
@@ -700,7 +700,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some(detail),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo --alias {alias}` to record the current workspace analyzer set."
+                "Trigger a reindex with `cairn ctl reindex-repo {alias}` to record the current workspace analyzer set."
             )),
         );
     }
@@ -1221,7 +1221,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("reindex-repo --alias stale")
+                .contains("reindex-repo stale")
         );
     }
 

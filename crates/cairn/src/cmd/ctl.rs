@@ -8,7 +8,8 @@
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
 use cairn_proto::control::{
-    DoctorReport, DoctorStatus, JobsCancelResult, JobsListResult, PruneResult, StatusReport,
+    DoctorReport, DoctorStatus, JobSummary, JobsCancelResult, JobsListResult, PruneResult,
+    StatusReport,
 };
 use cairn_proto::jsonrpc::{JsonRpcVersion, Request, RequestId, Response};
 use clap::{Args as ClapArgs, Subcommand};
@@ -59,6 +60,12 @@ enum CtlCommand {
         /// Restrict listing to one state.
         #[arg(long)]
         state: Option<String>,
+        /// Include historical jobs from old manifests.
+        #[arg(long)]
+        all: bool,
+        /// Maximum number of rows to print.
+        #[arg(long)]
+        limit: Option<u32>,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -111,13 +118,15 @@ pub async fn run(args: Args) -> Result<()> {
         CtlCommand::Jobs {
             alias,
             state,
+            all,
+            limit,
             json,
             cancel,
         } => match cancel {
             Some(job_id) => ("jobs.cancel", json!({"job_id": job_id}), None, json),
             None => (
                 "jobs.list",
-                json!({"alias": alias, "state": state}),
+                json!({"alias": alias, "state": state, "all": all, "limit": limit}),
                 None,
                 json,
             ),
@@ -131,7 +140,14 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .with_context(|| format!("talking to {}", paths.control.display()))?;
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&resp.result).unwrap());
+        if method == "jobs.list"
+            && let Some(value) = &resp.result
+            && let Ok(report) = serde_json::from_value::<JobsListResult>(value.clone())
+        {
+            println!("{}", serde_json::to_string_pretty(&report.jobs).unwrap());
+        } else {
+            println!("{}", serde_json::to_string_pretty(&resp.result).unwrap());
+        }
     } else {
         render(method, &resp);
     }
@@ -327,13 +343,28 @@ fn render_status(r: &StatusReport) {
                 snap.size_bytes,
             );
         }
-        for job in &repo.jobs {
-            println!(
-                "      job {}: {} -> {}",
-                job.job_id, job.analyzer_id, job.state
-            );
+        if !repo.job_summary.is_empty() {
+            println!("      jobs: {}", render_job_summary(&repo.job_summary));
         }
     }
+}
+
+fn render_job_summary(summary: &JobSummary) -> String {
+    [
+        ("queued", summary.queued),
+        ("running", summary.running),
+        ("succeeded", summary.succeeded),
+        ("skipped", summary.skipped),
+        ("failed", summary.failed),
+        ("timed_out", summary.timed_out),
+        ("cancelled", summary.cancelled),
+        ("other", summary.other),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(name, count)| format!("{count} {name}"))
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 fn render_doctor(r: &DoctorReport) {

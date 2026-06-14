@@ -59,6 +59,14 @@ pub struct JobsListArgs {
     /// Optional job-state filter, using the daemon's stored state strings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Include historical rows from manifests no current anchor points at.
+    /// The default view keeps active jobs plus the latest terminal row per
+    /// `(repo, analyzer)` for current manifests.
+    #[serde(default)]
+    pub all: bool,
+    /// Maximum number of rows after filtering and global ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// Arguments to the `jobs.cancel` control method.
@@ -133,8 +141,13 @@ pub struct RepoStatus {
     pub root: String,
     /// Snapshot manifests reachable through this repo's anchors.
     pub snapshots: Vec<SnapshotStatus>,
-    /// Analyzer jobs for this repo. Empty lists are omitted to keep status
-    /// output compact.
+    /// Compact analyzer-job state counts for manifests reachable through
+    /// current anchors. Detailed history lives under `jobs.list`.
+    #[serde(default, skip_serializing_if = "JobSummary::is_empty")]
+    pub job_summary: JobSummary,
+    /// Analyzer jobs for this repo. Kept for wire compatibility with older
+    /// daemons/clients, but new `status` responses leave it empty to avoid
+    /// dumping job history inline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobSnapshot>,
 }
@@ -148,6 +161,40 @@ impl RepoStatus {
             .flat_map(|s| s.enrichment.iter().map(|e| e.language.as_str()))
             .collect()
     }
+}
+
+/// State-count summary for analyzer jobs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobSummary {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queued: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub running: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub succeeded: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub timed_out: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cancelled: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub other: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total: u64,
+}
+
+impl JobSummary {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Runtime status for one snapshot manifest.
@@ -242,6 +289,7 @@ mod status_tests {
                 symbol_count: 1,
                 size_bytes: 1,
             }],
+            job_summary: JobSummary::default(),
             jobs: Vec::new(),
         };
         assert_eq!(
