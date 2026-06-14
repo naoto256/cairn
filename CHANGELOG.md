@@ -5,6 +5,28 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.4.2] — 2026-06-14
+
+### Fixed
+
+- **Daemon / client version match guard.** The CLI and MCP front-ends
+  did not verify the running daemon's version, so a stale daemon
+  (e.g. left over from a previous install) silently produced
+  confusing failures rather than an actionable diagnostic. The
+  front-ends now fetch the daemon version through the existing
+  `ctl status` response once per process and compare it against
+  `CARGO_PKG_VERSION` using a pre-1.0 SemVer rule:
+  - Same patch / patch drift: silent.
+  - Minor mismatch: stderr warning, continues.
+  - Major mismatch (CLI): actionable error, aborts.
+  - Major mismatch (MCP): stderr warning, continues serving so the
+    host can surface the diagnostic without breaking the JSON-RPC
+    session.
+  - `cairn ctl shutdown` deliberately bypasses the guard so it
+    remains usable as the non-Homebrew remediation path. Warning
+    text points users at `brew services restart cairn` or
+    `cairn ctl shutdown` then `cairn daemon` (#150).
+
 ## [0.4.1] — 2026-06-14
 
 ### Fixed
