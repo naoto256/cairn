@@ -76,6 +76,17 @@ pub struct JobsCancelArgs {
     pub job_id: i64,
 }
 
+/// Arguments to the `jobs.prune` control method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsPruneArgs {
+    /// Repository alias to prune, or `None` for all repos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// When true, count rows that would be removed without deleting them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
 /// Result of `jobs.list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsListResult {
@@ -147,6 +158,28 @@ pub struct JobsCancelResult {
     pub cancelled: bool,
     /// Human-readable outcome, including why no cancellation happened.
     pub reason: String,
+}
+
+/// Result of `jobs.prune`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsPruneResult {
+    /// Per-repository deletion counts.
+    pub repos: Vec<JobsPruneRepoEntry>,
+    /// Sum of [`JobsPruneRepoEntry::deleted_runs_count`] across all entries.
+    pub total_deleted_runs: u64,
+    /// Sum of [`JobsPruneRepoEntry::deleted_index_entries_count`] across all entries.
+    pub total_deleted_index_entries: u64,
+}
+
+/// Deletion summary for one repository's analyzer job rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsPruneRepoEntry {
+    /// Repository alias that was pruned.
+    pub alias: String,
+    /// Number of historical terminal `workspace_analysis_runs` rows removed.
+    pub deleted_runs_count: u64,
+    /// Number of runtime job-index entries removed for deleted job ids.
+    pub deleted_index_entries_count: u64,
 }
 
 // ─── status ────────────────────────────────────────────────────────────────

@@ -8,8 +8,8 @@
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
 use cairn_proto::control::{
-    DoctorReport, DoctorStatus, JobSummary, JobsCancelResult, JobsListResult, PruneResult,
-    StatusReport,
+    DoctorReport, DoctorStatus, JobSummary, JobsCancelResult, JobsListResult, JobsPruneResult,
+    PruneResult, StatusReport,
 };
 use cairn_proto::jsonrpc::Response;
 use clap::{Args as ClapArgs, Subcommand};
@@ -56,7 +56,7 @@ enum CtlCommand {
     /// List or cancel background analyzer jobs.
     Jobs {
         /// Restrict listing to one repo alias.
-        #[arg(long)]
+        #[arg(long, alias = "repo")]
         alias: Option<String>,
         /// Restrict listing to one state.
         #[arg(long)]
@@ -73,6 +73,12 @@ enum CtlCommand {
         /// Cancel a job by id.
         #[arg(long)]
         cancel: Option<i64>,
+        /// Prune historical terminal job rows from old manifests.
+        #[arg(long)]
+        prune: bool,
+        /// Count rows that would be pruned without deleting them.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Delete cached blobs whose parser IDs no current backend owns.
     Prune {
@@ -93,7 +99,7 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     let check_version = !matches!(&args.command, CtlCommand::Shutdown);
-    let (method, params, wait_after, json_output) = match args.command {
+    let (method, params, wait_after, json_output, dry_run_output) = match args.command {
         CtlCommand::RegisterRepo { path, alias } => {
             let canon = path
                 .canonicalize()
@@ -103,10 +109,13 @@ pub async fn run(args: Args) -> Result<()> {
                 json!({"path": canon.to_string_lossy(), "alias": alias}),
                 None,
                 false,
+                false,
             )
         }
-        CtlCommand::RemoveRepo { alias } => ("remove_repo", json!({"alias": alias}), None, false),
-        CtlCommand::Status => ("status", Value::Null, None, false),
+        CtlCommand::RemoveRepo { alias } => {
+            ("remove_repo", json!({"alias": alias}), None, false, false)
+        }
+        CtlCommand::Status => ("status", Value::Null, None, false, false),
         CtlCommand::ReindexRepo {
             alias,
             wait,
@@ -116,6 +125,7 @@ pub async fn run(args: Args) -> Result<()> {
             json!({"alias": alias.clone()}),
             wait.then_some((alias, Duration::from_secs(timeout.unwrap_or(u64::MAX)))),
             false,
+            false,
         ),
         CtlCommand::Jobs {
             alias,
@@ -124,18 +134,41 @@ pub async fn run(args: Args) -> Result<()> {
             limit,
             json,
             cancel,
-        } => match cancel {
-            Some(job_id) => ("jobs.cancel", json!({"job_id": job_id}), None, json),
-            None => (
-                "jobs.list",
-                json!({"alias": alias, "state": state, "all": all, "limit": limit}),
-                None,
-                json,
-            ),
-        },
-        CtlCommand::Prune { repo } => ("prune", json!({"repo": repo}), None, false),
-        CtlCommand::Doctor => ("doctor", Value::Null, None, false),
-        CtlCommand::Shutdown => ("shutdown", Value::Null, None, false),
+            prune,
+            dry_run,
+        } => {
+            if prune {
+                if cancel.is_some() || state.is_some() || all || limit.is_some() {
+                    return Err(anyhow!(
+                        "--prune cannot be combined with --cancel, --state, --all, or --limit"
+                    ));
+                }
+                (
+                    "jobs.prune",
+                    json!({"repo": alias, "dry_run": dry_run}),
+                    None,
+                    json,
+                    dry_run,
+                )
+            } else {
+                if dry_run {
+                    return Err(anyhow!("--dry-run requires --prune"));
+                }
+                match cancel {
+                    Some(job_id) => ("jobs.cancel", json!({"job_id": job_id}), None, json, false),
+                    None => (
+                        "jobs.list",
+                        json!({"alias": alias, "state": state, "all": all, "limit": limit}),
+                        None,
+                        json,
+                        false,
+                    ),
+                }
+            }
+        }
+        CtlCommand::Prune { repo } => ("prune", json!({"repo": repo}), None, false, false),
+        CtlCommand::Doctor => ("doctor", Value::Null, None, false, false),
+        CtlCommand::Shutdown => ("shutdown", Value::Null, None, false, false),
     };
 
     if check_version {
@@ -155,7 +188,7 @@ pub async fn run(args: Args) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp.result).unwrap());
         }
     } else {
-        render(method, &resp);
+        render(method, &resp, dry_run_output);
     }
 
     if let Some(err) = resp.error {
@@ -167,7 +200,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 }
 
-fn render(method: &str, resp: &Response) {
+fn render(method: &str, resp: &Response, dry_run_output: bool) {
     if let Some(err) = &resp.error {
         eprintln!("error: {}", err.message);
         return;
@@ -207,6 +240,12 @@ fn render(method: &str, resp: &Response) {
         "jobs.cancel" => {
             if let Ok(report) = serde_json::from_value::<JobsCancelResult>(value.clone()) {
                 println!("cancelled={} {}", report.cancelled, report.reason);
+                return;
+            }
+        }
+        "jobs.prune" => {
+            if let Ok(report) = serde_json::from_value::<JobsPruneResult>(value.clone()) {
+                render_jobs_prune(&report, dry_run_output);
                 return;
             }
         }
@@ -324,6 +363,20 @@ fn render_prune(r: &PruneResult) {
     println!("deleted {} blob(s)", r.total_deleted);
     for repo in &r.repos {
         println!("  - {}: {}", repo.alias, repo.deleted_blob_count);
+    }
+}
+
+fn render_jobs_prune(r: &JobsPruneResult, dry_run: bool) {
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    println!(
+        "{verb} {} job run(s), {} job index entr(y/ies)",
+        r.total_deleted_runs, r.total_deleted_index_entries
+    );
+    for repo in &r.repos {
+        println!(
+            "  - {}: {} run(s), {} index entr(y/ies)",
+            repo.alias, repo.deleted_runs_count, repo.deleted_index_entries_count
+        );
     }
 }
 
