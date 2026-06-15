@@ -29,18 +29,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_proto::jsonrpc::{
-    Request, RequestId, Response, error_code, error_response as error_resp, ok_response as ok_resp,
-    serialize_response as serialize,
-};
 use linkme::distributed_slice;
 use serde_json::Value;
-use tracing::debug;
 
+use crate::Result;
 use crate::daemon::LineHandler;
-use crate::jsonrpc_errors;
+use crate::jsonrpc_dispatch::{self, RpcMethod};
 use crate::paths::CasDataDir;
-use crate::{Error, Result};
 
 pub mod methods;
 
@@ -82,6 +77,17 @@ pub struct DataCtx {
     pub cas_data_dir: Arc<CasDataDir>,
 }
 
+#[async_trait::async_trait]
+impl RpcMethod<DataCtx> for dyn DataMethod {
+    fn name(&self) -> &'static str {
+        DataMethod::name(self)
+    }
+
+    async fn dispatch(&self, ctx: &DataCtx, params: Value) -> Result<Value> {
+        DataMethod::dispatch(self, ctx, params).await
+    }
+}
+
 // ─── handler ───────────────────────────────────────────────────────────────
 
 /// Plain-JSON-RPC handler bound to `cairn.sock`. One instance per
@@ -95,11 +101,7 @@ pub struct DataRpc {
 impl DataRpc {
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Self {
-        let mut methods: HashMap<&'static str, Box<dyn DataMethod>> = HashMap::new();
-        for ctor in DATA_METHODS {
-            let method = ctor();
-            methods.insert(method.name(), method);
-        }
+        let methods = jsonrpc_dispatch::method_table(&DATA_METHODS);
         Self {
             ctx: DataCtx { cas_data_dir },
             methods,
@@ -110,38 +112,7 @@ impl DataRpc {
 #[async_trait::async_trait]
 impl LineHandler for DataRpc {
     async fn handle(&self, line: &str) -> Option<String> {
-        let req: Request = match serde_json::from_str(line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = error_resp(
-                    RequestId::Number(0),
-                    error_code::PARSE_ERROR,
-                    format!("invalid JSON-RPC envelope: {e}"),
-                );
-                return Some(serialize(&resp));
-            }
-        };
-        debug!(method = %req.method, "data RPC");
-        let resp = self.dispatch(req).await;
-        Some(serialize(&resp))
-    }
-}
-
-impl DataRpc {
-    async fn dispatch(&self, req: Request) -> Response {
-        let id = req.id.clone();
-        let Some(method) = self.methods.get(req.method.as_str()) else {
-            return error_resp(
-                id,
-                error_code::METHOD_NOT_FOUND,
-                format!("unknown method: {}", req.method),
-            );
-        };
-        let params = req.params.clone().unwrap_or(Value::Null);
-        match method.dispatch(&self.ctx, params).await {
-            Ok(value) => ok_resp(id, value),
-            Err(err) => error_from(id, &err),
-        }
+        Some(jsonrpc_dispatch::handle_line("data", &self.methods, &self.ctx, line).await)
     }
 }
 
@@ -152,9 +123,5 @@ impl DataRpc {
 /// [`error_from`] maps to `error_code::INVALID_PARAMS`) on shape
 /// mismatch.
 pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T> {
-    serde_json::from_value(params).map_err(|e| Error::InvalidParams(e.to_string()))
-}
-
-fn error_from(id: RequestId, err: &Error) -> Response {
-    jsonrpc_errors::error_from(id, err)
+    jsonrpc_dispatch::parse_params(params)
 }
