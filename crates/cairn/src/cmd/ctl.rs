@@ -1,9 +1,10 @@
 //! `cairn ctl` — management CLI.
 //!
-//! Talks to a running daemon's `control.sock`. Each invocation opens
-//! one short-lived UDS connection, sends one newline JSON-RPC
-//! request, reads one newline JSON-RPC reply, pretty-prints it, and
-//! exits with code 0 on success or 1 on an error response.
+//! Talks to a running daemon's management sockets. Most commands use
+//! `control.sock`; `repo list` reuses the read-only data socket's
+//! `list_repos` method so the wire protocol stays unchanged. Each
+//! invocation sends one newline JSON-RPC request, reads one reply,
+//! pretty-prints it, and exits with code 0 on success or 1 on error.
 
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
@@ -12,8 +13,10 @@ use cairn_proto::control::{
     PruneResult, StatusReport,
 };
 use cairn_proto::jsonrpc::Response;
+use cairn_proto::methods::ListReposResult;
 use clap::{Args as ClapArgs, Subcommand};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::rpc_client;
@@ -32,19 +35,40 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 enum CtlCommand {
-    /// Register a repository so the daemon starts watching and
-    /// indexing it.
-    RegisterRepo {
-        path: std::path::PathBuf,
+    /// Repository lifecycle commands.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Background analyzer job commands.
+    Jobs {
+        #[command(subcommand)]
+        command: JobsCommand,
+    },
+    /// CAS blob maintenance commands.
+    Blobs {
+        #[command(subcommand)]
+        command: BlobsCommand,
+    },
+    /// Daemon health and lifecycle commands.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RepoCommand {
+    /// Register a repository so the daemon starts watching and indexing it.
+    Register {
+        path: PathBuf,
         #[arg(long)]
         alias: String,
     },
-    /// Drop a repository (and its indexes) from the registry.
-    RemoveRepo { alias: String },
-    /// Show daemon health, registered repos, and snapshot progress.
-    Status,
+    /// Drop a repository alias from the registry.
+    Remove { alias: String },
     /// Force a full re-index of `alias`.
-    ReindexRepo {
+    Reindex {
         alias: String,
         /// Wait until queued analyzer jobs reach terminal states.
         #[arg(long)]
@@ -53,8 +77,18 @@ enum CtlCommand {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// List or cancel background analyzer jobs.
-    Jobs {
+    /// List registered repositories and snapshot summaries.
+    List {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JobsCommand {
+    /// List background analyzer jobs.
+    List {
         /// Restrict listing to one repo alias.
         #[arg(long, alias = "repo")]
         alias: Option<String>,
@@ -70,26 +104,68 @@ enum CtlCommand {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
-        /// Cancel a job by id.
+    },
+    /// Cancel a job by id.
+    Cancel {
+        job_id: i64,
+        /// Emit JSON instead of text.
         #[arg(long)]
-        cancel: Option<i64>,
-        /// Prune historical terminal job rows from old manifests.
+        json: bool,
+    },
+    /// Prune historical terminal job rows from old manifests.
+    Prune {
+        /// Restrict pruning to one registered repo alias.
         #[arg(long)]
-        prune: bool,
+        repo: Option<String>,
         /// Count rows that would be pruned without deleting them.
         #[arg(long)]
         dry_run: bool,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum BlobsCommand {
     /// Delete cached blobs whose parser IDs no current backend owns.
     Prune {
         /// Restrict pruning to one registered repo alias.
         #[arg(long)]
         repo: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// Show daemon health, registered repos, and snapshot progress.
+    Status,
     /// Diagnose dependencies, paths, and reachability.
     Doctor,
     /// Ask the daemon to shut down.
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtlSocket {
+    Control,
+    Data,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderHint {
+    Default,
+    JobsPrune { dry_run: bool },
+}
+
+#[derive(Debug)]
+struct CtlInvocation {
+    socket: CtlSocket,
+    method: &'static str,
+    params: Value,
+    wait_after: Option<(String, Duration)>,
+    json_output: bool,
+    render_hint: RenderHint,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -98,88 +174,22 @@ pub async fn run(args: Args) -> Result<()> {
         None => SocketPaths::from_platform_default()?,
     };
 
-    let check_version = !matches!(&args.command, CtlCommand::Shutdown);
-    let (method, params, wait_after, json_output, dry_run_output) = match args.command {
-        CtlCommand::RegisterRepo { path, alias } => {
-            let canon = path
-                .canonicalize()
-                .with_context(|| format!("canonicalize {}", path.display()))?;
-            (
-                "register_repo",
-                json!({"path": canon.to_string_lossy(), "alias": alias}),
-                None,
-                false,
-                false,
-            )
-        }
-        CtlCommand::RemoveRepo { alias } => {
-            ("remove_repo", json!({"alias": alias}), None, false, false)
-        }
-        CtlCommand::Status => ("status", Value::Null, None, false, false),
-        CtlCommand::ReindexRepo {
-            alias,
-            wait,
-            timeout,
-        } => (
-            "reindex_repo",
-            json!({"alias": alias.clone()}),
-            wait.then_some((alias, Duration::from_secs(timeout.unwrap_or(u64::MAX)))),
-            false,
-            false,
-        ),
-        CtlCommand::Jobs {
-            alias,
-            state,
-            all,
-            limit,
-            json,
-            cancel,
-            prune,
-            dry_run,
-        } => {
-            if prune {
-                if cancel.is_some() || state.is_some() || all || limit.is_some() {
-                    return Err(anyhow!(
-                        "--prune cannot be combined with --cancel, --state, --all, or --limit"
-                    ));
-                }
-                (
-                    "jobs.prune",
-                    json!({"repo": alias, "dry_run": dry_run}),
-                    None,
-                    json,
-                    dry_run,
-                )
-            } else {
-                if dry_run {
-                    return Err(anyhow!("--dry-run requires --prune"));
-                }
-                match cancel {
-                    Some(job_id) => ("jobs.cancel", json!({"job_id": job_id}), None, json, false),
-                    None => (
-                        "jobs.list",
-                        json!({"alias": alias, "state": state, "all": all, "limit": limit}),
-                        None,
-                        json,
-                        false,
-                    ),
-                }
-            }
-        }
-        CtlCommand::Prune { repo } => ("prune", json!({"repo": repo}), None, false, false),
-        CtlCommand::Doctor => ("doctor", Value::Null, None, false, false),
-        CtlCommand::Shutdown => ("shutdown", Value::Null, None, false, false),
-    };
+    let check_version = should_check_daemon_version(&args.command);
+    let invocation = route_ctl_command(args.command)?;
 
     if check_version {
         check_daemon_version(&paths.control, VersionGuardMode::Cli).await?;
     }
 
-    let resp = rpc_client::round_trip(&paths.control, method, params)
+    let socket = match invocation.socket {
+        CtlSocket::Control => &paths.control,
+        CtlSocket::Data => &paths.cairn,
+    };
+    let resp = rpc_client::round_trip(socket, invocation.method, invocation.params)
         .await
-        .with_context(|| format!("talking to {}", paths.control.display()))?;
-    if json_output {
-        if method == "jobs.list"
+        .with_context(|| format!("talking to {}", socket.display()))?;
+    if invocation.json_output {
+        if invocation.method == "jobs.list"
             && let Some(value) = &resp.result
             && let Ok(report) = serde_json::from_value::<JobsListResult>(value.clone())
         {
@@ -188,19 +198,131 @@ pub async fn run(args: Args) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp.result).unwrap());
         }
     } else {
-        render(method, &resp, dry_run_output);
+        render(invocation.method, &resp, invocation.render_hint);
     }
 
     if let Some(err) = resp.error {
         Err(anyhow!(err.message))
-    } else if let Some((alias, timeout)) = wait_after {
+    } else if let Some((alias, timeout)) = invocation.wait_after {
         wait_for_jobs(&paths.control, &alias, timeout).await
     } else {
         Ok(())
     }
 }
 
-fn render(method: &str, resp: &Response, dry_run_output: bool) {
+fn should_check_daemon_version(command: &CtlCommand) -> bool {
+    // `daemon shutdown` is the remediation path for a mismatched daemon, so
+    // it must stay available even when the guard would otherwise abort.
+    !matches!(
+        command,
+        CtlCommand::Daemon {
+            command: DaemonCommand::Shutdown
+        }
+    )
+}
+
+fn route_ctl_command(command: CtlCommand) -> Result<CtlInvocation> {
+    match command {
+        CtlCommand::Repo { command } => route_repo_command(command),
+        CtlCommand::Jobs { command } => Ok(route_jobs_command(command)),
+        CtlCommand::Blobs { command } => Ok(route_blobs_command(command)),
+        CtlCommand::Daemon { command } => Ok(route_daemon_command(command)),
+    }
+}
+
+fn route_repo_command(command: RepoCommand) -> Result<CtlInvocation> {
+    match command {
+        RepoCommand::Register { path, alias } => {
+            let canon = path
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", path.display()))?;
+            Ok(control_invocation(
+                "register_repo",
+                json!({"path": canon.to_string_lossy(), "alias": alias}),
+            ))
+        }
+        RepoCommand::Remove { alias } => {
+            Ok(control_invocation("remove_repo", json!({"alias": alias})))
+        }
+        RepoCommand::Reindex {
+            alias,
+            wait,
+            timeout,
+        } => Ok(CtlInvocation {
+            wait_after: wait.then_some((
+                alias.clone(),
+                Duration::from_secs(timeout.unwrap_or(u64::MAX)),
+            )),
+            ..control_invocation("reindex_repo", json!({"alias": alias}))
+        }),
+        RepoCommand::List { json } => Ok(CtlInvocation {
+            socket: CtlSocket::Data,
+            method: "list_repos",
+            params: json!({"include_jobs": false}),
+            wait_after: None,
+            json_output: json,
+            render_hint: RenderHint::Default,
+        }),
+    }
+}
+
+fn route_jobs_command(command: JobsCommand) -> CtlInvocation {
+    match command {
+        JobsCommand::List {
+            alias,
+            state,
+            all,
+            limit,
+            json,
+        } => CtlInvocation {
+            json_output: json,
+            ..control_invocation(
+                "jobs.list",
+                json!({"alias": alias, "state": state, "all": all, "limit": limit}),
+            )
+        },
+        JobsCommand::Cancel { job_id, json } => CtlInvocation {
+            json_output: json,
+            ..control_invocation("jobs.cancel", json!({"job_id": job_id}))
+        },
+        JobsCommand::Prune {
+            repo,
+            dry_run,
+            json,
+        } => CtlInvocation {
+            json_output: json,
+            render_hint: RenderHint::JobsPrune { dry_run },
+            ..control_invocation("jobs.prune", json!({"repo": repo, "dry_run": dry_run}))
+        },
+    }
+}
+
+fn route_blobs_command(command: BlobsCommand) -> CtlInvocation {
+    match command {
+        BlobsCommand::Prune { repo } => control_invocation("prune", json!({"repo": repo})),
+    }
+}
+
+fn route_daemon_command(command: DaemonCommand) -> CtlInvocation {
+    match command {
+        DaemonCommand::Status => control_invocation("status", Value::Null),
+        DaemonCommand::Doctor => control_invocation("doctor", Value::Null),
+        DaemonCommand::Shutdown => control_invocation("shutdown", Value::Null),
+    }
+}
+
+fn control_invocation(method: &'static str, params: Value) -> CtlInvocation {
+    CtlInvocation {
+        socket: CtlSocket::Control,
+        method,
+        params,
+        wait_after: None,
+        json_output: false,
+        render_hint: RenderHint::Default,
+    }
+}
+
+fn render(method: &str, resp: &Response, render_hint: RenderHint) {
     if let Some(err) = &resp.error {
         eprintln!("error: {}", err.message);
         return;
@@ -209,9 +331,8 @@ fn render(method: &str, resp: &Response, dry_run_output: bool) {
         println!("ok");
         return;
     };
-    // Route the result based on which method we called — only
-    // `status` and `doctor` have structured payloads worth
-    // pretty-printing; everything else is the generic `Ack`.
+    // Route the result based on the stable daemon method name; B11 changed
+    // CLI shape only, not the control/data JSON-RPC methods.
     match method {
         "status" => {
             if let Ok(report) = serde_json::from_value::<StatusReport>(value.clone()) {
@@ -245,7 +366,19 @@ fn render(method: &str, resp: &Response, dry_run_output: bool) {
         }
         "jobs.prune" => {
             if let Ok(report) = serde_json::from_value::<JobsPruneResult>(value.clone()) {
+                let RenderHint::JobsPrune {
+                    dry_run: dry_run_output,
+                } = render_hint
+                else {
+                    return;
+                };
                 render_jobs_prune(&report, dry_run_output);
+                return;
+            }
+        }
+        "list_repos" => {
+            if let Ok(report) = serde_json::from_value::<ListReposResult>(value.clone()) {
+                render_repo_list(&report);
                 return;
             }
         }
@@ -380,6 +513,48 @@ fn render_jobs_prune(r: &JobsPruneResult, dry_run: bool) {
     }
 }
 
+fn render_repo_list(r: &ListReposResult) {
+    if r.repos.is_empty() {
+        println!("no repositories registered");
+        return;
+    }
+    for repo in &r.repos {
+        let languages = repo.languages();
+        let snapshots = repo.snapshots.len();
+        let ready = repo
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status == "ready")
+            .count();
+        let stale = repo
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status == "stale")
+            .count();
+        let files = repo
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.file_count)
+            .sum::<u64>();
+        let symbols = repo
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.symbol_count)
+            .sum::<u64>();
+        println!(
+            "{}\t{}\t[{}]\tsnapshots={} ready={} stale={} files={} symbols={}",
+            repo.alias,
+            repo.root,
+            languages.iter().copied().collect::<Vec<_>>().join(","),
+            snapshots,
+            ready,
+            stale,
+            files,
+            symbols
+        );
+    }
+}
+
 fn render_status(r: &StatusReport) {
     println!("cairn {} (uptime: {}s)", r.daemon_version, r.uptime_secs);
     if r.repos.is_empty() {
@@ -475,11 +650,71 @@ mod tests {
         });
 
         run(Args {
-            command: CtlCommand::Shutdown,
+            command: CtlCommand::Daemon {
+                command: DaemonCommand::Shutdown,
+            },
             runtime_dir: Some(dir.path().to_path_buf()),
         })
         .await
         .unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn repo_list_routes_to_data_plane_list_repos_without_jobs() {
+        let invocation = route_ctl_command(CtlCommand::Repo {
+            command: RepoCommand::List { json: true },
+        })
+        .unwrap();
+
+        assert_eq!(invocation.socket, CtlSocket::Data);
+        assert_eq!(invocation.method, "list_repos");
+        assert_eq!(
+            invocation.params,
+            serde_json::json!({"include_jobs": false})
+        );
+        assert!(invocation.json_output);
+    }
+
+    #[test]
+    fn jobs_prune_routes_to_control_plane_with_dry_run_hint() {
+        let invocation = route_ctl_command(CtlCommand::Jobs {
+            command: JobsCommand::Prune {
+                repo: Some("demo".into()),
+                dry_run: true,
+                json: false,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(invocation.socket, CtlSocket::Control);
+        assert_eq!(invocation.method, "jobs.prune");
+        assert_eq!(
+            invocation.params,
+            serde_json::json!({"repo": "demo", "dry_run": true})
+        );
+        assert_eq!(
+            invocation.render_hint,
+            RenderHint::JobsPrune { dry_run: true }
+        );
+    }
+
+    #[test]
+    fn daemon_shutdown_is_only_ctl_command_that_skips_version_guard() {
+        assert!(!should_check_daemon_version(&CtlCommand::Daemon {
+            command: DaemonCommand::Shutdown,
+        }));
+        assert!(should_check_daemon_version(&CtlCommand::Daemon {
+            command: DaemonCommand::Status,
+        }));
+        assert!(should_check_daemon_version(&CtlCommand::Jobs {
+            command: JobsCommand::List {
+                alias: None,
+                state: None,
+                all: false,
+                limit: None,
+                json: false,
+            },
+        }));
     }
 }

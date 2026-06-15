@@ -171,4 +171,36 @@ mod tests {
         assert!(help.contains("Analyzer*"));
         assert!(help.contains("--container / --path / --kind"));
     }
+
+    #[test]
+    fn ctl_help_uses_object_action_surface_without_legacy_top_level_verbs() {
+        let cmd = super::Cli::command();
+        let ctl = cmd
+            .get_subcommands()
+            .find(|command| command.get_name() == "ctl")
+            .expect("ctl subcommand");
+        let top_level = ctl
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+
+        assert!(top_level.contains(&"repo"));
+        assert!(top_level.contains(&"jobs"));
+        assert!(top_level.contains(&"blobs"));
+        assert!(top_level.contains(&"daemon"));
+        for legacy in [
+            "register-repo",
+            "remove-repo",
+            "reindex-repo",
+            "status",
+            "doctor",
+            "shutdown",
+            "prune",
+        ] {
+            assert!(
+                !top_level.contains(&legacy),
+                "legacy command still exposed: {legacy}"
+            );
+        }
+    }
 }
