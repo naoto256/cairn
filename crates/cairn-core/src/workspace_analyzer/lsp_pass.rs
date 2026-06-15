@@ -75,6 +75,10 @@ pub struct LspDefinitionPass {
     pub retry: DefinitionRetryPolicy,
     /// Grammar-specific extraction of the identifiers to resolve.
     pub collect_definition_sites: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+    /// Some language servers return the unresolved use-site itself as
+    /// the "definition". When enabled, target locations that point at
+    /// any requested site in the same document are treated as unresolved.
+    pub suppress_definition_targets_at_requested_sites: bool,
 }
 
 /// One ref-kind-specific extractor inside a multi-kind LSP pass.
@@ -105,6 +109,10 @@ pub struct LspMultiKindDefinitionPass {
     pub retry: DefinitionRetryPolicy,
     /// Ref-kind-specific site extractors run against each source file.
     pub collectors: Vec<LspDefinitionCollector>,
+    /// Some language servers return the unresolved use-site itself as
+    /// the "definition". When enabled, target locations that point at
+    /// any requested site in the same document are treated as unresolved.
+    pub suppress_definition_targets_at_requested_sites: bool,
 }
 
 /// Run one LSP definition pass over `files` and return the resolved
@@ -135,6 +143,8 @@ pub fn run_lsp_definition_pass(
     let ref_kind = pass.ref_kind;
     let retry = pass.retry;
     let collect = pass.collect_definition_sites;
+    let suppress_definition_targets_at_requested_sites =
+        pass.suppress_definition_targets_at_requested_sites;
     let progress = progress.clone();
     pool.with_lsp(key, pass.spawn_spec, move |client| {
         Box::pin(async move {
@@ -147,6 +157,7 @@ pub fn run_lsp_definition_pass(
                 ref_kind,
                 retry,
                 collect,
+                suppress_definition_targets_at_requested_sites,
                 progress,
                 &mut facts,
             )
@@ -185,6 +196,8 @@ pub fn run_lsp_multi_kind_definition_pass(
     let analyzer_id = pass.analyzer_id;
     let retry = pass.retry;
     let collectors = pass.collectors;
+    let suppress_definition_targets_at_requested_sites =
+        pass.suppress_definition_targets_at_requested_sites;
     let progress = progress.clone();
     pool.with_lsp(key, pass.spawn_spec, move |client| {
         Box::pin(async move {
@@ -196,6 +209,7 @@ pub fn run_lsp_multi_kind_definition_pass(
                 analyzer_id,
                 retry,
                 &collectors,
+                suppress_definition_targets_at_requested_sites,
                 progress,
                 &mut facts,
             )
@@ -216,6 +230,7 @@ async fn collect_resolved_refs(
     ref_kind: RefKind,
     retry: DefinitionRetryPolicy,
     collect_definition_sites: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+    suppress_definition_targets_at_requested_sites: bool,
     progress: AnalyzerProgress,
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
@@ -244,6 +259,7 @@ async fn collect_resolved_refs(
             retry,
             analyzer_id,
             &uri,
+            suppress_definition_targets_at_requested_sites,
             progress.clone(),
         )
         .await;
@@ -292,6 +308,7 @@ async fn collect_multi_kind_resolved_refs(
     analyzer_id: &'static str,
     retry: DefinitionRetryPolicy,
     collectors: &[LspDefinitionCollector],
+    suppress_definition_targets_at_requested_sites: bool,
     progress: AnalyzerProgress,
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
@@ -333,6 +350,7 @@ async fn collect_multi_kind_resolved_refs(
             retry,
             analyzer_id,
             &uri,
+            suppress_definition_targets_at_requested_sites,
             progress.clone(),
         )
         .await;
@@ -415,12 +433,14 @@ async fn collect_definition_site_locations<F, Fut>(
     retry: DefinitionRetryPolicy,
     analyzer_id: &str,
     uri: &Url,
+    suppress_definition_targets_at_requested_sites: bool,
     progress: AnalyzerProgress,
 ) -> DefinitionBatch
 where
     F: Fn(DefinitionSite) -> Fut,
     Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
 {
+    let requested_sites = sites.clone();
     let mut results = stream::iter(sites)
         .map(|site| {
             let definition = &definition;
@@ -453,9 +473,19 @@ where
     let mut batch = DefinitionBatch::default();
     for (site, result) in results {
         match result {
-            Ok(locations) => batch
-                .resolved
-                .push(ResolvedDefinitionSite { site, locations }),
+            Ok(locations) => {
+                let locations = filter_requested_site_locations(
+                    locations,
+                    uri,
+                    &requested_sites,
+                    suppress_definition_targets_at_requested_sites,
+                );
+                if !locations.is_empty() {
+                    batch
+                        .resolved
+                        .push(ResolvedDefinitionSite { site, locations });
+                }
+            }
             Err(err) => {
                 batch.error_count += 1;
                 warn!(
@@ -477,12 +507,14 @@ async fn collect_multi_kind_definition_site_locations<F, Fut>(
     retry: DefinitionRetryPolicy,
     analyzer_id: &str,
     uri: &Url,
+    suppress_definition_targets_at_requested_sites: bool,
     progress: AnalyzerProgress,
 ) -> MultiKindDefinitionBatch
 where
     F: Fn(DefinitionSite) -> Fut,
     Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
 {
+    let requested_sites = sites.iter().map(|request| request.site).collect::<Vec<_>>();
     let mut results = stream::iter(sites)
         .map(|request| {
             let definition = &definition;
@@ -516,11 +548,21 @@ where
     let mut batch = MultiKindDefinitionBatch::default();
     for (request, result) in results {
         match result {
-            Ok(locations) => batch.resolved.push(ResolvedMultiKindDefinitionSite {
-                ref_kind: request.ref_kind,
-                site: request.site,
-                locations,
-            }),
+            Ok(locations) => {
+                let locations = filter_requested_site_locations(
+                    locations,
+                    uri,
+                    &requested_sites,
+                    suppress_definition_targets_at_requested_sites,
+                );
+                if !locations.is_empty() {
+                    batch.resolved.push(ResolvedMultiKindDefinitionSite {
+                        ref_kind: request.ref_kind,
+                        site: request.site,
+                        locations,
+                    });
+                }
+            }
             Err(err) => {
                 batch.error_count += 1;
                 increment_kind_count(&mut batch.error_counts_by_kind, request.ref_kind);
@@ -536,6 +578,32 @@ where
         }
     }
     batch
+}
+
+fn filter_requested_site_locations(
+    locations: Vec<Location>,
+    uri: &Url,
+    requested_sites: &[DefinitionSite],
+    suppress: bool,
+) -> Vec<Location> {
+    if !suppress {
+        return locations;
+    }
+    locations
+        .into_iter()
+        .filter(|location| !is_requested_site_location(location, uri, requested_sites))
+        .collect()
+}
+
+fn is_requested_site_location(
+    location: &Location,
+    uri: &Url,
+    requested_sites: &[DefinitionSite],
+) -> bool {
+    location.uri == *uri
+        && requested_sites
+            .iter()
+            .any(|site| location.range.start == site.position)
 }
 
 async fn definition_with_retry_from<F, Fut>(
@@ -881,6 +949,7 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            false,
             progress.clone(),
         )
         .await;
@@ -912,6 +981,7 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            false,
             progress.clone(),
         )
         .await;
@@ -938,6 +1008,7 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            false,
             AnalyzerProgress::default(),
         )
         .await;
@@ -948,6 +1019,37 @@ mod tests {
             .map(|resolved| resolved.site.position.line)
             .collect::<Vec<_>>();
         assert_eq!(lines, vec![1, 5, 9]);
+    }
+
+    #[tokio::test]
+    async fn definition_site_locations_can_suppress_requested_site_echoes() {
+        let sites = vec![test_site(1), test_site(2), test_site(3)];
+        let resolved = collect_definition_site_locations(
+            sites,
+            |site| async move {
+                let target_line = match site.position.line {
+                    // Direct unresolved-use echo.
+                    1 => 1,
+                    // Cross-use echo: another requested call-site in
+                    // the same document, observed from clangd when a C
+                    // fallback compile cannot resolve external APIs.
+                    2 => 1,
+                    // A real definition outside requested sites.
+                    _ => 9,
+                };
+                Ok::<_, crate::lsp::Error>(vec![test_location_at(target_line)])
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+            true,
+            AnalyzerProgress::default(),
+        )
+        .await;
+
+        assert_eq!(resolved.resolved.len(), 1);
+        assert_eq!(resolved.resolved[0].site.position.line, 3);
+        assert_eq!(resolved.resolved[0].locations, vec![test_location_at(9)]);
     }
 
     #[tokio::test]
@@ -971,6 +1073,7 @@ mod tests {
                 DefinitionRetryPolicy::default(),
                 "test-lsp",
                 &test_uri(),
+                false,
                 AnalyzerProgress::default(),
             )
             .await;
@@ -1013,6 +1116,7 @@ mod tests {
             DefinitionRetryPolicy::default(),
             "test-lsp",
             &test_uri(),
+            false,
             progress.clone(),
         )
         .await;
@@ -1021,5 +1125,37 @@ mod tests {
         assert_eq!(resolved.resolved.len(), 1);
         assert_eq!(resolved.error_count, 2);
         assert_eq!(resolved.error_counts_by_kind, vec![(RefKind::Import, 2)]);
+    }
+
+    #[tokio::test]
+    async fn multi_kind_definition_sites_can_suppress_requested_site_echoes() {
+        let sites = vec![
+            DefinitionRequestSite {
+                ref_kind: RefKind::Call,
+                site: test_site(1),
+            },
+            DefinitionRequestSite {
+                ref_kind: RefKind::Import,
+                site: test_site(2),
+            },
+        ];
+        let resolved = collect_multi_kind_definition_site_locations(
+            sites,
+            |site| async move {
+                let target_line = if site.position.line == 1 { 2 } else { 9 };
+                Ok::<_, crate::lsp::Error>(vec![test_location_at(target_line)])
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+            true,
+            AnalyzerProgress::default(),
+        )
+        .await;
+
+        assert_eq!(resolved.resolved.len(), 1);
+        assert_eq!(resolved.resolved[0].ref_kind, RefKind::Import);
+        assert_eq!(resolved.resolved[0].site.position.line, 2);
+        assert_eq!(resolved.resolved[0].locations, vec![test_location_at(9)]);
     }
 }

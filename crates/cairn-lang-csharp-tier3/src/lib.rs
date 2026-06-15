@@ -130,6 +130,7 @@ fn run_csharp_ls_pass(
                 retry_file_not_found: true,
             },
             collect_definition_sites: collect,
+            suppress_definition_targets_at_requested_sites: false,
         },
         repo_root,
         files,
@@ -599,6 +600,7 @@ class Declared : BaseWidget, IWidget {
                 },
                 retry: DefinitionRetryPolicy::default(),
                 collect_definition_sites: collect,
+                suppress_definition_targets_at_requested_sites: false,
             },
             repo_root,
             &[WorkspaceFile {

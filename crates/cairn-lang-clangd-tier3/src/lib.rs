@@ -40,7 +40,7 @@ const CLANGD_POOL_ID: &str = "clangd-lsp";
 const C_ANALYZER_ID: &str = "clangd-c-lsp";
 const CPP_ANALYZER_ID: &str = "clangd-cpp-lsp";
 const OBJC_ANALYZER_ID: &str = "clangd-objc-lsp";
-const ANALYZER_REVISION: u32 = 1;
+const ANALYZER_REVISION: u32 = 2;
 const POOL_CONFIG_ID: &str = "clangd-lsp-v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -239,6 +239,7 @@ fn run_clangd_passes(
                     collect_definition_sites: include_collector_for(language),
                 },
             ],
+            suppress_definition_targets_at_requested_sites: true,
         },
         repo_root,
         files,
@@ -795,6 +796,7 @@ void f() { normal(); }
                     ref_kind: RefKind::Call,
                     collect_definition_sites: collect_c_calls,
                 }],
+                suppress_definition_targets_at_requested_sites: true,
             },
             tmp.path(),
             &[WorkspaceFile {
@@ -877,6 +879,7 @@ void f() { normal(); }
                     ref_kind,
                     collect_definition_sites: collect,
                 }],
+                suppress_definition_targets_at_requested_sites: true,
             },
             repo_root,
             &[WorkspaceFile {

@@ -87,6 +87,7 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
                     retry_file_not_found: true,
                 },
                 collect_definition_sites: collect_method_calls,
+                suppress_definition_targets_at_requested_sites: false,
             },
             repo_root,
             files,

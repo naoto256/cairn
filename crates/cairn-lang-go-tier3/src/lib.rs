@@ -84,6 +84,7 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
                     retry_file_not_found: false,
                 },
                 collect_definition_sites: collect_method_calls,
+                suppress_definition_targets_at_requested_sites: false,
             },
             repo_root,
             files,
