@@ -17,6 +17,43 @@ use crate::common::{
 };
 use crate::control::JobSnapshot;
 
+// ─── shared argument fragments ─────────────────────────────────────────────
+
+/// Repository filter shared by query methods.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoScope {
+    /// Repository alias. `None` searches every registered repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+/// Snapshot selector shared by methods that can address a branch or
+/// explicit anchor. Flattening keeps the public wire shape stable:
+/// callers still send `repo`, `branch`, and `anchor` at the top level.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnapshotScope {
+    /// Repository alias. `None` searches every registered repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Bare branch name to query. Ignored when `anchor` is supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
+    /// `tentative/<id>`). Takes priority over `branch` when set;
+    /// supplying only the bare branch name still works via `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+}
+
+/// Optional result cap shared by list-like methods.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaginationArgs {
+    /// Maximum number of items to return. `None` uses the daemon default;
+    /// reaching the effective limit marks the result as partial with `cap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 // ─── list_repos ─────────────────────────────────────────────────────────────
 
 /// Arguments to `list_repos`.
@@ -174,12 +211,12 @@ mod list_repos_tests {
 /// Arguments to `get_outline`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineArgs {
-    /// Repository alias. `None` searches every registered repo and
+    /// Repository filter. `None` searches every registered repo and
     /// returns matching outlines from each; identical-named paths
     /// across repos are distinguished by the `file` field on each
     /// returned item.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    #[serde(flatten)]
+    pub scope: RepoScope,
     /// Single file to outline, relative to the repo root. Required when
     /// `path` is absent; omitted in directory mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,10 +239,9 @@ pub struct OutlineArgs {
     /// crate or package root. Ignored in single-file mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<u32>,
-    /// Maximum number of items to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Result of `get_outline`. Empty `doc`/`signature` fields are omitted on the
@@ -285,19 +321,9 @@ pub struct FindSymbolArgs {
     /// instead when you want a structural enumeration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Repository alias. `None` searches every registered repo (the
-    /// "which repo has parse_args?" case); pass a concrete alias to
-    /// restrict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// Restrict matches to one symbol kind. `None` allows all kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SymbolKind>,
@@ -337,10 +363,9 @@ pub struct FindSymbolArgs {
     /// order, and prefix matching requires an explicit trailing `*`.
     #[serde(default)]
     pub fuzzy: bool,
-    /// Maximum number of hits to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
     /// When true, hits omit the `signature` field. Use for broad
     /// enumerations (e.g. `kind = "function"` over a directory) where
     /// the signature dominates wire/context cost. Named for
@@ -421,24 +446,15 @@ pub struct FindSymbolHit {
 /// interface/base side of a type-relation edge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSubtypesArgs {
-    /// Repository alias. `None` searches every registered repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// The base type or trait/interface. Match returns every type
     /// that implements / extends / mixes in this name.
     pub name: String,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    /// Maximum number of hits to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Arguments to `find_supertypes`. Asks "what does `name` extend /
@@ -446,24 +462,15 @@ pub struct FindSubtypesArgs {
 /// interface/base side of an edge originating at `name`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindSupertypesArgs {
-    /// Repository alias. `None` searches every registered repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// The subtype. Match returns every base type / trait / interface
     /// / mixin this name implements or inherits from.
     pub name: String,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    /// Maximum number of hits to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Result of `find_subtypes`.
@@ -529,25 +536,16 @@ pub struct ImplHit {
 /// Arguments to `find_imports`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportsArgs {
-    /// Repository alias. `None` searches every registered repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// File whose imports to list (path relative to repo root). When
     /// omitted, every import in the (filtered) snapshot is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    /// Maximum number of imports to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Result of `find_imports`.
@@ -614,9 +612,9 @@ pub enum ReferenceDirection {
 /// Arguments to `find_references`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindReferencesArgs {
-    /// Repository alias. `None` searches every registered repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// Name or qualified path of the **anchor** symbol. In the default
     /// `direction = Incoming` this is the *target* (who calls X);
     /// with `Outgoing` it is the *enclosing* container (what does X
@@ -640,19 +638,9 @@ pub struct FindReferencesArgs {
     /// true to return the legacy full ref set for debugging.
     #[serde(default)]
     pub include_noise: bool,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    /// Maximum number of references to return. `None` uses the daemon
-    /// default; reaching the effective limit marks the result as partial
-    /// with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Result of `find_references`.
@@ -715,47 +703,30 @@ pub struct FindReferenceHit {
 /// Arguments to `find_callers`. "Who calls `name`?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindCallersArgs {
-    /// Repository alias. `None` searches every registered repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// Callee symbol. Matches `refs.target_qualified` first when the
     /// name carries `::`, falling back to the bare last segment;
     /// bare names go straight to the name index.
     pub name: String,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    /// Maximum number of callers to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Arguments to `find_callees`. "What does `name` call?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindCalleesArgs {
-    /// Repository alias. `None` searches every registered repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// Caller (enclosing) symbol. Matches `symbols.qualified` via
     /// the enclosing FK on each ref row.
     pub name: String,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    /// Maximum number of callees to return. `None` uses the daemon default;
-    /// reaching the effective limit marks the result as partial with `cap`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Optional result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Result of `find_callers`.
@@ -835,23 +806,13 @@ pub struct CallHit {
 /// Arguments to `get_symbol_source`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSymbolSourceArgs {
-    /// Repository alias. `None` searches every registered repo and
-    /// returns the first match — useful when the qualified name is
-    /// unique across the registry. Pass an alias to restrict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository + snapshot scope.
+    #[serde(flatten)]
+    pub scope: SnapshotScope,
     /// Qualified name of the symbol (matches `qualified` in the
     /// `symbols` table). Use `find_symbols` first if you only have a
     /// bare name and the repo has more than one match.
     pub qualified: String,
-    /// Bare branch name to query. Ignored when `anchor` is supplied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Raw anchor name (`HEAD`, `branch/<n>`, `tag/<n>`,
-    /// `tentative/<id>`). Takes priority over `branch` when set;
-    /// supplying only the bare branch name still works via `branch`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
     /// Path (relative to repo root) the symbol lives in. Optional
     /// disambiguator when the same qualified name exists in multiple
     /// files (rare; useful for cross-module test fixtures).
@@ -989,13 +950,51 @@ mod tests {
             "limit": 50
         });
         let args: OutlineArgs = serde_json::from_value(value).unwrap();
+        assert_eq!(args.scope.repo.as_deref(), Some("demo"));
         assert_eq!(args.file, None);
         assert_eq!(args.path.as_deref(), Some("src/"));
-        assert_eq!(args.limit, Some(50));
+        assert_eq!(args.pagination.limit, Some(50));
 
         let serialized = serde_json::to_value(args).unwrap();
         assert!(serialized.get("file").is_none());
+        assert_eq!(serialized["repo"], "demo");
         assert_eq!(serialized["path"], "src/");
+        assert_eq!(serialized["limit"], 50);
+        assert!(serialized.get("scope").is_none());
+        assert!(serialized.get("pagination").is_none());
+    }
+
+    #[test]
+    fn snapshot_scope_and_pagination_stay_flat_on_wire() {
+        let value = json!({
+            "repo": "demo",
+            "branch": "main",
+            "anchor": "HEAD",
+            "query": "parse_args",
+            "limit": 25
+        });
+
+        let args: FindSymbolArgs = serde_json::from_value(value).unwrap();
+        assert_eq!(args.scope.repo.as_deref(), Some("demo"));
+        assert_eq!(args.scope.branch.as_deref(), Some("main"));
+        assert_eq!(args.scope.anchor.as_deref(), Some("HEAD"));
+        assert_eq!(args.query.as_deref(), Some("parse_args"));
+        assert_eq!(args.pagination.limit, Some(25));
+
+        let serialized = serde_json::to_value(args).unwrap();
+        assert_eq!(
+            serialized,
+            json!({
+                "query": "parse_args",
+                "repo": "demo",
+                "branch": "main",
+                "anchor": "HEAD",
+                "limit": 25,
+                "include_inherited": false,
+                "fuzzy": false,
+                "signature_only": false
+            })
+        );
     }
 
     #[test]

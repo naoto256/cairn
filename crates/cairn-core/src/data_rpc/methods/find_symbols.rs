@@ -30,7 +30,7 @@ impl DataMethod for FindSymbols {
         let args: FindSymbolArgs = parse_params(params)?;
         validate(&args)?;
 
-        let effective_limit = args.limit.unwrap_or(50).max(1);
+        let effective_limit = args.pagination.limit.unwrap_or(50).max(1);
         let q = FindSymbolsArgs {
             query: args.query.clone(),
             fuzzy: args.fuzzy,
@@ -39,9 +39,9 @@ impl DataMethod for FindSymbols {
             path_prefix: args.path.clone(),
             limit: Some(limit_with_probe(effective_limit)),
         };
-        let anchor_arg = args.anchor.clone();
-        let branch_arg = args.branch.clone();
-        let requested_repo = args.repo.clone();
+        let anchor_arg = args.scope.anchor.clone();
+        let branch_arg = args.scope.branch.clone();
+        let requested_repo = args.scope.repo.clone();
         let signature_only = args.signature_only;
 
         let (hits, capped) = with_one_or_all_stores(
@@ -80,9 +80,9 @@ impl DataMethod for FindSymbols {
             .collect();
         let tier3_status = tier3_status_for_query(
             ctx,
-            args.repo.clone(),
-            args.anchor.clone(),
-            args.branch.clone(),
+            args.scope.repo.clone(),
+            args.scope.anchor.clone(),
+            args.scope.branch.clone(),
             "find_symbols",
         )
         .await?;
