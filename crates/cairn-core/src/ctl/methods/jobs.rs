@@ -1,6 +1,9 @@
-//! `jobs.list` / `jobs.cancel` — inspect and cancel background analyzer jobs.
+//! `jobs.list` / `jobs.cancel` / `jobs.prune` — manage background analyzer jobs.
 
-use cairn_proto::control::{JobsCancelArgs, JobsCancelResult, JobsListArgs, JobsListResult};
+use cairn_proto::control::{
+    JobsCancelArgs, JobsCancelResult, JobsListArgs, JobsListResult, JobsPruneArgs,
+    JobsPruneRepoEntry, JobsPruneResult,
+};
 use linkme::distributed_slice;
 use serde_json::Value;
 
@@ -11,6 +14,7 @@ use crate::{Error, Result};
 
 struct JobsList;
 struct JobsCancel;
+struct JobsPrune;
 
 #[async_trait::async_trait]
 impl ControlMethod for JobsList {
@@ -87,6 +91,41 @@ impl ControlMethod for JobsCancel {
     }
 }
 
+#[async_trait::async_trait]
+impl ControlMethod for JobsPrune {
+    fn name(&self) -> &'static str {
+        "jobs.prune"
+    }
+
+    async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
+        let args: JobsPruneArgs = parse_params(params)?;
+        let Some(manager) = &ctx.job_manager else {
+            return Err(Error::InvalidArgument("job manager unavailable".into()));
+        };
+        let manager = manager.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            manager.prune_jobs(args.repo.as_deref(), args.dry_run.unwrap_or(false))
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("jobs.prune", e))??;
+
+        Ok(serde_json::to_value(JobsPruneResult {
+            repos: result
+                .repos
+                .into_iter()
+                .map(|repo| JobsPruneRepoEntry {
+                    alias: repo.alias,
+                    deleted_runs_count: repo.deleted_runs_count,
+                    deleted_index_entries_count: repo.deleted_index_entries_count,
+                })
+                .collect(),
+            total_deleted_runs: result.total_deleted_runs,
+            total_deleted_index_entries: result.total_deleted_index_entries,
+        })
+        .unwrap())
+    }
+}
+
 #[allow(unsafe_code)]
 #[distributed_slice(CONTROL_METHODS)]
 static JOBS_LIST: fn() -> Box<dyn ControlMethod> = || Box::new(JobsList);
@@ -94,3 +133,7 @@ static JOBS_LIST: fn() -> Box<dyn ControlMethod> = || Box::new(JobsList);
 #[allow(unsafe_code)]
 #[distributed_slice(CONTROL_METHODS)]
 static JOBS_CANCEL: fn() -> Box<dyn ControlMethod> = || Box::new(JobsCancel);
+
+#[allow(unsafe_code)]
+#[distributed_slice(CONTROL_METHODS)]
+static JOBS_PRUNE: fn() -> Box<dyn ControlMethod> = || Box::new(JobsPrune);
