@@ -21,6 +21,7 @@ pub mod daemon;
 pub mod data_rpc;
 pub(crate) mod enrichment;
 pub mod jobs;
+pub(crate) mod jsonrpc_dispatch;
 pub(crate) mod jsonrpc_errors;
 pub mod lsp;
 pub mod lsp_discovery;

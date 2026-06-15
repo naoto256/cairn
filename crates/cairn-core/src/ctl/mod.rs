@@ -20,21 +20,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cairn_proto::jsonrpc::{
-    Request, RequestId, Response, error_code, error_response as error_resp, ok_response as ok_resp,
-    serialize_response as serialize,
-};
 use linkme::distributed_slice;
 use serde_json::Value;
 use tokio::sync::Notify;
-use tracing::debug;
 
+use crate::Result;
 use crate::daemon::LineHandler;
 use crate::jobs::JobManager;
-use crate::jsonrpc_errors;
+use crate::jsonrpc_dispatch::{self, RpcMethod};
 use crate::paths::CasDataDir;
 use crate::watcher::WatchManager;
-use crate::{Error, Result};
 
 pub mod methods;
 
@@ -71,6 +66,17 @@ pub struct CtlCtx {
     pub job_manager: Option<Arc<JobManager>>,
     pub version: &'static str,
     pub started_at: Instant,
+}
+
+#[async_trait::async_trait]
+impl RpcMethod<CtlCtx> for dyn ControlMethod {
+    fn name(&self) -> &'static str {
+        ControlMethod::name(self)
+    }
+
+    async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
+        ControlMethod::dispatch(self, ctx, params).await
+    }
 }
 
 // ─── handler ───────────────────────────────────────────────────────────────
@@ -111,11 +117,7 @@ impl CtlHandler {
         watch_manager: Option<Arc<WatchManager>>,
         job_manager: Option<Arc<JobManager>>,
     ) -> Self {
-        let mut methods: HashMap<&'static str, Box<dyn ControlMethod>> = HashMap::new();
-        for ctor in CONTROL_METHODS {
-            let method = ctor();
-            methods.insert(method.name(), method);
-        }
+        let methods = jsonrpc_dispatch::method_table(&CONTROL_METHODS);
         Self {
             ctx: CtlCtx {
                 cas_data_dir,
@@ -133,37 +135,7 @@ impl CtlHandler {
 #[async_trait::async_trait]
 impl LineHandler for CtlHandler {
     async fn handle(&self, line: &str) -> Option<String> {
-        let req: Request = match serde_json::from_str(line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = error_resp(
-                    RequestId::Number(0),
-                    error_code::PARSE_ERROR,
-                    format!("invalid JSON-RPC envelope: {e}"),
-                );
-                return Some(serialize(&resp));
-            }
-        };
-        debug!(method = %req.method, "control request");
-        Some(serialize(&self.dispatch(req).await))
-    }
-}
-
-impl CtlHandler {
-    async fn dispatch(&self, req: Request) -> Response {
-        let id = req.id.clone();
-        let Some(method) = self.methods.get(req.method.as_str()) else {
-            return error_resp(
-                id,
-                error_code::METHOD_NOT_FOUND,
-                format!("unknown method: {}", req.method),
-            );
-        };
-        let params = req.params.clone().unwrap_or(Value::Null);
-        match method.dispatch(&self.ctx, params).await {
-            Ok(value) => ok_resp(id, value),
-            Err(err) => error_from(id, &err),
-        }
+        Some(jsonrpc_dispatch::handle_line("control", &self.methods, &self.ctx, line).await)
     }
 }
 
@@ -173,9 +145,5 @@ impl CtlHandler {
 /// `Error::InvalidParams` which the envelope helper maps to
 /// `INVALID_PARAMS`.
 pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T> {
-    serde_json::from_value(params).map_err(|e| Error::InvalidParams(e.to_string()))
-}
-
-fn error_from(id: RequestId, err: &Error) -> Response {
-    jsonrpc_errors::error_from(id, err)
+    jsonrpc_dispatch::parse_params(params)
 }
