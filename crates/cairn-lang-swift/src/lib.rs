@@ -24,8 +24,8 @@ use cairn_lang_api::{
     SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
-    NestingTracker, Visitor, child_by_field, end_line_of, extract, line_of, node_text,
-    signature_slice, truncate,
+    DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
+    extract_doc_above_node, line_of, node_text, signature_slice,
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
@@ -378,48 +378,19 @@ fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
 /// immediately preceding the declaration. Plain `//` and `/* */`
 /// comments are not docs.
 fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut lines: Vec<String> = Vec::new();
-    let mut prev_end_row: Option<usize> = None;
-
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
-        }
-        match sibling.kind() {
-            "comment" | "multiline_comment" => {
-                let text = node_text(sibling, source);
-                let trimmed = text.trim_start();
-                let start_row = sibling.start_position().row;
-                if let Some(prev) = prev_end_row {
-                    if start_row > prev + 1 {
-                        lines.clear();
-                    }
-                }
-                if trimmed.starts_with("///") {
-                    lines.push(strip_doc_line(text));
-                } else if trimmed.starts_with("/**") {
-                    lines.clear();
-                    lines.push(strip_doc_block(text));
-                } else {
-                    lines.clear();
-                }
-                prev_end_row = Some(sibling.end_position().row);
-            }
-            _ if sibling.is_extra() => {}
-            _ => {
-                lines.clear();
-                prev_end_row = None;
+    extract_doc_above_node(node, source, |sibling, text| match sibling.kind() {
+        "comment" | "multiline_comment" => {
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("///") {
+                Some(DocCommentPart::Append(strip_doc_line(text)))
+            } else if trimmed.starts_with("/**") {
+                Some(DocCommentPart::Replace(strip_doc_block(text)))
+            } else {
+                Some(DocCommentPart::Reset)
             }
         }
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(truncate(&lines.join("\n"), 1024))
-    }
+        _ => None,
+    })
 }
 
 fn strip_doc_line(text: &str) -> String {

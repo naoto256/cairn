@@ -14,5 +14,8 @@ description = "Generic tree-sitter floor: syntactic extraction shared across all
 cairn-lang-api.workspace = true
 tree-sitter.workspace = true
 
+[dev-dependencies]
+tree-sitter-rust.workspace = true
+
 [lints]
 workspace = true

@@ -29,8 +29,8 @@ use cairn_lang_api::{
     SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
-    NestingTracker, Visitor, child_by_field, collapse_ws, end_line_of, extract, line_of, node_text,
-    signature_slice, truncate,
+    DocCommentPart, NestingTracker, Visitor, child_by_field, collapse_ws, end_line_of, extract,
+    extract_doc_above_node, line_of, node_text, signature_slice, truncate,
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
@@ -337,27 +337,16 @@ fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
 /// the declaration (annotations are part of the declaration's
 /// `modifiers` child, so the comment really is the preceding sibling).
 fn extract_javadoc(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut last_doc: Option<String> = None;
-
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
+    extract_doc_above_node(node, source, |sibling, text| match sibling.kind() {
+        "block_comment" if text.trim_start().starts_with("/**") => {
+            Some(DocCommentPart::Replace(strip_javadoc_markers(text)))
         }
-        match sibling.kind() {
-            "block_comment" if node_text(sibling, source).trim_start().starts_with("/**") => {
-                last_doc = Some(strip_javadoc_markers(node_text(sibling, source)));
-            }
-            // Any other comment between a javadoc and the declaration
-            // detaches the javadoc.
-            "block_comment" | "line_comment" => last_doc = None,
-            _ if !sibling.is_extra() => last_doc = None,
-            _ => {}
-        }
-    }
-
-    last_doc.filter(|doc| !doc.is_empty())
+        // Any other comment between a javadoc and the declaration
+        // detaches the javadoc.
+        "block_comment" | "line_comment" => Some(DocCommentPart::Reset),
+        _ => None,
+    })
+    .filter(|doc| !doc.is_empty())
 }
 
 fn strip_javadoc_markers(text: &str) -> String {
