@@ -29,10 +29,10 @@ impl DataMethod for GetOutline {
             ));
         }
 
-        let repo_alias = args.repo.clone();
+        let repo_alias = args.scope.repo.clone();
         let file = args.file.clone();
         let path = args.path.clone();
-        let effective_limit = args.limit.unwrap_or(200).clamp(1, 1000);
+        let effective_limit = args.pagination.limit.unwrap_or(200).clamp(1, 1000);
         let filter = OutlineFilter {
             kind: args.kind,
             max_depth: args.max_depth,
@@ -79,14 +79,14 @@ impl DataMethod for GetOutline {
         .await?;
 
         debug!(
-            repo = ?args.repo,
+            repo = ?args.scope.repo,
             file = ?args.file,
             path = ?args.path,
             count = items.len(),
             "outline served"
         );
         let tier3_status =
-            tier3_status_for_query(ctx, args.repo.clone(), None, None, "get_outline").await?;
+            tier3_status_for_query(ctx, args.scope.repo.clone(), None, None, "get_outline").await?;
         Ok(serde_json::to_value(OutlineResult {
             items,
             completeness: completeness_for_cap(capped),

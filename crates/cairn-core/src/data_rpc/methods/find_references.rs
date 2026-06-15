@@ -34,7 +34,7 @@ impl DataMethod for FindReferences {
             ));
         }
 
-        let effective_limit = args.limit.unwrap_or(100).max(1);
+        let effective_limit = args.pagination.limit.unwrap_or(100).max(1);
         let q = QueryArgs {
             symbol: args.symbol.clone(),
             direction: args.direction,
@@ -42,9 +42,9 @@ impl DataMethod for FindReferences {
             include_noise: args.include_noise,
             limit: Some(limit_with_probe(effective_limit)),
         };
-        let anchor_arg = args.anchor.clone();
-        let branch_arg = args.branch.clone();
-        let requested_repo = args.repo.clone();
+        let anchor_arg = args.scope.anchor.clone();
+        let branch_arg = args.scope.branch.clone();
+        let requested_repo = args.scope.repo.clone();
 
         let (items, capped) = with_one_or_all_stores(
             ctx,
@@ -71,9 +71,9 @@ impl DataMethod for FindReferences {
         .await?;
         let tier3_status = tier3_status_for_query(
             ctx,
-            args.repo.clone(),
-            args.anchor.clone(),
-            args.branch.clone(),
+            args.scope.repo.clone(),
+            args.scope.anchor.clone(),
+            args.scope.branch.clone(),
             "find_references",
         )
         .await?;
