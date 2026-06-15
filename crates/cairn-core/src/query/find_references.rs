@@ -94,9 +94,8 @@ fn run_find_references(
                              AND t.line = r.line
                              AND t.kind = r.kind
                              AND t.target_name = r.target_name
-                             AND t.target_qualified IS r.target_qualified
                              AND t.enclosing_id IS r.enclosing_id
-                        ) AS has_tier3_same_line,
+                        ) AS has_tier3_same_line_target_name,
                         ROW_NUMBER() OVER (
                           PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
                           ORDER BY
@@ -142,7 +141,7 @@ fn run_find_references(
                     source_rank > 0
                     AND byte_start = 0
                     AND byte_end = 0
-                    AND has_tier3_same_line
+                    AND has_tier3_same_line_target_name
                 )",
             );
         }
