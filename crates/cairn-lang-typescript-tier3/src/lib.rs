@@ -17,8 +17,9 @@ use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrateg
 use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
-    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector,
+    LspMultiKindDefinitionPass, RefKind, WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts,
+    WorkspaceFile, run_lsp_multi_kind_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -211,49 +212,29 @@ fn run_ts_passes(
     files: &[WorkspaceFile],
     progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
-    let mut facts = run_ts_pass(
-        language,
-        repo_root,
-        files,
-        RefKind::Call,
-        call_collector_for(language),
-        progress,
-    )?;
-    let import_facts = run_ts_pass(
-        language,
-        repo_root,
-        files,
-        RefKind::Import,
-        import_collector_for(language),
-        progress,
-    )?;
-    facts.resolved_refs.extend(import_facts.resolved_refs);
-    Ok(facts)
-}
-
-fn run_ts_pass(
-    language: TsLanguage,
-    repo_root: &Path,
-    files: &[WorkspaceFile],
-    ref_kind: RefKind,
-    collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
-    progress: &AnalyzerProgress,
-) -> Result<WorkspaceFacts> {
-    run_lsp_definition_pass(
-        LspDefinitionPass {
+    run_lsp_multi_kind_definition_pass(
+        LspMultiKindDefinitionPass {
             analyzer_id: language.analyzer_id,
             // typescript-language-server multiplexes TS, JS, and TSX through the
             // same TypeScript project service. Sharing the pool avoids starting
             // three servers for the same repo while preserving per-parser runs.
             pool_analyzer_id: Some(TYPESCRIPT_POOL_ID),
             language: "typescript-language-server",
-            ref_kind,
             spawn_spec: typescript_spawn_spec(language, repo_root),
             retry: DefinitionRetryPolicy {
                 retry_empty_definition: true,
                 retry_file_not_found: true,
             },
-            collect_definition_sites: collect,
+            collectors: vec![
+                LspDefinitionCollector {
+                    ref_kind: RefKind::Call,
+                    collect_definition_sites: call_collector_for(language),
+                },
+                LspDefinitionCollector {
+                    ref_kind: RefKind::Import,
+                    collect_definition_sites: import_collector_for(language),
+                },
+            ],
         },
         repo_root,
         files,
@@ -650,12 +631,11 @@ export function View() { return <button onClick={() => helper()} />; }
         let script = repo_root.join("mock_lsp.py");
         fs::write(&script, mock_lsp_script()).unwrap();
         let target_uri = Url::from_file_path(target).unwrap().as_str().to_string();
-        run_lsp_definition_pass(
-            LspDefinitionPass {
+        run_lsp_multi_kind_definition_pass(
+            LspMultiKindDefinitionPass {
                 analyzer_id: "mock-typescript-language-server-ts-lsp",
                 pool_analyzer_id: Some("mock-typescript-language-server-lsp"),
                 language: "mock-typescript-language-server",
-                ref_kind,
                 spawn_spec: LspSpawnSpec {
                     binary: python.to_path_buf(),
                     workspace_root: repo_root.to_path_buf(),
@@ -669,7 +649,10 @@ export function View() { return <button onClick={() => helper()} />; }
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),
-                collect_definition_sites: collect,
+                collectors: vec![LspDefinitionCollector {
+                    ref_kind,
+                    collect_definition_sites: collect,
+                }],
             },
             repo_root,
             &[WorkspaceFile {

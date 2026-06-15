@@ -36,7 +36,8 @@ mod persist;
 mod run;
 
 pub use lsp_pass::{
-    DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, run_lsp_definition_pass,
+    DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
+    LspMultiKindDefinitionPass, run_lsp_definition_pass, run_lsp_multi_kind_definition_pass,
 };
 pub use run::run_registered_workspace_analyzers;
 pub(crate) use run::{

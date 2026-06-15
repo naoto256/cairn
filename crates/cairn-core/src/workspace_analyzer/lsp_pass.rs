@@ -77,6 +77,36 @@ pub struct LspDefinitionPass {
     pub collect_definition_sites: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
 }
 
+/// One ref-kind-specific extractor inside a multi-kind LSP pass.
+///
+/// Grouping collectors lets a backend read and sync each document once
+/// while still preserving the ref kind attached to every definition
+/// request.
+#[derive(Debug, Clone, Copy)]
+pub struct LspDefinitionCollector {
+    /// Ref kind recorded for every resolved site this collector emits.
+    pub ref_kind: RefKind,
+    /// Grammar-specific extraction of the identifiers to resolve.
+    pub collect_definition_sites: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
+}
+
+/// Everything a language crate hands the substrate to run several
+/// definition kinds over one document synchronization.
+pub struct LspMultiKindDefinitionPass {
+    /// Stable analyzer identifier, e.g. `"clangd-cpp-lsp"`.
+    pub analyzer_id: &'static str,
+    /// Optional analyzer id used only for pooling. Defaults to
+    /// [`Self::analyzer_id`].
+    pub pool_analyzer_id: Option<&'static str>,
+    /// Pool-key language tag, e.g. `"clangd"`.
+    pub language: &'static str,
+    /// Launch and readiness settings for the pooled server.
+    pub spawn_spec: LspSpawnSpec,
+    pub retry: DefinitionRetryPolicy,
+    /// Ref-kind-specific site extractors run against each source file.
+    pub collectors: Vec<LspDefinitionCollector>,
+}
+
 /// Run one LSP definition pass over `files` and return the resolved
 /// refs as workspace facts.
 ///
@@ -117,6 +147,55 @@ pub fn run_lsp_definition_pass(
                 ref_kind,
                 retry,
                 collect,
+                progress,
+                &mut facts,
+            )
+            .await
+            .map_err(core_error_to_lsp)?;
+            Ok(facts)
+        })
+    })
+    .map_err(Error::Lsp)
+}
+
+/// Run several LSP definition collectors over `files`, synchronizing
+/// each document at most once per file.
+///
+/// # Errors
+/// Returns [`Error::Lsp`] for binary availability, spawn, readiness,
+/// and protocol failures, and IO errors when a worktree file cannot
+/// be read.
+pub fn run_lsp_multi_kind_definition_pass(
+    pass: LspMultiKindDefinitionPass,
+    repo_root: &Path,
+    files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
+) -> Result<WorkspaceFacts> {
+    let key = PoolKey::lsp(
+        pass.language,
+        repo_root,
+        pass.pool_analyzer_id.unwrap_or(pass.analyzer_id),
+        &pass.spawn_spec.binary,
+        &pass.spawn_spec.config_hash,
+    )
+    .map_err(Error::Lsp)?;
+    let pool = lsp_pool::global().map_err(Error::Lsp)?;
+    let repo_root = repo_root.to_path_buf();
+    let files = files.to_vec();
+    let analyzer_id = pass.analyzer_id;
+    let retry = pass.retry;
+    let collectors = pass.collectors;
+    let progress = progress.clone();
+    pool.with_lsp(key, pass.spawn_spec, move |client| {
+        Box::pin(async move {
+            let mut facts = WorkspaceFacts::default();
+            collect_multi_kind_resolved_refs(
+                client,
+                &repo_root,
+                &files,
+                analyzer_id,
+                retry,
+                &collectors,
                 progress,
                 &mut facts,
             )
@@ -205,8 +284,114 @@ async fn collect_resolved_refs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn collect_multi_kind_resolved_refs(
+    client: &mut PooledLsp<'_>,
+    repo_root: &Path,
+    files: &[WorkspaceFile],
+    analyzer_id: &'static str,
+    retry: DefinitionRetryPolicy,
+    collectors: &[LspDefinitionCollector],
+    progress: AnalyzerProgress,
+    facts: &mut WorkspaceFacts,
+) -> Result<()> {
+    for file in files {
+        let Some(path) = &file.worktree_path else {
+            continue;
+        };
+        let read_started = Instant::now();
+        let source = std::fs::read_to_string(path)?;
+        let read_elapsed = read_started.elapsed();
+        let collect_started = Instant::now();
+        let mut sites = Vec::new();
+        let mut kind_site_counts = Vec::with_capacity(collectors.len());
+        for collector in collectors {
+            let collected = (collector.collect_definition_sites)(source.as_bytes())?;
+            kind_site_counts.push((collector.ref_kind, collected.len()));
+            sites.extend(collected.into_iter().map(|site| DefinitionRequestSite {
+                ref_kind: collector.ref_kind,
+                site,
+            }));
+        }
+        let collect_elapsed = collect_started.elapsed();
+        if sites.is_empty() {
+            progress.tick();
+            continue;
+        }
+        let uri = Url::from_file_path(path).map_err(Error::Lsp)?;
+        let sync_started = Instant::now();
+        client
+            .sync_document(&uri, &source)
+            .await
+            .map_err(Error::Lsp)?;
+        let sync_elapsed = sync_started.elapsed();
+        let site_count = sites.len();
+        let definition_started = Instant::now();
+        let resolved_batch = collect_multi_kind_definition_site_locations(
+            sites,
+            |site| client.definition(&uri, site.position),
+            retry,
+            analyzer_id,
+            &uri,
+            progress.clone(),
+        )
+        .await;
+        let definition_elapsed = definition_started.elapsed();
+        debug!(
+            analyzer_id,
+            path = %file.path,
+            sites = site_count,
+            kind_site_counts = %format_kind_counts(&kind_site_counts),
+            resolved_sites = resolved_batch.resolved.len(),
+            site_errors = resolved_batch.error_count,
+            kind_error_counts = %format_kind_counts(&resolved_batch.error_counts_by_kind),
+            read_elapsed_ms = read_elapsed.as_millis(),
+            collect_elapsed_ms = collect_elapsed.as_millis(),
+            sync_elapsed_ms = sync_elapsed.as_millis(),
+            definition_elapsed_ms = definition_elapsed.as_millis(),
+            "LSP multi-kind definition pass processed file"
+        );
+        for resolved_site in resolved_batch.resolved {
+            for target in resolved_site.locations {
+                let target_path = location_to_repo_path(repo_root, &target);
+                facts.resolved_refs.push(ResolvedRef {
+                    source_path: file.path.clone(),
+                    source_position: resolved_site.site.position,
+                    source_byte_range: resolved_site.site.byte_start..resolved_site.site.byte_end,
+                    kind: resolved_site.ref_kind,
+                    target,
+                    target_path,
+                });
+            }
+        }
+        if let Err(err) = client.close_document(&uri).await {
+            warn!(
+                analyzer_id,
+                uri = uri.as_str(),
+                error = %err,
+                "failed to close LSP document after multi-kind definition pass"
+            );
+        }
+        progress.tick();
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedDefinitionSite {
+    site: DefinitionSite,
+    locations: Vec<Location>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefinitionRequestSite {
+    ref_kind: RefKind,
+    site: DefinitionSite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedMultiKindDefinitionSite {
+    ref_kind: RefKind,
     site: DefinitionSite,
     locations: Vec<Location>,
 }
@@ -215,6 +400,13 @@ struct ResolvedDefinitionSite {
 struct DefinitionBatch {
     resolved: Vec<ResolvedDefinitionSite>,
     error_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct MultiKindDefinitionBatch {
+    resolved: Vec<ResolvedMultiKindDefinitionSite>,
+    error_count: usize,
+    error_counts_by_kind: Vec<(RefKind, usize)>,
 }
 
 async fn collect_definition_site_locations<F, Fut>(
@@ -270,6 +462,73 @@ where
                     analyzer_id,
                     uri = uri.as_str(),
                     ?site,
+                    error = %err,
+                    "definition request failed; skipping site"
+                );
+            }
+        }
+    }
+    batch
+}
+
+async fn collect_multi_kind_definition_site_locations<F, Fut>(
+    sites: Vec<DefinitionRequestSite>,
+    definition: F,
+    retry: DefinitionRetryPolicy,
+    analyzer_id: &str,
+    uri: &Url,
+    progress: AnalyzerProgress,
+) -> MultiKindDefinitionBatch
+where
+    F: Fn(DefinitionSite) -> Fut,
+    Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
+{
+    let mut results = stream::iter(sites)
+        .map(|request| {
+            let definition = &definition;
+            let progress = progress.clone();
+            async move {
+                let result = definition_with_retry_from(
+                    || definition(request.site),
+                    retry,
+                    analyzer_id,
+                    uri,
+                    request.site.position,
+                )
+                .await;
+                progress.tick();
+                (request, result)
+            }
+        })
+        .buffer_unordered(DEFINITION_PIPELINE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_by_key(|(request, _)| {
+        (
+            request.site.position.line,
+            request.site.position.character,
+            request.site.byte_start,
+            request.site.byte_end,
+            ref_kind_sort_key(request.ref_kind),
+        )
+    });
+
+    let mut batch = MultiKindDefinitionBatch::default();
+    for (request, result) in results {
+        match result {
+            Ok(locations) => batch.resolved.push(ResolvedMultiKindDefinitionSite {
+                ref_kind: request.ref_kind,
+                site: request.site,
+                locations,
+            }),
+            Err(err) => {
+                batch.error_count += 1;
+                increment_kind_count(&mut batch.error_counts_by_kind, request.ref_kind);
+                warn!(
+                    analyzer_id,
+                    uri = uri.as_str(),
+                    ?request.site,
+                    ref_kind = ?request.ref_kind,
                     error = %err,
                     "definition request failed; skipping site"
                 );
@@ -337,6 +596,50 @@ fn core_error_to_lsp(err: Error) -> crate::lsp::Error {
     match err {
         Error::Lsp(err) => err,
         err => crate::lsp::Error::Protocol(err.to_string()),
+    }
+}
+
+fn increment_kind_count(counts: &mut Vec<(RefKind, usize)>, ref_kind: RefKind) {
+    if let Some((_, count)) = counts.iter_mut().find(|(kind, _)| *kind == ref_kind) {
+        *count += 1;
+    } else {
+        counts.push((ref_kind, 1));
+    }
+}
+
+fn format_kind_counts(counts: &[(RefKind, usize)]) -> String {
+    counts
+        .iter()
+        .map(|(kind, count)| format!("{}={count}", ref_kind_name(*kind)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn ref_kind_sort_key(kind: RefKind) -> u8 {
+    match kind {
+        RefKind::Call => 0,
+        RefKind::Type => 1,
+        RefKind::Import => 2,
+        RefKind::Instantiate => 3,
+        RefKind::Read => 4,
+        RefKind::Write => 5,
+        RefKind::Override => 6,
+        RefKind::MacroInvoke => 7,
+        RefKind::Annotation => 8,
+    }
+}
+
+fn ref_kind_name(kind: RefKind) -> &'static str {
+    match kind {
+        RefKind::Call => "call",
+        RefKind::Type => "type",
+        RefKind::Import => "import",
+        RefKind::Instantiate => "instantiate",
+        RefKind::Read => "read",
+        RefKind::Write => "write",
+        RefKind::Override => "override",
+        RefKind::MacroInvoke => "macro_invoke",
+        RefKind::Annotation => "annotation",
     }
 }
 
@@ -645,5 +948,78 @@ mod tests {
             .map(|resolved| resolved.site.position.line)
             .collect::<Vec<_>>();
         assert_eq!(lines, vec![1, 5, 9]);
+    }
+
+    #[tokio::test]
+    async fn multi_kind_definition_sites_preserve_ref_kind() {
+        let sites = vec![
+            DefinitionRequestSite {
+                ref_kind: RefKind::Import,
+                site: test_site(2),
+            },
+            DefinitionRequestSite {
+                ref_kind: RefKind::Call,
+                site: test_site(1),
+            },
+        ];
+        let resolved =
+            collect_multi_kind_definition_site_locations(
+                sites,
+                |site| async move {
+                    Ok::<_, crate::lsp::Error>(vec![test_location_at(site.position.line)])
+                },
+                DefinitionRetryPolicy::default(),
+                "test-lsp",
+                &test_uri(),
+                AnalyzerProgress::default(),
+            )
+            .await;
+
+        let observed = resolved
+            .resolved
+            .iter()
+            .map(|resolved| (resolved.ref_kind, resolved.site.position.line))
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![(RefKind::Call, 1), (RefKind::Import, 2)]);
+        assert_eq!(resolved.error_count, 0);
+    }
+
+    #[tokio::test]
+    async fn multi_kind_definition_site_errors_are_counted_by_kind() {
+        let sites = vec![
+            DefinitionRequestSite {
+                ref_kind: RefKind::Call,
+                site: test_site(1),
+            },
+            DefinitionRequestSite {
+                ref_kind: RefKind::Import,
+                site: test_site(2),
+            },
+            DefinitionRequestSite {
+                ref_kind: RefKind::Import,
+                site: test_site(3),
+            },
+        ];
+        let progress = AnalyzerProgress::default();
+        let resolved = collect_multi_kind_definition_site_locations(
+            sites,
+            |site| async move {
+                if site.position.line == 1 {
+                    Ok(vec![test_location_at(site.position.line)])
+                } else {
+                    Err(crate::lsp::Error::Protocol("boom".into()))
+                }
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+            progress.clone(),
+        )
+        .await;
+
+        assert_eq!(progress.snapshot(), 3);
+        assert_eq!(resolved.resolved.len(), 1);
+        assert_eq!(resolved.error_count, 2);
+        assert_eq!(resolved.error_counts_by_kind, vec![(RefKind::Import, 2)]);
     }
 }
