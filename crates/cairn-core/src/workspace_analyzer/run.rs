@@ -10,7 +10,10 @@ use crate::manifest::{ManifestEntry, ManifestId};
 use crate::{Error, Result};
 
 use super::persist::persist_resolved_refs;
-use super::{AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFile, all_workspace_analyzers};
+use super::{
+    AnalyzerProgress, AnalyzerProgressObserver, WorkspaceAnalyzer, WorkspaceFile,
+    all_workspace_analyzers,
+};
 
 // Timeout is a hang detector, not a total work cap. T3 measured nlohmann's
 // C++ pass advancing through 47.4k definition sites with zero request errors
@@ -106,6 +109,7 @@ pub(super) fn run_workspace_analyzers_with_timeout(
                 now_ns,
                 analyzer_stall_timeout,
                 job_id: None,
+                progress_observer: None,
             },
         )?;
         inserted += outcome.inserted_refs;
@@ -122,6 +126,7 @@ pub(crate) struct AnalyzerRunRequest<'a> {
     pub(crate) now_ns: i64,
     pub(crate) analyzer_stall_timeout: Duration,
     pub(crate) job_id: Option<i64>,
+    pub(crate) progress_observer: Option<AnalyzerProgressObserver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +148,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         now_ns,
         analyzer_stall_timeout,
         job_id,
+        progress_observer,
     } = request;
     let analyzer_id = analyzer.id();
     let analyzer_revision = analyzer.revision();
@@ -192,6 +198,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         manifest_id,
         &files,
         analyzer_stall_timeout,
+        progress_observer,
     ) {
         AnalyzerRun::Completed(Ok(facts)) => {
             let inserted_refs =
@@ -296,11 +303,14 @@ fn analyze_workspace_with_timeout(
     manifest_id: ManifestId,
     files: &[WorkspaceFile],
     timeout: Duration,
+    progress_observer: Option<AnalyzerProgressObserver>,
 ) -> AnalyzerRun {
     let repo_root = repo_root.to_path_buf();
     let files = files.to_vec();
     let (tx, rx) = mpsc::channel();
-    let progress = AnalyzerProgress::default();
+    let progress = progress_observer
+        .map(AnalyzerProgress::with_observer)
+        .unwrap_or_default();
     let worker_progress = progress.clone();
     let worker = std::thread::spawn(move || {
         let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files, &worker_progress);
@@ -689,6 +699,7 @@ mod tests {
                 worktree_path: None,
             }],
             Duration::from_millis(10),
+            None,
         );
 
         *STALLED_ANALYZER_CLEANUP_OBSERVER
