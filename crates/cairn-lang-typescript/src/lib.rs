@@ -19,8 +19,8 @@ use cairn_lang_api::{
     SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
-    NestingTracker, Visitor, child_by_field, end_line_of, extract, line_of, node_text,
-    signature_slice, truncate,
+    DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
+    extract_doc_above_node, line_of, node_text, signature_slice, truncate,
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
@@ -281,27 +281,17 @@ fn typescript_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
 }
 
 fn extract_jsdoc(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut last_doc: Option<String> = None;
-
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
+    extract_doc_above_node(node, source, |sibling, text| {
+        if sibling.kind() != "comment" {
+            return None;
         }
-        if sibling.kind() == "comment" {
-            let text = node_text(sibling, source);
-            if text.trim_start().starts_with("/**") {
-                last_doc = Some(strip_jsdoc_markers(text));
-            } else {
-                last_doc = None;
-            }
-        } else if !sibling.is_extra() {
-            last_doc = None;
+        if text.trim_start().starts_with("/**") {
+            Some(DocCommentPart::Replace(strip_jsdoc_markers(text)))
+        } else {
+            Some(DocCommentPart::Reset)
         }
-    }
-
-    last_doc.filter(|doc| !doc.is_empty())
+    })
+    .filter(|doc| !doc.is_empty())
 }
 
 fn strip_jsdoc_markers(text: &str) -> String {
