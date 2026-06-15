@@ -27,11 +27,9 @@
 //! refs. See its module docs.
 //!
 //! Limitations:
-//! - The `.h` extension is intentionally NOT claimed: the C backend
-//!   already claims it, and tree-sitter-cpp can parse most C-shaped
-//!   headers, so routing both backends to `.h` would double-index. C++
-//!   headers that need full C++ parsing should use `.hpp` / `.hh` /
-//!   `.hxx` / `.h++` / `.H`. A heuristic-based router may revisit this.
+//! - The `.h` extension is intentionally NOT claimed here: the register
+//!   layer routes ambiguous C-family headers by content so a `.h` blob is
+//!   still indexed once, under either the C or C++ parser id.
 //! - Template instantiation callee resolution across files is out of
 //!   scope; same-file resolution still works. Overloads (more than one
 //!   same-file method sharing a bare name) deliberately leave the call
@@ -944,7 +942,7 @@ mod tests {
         assert!(patterns.contains(&"*.hh"));
         assert!(
             !patterns.contains(&"*.h"),
-            ".h stays with the C backend in v1",
+            ".h is routed by content in the register layer",
         );
     }
 

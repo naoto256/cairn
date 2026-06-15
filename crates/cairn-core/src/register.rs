@@ -172,6 +172,9 @@ where
         if pick_backend_for_path(&backends, hint.path).is_some() {
             return true;
         }
+        if is_c_family_header_path(hint.path) {
+            return true;
+        }
         hint.is_executable
     };
 
@@ -374,11 +377,230 @@ fn pick_backend_with_shebang_fallback<'a>(
     if let Some(backend) = pick_backend_for_path(backends, path) {
         return Some(backend);
     }
+    if let Some(backend) = pick_c_family_header_backend(backends, path, content) {
+        return Some(backend);
+    }
     let first_line = read_first_line(content)?;
     if !first_line.starts_with("#!") {
         return None;
     }
     pick_backend_for_shebang(backends, first_line)
+}
+
+const C_FAMILY_HEADER_SCAN_LIMIT: usize = 64 * 1024;
+
+fn is_c_family_header_path(path: &str) -> bool {
+    Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("h")
+}
+
+fn pick_c_family_header_backend<'a>(
+    backends: &'a [Box<dyn LanguageBackend>],
+    path: &str,
+    content: &[u8],
+) -> Option<&'a dyn LanguageBackend> {
+    if !is_c_family_header_path(path) {
+        return None;
+    }
+    // Ambiguous `.h` files are common in both C and C++ projects. The
+    // manifest must include them before content is loaded, then parsing
+    // chooses one parser id here so the blob is indexed exactly once.
+    let parser_id = if header_looks_cpp(content) {
+        "tree-sitter-cpp"
+    } else {
+        "tree-sitter-c"
+    };
+    backends
+        .iter()
+        .find(|backend| backend.parser_id() == parser_id)
+        .map(|backend| backend.as_ref())
+}
+
+fn header_looks_cpp(content: &[u8]) -> bool {
+    let window = &content[..content.len().min(C_FAMILY_HEADER_SCAN_LIMIT)];
+    let masked = mask_c_family_comments_and_literals(window);
+    has_cpp_std_include(&masked)
+        || contains_cpp_word(&masked, b"namespace")
+        || contains_cpp_class_keyword(&masked)
+        || contains_cpp_word(&masked, b"template")
+        || contains_cpp_word(&masked, b"typename")
+        || contains_cpp_word(&masked, b"concept")
+        || contains_cpp_word(&masked, b"requires")
+        || contains_cpp_word(&masked, b"constexpr")
+        // C23 added `nullptr`, so this can misroute future pure-C headers.
+        // It remains a strong practical C++ signal for today's codebases.
+        || contains_cpp_word(&masked, b"nullptr")
+        || contains_cpp_word(&masked, b"noexcept")
+        || contains_cpp_word(&masked, b"operator")
+        || contains_access_specifier(&masked, b"public")
+        || contains_access_specifier(&masked, b"private")
+        || contains_access_specifier(&masked, b"protected")
+        || contains_subslice(&masked, b"::")
+}
+
+fn mask_c_family_comments_and_literals(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        match input[i] {
+            b'/' if input.get(i + 1) == Some(&b'/') => {
+                out.extend_from_slice(b"  ");
+                i += 2;
+                while i < input.len() && input[i] != b'\n' {
+                    out.push(b' ');
+                    i += 1;
+                }
+            }
+            b'/' if input.get(i + 1) == Some(&b'*') => {
+                out.extend_from_slice(b"  ");
+                i += 2;
+                while i < input.len() {
+                    if input[i] == b'\n' {
+                        out.push(b'\n');
+                        i += 1;
+                        continue;
+                    }
+                    if input[i] == b'*' && input.get(i + 1) == Some(&b'/') {
+                        out.extend_from_slice(b"  ");
+                        i += 2;
+                        break;
+                    }
+                    out.push(b' ');
+                    i += 1;
+                }
+            }
+            b'"' | b'\'' => {
+                let quote = input[i];
+                out.push(b' ');
+                i += 1;
+                while i < input.len() {
+                    if input[i] == b'\n' {
+                        out.push(b'\n');
+                        i += 1;
+                        break;
+                    }
+                    if input[i] == b'\\' {
+                        out.push(b' ');
+                        if i + 1 < input.len() {
+                            out.push(if input[i + 1] == b'\n' { b'\n' } else { b' ' });
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    let done = input[i] == quote;
+                    out.push(b' ');
+                    i += 1;
+                    if done {
+                        break;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn has_cpp_std_include(masked: &[u8]) -> bool {
+    masked.split(|byte| *byte == b'\n').any(|line| {
+        let mut i = skip_ascii_ws(line, 0);
+        if line.get(i) != Some(&b'#') {
+            return false;
+        }
+        i = skip_ascii_ws(line, i + 1);
+        if !starts_with_word_at(line, i, b"include") {
+            return false;
+        }
+        i = skip_ascii_ws(line, i + b"include".len());
+        if line.get(i) != Some(&b'<') {
+            return false;
+        }
+        let header_start = i + 1;
+        let Some(header_end) = line[header_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .map(|offset| header_start + offset)
+        else {
+            return false;
+        };
+        matches!(
+            &line[header_start..header_end],
+            b"iostream"
+                | b"string"
+                | b"vector"
+                | b"memory"
+                | b"optional"
+                | b"variant"
+                | b"span"
+                | b"unordered_map"
+                | b"unordered_set"
+                | b"map"
+                | b"set"
+                | b"array"
+                | b"tuple"
+                | b"type_traits"
+                | b"utility"
+        )
+    })
+}
+
+fn contains_cpp_word(masked: &[u8], word: &[u8]) -> bool {
+    find_words(masked, word).any(|_| true)
+}
+
+fn contains_cpp_class_keyword(masked: &[u8]) -> bool {
+    find_words(masked, b"class").any(|start| start == 0 || masked[start - 1] != b'@')
+}
+
+fn contains_access_specifier(masked: &[u8], word: &[u8]) -> bool {
+    find_words(masked, word).any(|start| {
+        let after = skip_ascii_ws(masked, start + word.len());
+        masked.get(after) == Some(&b':')
+    })
+}
+
+fn find_words<'a>(haystack: &'a [u8], word: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    haystack
+        .windows(word.len())
+        .enumerate()
+        .filter_map(move |(i, w)| {
+            (w == word
+                && i.checked_sub(1)
+                    .and_then(|prev| haystack.get(prev))
+                    .is_none_or(|byte| !is_identifier_byte(*byte))
+                && haystack
+                    .get(i + word.len())
+                    .is_none_or(|byte| !is_identifier_byte(*byte)))
+            .then_some(i)
+        })
+}
+
+fn starts_with_word_at(haystack: &[u8], offset: usize, word: &[u8]) -> bool {
+    haystack
+        .get(offset..offset + word.len())
+        .is_some_and(|candidate| candidate == word)
+        && haystack
+            .get(offset + word.len())
+            .is_none_or(|byte| !is_identifier_byte(*byte))
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut offset: usize) -> usize {
+    while matches!(bytes.get(offset), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        offset += 1;
+    }
+    offset
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn read_first_line(content: &[u8]) -> Option<&str> {
@@ -536,6 +758,8 @@ mod tests {
     use super::*;
     use crate::cas::store;
     use crate::testutil::{init_repo, run_git};
+    use cairn_lang_c as _;
+    use cairn_lang_cpp as _;
     use cairn_lang_python::PythonBackend;
     use cairn_lang_rust as _;
     use std::cell::Cell;
@@ -548,6 +772,22 @@ mod tests {
     fn init_rust_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
         let (tmp, _sha) = init_repo(files);
         tmp
+    }
+
+    fn parser_ids_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT b.parser_id
+                 FROM manifest_entries me
+                 JOIN blobs b ON b.blob_sha = me.blob_sha
+                 WHERE me.manifest_id = ?1 AND me.path = ?2
+                 ORDER BY b.parser_id",
+            )
+            .unwrap();
+        stmt.query_map(params![manifest_id.0, path], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     #[test]
@@ -752,6 +992,59 @@ mod tests {
             })
             .unwrap();
         assert!(count >= 1);
+    }
+
+    #[test]
+    fn dot_h_with_cpp_signals_routes_to_cpp_parser() {
+        let repo = init_rust_repo(&[(
+            "include/widget.h",
+            "#include <vector>\nnamespace app { class Widget {}; }\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        assert_eq!(
+            parser_ids_for_path(&conn, outcome.tentative_manifest, "include/widget.h"),
+            vec!["tree-sitter-cpp"]
+        );
+    }
+
+    #[test]
+    fn dot_h_without_cpp_signals_routes_to_c_parser() {
+        let repo = init_rust_repo(&[(
+            "include/api.h",
+            "typedef struct widget { int id; } widget_t;\nint widget_id(widget_t *w);\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        assert_eq!(
+            parser_ids_for_path(&conn, outcome.tentative_manifest, "include/api.h"),
+            vec!["tree-sitter-c"]
+        );
+    }
+
+    #[test]
+    fn dot_h_cpp_signals_in_comments_and_strings_do_not_route_to_cpp() {
+        let repo = init_rust_repo(&[(
+            "include/plain.h",
+            "/* namespace app { class Widget {}; } */\n\
+             const char *text = \"#include <vector>\";\n\
+             typedef struct widget { int id; } widget_t;\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        assert_eq!(
+            parser_ids_for_path(&conn, outcome.tentative_manifest, "include/plain.h"),
+            vec!["tree-sitter-c"]
+        );
     }
 
     #[test]

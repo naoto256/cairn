@@ -33,6 +33,8 @@ tempfile = "3"
 cairn-lang-rust.workspace = true
 cairn-lang-python.workspace = true
 cairn-lang-typescript.workspace = true
+cairn-lang-c.workspace = true
+cairn-lang-cpp.workspace = true
 # markdown is a genuinely syntactic-only backend (no analyzer); used in
 # tests to exercise the Syntactic → Completeness::Partial wiring.
 cairn-lang-markdown.workspace = true
