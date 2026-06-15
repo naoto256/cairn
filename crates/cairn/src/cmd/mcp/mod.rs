@@ -42,10 +42,10 @@ use linkme::distributed_slice;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::error;
 
+use super::rpc_client;
 use super::version_guard::{VersionGuardMode, check_daemon_version};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -327,7 +327,7 @@ impl Dispatcher {
                     method,
                     params: Some(params),
                 };
-                match send_json_rpc(&self.paths.cairn, &req).await {
+                match rpc_client::send_request(&self.paths.cairn, &req).await {
                     Ok(resp) => mcp_wrap_rpc_response(id, resp),
                     Err(e) => {
                         error_resp(id, error_code::INTERNAL_ERROR, format!("data socket: {e}"))
@@ -341,7 +341,7 @@ impl Dispatcher {
                     method,
                     params: Some(params),
                 };
-                match send_json_rpc(&self.paths.control, &req).await {
+                match rpc_client::send_request(&self.paths.control, &req).await {
                     Ok(resp) => mcp_wrap_rpc_response(id, resp),
                     Err(e) => error_resp(
                         id,
@@ -408,20 +408,6 @@ fn line_from_bytes(mut buf: Vec<u8>) -> std::io::Result<McpLine> {
     String::from_utf8(buf)
         .map(McpLine::Line)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-async fn send_json_rpc(socket: &std::path::Path, req: &RpcRequest) -> std::io::Result<RpcResponse> {
-    let stream = UnixStream::connect(socket).await?;
-    let (read, mut write) = stream.into_split();
-    let body = serde_json::to_string(req)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write.write_all(body.as_bytes()).await?;
-    write.write_all(b"\n").await?;
-    write.flush().await?;
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // ─── response wrapping ────────────────────────────────────────────────────
