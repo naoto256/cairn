@@ -51,7 +51,7 @@ pub async fn run(args: Args) -> Result<()> {
         cas_data_dir.clone(),
         job_manager.clone(),
     ));
-    spawn_registered_watchers(watch_manager.clone());
+    start_registered_watchers(watch_manager.clone()).await;
 
     let shutdown = Arc::new(Notify::new());
     spawn_signal_handler(shutdown.clone());
@@ -99,10 +99,41 @@ fn spawn_signal_handler(shutdown: Arc<Notify>) {
     });
 }
 
-fn spawn_registered_watchers(watch_manager: Arc<WatchManager>) {
-    tokio::task::spawn_blocking(move || {
+async fn start_registered_watchers(watch_manager: Arc<WatchManager>) {
+    let result = tokio::task::spawn_blocking(move || {
         if let Err(err) = watch_manager.start_registered() {
             tracing::warn!(error = %err, "failed to start registered repo watchers");
         }
-    });
+    })
+    .await;
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "registered repo watcher startup task failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_core::cas::registry as cas_registry;
+    use cairn_core::paths::{CasDataDir, path_hash};
+
+    #[tokio::test]
+    async fn start_registered_watchers_waits_until_alias_is_watched() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let canonical = repo.path().canonicalize().unwrap();
+        let repo_hash = path_hash(&canonical);
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(&tx, "demo", &canonical.to_string_lossy(), &repo_hash, 1).unwrap();
+        tx.commit().unwrap();
+
+        let watch_manager = Arc::new(WatchManager::new(cas));
+
+        start_registered_watchers(watch_manager.clone()).await;
+
+        assert!(watch_manager.is_watching_alias("demo"));
+    }
 }
