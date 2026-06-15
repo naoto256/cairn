@@ -236,6 +236,7 @@ fn run_ts_passes(
                     collect_definition_sites: import_collector_for(language),
                 },
             ],
+            suppress_definition_targets_at_requested_sites: false,
         },
         repo_root,
         files,
@@ -913,6 +914,7 @@ export function View() {
                     ref_kind,
                     collect_definition_sites: collect,
                 }],
+                suppress_definition_targets_at_requested_sites: false,
             },
             repo_root,
             &[WorkspaceFile {
