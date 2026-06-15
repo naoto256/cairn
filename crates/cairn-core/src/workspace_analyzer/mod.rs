@@ -70,27 +70,53 @@ struct AnalyzerProgressState {
     cancelled: AtomicBool,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Cloneable progress and cancellation handle shared between the runner and
 /// one workspace analyzer invocation. Ticks are monotonic liveness beacons, not
 /// a file count contract.
-pub struct AnalyzerProgress(Arc<AnalyzerProgressState>);
+#[derive(Clone, Default)]
+pub struct AnalyzerProgress {
+    state: Arc<AnalyzerProgressState>,
+    observer: Option<AnalyzerProgressObserver>,
+}
+
+pub(crate) type AnalyzerProgressObserver = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+impl std::fmt::Debug for AnalyzerProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyzerProgress")
+            .field("ticks", &self.snapshot())
+            .field("cancelled", &self.is_cancelled())
+            .field("has_observer", &self.observer.is_some())
+            .finish()
+    }
+}
 
 impl AnalyzerProgress {
+    #[must_use]
+    pub(crate) fn with_observer(observer: AnalyzerProgressObserver) -> Self {
+        Self {
+            state: Arc::default(),
+            observer: Some(observer),
+        }
+    }
+
     /// Marks forward progress for stall detection. An analyzer should call this
     /// after bounded units of work such as a file, request, or retry completes.
     pub fn tick(&self) {
-        self.0.ticks.fetch_add(1, Ordering::Relaxed);
+        let ticks = self.state.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(observer) = &self.observer {
+            observer(ticks);
+        }
     }
 
     #[must_use]
     /// Returns the current liveness tick value observed by the runner.
     pub fn snapshot(&self) -> u64 {
-        self.0.ticks.load(Ordering::Relaxed)
+        self.state.ticks.load(Ordering::Relaxed)
     }
 
     pub(crate) fn cancel(&self) {
-        self.0.cancelled.store(true, Ordering::Relaxed);
+        self.state.cancelled.store(true, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -98,7 +124,7 @@ impl AnalyzerProgress {
     /// Implementations should check this between expensive operations and
     /// return promptly when it becomes true.
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Relaxed)
+        self.state.cancelled.load(Ordering::Relaxed)
     }
 }
 

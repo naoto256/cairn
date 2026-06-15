@@ -108,6 +108,36 @@ pub struct JobSnapshot {
     /// Terminal error text. `None` means no error has been recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Pool group this analyzer waits on when it shares an LSP process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_group: Option<String>,
+    /// Scheduler-side state such as `queued`, `waiting_pool_group`, or `running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_state: Option<String>,
+    /// Original enqueue timestamp in nanoseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueued_at: Option<i64>,
+    /// Analyzer execution start timestamp in nanoseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_started_at: Option<i64>,
+    /// Time spent queued before execution or completion, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<u64>,
+    /// Time spent waiting for a shared pool-group slot, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_wait_ms: Option<u64>,
+    /// Analyzer execution time since start, or total run time after completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_ms: Option<u64>,
+    /// Analyzer progress ticks observed during this daemon lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_ticks: Option<u64>,
+    /// Last observed progress timestamp in nanoseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<i64>,
+    /// Approximate progress ticks per minute while the job has been running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_per_minute: Option<f64>,
 }
 
 /// Result of `jobs.cancel`.

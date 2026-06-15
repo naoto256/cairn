@@ -276,16 +276,47 @@ fn render_jobs(r: &JobsListResult) {
             .finished_at
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".into());
+        let metrics = render_job_metrics(job);
         match &job.error {
             Some(error) => println!(
-                "job {}: {} {} -> {} finished={} error={}",
-                job.job_id, job.alias, job.analyzer_id, job.state, finished, error
+                "job {}: {} {} -> {} finished={}{} error={}",
+                job.job_id, job.alias, job.analyzer_id, job.state, finished, metrics, error
             ),
             None => println!(
-                "job {}: {} {} -> {} finished={}",
-                job.job_id, job.alias, job.analyzer_id, job.state, finished
+                "job {}: {} {} -> {} finished={}{}",
+                job.job_id, job.alias, job.analyzer_id, job.state, finished, metrics
             ),
         }
+    }
+}
+
+fn render_job_metrics(job: &cairn_proto::control::JobSnapshot) -> String {
+    let mut parts = Vec::new();
+    if let Some(state) = &job.scheduler_state {
+        parts.push(format!("scheduler={state}"));
+    }
+    if let Some(group) = &job.pool_group {
+        parts.push(format!("group={group}"));
+    }
+    if let Some(ms) = job.queued_ms {
+        parts.push(format!("queued={}ms", ms));
+    }
+    if let Some(ms) = job.pool_wait_ms {
+        parts.push(format!("pool_wait={}ms", ms));
+    }
+    if let Some(ms) = job.run_ms {
+        parts.push(format!("run={}ms", ms));
+    }
+    if let Some(ticks) = job.progress_ticks {
+        parts.push(format!("progress={ticks}"));
+    }
+    if let Some(rate) = job.progress_per_minute {
+        parts.push(format!("rate={rate:.1}/min"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
     }
 }
 
