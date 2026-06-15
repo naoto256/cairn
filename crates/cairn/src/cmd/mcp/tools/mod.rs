@@ -14,6 +14,7 @@ mod find_references;
 mod find_subtypes;
 mod find_supertypes;
 mod find_symbols;
+mod forwarding;
 mod get_outline;
 mod get_symbol_source;
 mod list_repos;
