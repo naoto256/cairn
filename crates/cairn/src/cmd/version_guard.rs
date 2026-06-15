@@ -4,11 +4,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use cairn_proto::control::StatusReport;
-use cairn_proto::jsonrpc::{JsonRpcVersion, Request, RequestId, Response};
+use cairn_proto::jsonrpc::Response;
 use cairn_proto::version::{VersionCompatibility, pre_one_zero_compat};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+
+use super::rpc_client;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -76,34 +76,18 @@ async fn daemon_version(socket_path: &Path) -> Result<String> {
 }
 
 async fn control_status(socket_path: &Path) -> Result<Response> {
-    let req = Request {
-        jsonrpc: JsonRpcVersion::V2,
-        id: RequestId::Number(1),
-        method: "status".into(),
-        params: Some(Value::Null),
-    };
-    let stream = UnixStream::connect(socket_path).await?;
-    let (read, mut write) = stream.into_split();
-    let mut line = serde_json::to_string(&req)?;
-    line.push('\n');
-    write.write_all(line.as_bytes()).await?;
-    write.flush().await?;
-    let mut reader = BufReader::new(read);
-    let mut buf = String::new();
-    let n = reader.read_line(&mut buf).await?;
-    if n == 0 {
-        return Err(anyhow!("daemon closed the connection without responding"));
-    }
-    serde_json::from_str(buf.trim())
-        .with_context(|| format!("parsing status response: {}", buf.trim()))
+    rpc_client::round_trip(socket_path, "status", Value::Null)
+        .await
+        .context("requesting daemon status")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cairn_proto::control::StatusReport;
-    use cairn_proto::jsonrpc::ok_response;
+    use cairn_proto::jsonrpc::{RequestId, ok_response};
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     #[tokio::test]

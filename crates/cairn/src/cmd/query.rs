@@ -21,7 +21,6 @@
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
 use cairn_proto::Completeness;
-use cairn_proto::jsonrpc::{JsonRpcVersion, Request, RequestId, Response};
 use cairn_proto::methods::{
     FindCalleesResult, FindCallersResult, FindReferencesResult, FindSubtypesResult,
     FindSupertypesResult, FindSymbolResult, GetSymbolSourceResult, ImportsResult, ListReposResult,
@@ -29,9 +28,8 @@ use cairn_proto::methods::{
 };
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
+use super::rpc_client;
 use super::version_guard::{VersionGuardMode, check_daemon_version};
 
 #[derive(ClapArgs, Debug)]
@@ -462,7 +460,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     check_daemon_version(&paths.control, VersionGuardMode::Cli).await?;
 
-    let resp = round_trip(&paths.cairn, method, params)
+    let resp = rpc_client::round_trip(&paths.cairn, method, params)
         .await
         .with_context(|| format!("talking to {}", paths.cairn.display()))?;
 
@@ -555,34 +553,6 @@ fn symbols_query(args: SymbolsQueryArgs<'_>) -> Value {
         p.insert("signature_only".into(), Value::Bool(true));
     }
     Value::Object(p)
-}
-
-async fn round_trip(
-    socket_path: &std::path::Path,
-    method: &str,
-    params: Value,
-) -> Result<Response> {
-    let req = Request {
-        jsonrpc: JsonRpcVersion::V2,
-        id: RequestId::Number(1),
-        method: method.into(),
-        params: Some(params),
-    };
-    let stream = UnixStream::connect(socket_path).await?;
-    let (read, mut write) = stream.into_split();
-    let mut line = serde_json::to_string(&req)?;
-    line.push('\n');
-    write.write_all(line.as_bytes()).await?;
-    write.flush().await?;
-    let mut reader = BufReader::new(read);
-    let mut buf = String::new();
-    let n = reader.read_line(&mut buf).await?;
-    if n == 0 {
-        return Err(anyhow!("daemon closed the connection without responding"));
-    }
-    let resp: Response = serde_json::from_str(buf.trim())
-        .with_context(|| format!("parsing response: {}", buf.trim()))?;
-    Ok(resp)
 }
 
 // ─── rendering ─────────────────────────────────────────────────────────────
