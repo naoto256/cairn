@@ -5,4 +5,5 @@ pub mod ctl;
 pub mod daemon;
 pub mod mcp;
 pub mod query;
+mod rpc_client;
 mod version_guard;
