@@ -71,6 +71,20 @@ pub struct CancelResult {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsPruneSummary {
+    pub repos: Vec<JobsPruneRepoSummary>,
+    pub total_deleted_runs: u64,
+    pub total_deleted_index_entries: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsPruneRepoSummary {
+    pub alias: String,
+    pub deleted_runs_count: u64,
+    pub deleted_index_entries_count: u64,
+}
+
 #[derive(Debug, Clone)]
 struct Job {
     id: JobId,
@@ -166,11 +180,28 @@ impl JobIndex {
             .cloned()
     }
 
-    fn remove(&self, job_id: JobId) {
+    fn remove(&self, job_id: JobId) -> bool {
         self.inner
             .lock()
             .expect("job index lock poisoned")
-            .remove(&job_id);
+            .remove(&job_id)
+            .is_some()
+    }
+
+    fn remove_many(&self, job_ids: &[JobId]) -> u64 {
+        let mut index = self.inner.lock().expect("job index lock poisoned");
+        job_ids
+            .iter()
+            .filter(|job_id| index.remove(job_id).is_some())
+            .count() as u64
+    }
+
+    fn count_present(&self, job_ids: &[JobId]) -> u64 {
+        let index = self.inner.lock().expect("job index lock poisoned");
+        job_ids
+            .iter()
+            .filter(|job_id| index.contains_key(job_id))
+            .count() as u64
     }
 }
 
@@ -675,6 +706,52 @@ impl JobManager {
         Ok(out)
     }
 
+    pub fn prune_jobs(&self, repo_filter: Option<&str>, dry_run: bool) -> Result<JobsPruneSummary> {
+        let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+        let entries = match repo_filter {
+            Some(alias) => {
+                let entry = cas_registry::lookup_by_alias(&index, alias)?.ok_or_else(|| {
+                    Error::RepoNotFound {
+                        alias: alias.into(),
+                    }
+                })?;
+                vec![entry]
+            }
+            None => cas_registry::list_all(&index)?,
+        };
+
+        let mut repos = Vec::with_capacity(entries.len());
+        let mut total_deleted_runs = 0_u64;
+        let mut total_deleted_index_entries = 0_u64;
+        for entry in entries {
+            let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
+            let mut conn = cas_store::open(&store_path)?;
+            let active_orphans = count_orphan_active_runs(&conn)?;
+            if active_orphans > 0 {
+                warn!(
+                    alias = %entry.alias,
+                    active_orphans,
+                    "jobs prune preserved active jobs for manifests no current anchor references"
+                );
+            }
+            let (deleted_runs_count, deleted_index_entries_count) =
+                prune_jobs_in_store(&mut conn, &self.job_index, dry_run)?;
+            total_deleted_runs = total_deleted_runs.saturating_add(deleted_runs_count);
+            total_deleted_index_entries =
+                total_deleted_index_entries.saturating_add(deleted_index_entries_count);
+            repos.push(JobsPruneRepoSummary {
+                alias: entry.alias,
+                deleted_runs_count,
+                deleted_index_entries_count,
+            });
+        }
+        Ok(JobsPruneSummary {
+            repos,
+            total_deleted_runs,
+            total_deleted_index_entries,
+        })
+    }
+
     pub fn cancel(&self, job_id: JobId) -> Result<CancelResult> {
         if let Some(locator) = self.job_index.get(job_id) {
             let store_path = self.cas_data_dir.store_db_path(&locator.repo_hash);
@@ -1086,6 +1163,65 @@ fn collect_current_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSna
     collect_job_rows(&mut stmt, alias)
 }
 
+const ORPHAN_TERMINAL_RUNS_WHERE: &str = "
+    manifest_id NOT IN (SELECT DISTINCT manifest_id FROM anchors)
+    AND status IN ('succeeded', 'failed', 'cancelled', 'skipped', 'timed_out')
+";
+
+fn prune_jobs_in_store(
+    conn: &mut Connection,
+    job_index: &JobIndex,
+    dry_run: bool,
+) -> Result<(u64, u64)> {
+    let job_ids = orphan_terminal_job_ids(conn)?;
+    let deleted_runs_count = count_orphan_terminal_runs(conn)?;
+    if dry_run {
+        return Ok((deleted_runs_count, job_index.count_present(&job_ids)));
+    }
+
+    let tx = conn.transaction()?;
+    let deleted = tx.execute(
+        &format!("DELETE FROM workspace_analysis_runs WHERE {ORPHAN_TERMINAL_RUNS_WHERE}"),
+        [],
+    )?;
+    tx.commit()?;
+
+    let deleted_runs_count = u64::try_from(deleted).unwrap_or(u64::MAX);
+    let deleted_index_entries_count = job_index.remove_many(&job_ids);
+    Ok((deleted_runs_count, deleted_index_entries_count))
+}
+
+fn count_orphan_terminal_runs(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM workspace_analysis_runs WHERE {ORPHAN_TERMINAL_RUNS_WHERE}"),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+fn orphan_terminal_job_ids(conn: &Connection) -> Result<Vec<JobId>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT job_id FROM workspace_analysis_runs
+         WHERE job_id IS NOT NULL AND {ORPHAN_TERMINAL_RUNS_WHERE}"
+    ))?;
+    let job_ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(job_ids)
+}
+
+fn count_orphan_active_runs(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workspace_analysis_runs
+         WHERE manifest_id NOT IN (SELECT DISTINCT manifest_id FROM anchors)
+           AND status IN ('queued', 'running')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 fn collect_job_rows(stmt: &mut rusqlite::Statement<'_>, alias: &str) -> Result<Vec<JobSnapshot>> {
     let rows = stmt
         .query_map([], |r| {
@@ -1303,6 +1439,7 @@ mod tests {
     use crate::cas::{registry as cas_registry, store as cas_store};
     use crate::manifest::ManifestId;
     use crate::paths::CasDataDir;
+    use crate::workspace_analyzer::RunStatus;
 
     use super::{
         DispatchJob, Job, JobId, JobIndex, JobListOptions, JobManager, JobRuntimeMetricsStore,
@@ -1699,6 +1836,62 @@ mod tests {
     }
 
     #[test]
+    fn prune_jobs_removes_orphan_terminal_rows_and_job_index_entries() {
+        let (_data, _repo, manager, conn) = prune_test_manager();
+        insert_manifest(&conn, 1);
+        insert_manifest(&conn, 2);
+        insert_anchor(&conn, "HEAD", 1);
+        insert_job_run(&conn, 1, "current-lsp", "succeeded", Some(12));
+        insert_job_run(&conn, 2, "orphan-terminal-lsp", "succeeded", Some(10));
+        insert_job_run(&conn, 2, "orphan-active-lsp", "running", Some(11));
+        manager.job_index.insert(10, "repo", "repo-hash");
+        manager.job_index.insert(11, "repo", "repo-hash");
+        manager.job_index.insert(12, "repo", "repo-hash");
+
+        let result = manager.prune_jobs(Some("repo"), false).unwrap();
+
+        assert_eq!(result.total_deleted_runs, 1);
+        assert_eq!(result.total_deleted_index_entries, 1);
+        assert_eq!(result.repos[0].deleted_runs_count, 1);
+        assert_eq!(result.repos[0].deleted_index_entries_count, 1);
+        assert_eq!(
+            count_runs(&conn, 2, "orphan-terminal-lsp"),
+            0,
+            "orphan terminal row should be pruned"
+        );
+        assert_eq!(
+            count_runs(&conn, 2, "orphan-active-lsp"),
+            1,
+            "active orphan rows stay visible instead of being hidden by GC"
+        );
+        assert_eq!(
+            count_runs(&conn, 1, "current-lsp"),
+            1,
+            "current-anchor terminal rows are retained"
+        );
+        assert!(manager.job_index.get(10).is_none());
+        assert!(manager.job_index.get(11).is_some());
+        assert!(manager.job_index.get(12).is_some());
+    }
+
+    #[test]
+    fn prune_jobs_dry_run_counts_without_deleting_rows_or_index_entries() {
+        let (_data, _repo, manager, conn) = prune_test_manager();
+        insert_manifest(&conn, 1);
+        insert_manifest(&conn, 2);
+        insert_anchor(&conn, "HEAD", 1);
+        insert_job_run(&conn, 2, "orphan-terminal-lsp", "failed", Some(20));
+        manager.job_index.insert(20, "repo", "repo-hash");
+
+        let result = manager.prune_jobs(None, true).unwrap();
+
+        assert_eq!(result.total_deleted_runs, 1);
+        assert_eq!(result.total_deleted_index_entries, 1);
+        assert_eq!(count_runs(&conn, 2, "orphan-terminal-lsp"), 1);
+        assert!(manager.job_index.get(20).is_some());
+    }
+
+    #[test]
     fn runtime_metrics_decorate_running_progress_rate() {
         let metrics = JobRuntimeMetricsStore::default();
         metrics.mark_enqueued(7, None, 1_000_000_000);
@@ -1793,5 +1986,74 @@ mod tests {
             config_hash: "cfg",
             pool_group: None,
         }
+    }
+
+    fn prune_test_manager() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<JobManager>,
+        rusqlite::Connection,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        {
+            let mut index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(&tx, "repo", repo.path().to_str().unwrap(), "repo-hash", 1)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = cas_store::open(&cas_data_dir.store_db_path("repo-hash")).unwrap();
+        let manager = JobManager::new(cas_data_dir);
+        (data, repo, manager, conn)
+    }
+
+    fn insert_manifest(conn: &rusqlite::Connection, manifest_id: i64) {
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (?1, 'tentative', 0)",
+            [manifest_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_anchor(conn: &rusqlite::Connection, anchor_name: &str, manifest_id: i64) {
+        conn.execute(
+            "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES (?1, ?2, 0)",
+            rusqlite::params![anchor_name, manifest_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_job_run(
+        conn: &rusqlite::Connection,
+        manifest_id: i64,
+        analyzer_id: &str,
+        status: &str,
+        job_id: Option<i64>,
+    ) {
+        let finished_at_ns = RunStatus::from_str(status)
+            .filter(|state| state.is_terminal())
+            .map(|_| 20_i64);
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash, status,
+                started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+             VALUES (?1, ?2, 1, 'cfg', ?3, 10, ?4, NULL, ?5, 0)",
+            rusqlite::params![manifest_id, analyzer_id, status, finished_at_ns, job_id],
+        )
+        .unwrap();
+    }
+
+    fn count_runs(conn: &rusqlite::Connection, manifest_id: i64, analyzer_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM workspace_analysis_runs
+             WHERE manifest_id = ?1 AND analyzer_id = ?2",
+            rusqlite::params![manifest_id, analyzer_id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 }
