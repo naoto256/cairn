@@ -81,6 +81,16 @@ fn collect_jobs(conn: &rusqlite::Connection, alias: &str) -> Result<Vec<JobSnaps
                 started_at: None,
                 finished_at: r.get(4)?,
                 error: r.get(5)?,
+                pool_group: None,
+                scheduler_state: None,
+                enqueued_at: None,
+                run_started_at: None,
+                queued_ms: None,
+                pool_wait_ms: None,
+                run_ms: None,
+                progress_ticks: None,
+                last_progress_at: None,
+                progress_per_minute: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

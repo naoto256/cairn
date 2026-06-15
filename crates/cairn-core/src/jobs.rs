@@ -37,7 +37,7 @@ pub struct QueuedAnalyzerJob {
     pub state: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobSnapshot {
     pub job_id: JobId,
     pub alias: String,
@@ -47,6 +47,16 @@ pub struct JobSnapshot {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+    pub pool_group: Option<String>,
+    pub scheduler_state: Option<String>,
+    pub enqueued_at: Option<i64>,
+    pub run_started_at: Option<i64>,
+    pub queued_ms: Option<u64>,
+    pub pool_wait_ms: Option<u64>,
+    pub run_ms: Option<u64>,
+    pub progress_ticks: Option<u64>,
+    pub last_progress_at: Option<i64>,
+    pub progress_per_minute: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,12 +81,155 @@ struct Job {
     analyzer_id: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct JobRuntimeMetricsStore {
+    inner: Arc<Mutex<HashMap<JobId, JobRuntimeMetrics>>>,
+}
+
+// Runtime-only scheduler metrics make active jobs diagnosable without a CAS
+// schema bump. Historical rows after daemon restart simply omit these optional
+// fields on the wire.
+#[derive(Debug, Clone)]
+struct JobRuntimeMetrics {
+    enqueued_at_ns: i64,
+    pool_group: Option<String>,
+    scheduler_state: String,
+    pool_wait_started_at_ns: Option<i64>,
+    pool_wait_ms: u64,
+    run_started_at_ns: Option<i64>,
+    finished_at_ns: Option<i64>,
+    progress_ticks: u64,
+    last_progress_at_ns: Option<i64>,
+}
+
+impl JobRuntimeMetricsStore {
+    fn mark_enqueued(&self, job_id: JobId, pool_group: Option<&'static str>, enqueued_at_ns: i64) {
+        self.inner
+            .lock()
+            .expect("job metrics lock poisoned")
+            .insert(
+                job_id,
+                JobRuntimeMetrics {
+                    enqueued_at_ns,
+                    pool_group: pool_group.map(str::to_string),
+                    scheduler_state: "queued".into(),
+                    pool_wait_started_at_ns: None,
+                    pool_wait_ms: 0,
+                    run_started_at_ns: None,
+                    finished_at_ns: None,
+                    progress_ticks: 0,
+                    last_progress_at_ns: None,
+                },
+            );
+    }
+
+    fn mark_waiting_pool_group(&self, job_id: JobId, pool_group: &'static str) {
+        let now = now_ns();
+        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
+        let entry = metrics.entry(job_id).or_insert_with(|| JobRuntimeMetrics {
+            enqueued_at_ns: now,
+            pool_group: Some(pool_group.to_string()),
+            scheduler_state: "queued".into(),
+            pool_wait_started_at_ns: None,
+            pool_wait_ms: 0,
+            run_started_at_ns: None,
+            finished_at_ns: None,
+            progress_ticks: 0,
+            last_progress_at_ns: None,
+        });
+        entry.pool_group = Some(pool_group.to_string());
+        entry.scheduler_state = "waiting_pool_group".into();
+        entry.pool_wait_started_at_ns.get_or_insert(now);
+    }
+
+    fn mark_running(&self, job_id: JobId) {
+        let now = now_ns();
+        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
+        if let Some(entry) = metrics.get_mut(&job_id) {
+            if let Some(started) = entry.pool_wait_started_at_ns.take() {
+                entry.pool_wait_ms = entry
+                    .pool_wait_ms
+                    .saturating_add(duration_ms(started, now).unwrap_or(0));
+            }
+            entry.scheduler_state = "running".into();
+            entry.run_started_at_ns.get_or_insert(now);
+        }
+    }
+
+    fn mark_progress(&self, job_id: JobId, ticks: u64) {
+        let now = now_ns();
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("job metrics lock poisoned")
+            .get_mut(&job_id)
+        {
+            entry.progress_ticks = ticks;
+            entry.last_progress_at_ns = Some(now);
+        }
+    }
+
+    fn mark_finished(&self, job_id: JobId, state: &str) {
+        let now = now_ns();
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("job metrics lock poisoned")
+            .get_mut(&job_id)
+        {
+            if let Some(started) = entry.pool_wait_started_at_ns.take() {
+                entry.pool_wait_ms = entry
+                    .pool_wait_ms
+                    .saturating_add(duration_ms(started, now).unwrap_or(0));
+            }
+            entry.scheduler_state = state.to_string();
+            entry.finished_at_ns = Some(now);
+        }
+    }
+
+    fn decorate(&self, snapshot: &mut JobSnapshot, observed_at_ns: i64) {
+        let metrics = self.inner.lock().expect("job metrics lock poisoned");
+        let Some(entry) = metrics.get(&snapshot.job_id) else {
+            return;
+        };
+        snapshot.pool_group = entry.pool_group.clone();
+        snapshot.scheduler_state = Some(entry.scheduler_state.clone());
+        snapshot.enqueued_at = Some(entry.enqueued_at_ns);
+        snapshot.run_started_at = entry.run_started_at_ns;
+        snapshot.queued_ms = entry
+            .run_started_at_ns
+            .or(entry.finished_at_ns)
+            .or_else(|| matches!(snapshot.state.as_str(), "queued").then_some(observed_at_ns))
+            .and_then(|end| duration_ms(entry.enqueued_at_ns, end));
+        let pool_wait_ms = entry.pool_wait_ms.saturating_add(
+            entry
+                .pool_wait_started_at_ns
+                .and_then(|started| duration_ms(started, observed_at_ns))
+                .unwrap_or(0),
+        );
+        snapshot.pool_wait_ms =
+            (entry.pool_group.is_some() || pool_wait_ms > 0).then_some(pool_wait_ms);
+        snapshot.run_ms = entry.run_started_at_ns.and_then(|started| {
+            duration_ms(started, entry.finished_at_ns.unwrap_or(observed_at_ns))
+        });
+        snapshot.progress_ticks = Some(entry.progress_ticks);
+        snapshot.last_progress_at = entry.last_progress_at_ns;
+        snapshot.progress_per_minute = match (snapshot.run_ms, entry.progress_ticks) {
+            (Some(run_ms), ticks) if run_ms > 0 && ticks > 0 => {
+                Some((ticks as f64) * 60_000.0 / (run_ms as f64))
+            }
+            _ => None,
+        };
+    }
+}
+
 pub struct JobManager {
     cas_data_dir: Arc<CasDataDir>,
     sender: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     receiver: Arc<AsyncMutex<mpsc::UnboundedReceiver<Job>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     pool_group_locks: PoolGroupLocks,
+    runtime_metrics: JobRuntimeMetricsStore,
 }
 
 pub struct EnqueueReindex<'a> {
@@ -99,6 +252,7 @@ impl JobManager {
             receiver: Arc::new(AsyncMutex::new(receiver)),
             workers: Mutex::new(Vec::new()),
             pool_group_locks: PoolGroupLocks::default(),
+            runtime_metrics: JobRuntimeMetricsStore::default(),
         })
     }
 
@@ -145,6 +299,11 @@ impl JobManager {
                      WHERE manifest_id = ?2 AND analyzer_id = ?3",
                     params![next_id, manifest_id, analyzer_id],
                 )?;
+                self.runtime_metrics.mark_enqueued(
+                    next_id,
+                    pool_group_for_analyzer_id(&analyzer_id).ok().flatten(),
+                    now_ns(),
+                );
             }
             let mut stmt = conn.prepare(
                 "SELECT job_id, manifest_id, analyzer_id
@@ -162,6 +321,11 @@ impl JobManager {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (id, manifest_id, analyzer_id) in rows {
+                self.runtime_metrics.mark_enqueued(
+                    id,
+                    pool_group_for_analyzer_id(&analyzer_id).ok().flatten(),
+                    now_ns(),
+                );
                 self.enqueue_memory(Job {
                     id,
                     alias: entry.alias.clone(),
@@ -190,6 +354,7 @@ impl JobManager {
         for (job_id, analyzer) in (first_id..).zip(all_workspace_analyzers()) {
             let analyzer_id = analyzer.id();
             let analyzer_revision = analyzer.revision();
+            let pool_group = analyzer.pool_group();
             let cfg = config_hash(repo_root, analyzer.config_paths());
             mark_run(
                 conn,
@@ -211,6 +376,8 @@ impl JobManager {
                  WHERE manifest_id = ?1 AND analyzer_id = ?2",
                 params![manifest_id.0, analyzer_id],
             )?;
+            self.runtime_metrics
+                .mark_enqueued(job_id, pool_group, now_ns);
             self.enqueue_memory(Job {
                 id: job_id,
                 alias: alias.to_string(),
@@ -253,6 +420,10 @@ impl JobManager {
             } else {
                 collect_current_job_rows(&conn, &entry.alias)?
             };
+            let observed_at_ns = now_ns();
+            for row in &mut rows {
+                self.runtime_metrics.decorate(row, observed_at_ns);
+            }
             if !options.include_all {
                 rows = latest_default_job_rows(rows);
             }
@@ -293,6 +464,8 @@ impl JobManager {
                          WHERE job_id = ?2",
                         params![now_ns(), job_id],
                     )?;
+                    self.runtime_metrics
+                        .mark_finished(job_id, RunStatus::Cancelled.as_str());
                     return Ok(CancelResult {
                         cancelled: true,
                         reason: "queued job cancelled".into(),
@@ -370,9 +543,11 @@ impl JobManager {
     async fn run_job(&self, job: Job) -> Result<()> {
         let pool_group = pool_group_for_analyzer_id(&job.analyzer_id)?;
         let _pool_group_guard = if let Some(group) = pool_group {
+            self.runtime_metrics.mark_waiting_pool_group(job.id, group);
             let wait_started = Instant::now();
             let guard = self.pool_group_locks.lock(group).await;
             let wait_elapsed = wait_started.elapsed();
+            self.runtime_metrics.mark_running(job.id);
             if wait_elapsed.as_millis() > 0 {
                 debug!(
                     alias = %job.alias,
@@ -385,9 +560,11 @@ impl JobManager {
             }
             Some(guard)
         } else {
+            self.runtime_metrics.mark_running(job.id);
             None
         };
-        tokio::task::spawn_blocking(move || run_job_blocking(job))
+        let runtime_metrics = self.runtime_metrics.clone();
+        tokio::task::spawn_blocking(move || run_job_blocking(job, runtime_metrics))
             .await
             .map_err(|e| Error::internal_task_panic("analyzer job", e))?
     }
@@ -426,6 +603,16 @@ fn collect_job_rows(stmt: &mut rusqlite::Statement<'_>, alias: &str) -> Result<V
                 started_at: None,
                 finished_at: r.get(4)?,
                 error: r.get(5)?,
+                pool_group: None,
+                scheduler_state: None,
+                enqueued_at: None,
+                run_started_at: None,
+                queued_ms: None,
+                pool_wait_ms: None,
+                run_ms: None,
+                progress_ticks: None,
+                last_progress_at: None,
+                progress_per_minute: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -494,7 +681,7 @@ fn pool_group_for_analyzer_id(analyzer_id: &str) -> Result<Option<&'static str>>
         .ok_or_else(|| Error::InvalidArgument(format!("unknown analyzer: {analyzer_id}")))
 }
 
-fn run_job_blocking(job: Job) -> Result<()> {
+fn run_job_blocking(job: Job, runtime_metrics: JobRuntimeMetricsStore) -> Result<()> {
     let mut conn = cas_store::open(&job.store_path)?;
     let row: Option<(String, i64)> = conn
         .query_row(
@@ -517,6 +704,7 @@ fn run_job_blocking(job: Job) -> Result<()> {
              WHERE job_id = ?2",
             params![now_ns(), job.id],
         )?;
+        runtime_metrics.mark_finished(job.id, RunStatus::Cancelled.as_str());
         return Ok(());
     }
     if state != RunStatus::Queued.as_str() && state != RunStatus::Running.as_str() {
@@ -529,6 +717,12 @@ fn run_job_blocking(job: Job) -> Result<()> {
         .ok_or_else(|| Error::InvalidArgument(format!("unknown analyzer: {}", job.analyzer_id)))?;
     let entries = manifest::get_entries(&conn, job.manifest_id)?;
     let now = now_ns();
+    let progress_metrics = runtime_metrics.clone();
+    let job_id = job.id;
+    let progress_observer: crate::workspace_analyzer::AnalyzerProgressObserver =
+        Arc::new(move |ticks| {
+            progress_metrics.mark_progress(job_id, ticks);
+        });
     info!(
         alias = %job.alias,
         analyzer_id = %job.analyzer_id,
@@ -545,8 +739,10 @@ fn run_job_blocking(job: Job) -> Result<()> {
             now_ns: now,
             analyzer_stall_timeout: ANALYZER_STALL_TIMEOUT,
             job_id: Some(job.id),
+            progress_observer: Some(progress_observer),
         },
     )?;
+    runtime_metrics.mark_finished(job.id, outcome.status.as_str());
     info!(
         alias = %job.alias,
         analyzer_id = %job.analyzer_id,
@@ -574,6 +770,11 @@ fn now_ns() -> i64 {
             .unwrap_or_default(),
     )
     .unwrap_or(i64::MAX)
+}
+
+fn duration_ms(start_ns: i64, end_ns: i64) -> Option<u64> {
+    let delta = end_ns.checked_sub(start_ns)?;
+    u64::try_from(delta / 1_000_000).ok()
 }
 
 fn worker_concurrency() -> usize {
@@ -623,8 +824,8 @@ mod tests {
     use tracing::{Event, Level, Metadata, Subscriber};
 
     use super::{
-        JobSnapshot, MAX_WORKER_CONCURRENCY, PoolGroupLocks, latest_default_job_rows,
-        worker_concurrency_from_env_value,
+        JobRuntimeMetricsStore, JobSnapshot, MAX_WORKER_CONCURRENCY, PoolGroupLocks,
+        latest_default_job_rows, now_ns, worker_concurrency_from_env_value,
     };
 
     #[derive(Default)]
@@ -833,6 +1034,42 @@ mod tests {
         waiter.await.expect("different-group waiter task panicked");
     }
 
+    #[test]
+    fn runtime_metrics_decorate_pool_waiting_job() {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(42, Some("clangd-lsp"), 1_000_000_000);
+        metrics.mark_waiting_pool_group(42, "clangd-lsp");
+
+        let mut snapshot = job(42, "clangd-cpp-lsp", "queued");
+        metrics.decorate(&mut snapshot, 2_500_000_000);
+
+        assert_eq!(snapshot.pool_group.as_deref(), Some("clangd-lsp"));
+        assert_eq!(
+            snapshot.scheduler_state.as_deref(),
+            Some("waiting_pool_group")
+        );
+        assert_eq!(snapshot.enqueued_at, Some(1_000_000_000));
+        assert!(snapshot.queued_ms.is_some_and(|ms| ms >= 1500));
+        assert!(snapshot.pool_wait_ms.is_some());
+    }
+
+    #[test]
+    fn runtime_metrics_decorate_running_progress_rate() {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(7, None, 1_000_000_000);
+        metrics.mark_running(7);
+        metrics.mark_progress(7, 120);
+        std::thread::sleep(Duration::from_millis(2));
+
+        let mut snapshot = job(7, "pyright-lsp", "running");
+        metrics.decorate(&mut snapshot, now_ns());
+
+        assert_eq!(snapshot.scheduler_state.as_deref(), Some("running"));
+        assert_eq!(snapshot.progress_ticks, Some(120));
+        assert!(snapshot.last_progress_at.is_some());
+        assert!(snapshot.progress_per_minute.is_some());
+    }
+
     fn job(job_id: i64, analyzer_id: &str, state: &str) -> JobSnapshot {
         JobSnapshot {
             job_id,
@@ -843,6 +1080,16 @@ mod tests {
             started_at: None,
             finished_at: None,
             error: None,
+            pool_group: None,
+            scheduler_state: None,
+            enqueued_at: None,
+            run_started_at: None,
+            queued_ms: None,
+            pool_wait_ms: None,
+            run_ms: None,
+            progress_ticks: None,
+            last_progress_at: None,
+            progress_per_minute: None,
         }
     }
 }

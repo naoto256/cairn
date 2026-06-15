@@ -50,6 +50,16 @@ impl ControlMethod for JobsList {
                     started_at: job.started_at,
                     finished_at: job.finished_at,
                     error: job.error,
+                    pool_group: job.pool_group,
+                    scheduler_state: job.scheduler_state,
+                    enqueued_at: job.enqueued_at,
+                    run_started_at: job.run_started_at,
+                    queued_ms: job.queued_ms,
+                    pool_wait_ms: job.pool_wait_ms,
+                    run_ms: job.run_ms,
+                    progress_ticks: job.progress_ticks,
+                    last_progress_at: job.last_progress_at,
+                    progress_per_minute: job.progress_per_minute,
                 })
                 .collect(),
         })
