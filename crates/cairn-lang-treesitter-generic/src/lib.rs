@@ -148,6 +148,89 @@ pub fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
     std::str::from_utf8(&source[node.byte_range()]).unwrap_or("")
 }
 
+/// How a language-specific doc classifier wants a preceding sibling to
+/// affect the current doc run.
+pub enum DocCommentPart {
+    /// Add one line/block to the current contiguous doc run.
+    Append(String),
+    /// Replace the current run with one block. Used for block doc
+    /// comments where the closest block wins over earlier comments.
+    Replace(String),
+    /// Clear any candidate doc seen so far.
+    Reset,
+}
+
+/// Extract the doc comment immediately above `node`.
+///
+/// Tree-sitter exposes comments as extra sibling nodes in most grammars,
+/// but each language has different marker rules (`#`, `///`, `/** */`,
+/// Javadoc vs plain block comments). This helper owns the adjacency
+/// policy while callers decide whether a sibling is a doc, a reset, or
+/// irrelevant extra trivia.
+#[must_use]
+pub fn extract_doc_above_node(
+    node: Node<'_>,
+    source: &[u8],
+    mut classify: impl FnMut(Node<'_>, &str) -> Option<DocCommentPart>,
+) -> Option<String> {
+    let parent = node.parent()?;
+    let mut cursor = parent.walk();
+    let mut lines: Vec<String> = Vec::new();
+    let mut prev_end_row: Option<usize> = None;
+
+    for sibling in parent.children(&mut cursor) {
+        if sibling.start_byte() >= node.start_byte() {
+            break;
+        }
+        let sibling_text = node_text(sibling, source);
+        match classify(sibling, sibling_text) {
+            Some(DocCommentPart::Append(text)) => {
+                if prev_end_row.is_some_and(|prev| sibling.start_position().row > prev + 1) {
+                    lines.clear();
+                }
+                lines.push(text);
+                prev_end_row = Some(occupied_end_row(sibling, sibling_text));
+            }
+            Some(DocCommentPart::Replace(text)) => {
+                if prev_end_row.is_some_and(|prev| sibling.start_position().row > prev + 1) {
+                    lines.clear();
+                }
+                lines.clear();
+                lines.push(text);
+                prev_end_row = Some(occupied_end_row(sibling, sibling_text));
+            }
+            Some(DocCommentPart::Reset) => {
+                lines.clear();
+                prev_end_row = None;
+            }
+            None if !sibling.is_extra() => {
+                lines.clear();
+                prev_end_row = None;
+            }
+            None => {}
+        }
+    }
+
+    if prev_end_row.is_some_and(|prev| node.start_position().row > prev + 1) {
+        return None;
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(truncate(&lines.join("\n"), 1024))
+    }
+}
+
+fn occupied_end_row(node: Node<'_>, text: &str) -> usize {
+    let trailing_newlines = text
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\n')
+        .count();
+    node.end_position().row.saturating_sub(trailing_newlines)
+}
+
 /// 1-based line number for a tree-sitter point (which uses 0-based rows).
 #[must_use]
 pub fn line_of(node: Node<'_>) -> u32 {
@@ -219,6 +302,7 @@ pub fn signature_slice(node: Node<'_>, source: &[u8], body_start: Option<usize>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Parser;
 
     #[test]
     fn collapse_ws_normalizes_runs() {
@@ -239,6 +323,73 @@ mod tests {
     #[test]
     fn truncate_short_input_unchanged() {
         assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    #[test]
+    fn extract_doc_above_node_collects_adjacent_run_and_strips_markers() {
+        let src = "/// first\n/// second\nfn f() {}\n";
+
+        let doc = first_function_doc(src);
+
+        assert_eq!(doc.as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn extract_doc_above_node_breaks_on_blank_line() {
+        let src = "/// stale\n\nfn f() {}\n";
+
+        let doc = first_function_doc(src);
+
+        assert_eq!(doc, None);
+    }
+
+    #[test]
+    fn extract_doc_above_node_resets_on_non_doc_comment() {
+        let src = "/// stale\n// plain\nfn f() {}\n";
+
+        let doc = first_function_doc(src);
+
+        assert_eq!(doc, None);
+    }
+
+    #[test]
+    fn extract_doc_above_node_replace_keeps_closest_block() {
+        let src = "/** old */\n/** new */\nfn f() {}\n";
+
+        let doc = first_function_doc(src);
+
+        assert_eq!(doc.as_deref(), Some("new"));
+    }
+
+    fn first_function_doc(src: &str) -> Option<String> {
+        let mut parser = Parser::new();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let node = root
+            .children(&mut cursor)
+            .find(|node| node.kind() == "function_item")
+            .expect("function_item missing");
+        extract_doc_above_node(node, src.as_bytes(), rust_doc_part)
+    }
+
+    fn rust_doc_part(node: Node<'_>, text: &str) -> Option<DocCommentPart> {
+        if node.kind() != "line_comment" && node.kind() != "block_comment" {
+            return None;
+        }
+        let trimmed = text.trim();
+        if let Some(rest) = trimmed.strip_prefix("///") {
+            Some(DocCommentPart::Append(rest.trim().to_string()))
+        } else if let Some(inner) = trimmed
+            .strip_prefix("/**")
+            .and_then(|s| s.strip_suffix("*/"))
+        {
+            Some(DocCommentPart::Replace(inner.trim().to_string()))
+        } else {
+            Some(DocCommentPart::Reset)
+        }
     }
 }
 

@@ -49,8 +49,8 @@ use cairn_lang_api::{
     SymbolFact, SymbolKind, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
-    NestingTracker, Visitor, child_by_field, end_line_of, extract, line_of, node_text,
-    signature_slice, truncate,
+    DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
+    extract_doc_above_node, line_of, node_text, signature_slice,
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
@@ -869,35 +869,9 @@ fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
 }
 
 fn doc_from_preceding_comments(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut lines: Vec<String> = Vec::new();
-    let mut prev_end_row: Option<usize> = None;
-
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
-        }
-        if sibling.kind() == "comment" {
-            let start_row = sibling.start_position().row;
-            if let Some(prev) = prev_end_row {
-                if start_row > prev + 1 {
-                    lines.clear();
-                }
-            }
-            lines.push(strip_c_comment_marker(node_text(sibling, source)));
-            prev_end_row = Some(sibling.end_position().row);
-        } else if !sibling.is_extra() {
-            lines.clear();
-            prev_end_row = None;
-        }
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(truncate(&lines.join("\n"), 1024))
-    }
+    extract_doc_above_node(node, source, |sibling, text| {
+        (sibling.kind() == "comment").then(|| DocCommentPart::Append(strip_c_comment_marker(text)))
+    })
 }
 
 fn strip_c_comment_marker(text: &str) -> String {

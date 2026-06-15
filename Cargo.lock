@@ -506,6 +506,7 @@ version = "0.4.2"
 dependencies = [
  "cairn-lang-api",
  "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]
