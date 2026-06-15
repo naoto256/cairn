@@ -38,9 +38,9 @@ impl DataMethod for GetSymbolSource {
         let qualified = args.qualified.clone();
         let file_filter = args.file.clone();
         let signature_only = args.signature_only;
-        let anchor_arg = args.anchor.clone();
-        let branch_arg = args.branch.clone();
-        let requested_repo = args.repo.clone();
+        let anchor_arg = args.scope.anchor.clone();
+        let branch_arg = args.scope.branch.clone();
+        let requested_repo = args.scope.repo.clone();
         let cas_data_dir = ctx.cas_data_dir.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {
