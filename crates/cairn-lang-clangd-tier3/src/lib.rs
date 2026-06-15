@@ -27,8 +27,9 @@ use cairn_core::lsp::pool::{AvailabilityStrategy, LspSpawnSpec, ReadinessStrateg
 use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
-    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector,
+    LspMultiKindDefinitionPass, RefKind, WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts,
+    WorkspaceFile, run_lsp_multi_kind_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -218,46 +219,26 @@ fn run_clangd_passes(
     files: &[WorkspaceFile],
     progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
-    let mut facts = run_clangd_pass(
-        language,
-        repo_root,
-        files,
-        RefKind::Call,
-        call_collector_for(language),
-        progress,
-    )?;
-    let include_facts = run_clangd_pass(
-        language,
-        repo_root,
-        files,
-        RefKind::Import,
-        include_collector_for(language),
-        progress,
-    )?;
-    facts.resolved_refs.extend(include_facts.resolved_refs);
-    Ok(facts)
-}
-
-fn run_clangd_pass(
-    language: ClangdLanguage,
-    repo_root: &Path,
-    files: &[WorkspaceFile],
-    ref_kind: RefKind,
-    collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
-    progress: &AnalyzerProgress,
-) -> Result<WorkspaceFacts> {
-    run_lsp_definition_pass(
-        LspDefinitionPass {
+    run_lsp_multi_kind_definition_pass(
+        LspMultiKindDefinitionPass {
             analyzer_id: language.analyzer_id,
             pool_analyzer_id: Some(CLANGD_POOL_ID),
             language: "clangd",
-            ref_kind,
             spawn_spec: clangd_spawn_spec(language, repo_root),
             retry: DefinitionRetryPolicy {
                 retry_empty_definition: true,
                 retry_file_not_found: true,
             },
-            collect_definition_sites: collect,
+            collectors: vec![
+                LspDefinitionCollector {
+                    ref_kind: RefKind::Call,
+                    collect_definition_sites: call_collector_for(language),
+                },
+                LspDefinitionCollector {
+                    ref_kind: RefKind::Import,
+                    collect_definition_sites: include_collector_for(language),
+                },
+            ],
         },
         repo_root,
         files,
@@ -788,12 +769,11 @@ void f() { normal(); }
         fs::write(&script, mock_lsp_script()).unwrap();
         let target_uri = Url::from_file_path(&target).unwrap().as_str().to_string();
 
-        let facts = run_lsp_definition_pass(
-            LspDefinitionPass {
+        let facts = run_lsp_multi_kind_definition_pass(
+            LspMultiKindDefinitionPass {
                 analyzer_id: "mock-clangd-c-lsp-close",
                 pool_analyzer_id: Some("mock-clangd-lsp-close"),
                 language: "mock-clangd-close",
-                ref_kind: RefKind::Call,
                 spawn_spec: LspSpawnSpec {
                     binary: python,
                     workspace_root: tmp.path().to_path_buf(),
@@ -811,7 +791,10 @@ void f() { normal(); }
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),
-                collect_definition_sites: collect_c_calls,
+                collectors: vec![LspDefinitionCollector {
+                    ref_kind: RefKind::Call,
+                    collect_definition_sites: collect_c_calls,
+                }],
             },
             tmp.path(),
             &[WorkspaceFile {
@@ -872,12 +855,11 @@ void f() { normal(); }
         let script = repo_root.join("mock_lsp.py");
         fs::write(&script, mock_lsp_script()).unwrap();
         let target_uri = Url::from_file_path(target).unwrap().as_str().to_string();
-        run_lsp_definition_pass(
-            LspDefinitionPass {
+        run_lsp_multi_kind_definition_pass(
+            LspMultiKindDefinitionPass {
                 analyzer_id: "mock-clangd-c-lsp",
                 pool_analyzer_id: Some("mock-clangd-lsp"),
                 language: "mock-clangd",
-                ref_kind,
                 spawn_spec: LspSpawnSpec {
                     binary: python.to_path_buf(),
                     workspace_root: repo_root.to_path_buf(),
@@ -891,7 +873,10 @@ void f() { normal(); }
                     initialization_options: json!({}),
                 },
                 retry: DefinitionRetryPolicy::default(),
-                collect_definition_sites: collect,
+                collectors: vec![LspDefinitionCollector {
+                    ref_kind,
+                    collect_definition_sites: collect,
+                }],
             },
             repo_root,
             &[WorkspaceFile {
