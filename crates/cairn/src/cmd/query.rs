@@ -78,7 +78,10 @@ enum QueryCommand {
         limit: Option<u32>,
     },
     /// Look up a definition by name (function, struct, method, …).
-    #[command(alias = "find-symbols")]
+    #[command(
+        alias = "find-symbols",
+        long_about = "Look up a definition by name (function, struct, method, ...).\n\nIf results are empty, relax one dimension at a time: try the exact name without --fuzzy, add a prefix wildcard such as \"Analyzer*\", or remove --container / --path / --kind filters."
+    )]
     Symbols {
         /// Symbol query — exact name unless `--fuzzy`.
         query: String,
