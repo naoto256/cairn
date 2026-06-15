@@ -5,15 +5,15 @@
 //! daemon-visible job state and keeps the expensive LSP-backed work out
 //! of short-lived control requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -75,10 +75,138 @@ pub struct CancelResult {
 struct Job {
     id: JobId,
     alias: String,
+    repo_hash: String,
     store_path: PathBuf,
     repo_root: PathBuf,
     manifest_id: ManifestId,
     analyzer_id: String,
+}
+
+struct QueueAnalyzerRun<'a> {
+    conn: &'a mut Connection,
+    alias: &'a str,
+    repo_hash: &'a str,
+    repo_root: &'a Path,
+    manifest_id: ManifestId,
+    now_ns: i64,
+    job_id: JobId,
+    analyzer_id: &'a str,
+    analyzer_revision: u32,
+    config_hash: &'a str,
+    pool_group: Option<&'static str>,
+}
+
+#[derive(Debug)]
+enum SchedulerMsg {
+    Enqueue(Job),
+    WorkerFinished {
+        job_id: JobId,
+        pool_group: Option<&'static str>,
+        key: JobKey,
+    },
+    Cancel(JobId),
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct DispatchJob {
+    job: Job,
+    pool_group: Option<&'static str>,
+    key: JobKey,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct JobKey {
+    manifest_id: ManifestId,
+    analyzer_id: String,
+}
+
+impl JobKey {
+    fn from_job(job: &Job) -> Self {
+        Self {
+            manifest_id: job.manifest_id,
+            analyzer_id: job.analyzer_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum GroupLane {
+    Pooled(&'static str),
+    Unpooled,
+}
+
+#[derive(Debug, Clone)]
+struct JobLocator {
+    alias: String,
+    repo_hash: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JobIndex {
+    inner: Arc<Mutex<HashMap<JobId, JobLocator>>>,
+}
+
+impl JobIndex {
+    fn insert(&self, job_id: JobId, alias: &str, repo_hash: &str) {
+        self.inner.lock().expect("job index lock poisoned").insert(
+            job_id,
+            JobLocator {
+                alias: alias.to_string(),
+                repo_hash: repo_hash.to_string(),
+            },
+        );
+    }
+
+    fn get(&self, job_id: JobId) -> Option<JobLocator> {
+        self.inner
+            .lock()
+            .expect("job index lock poisoned")
+            .get(&job_id)
+            .cloned()
+    }
+
+    fn remove(&self, job_id: JobId) {
+        self.inner
+            .lock()
+            .expect("job index lock poisoned")
+            .remove(&job_id);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TrackedJobKeys {
+    inner: Arc<Mutex<HashSet<JobKey>>>,
+}
+
+impl TrackedJobKeys {
+    fn reserve_after(
+        &self,
+        key: JobKey,
+        write_current_row: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        let mut keys = self.inner.lock().expect("tracked job key lock poisoned");
+        if keys.contains(&key) {
+            return Ok(false);
+        }
+        write_current_row()?;
+        keys.insert(key);
+        Ok(true)
+    }
+
+    fn reserve_existing(&self, key: JobKey) -> bool {
+        self.inner
+            .lock()
+            .expect("tracked job key lock poisoned")
+            .insert(key)
+    }
+
+    fn release(&self, key: &JobKey) {
+        self.inner
+            .lock()
+            .expect("tracked job key lock poisoned")
+            .remove(key);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,11 +353,15 @@ impl JobRuntimeMetricsStore {
 
 pub struct JobManager {
     cas_data_dir: Arc<CasDataDir>,
-    sender: Mutex<Option<mpsc::UnboundedSender<Job>>>,
-    receiver: Arc<AsyncMutex<mpsc::UnboundedReceiver<Job>>>,
+    scheduler_sender: Mutex<Option<mpsc::UnboundedSender<SchedulerMsg>>>,
+    scheduler_receiver: Mutex<Option<mpsc::UnboundedReceiver<SchedulerMsg>>>,
+    scheduler: Mutex<Option<JoinHandle<()>>>,
+    worker_sender: Mutex<Option<mpsc::UnboundedSender<DispatchJob>>>,
+    worker_receiver: Arc<AsyncMutex<mpsc::UnboundedReceiver<DispatchJob>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
-    pool_group_locks: PoolGroupLocks,
     runtime_metrics: JobRuntimeMetricsStore,
+    job_index: JobIndex,
+    tracked_keys: TrackedJobKeys,
 }
 
 pub struct EnqueueReindex<'a> {
@@ -245,14 +377,19 @@ pub struct EnqueueReindex<'a> {
 impl JobManager {
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Arc<Self> {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (scheduler_sender, scheduler_receiver) = mpsc::unbounded_channel();
+        let (worker_sender, worker_receiver) = mpsc::unbounded_channel();
         Arc::new(Self {
             cas_data_dir,
-            sender: Mutex::new(Some(sender)),
-            receiver: Arc::new(AsyncMutex::new(receiver)),
+            scheduler_sender: Mutex::new(Some(scheduler_sender)),
+            scheduler_receiver: Mutex::new(Some(scheduler_receiver)),
+            scheduler: Mutex::new(None),
+            worker_sender: Mutex::new(Some(worker_sender)),
+            worker_receiver: Arc::new(AsyncMutex::new(worker_receiver)),
             workers: Mutex::new(Vec::new()),
-            pool_group_locks: PoolGroupLocks::default(),
             runtime_metrics: JobRuntimeMetricsStore::default(),
+            job_index: JobIndex::default(),
+            tracked_keys: TrackedJobKeys::default(),
         })
     }
 
@@ -268,7 +405,35 @@ impl JobManager {
                 .expect("job worker lock poisoned")
                 .push(handle);
         }
-        info!(workers, "job workers started");
+        let scheduler_receiver = self
+            .scheduler_receiver
+            .lock()
+            .expect("job scheduler receiver lock poisoned")
+            .take();
+        if let Some(receiver) = scheduler_receiver {
+            let worker_sender = self
+                .worker_sender
+                .lock()
+                .expect("job worker sender lock poisoned")
+                .as_ref()
+                .cloned();
+            if let Some(worker_sender) = worker_sender {
+                let runtime_metrics = self.runtime_metrics.clone();
+                let tracked_keys = self.tracked_keys.clone();
+                let handle = tokio::spawn(async move {
+                    scheduler_loop(
+                        receiver,
+                        worker_sender,
+                        workers,
+                        runtime_metrics,
+                        tracked_keys,
+                    )
+                    .await;
+                });
+                *self.scheduler.lock().expect("job scheduler lock poisoned") = Some(handle);
+            }
+        }
+        info!(workers, "job scheduler and workers started");
     }
 
     pub fn restore_from_db(&self) -> Result<()> {
@@ -321,19 +486,34 @@ impl JobManager {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (id, manifest_id, analyzer_id) in rows {
+                let analyzer_id_for_key = analyzer_id.clone();
+                let key = JobKey {
+                    manifest_id,
+                    analyzer_id: analyzer_id_for_key.clone(),
+                };
+                if !self.tracked_keys.reserve_existing(key) {
+                    continue;
+                }
                 self.runtime_metrics.mark_enqueued(
                     id,
                     pool_group_for_analyzer_id(&analyzer_id).ok().flatten(),
                     now_ns(),
                 );
-                self.enqueue_memory(Job {
+                let enqueued = self.enqueue_memory(Job {
                     id,
                     alias: entry.alias.clone(),
+                    repo_hash: entry.repo_hash.clone(),
                     store_path: store_path.clone(),
                     repo_root: PathBuf::from(&entry.root_path),
                     manifest_id,
                     analyzer_id,
                 });
+                if !enqueued {
+                    self.tracked_keys.release(&JobKey {
+                        manifest_id,
+                        analyzer_id: analyzer_id_for_key,
+                    });
+                }
             }
         }
         Ok(())
@@ -356,13 +536,58 @@ impl JobManager {
             let analyzer_revision = analyzer.revision();
             let pool_group = analyzer.pool_group();
             let cfg = config_hash(repo_root, analyzer.config_paths());
+            if let Some(job) = self.queue_analyzer_run(QueueAnalyzerRun {
+                conn,
+                alias,
+                repo_hash,
+                repo_root,
+                manifest_id,
+                now_ns,
+                job_id,
+                analyzer_id,
+                analyzer_revision,
+                config_hash: &cfg,
+                pool_group,
+            })? {
+                jobs.push(job);
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(jobs);
+        }
+        Ok(jobs)
+    }
+
+    fn queue_analyzer_run(
+        &self,
+        request: QueueAnalyzerRun<'_>,
+    ) -> Result<Option<QueuedAnalyzerJob>> {
+        let QueueAnalyzerRun {
+            conn,
+            alias,
+            repo_hash,
+            repo_root,
+            manifest_id,
+            now_ns,
+            job_id,
+            analyzer_id,
+            analyzer_revision,
+            config_hash,
+            pool_group,
+        } = request;
+        let key = JobKey {
+            manifest_id,
+            analyzer_id: analyzer_id.to_string(),
+        };
+        let queued = self.tracked_keys.reserve_after(key.clone(), || {
             mark_run(
                 conn,
                 RunRecord {
                     manifest_id,
                     analyzer_id,
                     analyzer_revision,
-                    config_hash: &cfg,
+                    config_hash,
                     status: RunStatus::Queued,
                     started_at_ns: now_ns,
                     finished_at_ns: now_ns,
@@ -376,27 +601,37 @@ impl JobManager {
                  WHERE manifest_id = ?1 AND analyzer_id = ?2",
                 params![manifest_id.0, analyzer_id],
             )?;
-            self.runtime_metrics
-                .mark_enqueued(job_id, pool_group, now_ns);
-            self.enqueue_memory(Job {
-                id: job_id,
-                alias: alias.to_string(),
-                store_path: self.cas_data_dir.store_db_path(repo_hash),
-                repo_root: repo_root.to_path_buf(),
-                manifest_id,
-                analyzer_id: analyzer_id.to_string(),
-            });
-            jobs.push(QueuedAnalyzerJob {
+            Ok(())
+        })?;
+        if !queued {
+            debug!(
+                analyzer_id,
                 job_id,
-                analyzer_id: analyzer_id.to_string(),
-                state: RunStatus::Queued.as_str().to_string(),
-            });
+                manifest_id = manifest_id.0,
+                "coalesced duplicate analyzer job before updating current run row"
+            );
+            return Ok(None);
         }
 
-        if entries.is_empty() {
-            return Ok(jobs);
+        self.runtime_metrics
+            .mark_enqueued(job_id, pool_group, now_ns);
+        let enqueued = self.enqueue_memory(Job {
+            id: job_id,
+            alias: alias.to_string(),
+            repo_hash: repo_hash.to_string(),
+            store_path: self.cas_data_dir.store_db_path(repo_hash),
+            repo_root: repo_root.to_path_buf(),
+            manifest_id,
+            analyzer_id: analyzer_id.to_string(),
+        });
+        if !enqueued {
+            self.tracked_keys.release(&key);
         }
-        Ok(jobs)
+        Ok(enqueued.then(|| QueuedAnalyzerJob {
+            job_id,
+            analyzer_id: analyzer_id.to_string(),
+            state: RunStatus::Queued.as_str().to_string(),
+        }))
     }
 
     pub(crate) fn jobs(
@@ -441,64 +676,109 @@ impl JobManager {
     }
 
     pub fn cancel(&self, job_id: JobId) -> Result<CancelResult> {
+        if let Some(locator) = self.job_index.get(job_id) {
+            let store_path = self.cas_data_dir.store_db_path(&locator.repo_hash);
+            let conn = cas_store::open(&store_path)?;
+            if let Some(result) = self.cancel_in_store(&conn, job_id)? {
+                return Ok(result);
+            }
+            self.job_index.remove(job_id);
+            debug!(
+                alias = %locator.alias,
+                job_id,
+                "job index entry was stale; falling back to scan"
+            );
+        }
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
         for entry in cas_registry::list_all(&index)? {
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
             let conn = cas_store::open(&store_path)?;
-            let row: Option<(String, i64, String)> = conn
-                .query_row(
-                    "SELECT status, manifest_id, analyzer_id
-                     FROM workspace_analysis_runs WHERE job_id = ?1",
-                    [job_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let Some((state, manifest_id, analyzer_id)) = row else {
-                continue;
-            };
-            match RunStatus::from_str(&state) {
-                Some(RunStatus::Queued) => {
-                    conn.execute(
-                        "UPDATE workspace_analysis_runs
-                         SET status = 'cancelled', cancel_requested = 1, finished_at_ns = ?1
-                         WHERE job_id = ?2",
-                        params![now_ns(), job_id],
-                    )?;
-                    self.runtime_metrics
-                        .mark_finished(job_id, RunStatus::Cancelled.as_str());
-                    return Ok(CancelResult {
-                        cancelled: true,
-                        reason: "queued job cancelled".into(),
-                    });
-                }
-                Some(RunStatus::Running) => {
-                    conn.execute(
-                        "UPDATE workspace_analysis_runs
-                         SET cancel_requested = 1
-                         WHERE manifest_id = ?1 AND analyzer_id = ?2",
-                        params![manifest_id, analyzer_id],
-                    )?;
-                    return Ok(CancelResult {
-                        cancelled: false,
-                        reason: "running job marked for cancellation; analyzer will finish current request".into(),
-                    });
-                }
-                Some(state) if state.is_terminal() => {
-                    return Ok(CancelResult {
-                        cancelled: false,
-                        reason: format!("job already {}", state.as_str()),
-                    });
-                }
-                _ => {}
+            if let Some(result) = self.cancel_in_store(&conn, job_id)? {
+                self.job_index
+                    .insert(job_id, &entry.alias, &entry.repo_hash);
+                return Ok(result);
             }
         }
         Err(Error::InvalidArgument(format!("unknown job id: {job_id}")))
     }
 
+    fn cancel_in_store(&self, conn: &Connection, job_id: JobId) -> Result<Option<CancelResult>> {
+        let row: Option<(String, i64, String)> = conn
+            .query_row(
+                "SELECT status, manifest_id, analyzer_id
+                 FROM workspace_analysis_runs WHERE job_id = ?1",
+                [job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((state, manifest_id, analyzer_id)) = row else {
+            return Ok(None);
+        };
+        let result = match RunStatus::from_str(&state) {
+            Some(RunStatus::Queued) => {
+                conn.execute(
+                    "UPDATE workspace_analysis_runs
+                     SET status = 'cancelled', cancel_requested = 1, finished_at_ns = ?1
+                     WHERE job_id = ?2",
+                    params![now_ns(), job_id],
+                )?;
+                self.runtime_metrics
+                    .mark_finished(job_id, RunStatus::Cancelled.as_str());
+                self.notify_cancelled_job(job_id);
+                CancelResult {
+                    cancelled: true,
+                    reason: "queued job cancelled".into(),
+                }
+            }
+            Some(RunStatus::Running) => {
+                conn.execute(
+                    "UPDATE workspace_analysis_runs
+                     SET cancel_requested = 1
+                     WHERE manifest_id = ?1 AND analyzer_id = ?2",
+                    params![manifest_id, analyzer_id],
+                )?;
+                CancelResult {
+                    cancelled: false,
+                    reason:
+                        "running job marked for cancellation; analyzer will finish current request"
+                            .into(),
+                }
+            }
+            Some(state) if state.is_terminal() => CancelResult {
+                cancelled: false,
+                reason: format!("job already {}", state.as_str()),
+            },
+            _ => {
+                return Ok(None);
+            }
+        };
+        Ok(Some(result))
+    }
+
     pub async fn shutdown(&self, drain_timeout: Duration) {
         test_observe_job_manager_shutdown();
         {
-            let mut sender = self.sender.lock().expect("job sender lock poisoned");
+            let mut sender = self
+                .scheduler_sender
+                .lock()
+                .expect("job scheduler sender lock poisoned");
+            if let Some(sender) = sender.take() {
+                let _ = sender.send(SchedulerMsg::Shutdown);
+            }
+        }
+        let scheduler = self
+            .scheduler
+            .lock()
+            .expect("job scheduler lock poisoned")
+            .take();
+        if let Some(handle) = scheduler {
+            let _ = tokio::time::timeout(drain_timeout, handle).await;
+        }
+        {
+            let mut sender = self
+                .worker_sender
+                .lock()
+                .expect("job worker sender lock poisoned");
             sender.take();
         }
         let handles = {
@@ -513,60 +793,275 @@ impl JobManager {
         .await;
     }
 
-    fn enqueue_memory(&self, job: Job) {
-        let sender = self.sender.lock().expect("job sender lock poisoned");
+    fn enqueue_memory(&self, job: Job) -> bool {
+        let sender = self
+            .scheduler_sender
+            .lock()
+            .expect("job scheduler sender lock poisoned");
         match sender.as_ref() {
             Some(sender) => {
-                if let Err(err) = sender.send(job) {
+                let job_id = job.id;
+                let alias = job.alias.clone();
+                let repo_hash = job.repo_hash.clone();
+                if let Err(err) = sender.send(SchedulerMsg::Enqueue(job)) {
                     warn!(error = %err, "failed to enqueue analyzer job");
+                    false
+                } else {
+                    self.job_index.insert(job_id, &alias, &repo_hash);
+                    true
                 }
             }
-            None => warn!("job manager is shutting down; analyzer job was not enqueued"),
+            None => {
+                warn!("job manager is shutting down; analyzer job was not enqueued");
+                false
+            }
         }
     }
 
     async fn worker_loop(self: Arc<Self>) {
         loop {
-            let job = {
-                let mut receiver = self.receiver.lock().await;
+            let dispatch = {
+                let mut receiver = self.worker_receiver.lock().await;
                 receiver.recv().await
             };
-            let Some(job) = job else {
+            let Some(dispatch) = dispatch else {
                 break;
             };
-            if let Err(err) = self.run_job(job).await {
+            let job_id = dispatch.job.id;
+            let pool_group = dispatch.pool_group;
+            let key = dispatch.key.clone();
+            if let Err(err) = self.run_job(dispatch).await {
                 warn!(error = %err, "analyzer job failed");
+            }
+            self.notify_worker_finished(job_id, pool_group, key);
+        }
+    }
+
+    async fn run_job(&self, dispatch: DispatchJob) -> Result<()> {
+        let runtime_metrics = self.runtime_metrics.clone();
+        tokio::task::spawn_blocking(move || run_job_blocking(dispatch.job, runtime_metrics))
+            .await
+            .map_err(|e| Error::internal_task_panic("analyzer job", e))?
+    }
+
+    fn notify_worker_finished(&self, job_id: JobId, pool_group: Option<&'static str>, key: JobKey) {
+        let sender = self
+            .scheduler_sender
+            .lock()
+            .expect("job scheduler sender lock poisoned");
+        if let Some(sender) = sender.as_ref() {
+            let _ = sender.send(SchedulerMsg::WorkerFinished {
+                job_id,
+                pool_group,
+                key,
+            });
+        }
+    }
+
+    fn notify_cancelled_job(&self, job_id: JobId) {
+        let sender = self
+            .scheduler_sender
+            .lock()
+            .expect("job scheduler sender lock poisoned");
+        if let Some(sender) = sender.as_ref() {
+            let _ = sender.send(SchedulerMsg::Cancel(job_id));
+        }
+    }
+}
+
+async fn scheduler_loop(
+    mut receiver: mpsc::UnboundedReceiver<SchedulerMsg>,
+    worker_tx: mpsc::UnboundedSender<DispatchJob>,
+    worker_capacity: usize,
+    runtime_metrics: JobRuntimeMetricsStore,
+    tracked_keys: TrackedJobKeys,
+) {
+    let mut scheduler =
+        JobScheduler::new(worker_tx, worker_capacity, runtime_metrics, tracked_keys);
+    while let Some(message) = receiver.recv().await {
+        match message {
+            SchedulerMsg::Enqueue(job) => scheduler.enqueue(job),
+            SchedulerMsg::WorkerFinished {
+                job_id,
+                pool_group,
+                key,
+            } => scheduler.worker_finished(job_id, pool_group, key),
+            SchedulerMsg::Cancel(job_id) => scheduler.cancel(job_id),
+            SchedulerMsg::Shutdown => break,
+        }
+        scheduler.drain_runnable();
+    }
+}
+
+struct JobScheduler {
+    worker_tx: mpsc::UnboundedSender<DispatchJob>,
+    worker_capacity: usize,
+    runtime_metrics: JobRuntimeMetricsStore,
+    lanes: HashMap<GroupLane, VecDeque<Job>>,
+    ready_order: VecDeque<GroupLane>,
+    active_groups: HashSet<&'static str>,
+    active_workers: usize,
+    tracked_keys: TrackedJobKeys,
+    cancelled_jobs: HashSet<JobId>,
+}
+
+impl JobScheduler {
+    fn new(
+        worker_tx: mpsc::UnboundedSender<DispatchJob>,
+        worker_capacity: usize,
+        runtime_metrics: JobRuntimeMetricsStore,
+        tracked_keys: TrackedJobKeys,
+    ) -> Self {
+        Self {
+            worker_tx,
+            worker_capacity,
+            runtime_metrics,
+            lanes: HashMap::new(),
+            ready_order: VecDeque::new(),
+            active_groups: HashSet::new(),
+            active_workers: 0,
+            tracked_keys,
+            cancelled_jobs: HashSet::new(),
+        }
+    }
+
+    fn enqueue(&mut self, job: Job) {
+        let lane = self.lane_for(&job);
+        if let GroupLane::Pooled(group) = lane
+            && self.active_groups.contains(group)
+        {
+            self.runtime_metrics.mark_waiting_pool_group(job.id, group);
+        }
+        let was_empty = self.lanes.get(&lane).is_none_or(VecDeque::is_empty);
+        self.lanes.entry(lane).or_default().push_back(job);
+        if was_empty && !self.ready_order.contains(&lane) {
+            self.ready_order.push_back(lane);
+        }
+    }
+
+    fn cancel(&mut self, job_id: JobId) {
+        self.cancelled_jobs.insert(job_id);
+        self.remove_pending_job_id(job_id);
+    }
+
+    fn worker_finished(&mut self, _job_id: JobId, pool_group: Option<&'static str>, _key: JobKey) {
+        self.active_workers = self.active_workers.saturating_sub(1);
+        if let Some(group) = pool_group {
+            self.active_groups.remove(group);
+            let lane = GroupLane::Pooled(group);
+            if self.lanes.get(&lane).is_some_and(|jobs| !jobs.is_empty())
+                && !self.ready_order.contains(&lane)
+            {
+                self.ready_order.push_back(lane);
+            }
+        }
+        self.cancelled_jobs.remove(&_job_id);
+        self.tracked_keys.release(&_key);
+    }
+
+    fn drain_runnable(&mut self) {
+        while self.active_workers < self.worker_capacity {
+            let Some(lane) = self.ready_order.pop_front() else {
+                break;
+            };
+            if matches!(lane, GroupLane::Pooled(group) if self.active_groups.contains(group)) {
+                self.ready_order.push_back(lane);
+                if self.ready_order.iter().all(|candidate| {
+                    matches!(candidate, GroupLane::Pooled(group) if self.active_groups.contains(group))
+                }) {
+                    break;
+                }
+                continue;
+            }
+            let Some(job) = self.pop_next_job(lane) else {
+                continue;
+            };
+            let pool_group = match lane {
+                GroupLane::Pooled(group) => {
+                    self.active_groups.insert(group);
+                    Some(group)
+                }
+                GroupLane::Unpooled => None,
+            };
+            let key = JobKey::from_job(&job);
+            self.runtime_metrics.mark_running(job.id);
+            if self
+                .worker_tx
+                .send(DispatchJob {
+                    job,
+                    pool_group,
+                    key: key.clone(),
+                })
+                .is_err()
+            {
+                if let Some(group) = pool_group {
+                    self.active_groups.remove(group);
+                }
+                self.tracked_keys.release(&key);
+                break;
+            }
+            self.active_workers += 1;
+            if self.lanes.get(&lane).is_some_and(|jobs| !jobs.is_empty())
+                && !self.ready_order.contains(&lane)
+            {
+                self.ready_order.push_back(lane);
             }
         }
     }
 
-    async fn run_job(&self, job: Job) -> Result<()> {
-        let pool_group = pool_group_for_analyzer_id(&job.analyzer_id)?;
-        let _pool_group_guard = if let Some(group) = pool_group {
-            self.runtime_metrics.mark_waiting_pool_group(job.id, group);
-            let wait_started = Instant::now();
-            let guard = self.pool_group_locks.lock(group).await;
-            let wait_elapsed = wait_started.elapsed();
-            self.runtime_metrics.mark_running(job.id);
-            if wait_elapsed.as_millis() > 0 {
-                debug!(
-                    alias = %job.alias,
-                    analyzer_id = %job.analyzer_id,
-                    job_id = job.id,
-                    pool_group = group,
-                    wait_elapsed_ms = wait_elapsed.as_millis(),
-                    "analyzer job waited for pool group"
-                );
+    fn pop_next_job(&mut self, lane: GroupLane) -> Option<Job> {
+        loop {
+            let jobs = self.lanes.get_mut(&lane)?;
+            let job = jobs.pop_front()?;
+            if self.cancelled_jobs.remove(&job.id) {
+                self.tracked_keys.release(&JobKey::from_job(&job));
+                continue;
             }
-            Some(guard)
-        } else {
-            self.runtime_metrics.mark_running(job.id);
-            None
-        };
-        let runtime_metrics = self.runtime_metrics.clone();
-        tokio::task::spawn_blocking(move || run_job_blocking(job, runtime_metrics))
-            .await
-            .map_err(|e| Error::internal_task_panic("analyzer job", e))?
+            return Some(job);
+        }
+    }
+
+    fn remove_pending_job_id(&mut self, job_id: JobId) {
+        for jobs in self.lanes.values_mut() {
+            if let Some(index) = jobs.iter().position(|job| job.id == job_id) {
+                if let Some(job) = jobs.remove(index) {
+                    self.tracked_keys.release(&JobKey::from_job(&job));
+                }
+                return;
+            }
+        }
+    }
+
+    fn lane_for(&self, job: &Job) -> GroupLane {
+        #[cfg(test)]
+        if let Some(group) = test_pool_group_for_analyzer_id(&job.analyzer_id) {
+            return group.map_or(GroupLane::Unpooled, GroupLane::Pooled);
+        }
+
+        match pool_group_for_analyzer_id(&job.analyzer_id) {
+            Ok(Some(group)) => GroupLane::Pooled(group),
+            Ok(None) => GroupLane::Unpooled,
+            Err(err) => {
+                warn!(
+                    analyzer_id = %job.analyzer_id,
+                    error = %err,
+                    "unknown analyzer in scheduler; dispatching without pool group"
+                );
+                GroupLane::Unpooled
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_pool_group_for_analyzer_id(analyzer_id: &str) -> Option<Option<&'static str>> {
+    match analyzer_id {
+        "clangd-c-lsp" | "clangd-cpp-lsp" | "clangd-objc-lsp" => Some(Some("clangd-lsp")),
+        "typescript-language-server-ts-lsp"
+        | "typescript-language-server-js-lsp"
+        | "typescript-language-server-tsx-lsp" => Some(Some("typescript-language-server-lsp")),
+        "pyright-lsp" | "gopls-lsp" | "ruby-lsp" => Some(None),
+        _ => None,
     }
 }
 
@@ -653,25 +1148,6 @@ fn test_observe_job_manager_shutdown() {}
 #[cfg(test)]
 pub(crate) static JOB_MANAGER_SHUTDOWN_OBSERVER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     Mutex::new(None);
-
-#[derive(Default)]
-struct PoolGroupLocks {
-    groups: AsyncMutex<HashMap<&'static str, Arc<AsyncMutex<()>>>>,
-}
-
-impl PoolGroupLocks {
-    async fn lock(&self, group: &'static str) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut groups = self.groups.lock().await;
-            Arc::clone(
-                groups
-                    .entry(group)
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
-        };
-        lock.lock_owned().await
-    }
-}
 
 fn pool_group_for_analyzer_id(analyzer_id: &str) -> Result<Option<&'static str>> {
     all_workspace_analyzers()
@@ -814,17 +1290,23 @@ fn fallback_worker_concurrency() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
-    use tokio::sync::oneshot;
+    use tokio::sync::mpsc;
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::subscriber::Interest;
     use tracing::{Event, Level, Metadata, Subscriber};
 
+    use crate::cas::{registry as cas_registry, store as cas_store};
+    use crate::manifest::ManifestId;
+    use crate::paths::CasDataDir;
+
     use super::{
-        JobRuntimeMetricsStore, JobSnapshot, MAX_WORKER_CONCURRENCY, PoolGroupLocks,
+        DispatchJob, Job, JobId, JobIndex, JobListOptions, JobManager, JobRuntimeMetricsStore,
+        JobScheduler, JobSnapshot, MAX_WORKER_CONCURRENCY, QueueAnalyzerRun, TrackedJobKeys,
         latest_default_job_rows, now_ns, worker_concurrency_from_env_value,
     };
 
@@ -995,43 +1477,193 @@ mod tests {
         assert_eq!(ids, vec![7, 6, 4, 3, 2, 1]);
     }
 
-    #[tokio::test]
-    async fn same_pool_group_locks_serialize() {
-        let locks = Arc::new(PoolGroupLocks::default());
-        let first_guard = locks.lock("shared-lsp").await;
-        let (acquired_tx, acquired_rx) = oneshot::channel();
-        let waiting_locks = Arc::clone(&locks);
-        let waiter = tokio::spawn(async move {
-            let _guard = waiting_locks.lock("shared-lsp").await;
-            let _ = acquired_tx.send(());
-        });
+    #[test]
+    fn scheduler_serializes_same_pool_group() {
+        let (mut scheduler, mut rx) = test_scheduler(2);
+        scheduler.enqueue(test_job(1, 1, "clangd-c-lsp"));
+        scheduler.enqueue(test_job(2, 2, "clangd-cpp-lsp"));
+        scheduler.drain_runnable();
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), acquired_rx)
-                .await
-                .is_err(),
-            "second same-group lock acquired while the first guard was held"
-        );
-        drop(first_guard);
-        waiter.await.expect("same-group waiter task panicked");
+        let first = rx.try_recv().expect("first same-group job dispatched");
+        assert_eq!(first.job.id, 1);
+        assert!(rx.try_recv().is_err(), "second same-group job ran early");
+        assert!(scheduler.active_groups.contains("clangd-lsp"));
     }
 
-    #[tokio::test]
-    async fn different_pool_groups_do_not_block_each_other() {
-        let locks = Arc::new(PoolGroupLocks::default());
-        let _first_guard = locks.lock("clangd-lsp").await;
-        let (acquired_tx, acquired_rx) = oneshot::channel();
-        let waiting_locks = Arc::clone(&locks);
-        let waiter = tokio::spawn(async move {
-            let _guard = waiting_locks.lock("typescript-language-server-lsp").await;
-            let _ = acquired_tx.send(());
-        });
+    #[test]
+    fn scheduler_dispatches_different_group_while_one_waits() {
+        let (mut scheduler, mut rx) = test_scheduler(2);
+        scheduler.enqueue(test_job(1, 1, "clangd-c-lsp"));
+        scheduler.enqueue(test_job(2, 2, "clangd-cpp-lsp"));
+        scheduler.enqueue(test_job(3, 3, "typescript-language-server-ts-lsp"));
+        scheduler.drain_runnable();
 
-        tokio::time::timeout(Duration::from_millis(25), acquired_rx)
-            .await
-            .expect("different-group lock was blocked")
-            .expect("different-group waiter dropped before signaling");
-        waiter.await.expect("different-group waiter task panicked");
+        let dispatched = drain_dispatched(&mut rx);
+        let ids = dispatched.iter().map(|job| job.job.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn scheduler_parallelizes_unpooled_jobs_up_to_capacity() {
+        let (mut scheduler, mut rx) = test_scheduler(2);
+        scheduler.enqueue(test_job(1, 1, "pyright-lsp"));
+        scheduler.enqueue(test_job(2, 2, "ruby-lsp"));
+        scheduler.enqueue(test_job(3, 3, "gopls"));
+        scheduler.drain_runnable();
+
+        let dispatched = drain_dispatched(&mut rx);
+        assert_eq!(dispatched.len(), 2);
+        assert_eq!(scheduler.active_workers, 2);
+        assert!(scheduler.active_workers <= 2);
+    }
+
+    #[test]
+    fn scheduler_dispatches_waiting_group_after_completion() {
+        let (mut scheduler, mut rx) = test_scheduler(1);
+        scheduler.enqueue(test_job(1, 1, "clangd-c-lsp"));
+        scheduler.enqueue(test_job(2, 2, "clangd-cpp-lsp"));
+        scheduler.drain_runnable();
+        let first = rx.try_recv().expect("first job dispatched");
+
+        scheduler.worker_finished(first.job.id, first.pool_group, first.key);
+        scheduler.drain_runnable();
+
+        let second = rx
+            .try_recv()
+            .expect("same group job dispatched after release");
+        assert_eq!(second.job.id, 2);
+    }
+
+    #[test]
+    fn scheduler_cancel_drops_pending_job_before_dispatch() {
+        let (mut scheduler, mut rx) = test_scheduler(1);
+        scheduler.enqueue(test_job(1, 1, "pyright-lsp"));
+        scheduler.cancel(1);
+        scheduler.drain_runnable();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn duplicate_enqueue_does_not_overwrite_current_job_row() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        let manager = JobManager::new(Arc::clone(&cas_data_dir));
+        let repo_hash = "repo-hash";
+        let manifest_id = ManifestId(1);
+        {
+            let mut index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(&tx, "repo", repo.path().to_str().unwrap(), repo_hash, 1).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut conn = cas_store::open(&cas_data_dir.store_db_path(repo_hash)).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (?1, 'tentative', 0)",
+            [manifest_id.0],
+        )
+        .unwrap();
+
+        let first = manager
+            .queue_analyzer_run(test_queue_request(
+                &mut conn,
+                repo.path(),
+                repo_hash,
+                manifest_id,
+                1,
+            ))
+            .unwrap()
+            .expect("first job should queue");
+        assert_eq!(first.job_id, 1);
+
+        let queued_duplicate = manager
+            .queue_analyzer_run(test_queue_request(
+                &mut conn,
+                repo.path(),
+                repo_hash,
+                manifest_id,
+                2,
+            ))
+            .unwrap();
+        assert!(
+            queued_duplicate.is_none(),
+            "queued duplicate should coalesce before DB write"
+        );
+        let queued_row: (i64, String) = conn
+            .query_row(
+                "SELECT job_id, status
+                 FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'pyright-lsp'",
+                [manifest_id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(queued_row, (1, "queued".into()));
+
+        conn.execute(
+            "UPDATE workspace_analysis_runs
+             SET status = 'running'
+             WHERE manifest_id = ?1 AND analyzer_id = 'pyright-lsp'",
+            [manifest_id.0],
+        )
+        .unwrap();
+
+        let duplicate = manager
+            .queue_analyzer_run(test_queue_request(
+                &mut conn,
+                repo.path(),
+                repo_hash,
+                manifest_id,
+                3,
+            ))
+            .unwrap();
+        assert!(duplicate.is_none(), "active duplicate should coalesce");
+        let row: (i64, String, i64) = conn
+            .query_row(
+                "SELECT job_id, status, cancel_requested
+                 FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'pyright-lsp'",
+                [manifest_id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, "running".into(), 0));
+
+        let listed = manager
+            .jobs(
+                Some("repo"),
+                None,
+                JobListOptions {
+                    include_all: true,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_id, 1);
+
+        let cancelled = manager.cancel(1).unwrap();
+        assert!(!cancelled.cancelled);
+        assert!(cancelled.reason.contains("running job marked"));
+        let cancel_requested: i64 = conn
+            .query_row(
+                "SELECT cancel_requested FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'pyright-lsp'",
+                [manifest_id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancel_requested, 1);
+        assert!(
+            manager.cancel(2).is_err(),
+            "coalesced queued job id must not exist"
+        );
+        assert!(
+            manager.cancel(3).is_err(),
+            "coalesced active job id must not exist"
+        );
     }
 
     #[test]
@@ -1051,6 +1683,19 @@ mod tests {
         assert_eq!(snapshot.enqueued_at, Some(1_000_000_000));
         assert!(snapshot.queued_ms.is_some_and(|ms| ms >= 1500));
         assert!(snapshot.pool_wait_ms.is_some());
+    }
+
+    #[test]
+    fn job_index_round_trips_and_removes_locator() {
+        let index = JobIndex::default();
+        index.insert(99, "repo", "hash");
+
+        let locator = index.get(99).expect("job locator missing");
+        assert_eq!(locator.alias, "repo");
+        assert_eq!(locator.repo_hash, "hash");
+
+        index.remove(99);
+        assert!(index.get(99).is_none());
     }
 
     #[test]
@@ -1090,6 +1735,63 @@ mod tests {
             progress_ticks: None,
             last_progress_at: None,
             progress_per_minute: None,
+        }
+    }
+
+    fn test_scheduler(
+        worker_capacity: usize,
+    ) -> (JobScheduler, mpsc::UnboundedReceiver<DispatchJob>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            JobScheduler::new(
+                tx,
+                worker_capacity,
+                JobRuntimeMetricsStore::default(),
+                TrackedJobKeys::default(),
+            ),
+            rx,
+        )
+    }
+
+    fn drain_dispatched(rx: &mut mpsc::UnboundedReceiver<DispatchJob>) -> Vec<DispatchJob> {
+        let mut out = Vec::new();
+        while let Ok(job) = rx.try_recv() {
+            out.push(job);
+        }
+        out
+    }
+
+    fn test_job(id: JobId, manifest_id: i64, analyzer_id: &str) -> Job {
+        Job {
+            id,
+            alias: "repo".into(),
+            repo_hash: "repo-hash".into(),
+            store_path: PathBuf::from("/tmp/store.db"),
+            repo_root: PathBuf::from("/tmp/repo"),
+            manifest_id: ManifestId(manifest_id),
+            analyzer_id: analyzer_id.into(),
+        }
+    }
+
+    fn test_queue_request<'a>(
+        conn: &'a mut rusqlite::Connection,
+        repo_root: &'a Path,
+        repo_hash: &'a str,
+        manifest_id: ManifestId,
+        job_id: JobId,
+    ) -> QueueAnalyzerRun<'a> {
+        QueueAnalyzerRun {
+            conn,
+            alias: "repo",
+            repo_hash,
+            repo_root,
+            manifest_id,
+            now_ns: job_id,
+            job_id,
+            analyzer_id: "pyright-lsp",
+            analyzer_revision: 1,
+            config_hash: "cfg",
+            pool_group: None,
         }
     }
 }
