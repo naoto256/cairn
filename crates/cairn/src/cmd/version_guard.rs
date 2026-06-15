@@ -53,7 +53,7 @@ pub(crate) async fn check_daemon_version(socket_path: &Path, mode: VersionGuardM
 
 fn version_warning(daemon_version: &str) -> String {
     format!(
-        "warning: cairn daemon is {daemon_version}, CLI is {CLIENT_VERSION}; restart the daemon with 'brew services restart cairn' or use 'cairn ctl shutdown' then 'cairn daemon' (shutdown bypasses this guard) to pick up your installed CLI"
+        "warning: cairn daemon is {daemon_version}, CLI is {CLIENT_VERSION}; restart the daemon with 'brew services restart cairn' or use 'cairn ctl daemon shutdown' then 'cairn daemon' (shutdown bypasses this guard) to pick up your installed CLI"
     )
 }
 

@@ -165,7 +165,7 @@ fn registered_repo_path_check(entry: &cas_registry::AliasEntry) -> DoctorCheck {
         }),
         (!exists).then(|| {
             format!(
-                "Run `cairn ctl remove-repo --alias {}` to drop the alias entry (on-disk data is kept for any other aliases at the same path), or restore the directory at {}.",
+                "Run `cairn ctl repo remove {}` to drop the alias entry (on-disk data is kept for any other aliases at the same path), or restore the directory at {}.",
                 entry.alias, entry.root_path
             )
         }),
@@ -194,7 +194,7 @@ fn alias_watcher_checks(
                 }),
                 (!watching).then(|| {
                     format!(
-                        "Run `cairn ctl remove-repo --alias {}` then `cairn ctl register-repo --alias {} {}` to re-establish the FS watcher. Restarting the daemon is an alternative that re-installs every alias's watcher in one shot.",
+                        "Run `cairn ctl repo remove {}` then `cairn ctl repo register --alias {} {}` to re-establish the FS watcher. Restarting the daemon is an alternative that re-installs every alias's watcher in one shot.",
                         entry.alias, entry.alias, entry.root_path
                     )
                 }),
@@ -338,7 +338,7 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                     DoctorStatus::Warn,
                     Some("no tentative anchor yet (reads will fall back to HEAD)".into()),
                     Some(format!(
-                        "Run `cairn ctl reindex-repo {}` to build the tentative snapshot.",
+                        "Run `cairn ctl repo reindex {}` to build the tentative snapshot.",
                         probe.alias
                     )),
                 ),
@@ -348,7 +348,7 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                 DoctorStatus::Fail,
                 Some(error.clone()),
                 Some(format!(
-                    "Run `cairn ctl remove-repo --alias {}` then re-register, or restore the CAS file at {}.",
+                    "Run `cairn ctl repo remove {}` then re-register, or restore the CAS file at {}.",
                     probe.alias,
                     probe.store_path.display()
                 )),
@@ -594,7 +594,7 @@ fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                 DoctorStatus::Fail,
                 Some(error.clone()),
                 Some(format!(
-                    "Run `cairn ctl remove-repo --alias {}` then re-register, or restore the CAS file at {}.",
+                    "Run `cairn ctl repo remove {}` then re-register, or restore the CAS file at {}.",
                     probe.alias,
                     probe.store_path.display()
                 )),
@@ -612,7 +612,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
                 DoctorStatus::Warn,
                 Some(tier3_runs_detail(state)),
                 Some(format!(
-                    "Trigger a reindex with `cairn ctl reindex-repo {alias}` to record the current workspace analyzer set."
+                    "Trigger a reindex with `cairn ctl repo reindex {alias}` to record the current workspace analyzer set."
                 )),
             );
         }
@@ -622,7 +622,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some("no Tier-3 run recorded for this alias".into()),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo {alias}` or wait for the next file edit to drive a watcher tick."
+                "Trigger a reindex with `cairn ctl repo reindex {alias}` or wait for the next file edit to drive a watcher tick."
             )),
         );
     }
@@ -638,7 +638,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some(format!("{detail}; indexing in progress")),
             Some(format!(
-                "Track progress with `cairn ctl jobs --alias {alias}`."
+                "Track progress with `cairn ctl jobs list --alias {alias}`."
             )),
         );
     }
@@ -653,7 +653,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
                 run.error.as_deref().unwrap_or("unknown error")
             )),
             Some(format!(
-                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl reindex-repo {alias}`.",
+                "Check daemon logs near manifest {}; transient failures usually recover on the next watcher tick. If persistent, try `cairn ctl repo reindex {alias}`.",
                 run.manifest_id
             )),
         );
@@ -669,7 +669,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some(format!("{detail}; {} is {}", run.analyzer_id, run.status)),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo {alias}` when ready."
+                "Trigger a reindex with `cairn ctl repo reindex {alias}` when ready."
             )),
         );
     }
@@ -688,7 +688,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
                 run.analyzer_id, run.status, run.manifest_id
             )),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo {alias}` and check daemon logs if the status persists."
+                "Trigger a reindex with `cairn ctl repo reindex {alias}` and check daemon logs if the status persists."
             )),
         );
     }
@@ -700,7 +700,7 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
             DoctorStatus::Warn,
             Some(detail),
             Some(format!(
-                "Trigger a reindex with `cairn ctl reindex-repo {alias}` to record the current workspace analyzer set."
+                "Trigger a reindex with `cairn ctl repo reindex {alias}` to record the current workspace analyzer set."
             )),
         );
     }
@@ -960,7 +960,7 @@ mod tests {
             Some("missing: /definitely/missing/cairn/repo")
         );
         let remediation = check.remediation.expect("remediation");
-        assert!(remediation.contains("remove-repo --alias gone"));
+        assert!(remediation.contains("repo remove gone"));
         assert!(remediation.contains("/definitely/missing/cairn/repo"));
     }
 
@@ -992,7 +992,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("register-repo --alias demo")
+                .contains("repo register --alias demo")
         );
     }
 
@@ -1044,7 +1044,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("reindex-repo")
+                .contains("repo reindex")
         );
         assert_eq!(checks[2].status, DoctorStatus::Fail);
         assert_eq!(checks[2].detail.as_deref(), Some("not a database"));
@@ -1053,7 +1053,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("remove-repo")
+                .contains("repo remove")
         );
     }
 
@@ -1144,10 +1144,22 @@ mod tests {
         );
         assert_eq!(pending.status, DoctorStatus::Warn);
         assert!(pending.detail.as_deref().unwrap().contains("queued"));
-        assert!(pending.remediation.as_deref().unwrap().contains("ctl jobs"));
+        assert!(
+            pending
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("jobs list")
+        );
         assert_eq!(running.status, DoctorStatus::Warn);
         assert!(running.detail.as_deref().unwrap().contains("in progress"));
-        assert!(running.remediation.as_deref().unwrap().contains("ctl jobs"));
+        assert!(
+            running
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("jobs list")
+        );
         assert_eq!(failed.status, DoctorStatus::Warn);
         assert!(
             failed
@@ -1162,7 +1174,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("reindex-repo")
+                .contains("repo reindex")
         );
     }
 
@@ -1221,7 +1233,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("reindex-repo stale")
+                .contains("repo reindex stale")
         );
     }
 
@@ -1306,7 +1318,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("register-repo --alias demo")
+                .contains("repo register --alias demo")
         );
         let tentative = find_check(&report, "repo `demo` tentative snapshot present");
         assert_eq!(tentative.status, DoctorStatus::Warn);
@@ -1319,7 +1331,7 @@ mod tests {
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("reindex-repo")
+                .contains("repo reindex")
         );
     }
 

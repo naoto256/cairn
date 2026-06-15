@@ -87,7 +87,7 @@ cargo install --git https://github.com/naoto256/cairn cairn
 
 Optional runtime dependencies for Tier-3 cross-file resolution are the
 local LSP binaries listed in the Languages table. Make sure they are
-visible to the daemon; `cairn ctl doctor` reports which Tier-3
+visible to the daemon; `cairn ctl daemon doctor` reports which Tier-3
 analyzers are discoverable and how to fix missing tools.
 
 ### Daemon
@@ -239,16 +239,16 @@ both clamped to mode 0700.
 ### Register a repo
 
 ```sh
-cairn ctl register-repo --alias my-proj /path/to/repo
-cairn ctl status
+cairn ctl repo register --alias my-proj /path/to/repo
+cairn ctl daemon status
 ```
 
 A repo can carry more than one alias; removing one keeps the on-disk
 store alive while any other label still references it.
 
 Tier-3 workspace analyzers run in daemon background jobs. Use
-`cairn ctl jobs --alias my-proj` to inspect queued/running/completed
-analyzer work, or `cairn ctl reindex-repo my-proj --wait` when a
+`cairn ctl jobs list --alias my-proj` to inspect queued/running/completed
+analyzer work, or `cairn ctl repo reindex my-proj --wait` when a
 script needs to block until the current jobs finish.
 
 ## Languages
@@ -320,7 +320,7 @@ databases. Detached HEAD checkouts don't create snapshot rows.
 
 `branch/<n>` and `tag/<n>` anchors track live git refs: a ref that
 disappears from `git for-each-ref` is pruned from the anchor table on
-the next register / reindex pass, so `cairn ctl status` and
+the next register / reindex pass, so `cairn ctl daemon status` and
 `list_repos` don't keep stale labels. `HEAD` and `tentative/<id>` are
 not subject to that prune.
 
