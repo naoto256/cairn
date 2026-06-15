@@ -28,10 +28,9 @@
 //!   community convention every member appearing in a public header is
 //!   API surface, so they default to `Public`.
 //!
-//! File patterns: only `.m` is claimed. ObjC++ (`.mm`) and headers
-//! (`.h`) fall through to the C backend, which already degrades
-//! gracefully on ObjC-flavored declarations the same way it degrades
-//! on a C++ header.
+//! File patterns: only `.m` is claimed. ObjC++ (`.mm`) is left
+//! unclaimed, and headers (`.h`) go through the register layer's
+//! C-family header router.
 //!
 //! Tier-2 lives in [`analyzer`]: superclass inheritance, protocol
 //! conformance, category extension edges, and same-file message-send
@@ -64,8 +63,8 @@ impl LanguageBackend for ObjcBackend {
     }
 
     fn file_patterns(&self) -> &'static [&'static str] {
-        // `.mm` (ObjC++) and `.h` are deliberately left to the C
-        // backend — see the module docs.
+        // `.mm` (ObjC++) is deliberately left unclaimed; `.h` is routed
+        // by content in the register layer.
         &["*.m"]
     }
 
@@ -917,7 +916,7 @@ mod tests {
 
     #[test]
     fn claims_only_dot_m_files() {
-        // `.mm` (ObjC++) and `.h` are left to the C backend.
+        // `.mm` is unclaimed; `.h` is routed by content in register.
         assert_eq!(ObjcBackend.file_patterns(), &["*.m"]);
     }
 

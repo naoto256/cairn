@@ -23,9 +23,9 @@
 //! Preprocessor conditionals are handled naively: tree-sitter parses
 //! every branch, so a symbol defined in both arms of an `#ifdef` /
 //! `#else` pair is indexed twice (dedup is a future concern). `.h`
-//! headers are always parsed as C; a C++ header degrades gracefully to
-//! whatever C-shaped declarations remain. Tier-3 (clangd) is out of
-//! scope for this backend.
+//! headers are routed by the register layer using a small content
+//! heuristic, so this backend only claims `.c` directly. Tier-3
+//! (clangd) is out of scope for this backend.
 
 #![forbid(unsafe_code)]
 
@@ -49,7 +49,7 @@ impl LanguageBackend for CBackend {
     }
 
     fn file_patterns(&self) -> &'static [&'static str] {
-        &["*.c", "*.h"]
+        &["*.c"]
     }
 
     fn parser_id(&self) -> &'static str {
@@ -546,8 +546,8 @@ mod tests {
     }
 
     #[test]
-    fn claims_c_and_h_extensions() {
-        assert_eq!(CBackend.file_patterns(), &["*.c", "*.h"]);
+    fn claims_c_extension_only() {
+        assert_eq!(CBackend.file_patterns(), &["*.c"]);
     }
 
     #[test]
@@ -821,9 +821,11 @@ void f(void) {
     }
 
     #[test]
-    fn cpp_header_degrades_gracefully() {
-        // A C++ header indexed as C: the class fails to parse, but
-        // extraction succeeds and C-shaped declarations survive.
+    fn c_parser_ignores_cpp_only_header_surface_but_keeps_c_declarations() {
+        // The register-layer `.h` router sends obvious C++ headers to
+        // tree-sitter-cpp. This parser-level regression still protects
+        // the old graceful-degradation property for any C++-shaped input
+        // explicitly parsed as C.
         let src = br#"
 #include <string>
 
