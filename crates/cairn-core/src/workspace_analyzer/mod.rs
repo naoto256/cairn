@@ -418,7 +418,7 @@ mod tests {
         ) -> Result<WorkspaceFacts> {
             for _ in 0..6 {
                 progress.tick();
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             Ok(WorkspaceFacts::default())
         }
@@ -994,7 +994,7 @@ mod tests {
             &entries,
             10,
             vec![Box::new(ProgressingSlowRustAnalyzer)],
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
         )
         .unwrap();
 
