@@ -95,6 +95,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     #[test]
     fn runtime_language_backend_registry_includes_cli_linked_backends() {
         let mut backend_names = cairn_lang_api::all_backends()
@@ -154,5 +156,19 @@ mod tests {
                 "typescript-language-server-tsx-lsp"
             ]
         );
+    }
+
+    #[test]
+    fn query_symbols_help_includes_zero_hit_recovery_hint() {
+        let mut cmd = super::Cli::command();
+        let query = cmd.find_subcommand_mut("query").unwrap();
+        let symbols = query.find_subcommand_mut("symbols").unwrap();
+        let mut help = Vec::new();
+        symbols.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("If results are empty"));
+        assert!(help.contains("Analyzer*"));
+        assert!(help.contains("--container / --path / --kind"));
     }
 }
