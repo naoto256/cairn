@@ -139,7 +139,11 @@ enum BlobsCommand {
 #[derive(Subcommand, Debug)]
 enum DaemonCommand {
     /// Show daemon health, registered repos, and snapshot progress.
-    Status,
+    Status {
+        /// Expand per-snapshot details instead of the default repo summary.
+        #[arg(long)]
+        snapshots: bool,
+    },
     /// Diagnose dependencies, paths, and reachability.
     Doctor,
     /// Ask the daemon to shut down.
@@ -155,6 +159,7 @@ enum CtlSocket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderHint {
     Default,
+    Status { snapshots: bool },
     JobsPrune { dry_run: bool },
 }
 
@@ -305,7 +310,11 @@ fn route_blobs_command(command: BlobsCommand) -> CtlInvocation {
 
 fn route_daemon_command(command: DaemonCommand) -> CtlInvocation {
     match command {
-        DaemonCommand::Status => control_invocation("status", Value::Null),
+        DaemonCommand::Status { snapshots } => {
+            let mut invocation = control_invocation("status", Value::Null);
+            invocation.render_hint = RenderHint::Status { snapshots };
+            invocation
+        }
         DaemonCommand::Doctor => control_invocation("doctor", Value::Null),
         DaemonCommand::Shutdown => control_invocation("shutdown", Value::Null),
     }
@@ -336,7 +345,10 @@ fn render(method: &str, resp: &Response, render_hint: RenderHint) {
     match method {
         "status" => {
             if let Ok(report) = serde_json::from_value::<StatusReport>(value.clone()) {
-                render_status(&report);
+                let RenderHint::Status { snapshots } = render_hint else {
+                    return;
+                };
+                render_status(&report, snapshots);
                 return;
             }
         }
@@ -555,36 +567,67 @@ fn render_repo_list(r: &ListReposResult) {
     }
 }
 
-fn render_status(r: &StatusReport) {
+fn render_status(r: &StatusReport, snapshots: bool) {
     println!("cairn {} (uptime: {}s)", r.daemon_version, r.uptime_secs);
     if r.repos.is_empty() {
         println!("  (no repositories registered)");
         return;
     }
     for repo in &r.repos {
-        println!("  - {} ({})", repo.alias, repo.root);
-        let languages = repo.languages();
-        if !languages.is_empty() {
-            println!(
-                "      languages: {}",
-                languages.iter().copied().collect::<Vec<_>>().join(", ")
-            );
-        }
-        for snap in &repo.snapshots {
-            println!(
-                "      [{}] status={} enrichment={:?} files={} symbols={} bytes={}",
-                snap.branches.join("/"),
-                snap.status,
-                snap.enrichment,
-                snap.file_count,
-                snap.symbol_count,
-                snap.size_bytes,
-            );
+        println!("{}", render_status_repo_summary(repo));
+        if snapshots {
+            for snap in &repo.snapshots {
+                println!(
+                    "      [{}] status={} enrichment={:?} files={} symbols={} bytes={}",
+                    snap.branches.join("/"),
+                    snap.status,
+                    snap.enrichment,
+                    snap.file_count,
+                    snap.symbol_count,
+                    snap.size_bytes,
+                );
+            }
         }
         if !repo.job_summary.is_empty() {
             println!("      jobs: {}", render_job_summary(&repo.job_summary));
         }
     }
+}
+
+fn render_status_repo_summary(repo: &cairn_proto::control::RepoStatus) -> String {
+    let languages = repo.languages();
+    let snapshots = repo.snapshots.len();
+    let ready = repo
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == "ready")
+        .count();
+    let stale = repo
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == "stale")
+        .count();
+    let files = repo
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.file_count)
+        .sum::<u64>();
+    let symbols = repo
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.symbol_count)
+        .sum::<u64>();
+    format!(
+        "  - {} ({}) [{}] snapshots={} ready={} stale={} files={} symbols={}",
+        repo.alias,
+        repo.root,
+        languages.iter().copied().collect::<Vec<_>>().join(","),
+        snapshots,
+        ready,
+        stale,
+        files,
+        symbols
+    )
 }
 
 fn render_job_summary(summary: &JobSummary) -> String {
@@ -700,12 +743,83 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_defaults_to_repo_summary() {
+        let invocation = route_ctl_command(CtlCommand::Daemon {
+            command: DaemonCommand::Status { snapshots: false },
+        })
+        .unwrap();
+
+        assert_eq!(invocation.socket, CtlSocket::Control);
+        assert_eq!(invocation.method, "status");
+        assert_eq!(
+            invocation.render_hint,
+            RenderHint::Status { snapshots: false }
+        );
+    }
+
+    #[test]
+    fn daemon_status_snapshots_flag_preserves_expanded_rendering() {
+        let invocation = route_ctl_command(CtlCommand::Daemon {
+            command: DaemonCommand::Status { snapshots: true },
+        })
+        .unwrap();
+
+        assert_eq!(invocation.socket, CtlSocket::Control);
+        assert_eq!(invocation.method, "status");
+        assert_eq!(
+            invocation.render_hint,
+            RenderHint::Status { snapshots: true }
+        );
+    }
+
+    #[test]
+    fn status_repo_summary_collapses_snapshot_counts() {
+        let repo = cairn_proto::control::RepoStatus {
+            alias: "demo".into(),
+            root: "/repo/demo".into(),
+            snapshots: vec![
+                cairn_proto::control::SnapshotStatus {
+                    branches: vec!["HEAD".into()],
+                    status: "ready".into(),
+                    enrichment: vec![cairn_proto::common::LanguageEnrichment {
+                        language: "rust".into(),
+                        tier: cairn_proto::common::SourceTier::Semantic,
+                        has_analyzer: true,
+                    }],
+                    file_count: 3,
+                    symbol_count: 10,
+                    size_bytes: 100,
+                },
+                cairn_proto::control::SnapshotStatus {
+                    branches: vec!["feature".into()],
+                    status: "stale".into(),
+                    enrichment: vec![cairn_proto::common::LanguageEnrichment {
+                        language: "python".into(),
+                        tier: cairn_proto::common::SourceTier::Semantic,
+                        has_analyzer: true,
+                    }],
+                    file_count: 5,
+                    symbol_count: 20,
+                    size_bytes: 200,
+                },
+            ],
+            job_summary: JobSummary::default(),
+            jobs: Vec::new(),
+        };
+
+        assert_eq!(
+            render_status_repo_summary(&repo),
+            "  - demo (/repo/demo) [python,rust] snapshots=2 ready=1 stale=1 files=8 symbols=30"
+        );
+    }
+
+    #[test]
     fn daemon_shutdown_is_only_ctl_command_that_skips_version_guard() {
         assert!(!should_check_daemon_version(&CtlCommand::Daemon {
             command: DaemonCommand::Shutdown,
         }));
         assert!(should_check_daemon_version(&CtlCommand::Daemon {
-            command: DaemonCommand::Status,
+            command: DaemonCommand::Status { snapshots: false },
         }));
         assert!(should_check_daemon_version(&CtlCommand::Jobs {
             command: JobsCommand::List {
