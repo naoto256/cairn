@@ -5,6 +5,104 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-06-16
+
+### Added
+
+- **`tier3_status` rebuilt for query-relevant confidence.** Query
+  responses now carry an explicit `tier3_status.this_query` view
+  scoped to analyzers whose parser_id touches the query result, so
+  unrelated repo-wide analyzer failures no longer pollute the
+  confidence signal an agent reads on every call. The body shape
+  becomes `{ ready, analyzers[] }` where each entry exposes
+  `id` (nullable), `language` (singular), `state`, optional
+  machine-readable `reason_code`, and free-text `reason`. The
+  state enum is `ready / queued / running / missing / failed /
+  skipped / stale / not_applicable`; internal `succeeded` rows
+  collapse to `ready`. Pass `verbose_tier3=true` (CLI:
+  `--verbose-tier3`, MCP: `verbose_tier3` argument) to additionally
+  receive a `repo_wide` body covering the full repo's Tier-3
+  matrix for diagnostics (#172, #173).
+- **Scheduler and analyzer-job observability.** `cairn ctl jobs
+  list` now surfaces per-job `scheduler`, `group`, `queued_ms`,
+  `pool_wait_ms`, `run_ms`, `progress_ticks`, and rate so operators
+  and agents can tell a stalled run from a long but healthy one
+  without tailing the daemon log.
+- **`cairn ctl daemon status` repo summary view.** The default
+  output now collapses each repo into a single
+  `<alias> (<root>) [<langs>] snapshots=N ready=M stale=K files=Σ
+  symbols=Σ` line so the command stays usable on many-snapshot
+  registries; `--snapshots` restores the legacy per-snapshot
+  expansion (#171).
+- **`cairn ctl jobs prune`.** Historical terminal analyzer rows
+  from old manifests can now be garbage-collected with a
+  `--dry-run` preview, scoped optionally by `--repo`. Keeps the
+  active anchor's history intact.
+- **Content-aware C-family header routing.** Ambiguous
+  `.h` / `.hpp` headers now route to the C, C++, or Objective-C
+  backend based on file content rather than extension alone, which
+  fixes symbol extraction for header-only C++ libraries and mixed
+  Objective-C / C codebases.
+
+### Changed
+
+- **Breaking: `cairn ctl` admin surface reorganized by lifecycle.**
+  Top-level subcommands are now `repo` (register / remove /
+  reindex / list), `jobs` (list / cancel / prune), `blobs` (prune),
+  and `daemon` (status / doctor / shutdown). Pre-0.5.0 flat
+  commands (`register-repo`, `remove-repo`, `status`, `reindex-
+  repo`, `jobs`, `prune`, `doctor`, `shutdown`) are removed without
+  aliases.
+- **Breaking: `tier3_status` wire shape replaced.** The legacy flat
+  `tier3_status: { ready, pending_analyzers: [...] }` payload
+  emitted at the response root is removed; clients must read
+  `tier3_status.this_query.ready` and `tier3_status.this_query.
+  analyzers`. The `pending_analyzers` field and the
+  `PendingAnalyzer` struct are gone; `repo_wide` is opt-in via
+  `verbose_tier3` (#173, supersedes #172).
+- **MCP forwarding plumbing shared across tools.** All 12 MCP
+  tools now route through a single forwarding helper instead of
+  per-tool clients, which keeps daemon dispatch behavior consistent
+  and makes future surface additions a one-line registration.
+
+### Fixed
+
+- **Tier-3 reference echoes from clangd suppressed.** The
+  clangd-backed C / C++ / Objective-C backend no longer emits
+  use-site definition rows that point back at the use itself,
+  which produced false call edges where Tier-3 looked like it
+  resolved an external API to the caller it appeared in (e.g.
+  `wait_job(...)` calls binding to their enclosing `main`).
+- **Rust duplicate references at zero-range Tier-2 / Tier-3
+  joins.** `find_references` and `find_callers` no longer return
+  paired `target_qualified=foo` and `target_qualified=bar::foo`
+  rows when both a zero-range Tier-2 row and a Tier-3 row resolve
+  the same call site; the lower-quality row is dropped on the
+  default view. `include_noise=true` still returns both for
+  diagnostics.
+- **TypeScript Tier-3 skips local binding calls before LSP
+  definition requests.** Skipping calls that resolve to a same-file
+  local binding before issuing an LSP definition request stops
+  spurious Tier-3 round trips and matches the resolution policy
+  Rust and Python Tier-3 already use.
+- **Daemon awaits watcher startup before serving.** The control
+  and data sockets now appear only after every registered repo
+  watcher has reported ready, so an early-arriving CLI no longer
+  races a not-yet-loaded registry.
+
+### Performance
+
+- **Multi-kind LSP definition passes per document.** Tier-3 now
+  bundles definition queries for every reference kind in a
+  document into one LSP pass instead of one pass per kind, which
+  removes a multiplier-of-N visit cost on large files.
+- **Pool-aware analyzer scheduler.** Analyzer jobs that share a
+  pooled LSP backend (e.g. clangd across C / C++ / Objective-C)
+  are dispatched through a scheduler that serializes same-pool
+  work and parallelizes across pools, so pool contention no longer
+  blocks unrelated languages and stays observable through the new
+  job metrics.
+
 ## [0.4.2] — 2026-06-14
 
 ### Fixed
