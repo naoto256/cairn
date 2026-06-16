@@ -6,12 +6,14 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "get_symbol_source".into(),
-        description: "Default tool for reading the source of one specific symbol. Given a fully-qualified name (what `find_symbols` and `get_outline` return as `qualified`), returns the exact text of that function / struct / impl / enum / const as it appears in the file — signature, doc comment, and body. Much cheaper than `Read`-ing the whole file when you only need to look at one definition, and unambiguous about *which* `fn handle` you got. Pair with `find_symbols` to go from a free-form name to its source in two calls. If the same qualified name exists in multiple files (rare), pass `file` to disambiguate.\n\nSet `signature_only=true` to peek at the API surface (signature + doc string) without paying for the body bytes — useful for \"what does this take and return\" / \"what does the docstring say\" questions, or when iterating across many candidates before committing to a deep read.".into(),
+        description: format!(
+            "Default tool for reading the source of one specific symbol. Given a fully-qualified name (what `find_symbols` and `get_outline` return as `qualified`), returns the exact text of that function / struct / impl / enum / const as it appears in the file — signature, doc comment, and body. Much cheaper than `Read`-ing the whole file when you only need to look at one definition, and unambiguous about *which* `fn handle` you got. Pair with `find_symbols` to go from a free-form name to its source in two calls. If the same qualified name exists in multiple files (rare), pass `file` to disambiguate.\n\nSet `signature_only=true` to peek at the API surface (signature + doc string) without paying for the body bytes — useful for \"what does this take and return\" / \"what does the docstring say\" questions, or when iterating across many candidates before committing to a deep read. {VERBOSE_TIER3_DESC}"
+        ),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -21,6 +23,7 @@ fn spec() -> ToolSpec {
                 "anchor":    {"type": "string", "description": ANCHOR_PARAM_DESC},
                 "file":      {"type": "string", "description": "Path relative to repo root. Optional; only needed when the same qualified name exists in multiple files."},
                 "signature_only": {"type": "boolean", "description": "Return only the signature + doc string (no body bytes). Cheap API-surface peek; the `source` field is empty when this is set, `signature` and `doc` carry everything."},
+                "verbose_tier3": {"type": "boolean", "description": VERBOSE_TIER3_DESC},
             },
             "required": ["qualified"],
             "additionalProperties": false,

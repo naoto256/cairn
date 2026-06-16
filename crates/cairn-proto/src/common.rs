@@ -143,25 +143,77 @@ pub enum RefKind {
     Annotation,
 }
 
+/// Wire state for one Tier-3 analyzer entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyzerState {
+    Ready,
+    Queued,
+    Running,
+    Missing,
+    Failed,
+    Skipped,
+    Stale,
+    NotApplicable,
+}
+
+/// Machine-readable reason for a non-ready or intentionally skipped
+/// Tier-3 analyzer entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    BinaryNotFound,
+    NoMatchingFiles,
+    WorkspaceUnsuitable,
+    AnalyzerFailed,
+    TimedOut,
+    Stale,
+    NotApplicable,
+    Unknown,
+}
+
+/// One analyzer's readiness as exposed on query results.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Tier3AnalyzerStatus {
+    /// Stable analyzer identifier, e.g. a workspace analyzer name. `None`
+    /// means the language has no Tier-3 analyzer.
+    pub id: Option<String>,
+    /// Primary language this entry describes.
+    pub language: String,
+    /// Normalized wire state. Internal `succeeded` rows become `ready`.
+    pub state: AnalyzerState,
+    /// Machine-readable reason for non-ready states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<ReasonCode>,
+    /// Human-readable diagnostic text, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Tier3AnalyzerStatus {
+    #[must_use]
+    pub fn is_positive(&self) -> bool {
+        matches!(
+            self.state,
+            AnalyzerState::Ready | AnalyzerState::Skipped | AnalyzerState::NotApplicable
+        )
+    }
+}
+
 /// Tier-3 workspace analyzer readiness body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier3StatusBody {
     /// True when every Tier-3 analyzer relevant to the query reached a
     /// positive terminal state.
     pub ready: bool,
-    /// Analyzer runs that kept readiness false. Omitted on the wire
-    /// when there is nothing pending.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_analyzers: Vec<PendingAnalyzer>,
+    /// Analyzer entries relevant to this view.
+    pub analyzers: Vec<Tier3AnalyzerStatus>,
 }
 
 /// Tier-3 workspace analyzer readiness for the snapshots a query touched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier3Status {
-    /// Readiness for analyzers relevant to this query. Flattening keeps the
-    /// legacy wire shape (`ready`, `pending_analyzers`) stable; `repo_wide`
-    /// below is opt-in diagnostic context.
-    #[serde(flatten)]
+    /// Readiness for analyzers relevant to this query.
     pub this_query: Tier3StatusBody,
     /// Full repository readiness, included only when `verbose_tier3=true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,19 +250,17 @@ impl Tier3StatusBody {
     pub fn ready() -> Self {
         Self {
             ready: true,
-            pending_analyzers: Vec::new(),
+            analyzers: Vec::new(),
         }
     }
-}
 
-/// One Tier-3 analyzer that has not reached a positive terminal state.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PendingAnalyzer {
-    /// Stable analyzer identifier, e.g. a workspace analyzer name.
-    pub analyzer_id: String,
-    /// Current analyzer state as stored by the daemon. Consumers should
-    /// treat unknown values as non-ready.
-    pub state: String,
+    #[must_use]
+    pub fn from_analyzers(analyzers: Vec<Tier3AnalyzerStatus>) -> Self {
+        Self {
+            ready: analyzers.iter().all(Tier3AnalyzerStatus::is_positive),
+            analyzers,
+        }
+    }
 }
 
 /// How complete a query's answer is at the moment it was produced.
