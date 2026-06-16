@@ -7,7 +7,8 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_subtypes::into_wire_hit;
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, tier3_status_for_query, with_one_or_all_stores,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindSupertypesArgs as QueryArgs};
 use crate::{Error, Result};
@@ -37,7 +38,7 @@ impl DataMethod for FindSupertypes {
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
 
-        let (items, capped) = with_one_or_all_stores(
+        let (hits, capped) = with_one_or_all_stores(
             ctx,
             requested_repo,
             "find_supertypes",
@@ -52,17 +53,24 @@ impl DataMethod for FindSupertypes {
                 let hits = query::find_supertypes(conn, &anchor, &q)?;
                 Ok(hits
                     .into_iter()
-                    .map(|hit| into_wire_hit(&entry.alias, &anchor_label, hit))
+                    .map(|hit| {
+                        let parser_id = hit.parser_id.clone();
+                        (into_wire_hit(&entry.alias, &anchor_label, hit), parser_id)
+                    })
                     .collect())
             },
-            |_out: &mut Vec<ImplHit>| {},
+            |_out: &mut Vec<(ImplHit, String)>| {},
         )
         .await?;
+        let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
+        let items = hits.into_iter().map(|(item, _)| item).collect();
         let tier3_status = tier3_status_for_query(
             ctx,
             args.scope.repo.clone(),
             args.scope.anchor.clone(),
             args.scope.branch.clone(),
+            parser_ids,
+            args.tier3.verbose_tier3,
             "find_supertypes",
         )
         .await?;
