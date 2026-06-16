@@ -6,7 +6,7 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, VERBOSE_TIER3_DESC};
 
 const REF_KIND_DESC: &str = "Restrict to one RefKind. Use snake_case strings: `call`, `type`, `import`, `instantiate`, `read`, `write`, `override`, `macro_invoke`, or `annotation`. Omit for every kind.";
 
@@ -38,6 +38,7 @@ fn spec() -> ToolSpec {
                 "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
                 "anchor": {"type": "string", "description": ANCHOR_PARAM_DESC},
                 "limit":  {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
+                "verbose_tier3": {"type": "boolean", "description": VERBOSE_TIER3_DESC},
             },
             "required": ["symbol"],
             "additionalProperties": false,

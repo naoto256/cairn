@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use cairn_proto::{Completeness, PartialReason, PendingAnalyzer, Tier3Status, Tier3StatusBody};
+use cairn_proto::{
+    AnalyzerState, Completeness, PartialReason, ReasonCode, Tier3AnalyzerStatus, Tier3Status,
+    Tier3StatusBody,
+};
 use rusqlite::{OptionalExtension, params};
 
 use crate::anchor;
@@ -87,15 +90,14 @@ pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
     }
 }
 
-pub(crate) fn parser_id_filter<I>(parser_ids: I) -> Option<BTreeSet<String>>
+pub(crate) fn parser_id_filter<I>(parser_ids: I) -> BTreeSet<String>
 where
     I: IntoIterator<Item = String>,
 {
-    let parser_ids = parser_ids
+    parser_ids
         .into_iter()
         .filter(|parser_id| !parser_id.is_empty())
-        .collect::<BTreeSet<_>>();
-    (!parser_ids.is_empty()).then_some(parser_ids)
+        .collect::<BTreeSet<_>>()
 }
 
 pub(crate) async fn tier3_status_for_query(
@@ -103,7 +105,7 @@ pub(crate) async fn tier3_status_for_query(
     requested_repo: Option<String>,
     anchor_arg: Option<String>,
     branch_arg: Option<String>,
-    relevant_parser_ids: Option<BTreeSet<String>>,
+    relevant_parser_ids: BTreeSet<String>,
     verbose_tier3: bool,
     method_name: &'static str,
 ) -> Result<Tier3Status> {
@@ -122,8 +124,8 @@ pub(crate) async fn tier3_status_for_query(
             None => cas_registry::list_all(&index)?,
         };
 
-        let mut pending = BTreeSet::new();
-        let mut repo_wide_pending = BTreeSet::new();
+        let mut analyzers = Vec::new();
+        let mut repo_wide_analyzers = Vec::new();
         for entry in aliases {
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let conn = cas_store::open(&store_path)?;
@@ -135,32 +137,30 @@ pub(crate) async fn tier3_status_for_query(
             let Some(manifest_id) = anchor::resolve(&conn, &anchor)? else {
                 continue;
             };
-            pending.extend(
+            analyzers.extend(
                 compute_tier3_status_for_parser_ids(
                     &conn,
                     manifest_id,
-                    relevant_parser_ids.as_ref(),
+                    Some(&relevant_parser_ids),
                 )?
-                .pending_analyzers,
+                .analyzers,
             );
             if verbose_tier3 {
-                repo_wide_pending.extend(
+                repo_wide_analyzers.extend(
                     compute_tier3_status(&conn, manifest_id)?
                         .this_query
-                        .pending_analyzers,
+                        .analyzers,
                 );
             }
         }
-        let this_query = Tier3StatusBody {
-            ready: pending.is_empty(),
-            pending_analyzers: pending.into_iter().collect(),
-        };
+        analyzers.sort();
+        analyzers.dedup();
+        let this_query = Tier3StatusBody::from_analyzers(analyzers);
         let status = Tier3Status::from_body(this_query);
         if verbose_tier3 {
-            Ok(status.with_repo_wide(Tier3StatusBody {
-                ready: repo_wide_pending.is_empty(),
-                pending_analyzers: repo_wide_pending.into_iter().collect(),
-            }))
+            repo_wide_analyzers.sort();
+            repo_wide_analyzers.dedup();
+            Ok(status.with_repo_wide(Tier3StatusBody::from_analyzers(repo_wide_analyzers)))
         } else {
             Ok(status)
         }
@@ -232,41 +232,128 @@ fn compute_tier3_status_body_with_analyzers(
     relevant_parser_ids: Option<&BTreeSet<String>>,
 ) -> Result<Tier3StatusBody> {
     let manifest_parser_ids = manifest_parser_ids(conn, manifest_id)?;
-    let mut expected_ids = analyzers
-        .into_iter()
-        .filter(|analyzer| manifest_parser_ids.contains(analyzer.parser_id()))
-        .filter(|analyzer| {
-            relevant_parser_ids.is_none_or(|parser_ids| parser_ids.contains(analyzer.parser_id()))
-        })
-        .map(|analyzer| analyzer.id().to_string())
-        .collect::<Vec<_>>();
-    expected_ids.sort();
-    expected_ids.dedup();
-
-    if expected_ids.is_empty() {
-        return Ok(Tier3StatusBody::ready());
-    }
-
+    let manifest_parser_ids_sorted = manifest_parser_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let relevant_parser_ids = relevant_parser_ids.unwrap_or(&manifest_parser_ids_sorted);
+    let mut described_parser_ids = BTreeSet::new();
+    let mut statuses = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT status FROM workspace_analysis_runs
+        "SELECT status, error, analyzer_revision FROM workspace_analysis_runs
          WHERE manifest_id = ?1 AND analyzer_id = ?2",
     )?;
-    let mut pending = Vec::new();
-    for analyzer_id in expected_ids {
-        let state = stmt
-            .query_row(params![manifest_id.0, analyzer_id.as_str()], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .unwrap_or_else(|| "missing".to_string());
-        if !matches!(state.as_str(), "succeeded" | "skipped") {
-            pending.push(PendingAnalyzer { analyzer_id, state });
+
+    for analyzer in analyzers {
+        let parser_id = analyzer.parser_id();
+        if !manifest_parser_ids.contains(parser_id) || !relevant_parser_ids.contains(parser_id) {
+            continue;
         }
+        described_parser_ids.insert(parser_id.to_string());
+        let row = stmt
+            .query_row(params![manifest_id.0, analyzer.id()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()?;
+        statuses.push(analyzer_status_from_run(
+            analyzer.id(),
+            analyzer.language(),
+            analyzer.revision(),
+            row,
+        ));
     }
-    Ok(Tier3StatusBody {
-        ready: pending.is_empty(),
-        pending_analyzers: pending,
-    })
+
+    for parser_id in relevant_parser_ids {
+        if !manifest_parser_ids.contains(parser_id) || described_parser_ids.contains(parser_id) {
+            continue;
+        }
+        statuses.push(Tier3AnalyzerStatus {
+            id: None,
+            language: language_from_parser_id(parser_id),
+            state: AnalyzerState::NotApplicable,
+            reason_code: Some(ReasonCode::NotApplicable),
+            reason: Some("no tier3 analyzer for language".into()),
+        });
+    }
+    statuses.sort();
+    statuses.dedup();
+    Ok(Tier3StatusBody::from_analyzers(statuses))
+}
+
+fn analyzer_status_from_run(
+    analyzer_id: &str,
+    language: &str,
+    expected_revision: u32,
+    row: Option<(String, Option<String>, i64)>,
+) -> Tier3AnalyzerStatus {
+    let Some((status, error, revision)) = row else {
+        return Tier3AnalyzerStatus {
+            id: Some(analyzer_id.into()),
+            language: language.into(),
+            state: AnalyzerState::Missing,
+            reason_code: Some(ReasonCode::Unknown),
+            reason: Some("analyzer run not recorded".into()),
+        };
+    };
+    if revision != i64::from(expected_revision) {
+        return Tier3AnalyzerStatus {
+            id: Some(analyzer_id.into()),
+            language: language.into(),
+            state: AnalyzerState::Stale,
+            reason_code: Some(ReasonCode::Stale),
+            reason: Some(format!(
+                "analyzer revision changed from {revision} to {expected_revision}"
+            )),
+        };
+    }
+    let (state, reason_code) = match status.as_str() {
+        "succeeded" => (AnalyzerState::Ready, None),
+        "queued" => (AnalyzerState::Queued, None),
+        "running" => (AnalyzerState::Running, None),
+        "skipped" => (
+            AnalyzerState::Skipped,
+            reason_code_for_error(&status, error.as_deref()),
+        ),
+        "timed_out" => (AnalyzerState::Failed, Some(ReasonCode::TimedOut)),
+        "failed" => (AnalyzerState::Failed, Some(ReasonCode::AnalyzerFailed)),
+        _ => (AnalyzerState::Failed, Some(ReasonCode::Unknown)),
+    };
+    Tier3AnalyzerStatus {
+        id: Some(analyzer_id.into()),
+        language: language.into(),
+        state,
+        reason_code,
+        reason: error.or_else(|| (status == "cancelled").then(|| "cancelled".into())),
+    }
+}
+
+fn reason_code_for_error(status: &str, error: Option<&str>) -> Option<ReasonCode> {
+    let Some(error) = error else {
+        return (status != "succeeded").then_some(ReasonCode::Unknown);
+    };
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("binary") && (lower.contains("missing") || lower.contains("not available")) {
+        Some(ReasonCode::BinaryNotFound)
+    } else if lower.contains("no matching files") {
+        Some(ReasonCode::NoMatchingFiles)
+    } else if lower.contains("workspace unsuitable")
+        || lower.contains("gemfile without gemfile.lock")
+    {
+        Some(ReasonCode::WorkspaceUnsuitable)
+    } else if lower.contains("stalled") || lower.contains("timed out") {
+        Some(ReasonCode::TimedOut)
+    } else {
+        Some(ReasonCode::Unknown)
+    }
+}
+
+fn language_from_parser_id(parser_id: &str) -> String {
+    let language = parser_id.strip_prefix("tree-sitter-").unwrap_or(parser_id);
+    if language == "md" {
+        return "markdown".into();
+    }
+    language.strip_suffix("-ng").unwrap_or(language).to_string()
 }
 
 fn manifest_parser_ids(
@@ -399,6 +486,7 @@ mod tests {
     struct TestAnalyzer {
         id: &'static str,
         parser_id: &'static str,
+        language: &'static str,
     }
 
     impl WorkspaceAnalyzer for TestAnalyzer {
@@ -411,7 +499,7 @@ mod tests {
         }
 
         fn language(&self) -> &'static str {
-            "test"
+            self.language
         }
 
         fn parser_id(&self) -> &'static str {
@@ -472,15 +560,26 @@ mod tests {
             vec![Box::new(TestAnalyzer {
                 id: "demo-lsp",
                 parser_id: "tree-sitter-rust",
+                language: "rust",
             })],
         )
         .unwrap();
 
-        assert_eq!(status, Tier3Status::ready());
+        assert!(status.this_query.ready);
+        assert_eq!(
+            status.this_query.analyzers,
+            vec![Tier3AnalyzerStatus {
+                id: Some("demo-lsp".into()),
+                language: "rust".into(),
+                state: AnalyzerState::Ready,
+                reason_code: None,
+                reason: None,
+            }]
+        );
     }
 
     #[test]
-    fn tier3_status_reports_running_pending_analyzer() {
+    fn tier3_status_reports_running_analyzer() {
         let fixture = test_support::registered_fixture();
         let (conn, manifest_id) = demo_store(&fixture);
         insert_run(&conn, manifest_id, "demo-lsp", "running");
@@ -491,24 +590,26 @@ mod tests {
             vec![Box::new(TestAnalyzer {
                 id: "demo-lsp",
                 parser_id: "tree-sitter-rust",
+                language: "rust",
             })],
         )
         .unwrap();
 
         assert_eq!(
-            status,
-            Tier3Status::from_body(Tier3StatusBody {
-                ready: false,
-                pending_analyzers: vec![PendingAnalyzer {
-                    analyzer_id: "demo-lsp".into(),
-                    state: "running".into(),
-                }],
-            })
+            status.this_query.analyzers,
+            vec![Tier3AnalyzerStatus {
+                id: Some("demo-lsp".into()),
+                language: "rust".into(),
+                state: AnalyzerState::Running,
+                reason_code: None,
+                reason: None,
+            }]
         );
+        assert!(!status.this_query.ready);
     }
 
     #[test]
-    fn tier3_status_is_ready_when_no_analyzers_match_manifest() {
+    fn tier3_status_reports_not_applicable_when_no_analyzers_match_manifest() {
         let fixture = test_support::registered_fixture();
         let (conn, manifest_id) = demo_store(&fixture);
 
@@ -518,11 +619,22 @@ mod tests {
             vec![Box::new(TestAnalyzer {
                 id: "demo-lsp",
                 parser_id: "not-present",
+                language: "test",
             })],
         )
         .unwrap();
 
-        assert_eq!(status, Tier3Status::ready());
+        assert!(status.this_query.ready);
+        assert_eq!(
+            status.this_query.analyzers,
+            vec![Tier3AnalyzerStatus {
+                id: None,
+                language: "rust".into(),
+                state: AnalyzerState::NotApplicable,
+                reason_code: Some(ReasonCode::NotApplicable),
+                reason: Some("no tier3 analyzer for language".into()),
+            }]
+        );
     }
 
     #[test]
@@ -542,12 +654,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            status.pending_analyzers,
-            vec![PendingAnalyzer {
-                analyzer_id: "rust-lsp".into(),
-                state: "running".into(),
+            status.analyzers,
+            vec![Tier3AnalyzerStatus {
+                id: Some("rust-lsp".into()),
+                language: "rust".into(),
+                state: AnalyzerState::Running,
+                reason_code: None,
+                reason: None,
             }]
         );
+    }
+
+    #[test]
+    fn tier3_status_empty_parser_filter_does_not_expand_to_repo_wide() {
+        let fixture = multi_language_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_run(&conn, manifest_id, "rust-lsp", "running");
+        insert_run(&conn, manifest_id, "python-lsp", "running");
+
+        let parser_ids = BTreeSet::new();
+        let status = compute_tier3_status_body_with_analyzers(
+            &conn,
+            manifest_id,
+            multi_language_analyzers(),
+            Some(&parser_ids),
+        )
+        .unwrap();
+
+        assert!(status.ready);
+        assert!(status.analyzers.is_empty());
     }
 
     #[test]
@@ -570,15 +705,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            status.pending_analyzers,
+            status.analyzers,
             vec![
-                PendingAnalyzer {
-                    analyzer_id: "python-lsp".into(),
-                    state: "running".into(),
+                Tier3AnalyzerStatus {
+                    id: Some("python-lsp".into()),
+                    language: "python".into(),
+                    state: AnalyzerState::Running,
+                    reason_code: None,
+                    reason: None,
                 },
-                PendingAnalyzer {
-                    analyzer_id: "rust-lsp".into(),
-                    state: "running".into(),
+                Tier3AnalyzerStatus {
+                    id: Some("rust-lsp".into()),
+                    language: "rust".into(),
+                    state: AnalyzerState::Running,
+                    reason_code: None,
+                    reason: None,
                 },
             ]
         );
@@ -612,8 +753,42 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(status.this_query.pending_analyzers.len(), 1);
-        assert_eq!(status.repo_wide.unwrap().pending_analyzers.len(), 2);
+        assert_eq!(status.this_query.analyzers.len(), 1);
+        assert_eq!(status.repo_wide.unwrap().analyzers.len(), 2);
+    }
+
+    #[test]
+    fn tier3_status_not_applicable_for_markdown_only_query() {
+        let fixture = test_support::registered_fixture_with_files(&[("README.md", "# Project\n")]);
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_manifest_parser(
+            &conn,
+            manifest_id,
+            "README.md",
+            "markdown-fixture-sha",
+            "tree-sitter-md",
+        );
+        let parser_ids = BTreeSet::from(["tree-sitter-md".to_string()]);
+
+        let status = compute_tier3_status_body_with_analyzers(
+            &conn,
+            manifest_id,
+            Vec::new(),
+            Some(&parser_ids),
+        )
+        .unwrap();
+
+        assert!(status.ready);
+        assert_eq!(
+            status.analyzers,
+            vec![Tier3AnalyzerStatus {
+                id: None,
+                language: "markdown".into(),
+                state: AnalyzerState::NotApplicable,
+                reason_code: Some(ReasonCode::NotApplicable),
+                reason: Some("no tier3 analyzer for language".into()),
+            }]
+        );
     }
 
     fn multi_language_fixture() -> test_support::DataRpcFixture {
@@ -628,10 +803,12 @@ mod tests {
             Box::new(TestAnalyzer {
                 id: "rust-lsp",
                 parser_id: "tree-sitter-rust",
+                language: "rust",
             }),
             Box::new(TestAnalyzer {
                 id: "python-lsp",
                 parser_id: "tree-sitter-python",
+                language: "python",
             }),
         ]
     }
@@ -661,6 +838,27 @@ mod tests {
                 status, started_at_ns, finished_at_ns, error, job_id, cancel_requested)
              VALUES (?1, ?2, 1, 'cfg', ?3, 0, 0, NULL, NULL, 0)",
             params![manifest_id.0, analyzer_id, status],
+        )
+        .unwrap();
+    }
+
+    fn insert_manifest_parser(
+        conn: &rusqlite::Connection,
+        manifest_id: ManifestId,
+        path: &str,
+        blob_sha: &str,
+        parser_id: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![blob_sha, parser_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (?1, ?2, ?3)",
+            params![manifest_id.0, path, blob_sha],
         )
         .unwrap();
     }

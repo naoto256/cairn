@@ -1039,43 +1039,75 @@ mod tests {
     }
 
     #[test]
-    fn tier3_status_keeps_legacy_flat_wire_shape_by_default() {
+    fn tier3_status_this_query_field_explicit_in_wire() {
         let status = Tier3Status::ready();
         let serialized = serde_json::to_value(status).unwrap();
-        assert_eq!(serialized, json!({"ready": true}));
+        assert_eq!(
+            serialized,
+            json!({
+                "this_query": {
+                    "ready": true,
+                    "analyzers": []
+                }
+            })
+        );
 
         let parsed: Tier3Status = serde_json::from_value(json!({
-            "ready": false,
-            "pending_analyzers": [
-                {"analyzer_id": "rust-analyzer-lsp", "state": "running"}
-            ]
+            "this_query": {
+                "ready": false,
+                "analyzers": [
+                    {"id": "rust-analyzer-lsp", "language": "rust", "state": "running"}
+                ]
+            }
         }))
         .unwrap();
         assert!(!parsed.this_query.ready);
-        assert_eq!(parsed.this_query.pending_analyzers.len(), 1);
+        assert_eq!(parsed.this_query.analyzers.len(), 1);
         assert!(parsed.repo_wide.is_none());
     }
 
     #[test]
-    fn tier3_status_serializes_repo_wide_only_when_present() {
+    fn tier3_status_default_omits_repo_wide() {
+        let status = Tier3Status::ready();
+        let serialized = serde_json::to_value(status).unwrap();
+        assert!(serialized.get("repo_wide").is_none());
+    }
+
+    #[test]
+    fn tier3_status_verbose_includes_repo_wide() {
         let status = Tier3Status::from_body(crate::Tier3StatusBody {
             ready: true,
-            pending_analyzers: Vec::new(),
+            analyzers: Vec::new(),
         })
         .with_repo_wide(crate::Tier3StatusBody {
             ready: false,
-            pending_analyzers: vec![crate::PendingAnalyzer {
-                analyzer_id: "sourcekit-lsp".into(),
-                state: "binary missing".into(),
+            analyzers: vec![crate::Tier3AnalyzerStatus {
+                id: Some("sourcekit-lsp".into()),
+                language: "swift".into(),
+                state: crate::AnalyzerState::Missing,
+                reason_code: Some(crate::ReasonCode::BinaryNotFound),
+                reason: Some("sourcekit-lsp binary not found in PATH".into()),
             }],
         });
 
         let serialized = serde_json::to_value(status).unwrap();
-        assert_eq!(serialized["ready"], true);
+        assert_eq!(serialized["this_query"]["ready"], true);
         assert_eq!(serialized["repo_wide"]["ready"], false);
         assert_eq!(
-            serialized["repo_wide"]["pending_analyzers"][0]["analyzer_id"],
+            serialized["repo_wide"]["analyzers"][0]["id"],
             "sourcekit-lsp"
+        );
+    }
+
+    #[test]
+    fn analyzer_state_enum_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(crate::AnalyzerState::NotApplicable).unwrap(),
+            json!("not_applicable")
+        );
+        assert_eq!(
+            serde_json::to_value(crate::ReasonCode::BinaryNotFound).unwrap(),
+            json!("binary_not_found")
         );
     }
 

@@ -74,6 +74,9 @@ enum QueryCommand {
         max_depth: Option<u32>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Look up a definition by name (function, struct, method, …).
     #[command(
@@ -112,6 +115,9 @@ enum QueryCommand {
         /// cost.
         #[arg(long)]
         signature_only: bool,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Print the source of one symbol by qualified name.
     Source {
@@ -132,6 +138,9 @@ enum QueryCommand {
         /// qualified name when it exists in multiple files.
         #[arg(long)]
         file: Option<String>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Types that implement / extend / mix in the given name.
     Subtypes {
@@ -147,6 +156,9 @@ enum QueryCommand {
         anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Types that the given name extends / implements / mixes in.
     Supertypes {
@@ -162,6 +174,9 @@ enum QueryCommand {
         anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Functions that call the given symbol.
     ///
@@ -179,6 +194,9 @@ enum QueryCommand {
         anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Resolved calls made from inside the given symbol.
     Callees {
@@ -194,6 +212,9 @@ enum QueryCommand {
         anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Import edges (`use` statements / ES imports).
     Imports {
@@ -211,6 +232,9 @@ enum QueryCommand {
         anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
     /// Symmetric reference query — incoming or outgoing references.
     /// Use the dedicated `callers` / `callees` subcommands for the
@@ -240,6 +264,9 @@ enum QueryCommand {
         anchor: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
+        #[arg(long)]
+        verbose_tier3: bool,
     },
 }
 
@@ -274,6 +301,7 @@ pub async fn run(args: Args) -> Result<()> {
             kind,
             max_depth,
             limit,
+            verbose_tier3,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(r) = repo {
@@ -300,6 +328,7 @@ pub async fn run(args: Args) -> Result<()> {
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
             }
+            insert_verbose_tier3(&mut p, *verbose_tier3);
             ("get_outline", Value::Object(p))
         }
         QueryCommand::Symbols {
@@ -313,6 +342,7 @@ pub async fn run(args: Args) -> Result<()> {
             fuzzy,
             limit,
             signature_only,
+            verbose_tier3,
         } => (
             "find_symbols",
             symbols_query(SymbolsQueryArgs {
@@ -326,6 +356,7 @@ pub async fn run(args: Args) -> Result<()> {
                 fuzzy: *fuzzy,
                 limit: *limit,
                 signature_only: *signature_only,
+                verbose_tier3: *verbose_tier3,
             }),
         ),
         QueryCommand::Source {
@@ -334,6 +365,7 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             file,
+            verbose_tier3,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(r) = repo {
@@ -349,6 +381,7 @@ pub async fn run(args: Args) -> Result<()> {
             if let Some(f) = file {
                 p.insert("file".into(), Value::String(f.clone()));
             }
+            insert_verbose_tier3(&mut p, *verbose_tier3);
             ("get_symbol_source", Value::Object(p))
         }
         QueryCommand::Subtypes {
@@ -357,9 +390,10 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             limit,
+            verbose_tier3,
         } => (
             "find_subtypes",
-            name_query(name, repo, branch, anchor, *limit),
+            name_query(name, repo, branch, anchor, *limit, *verbose_tier3),
         ),
         QueryCommand::Supertypes {
             name,
@@ -367,9 +401,10 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             limit,
+            verbose_tier3,
         } => (
             "find_supertypes",
-            name_query(name, repo, branch, anchor, *limit),
+            name_query(name, repo, branch, anchor, *limit, *verbose_tier3),
         ),
         QueryCommand::Callers {
             name,
@@ -377,9 +412,10 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             limit,
+            verbose_tier3,
         } => (
             "find_callers",
-            name_query(name, repo, branch, anchor, *limit),
+            name_query(name, repo, branch, anchor, *limit, *verbose_tier3),
         ),
         QueryCommand::Callees {
             name,
@@ -387,9 +423,10 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             limit,
+            verbose_tier3,
         } => (
             "find_callees",
-            name_query(name, repo, branch, anchor, *limit),
+            name_query(name, repo, branch, anchor, *limit, *verbose_tier3),
         ),
         QueryCommand::Imports {
             file,
@@ -397,6 +434,7 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             limit,
+            verbose_tier3,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(repo) = repo {
@@ -416,6 +454,7 @@ pub async fn run(args: Args) -> Result<()> {
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
             }
+            insert_verbose_tier3(&mut p, *verbose_tier3);
             ("find_imports", Value::Object(p))
         }
         QueryCommand::Refs {
@@ -427,6 +466,7 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             limit,
+            verbose_tier3,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(repo) = repo {
@@ -454,6 +494,7 @@ pub async fn run(args: Args) -> Result<()> {
             if let Some(l) = limit {
                 p.insert("limit".into(), json!(l));
             }
+            insert_verbose_tier3(&mut p, *verbose_tier3);
             ("find_references", Value::Object(p))
         }
     };
@@ -491,6 +532,7 @@ fn name_query(
     branch: &Option<String>,
     anchor: &Option<String>,
     limit: Option<u32>,
+    verbose_tier3: bool,
 ) -> Value {
     let mut p = serde_json::Map::new();
     if let Some(repo) = repo {
@@ -506,6 +548,7 @@ fn name_query(
     if let Some(l) = limit {
         p.insert("limit".into(), json!(l));
     }
+    insert_verbose_tier3(&mut p, verbose_tier3);
     Value::Object(p)
 }
 
@@ -520,6 +563,7 @@ struct SymbolsQueryArgs<'a> {
     fuzzy: bool,
     limit: Option<u32>,
     signature_only: bool,
+    verbose_tier3: bool,
 }
 
 fn symbols_query(args: SymbolsQueryArgs<'_>) -> Value {
@@ -552,7 +596,14 @@ fn symbols_query(args: SymbolsQueryArgs<'_>) -> Value {
     if args.signature_only {
         p.insert("signature_only".into(), Value::Bool(true));
     }
+    insert_verbose_tier3(&mut p, args.verbose_tier3);
     Value::Object(p)
+}
+
+fn insert_verbose_tier3(p: &mut serde_json::Map<String, Value>, verbose_tier3: bool) {
+    if verbose_tier3 {
+        p.insert("verbose_tier3".into(), Value::Bool(true));
+    }
 }
 
 // ─── rendering ─────────────────────────────────────────────────────────────
@@ -761,6 +812,7 @@ mod tests {
             fuzzy: true,
             limit: Some(5),
             signature_only: true,
+            verbose_tier3: false,
         });
 
         assert_eq!(
@@ -793,8 +845,30 @@ mod tests {
             fuzzy: false,
             limit: None,
             signature_only: false,
+            verbose_tier3: false,
         });
 
         assert_eq!(value, json!({"query": "fetchJson"}));
+    }
+
+    #[test]
+    fn symbols_query_includes_verbose_tier3_when_requested() {
+        let none = None;
+
+        let value = symbols_query(SymbolsQueryArgs {
+            query: "fetchJson",
+            repo: &none,
+            branch: &none,
+            anchor: &none,
+            kind: &none,
+            path: &none,
+            container: &none,
+            fuzzy: false,
+            limit: None,
+            signature_only: false,
+            verbose_tier3: true,
+        });
+
+        assert_eq!(value, json!({"query": "fetchJson", "verbose_tier3": true}));
     }
 }

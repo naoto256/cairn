@@ -6,7 +6,10 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, SYMBOL_KIND_DESC};
+use super::{
+    ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, SYMBOL_KIND_DESC,
+    VERBOSE_TIER3_DESC,
+};
 
 fn spec() -> ToolSpec {
     ToolSpec {
@@ -28,6 +31,7 @@ fn spec() -> ToolSpec {
                 "fuzzy":  {"type": "boolean", "description": "When `query` is set, run SQLite FTS5 over name + qualified + doc instead of exact name / qualified matching. Spaces between bare tokens are AND, quoted text is an exact-order phrase, and prefix matching requires an explicit trailing `*`."},
                 "limit":  {"type": "integer", "minimum": 1, "maximum": 500, "description": "Cap on hits. If a probe finds more rows beyond this cap, the response is `completeness: partial` with reason `cap`."},
                 "signature_only": {"type": "boolean", "description": "Drop the `signature` field from each hit. Use for broad enumerations (e.g. `kind=\"function\"` over a directory) where the signature dominates wire / context cost."},
+                "verbose_tier3": {"type": "boolean", "description": VERBOSE_TIER3_DESC},
             },
             "additionalProperties": false,
         }),
