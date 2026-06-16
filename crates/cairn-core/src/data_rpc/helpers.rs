@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use cairn_proto::{Completeness, PartialReason, PendingAnalyzer, Tier3Status};
+use cairn_proto::{Completeness, PartialReason, PendingAnalyzer, Tier3Status, Tier3StatusBody};
 use rusqlite::{OptionalExtension, params};
 
 use crate::anchor;
@@ -87,11 +87,24 @@ pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
     }
 }
 
+pub(crate) fn parser_id_filter<I>(parser_ids: I) -> Option<BTreeSet<String>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let parser_ids = parser_ids
+        .into_iter()
+        .filter(|parser_id| !parser_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    (!parser_ids.is_empty()).then_some(parser_ids)
+}
+
 pub(crate) async fn tier3_status_for_query(
     ctx: &DataCtx,
     requested_repo: Option<String>,
     anchor_arg: Option<String>,
     branch_arg: Option<String>,
+    relevant_parser_ids: Option<BTreeSet<String>>,
+    verbose_tier3: bool,
     method_name: &'static str,
 ) -> Result<Tier3Status> {
     let cas_data_dir = ctx.cas_data_dir.clone();
@@ -110,6 +123,7 @@ pub(crate) async fn tier3_status_for_query(
         };
 
         let mut pending = BTreeSet::new();
+        let mut repo_wide_pending = BTreeSet::new();
         for entry in aliases {
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let conn = cas_store::open(&store_path)?;
@@ -121,12 +135,35 @@ pub(crate) async fn tier3_status_for_query(
             let Some(manifest_id) = anchor::resolve(&conn, &anchor)? else {
                 continue;
             };
-            pending.extend(compute_tier3_status(&conn, manifest_id)?.pending_analyzers);
+            pending.extend(
+                compute_tier3_status_for_parser_ids(
+                    &conn,
+                    manifest_id,
+                    relevant_parser_ids.as_ref(),
+                )?
+                .pending_analyzers,
+            );
+            if verbose_tier3 {
+                repo_wide_pending.extend(
+                    compute_tier3_status(&conn, manifest_id)?
+                        .this_query
+                        .pending_analyzers,
+                );
+            }
         }
-        Ok(Tier3Status {
+        let this_query = Tier3StatusBody {
             ready: pending.is_empty(),
             pending_analyzers: pending.into_iter().collect(),
-        })
+        };
+        let status = Tier3Status::from_body(this_query);
+        if verbose_tier3 {
+            Ok(status.with_repo_wide(Tier3StatusBody {
+                ready: repo_wide_pending.is_empty(),
+                pending_analyzers: repo_wide_pending.into_iter().collect(),
+            }))
+        } else {
+            Ok(status)
+        }
     })
     .await
     .map_err(|e| Error::internal_task_panic(format!("{method_name} tier3 status"), e))?
@@ -136,25 +173,78 @@ pub(crate) fn compute_tier3_status(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
 ) -> Result<Tier3Status> {
-    compute_tier3_status_with_analyzers(conn, manifest_id, all_workspace_analyzers())
+    Ok(Tier3Status::from_body(
+        compute_tier3_status_body_with_analyzers(
+            conn,
+            manifest_id,
+            all_workspace_analyzers(),
+            None,
+        )?,
+    ))
 }
 
+pub(crate) fn compute_tier3_status_response(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+    parser_ids: Option<&BTreeSet<String>>,
+    verbose_tier3: bool,
+) -> Result<Tier3Status> {
+    let status = Tier3Status::from_body(compute_tier3_status_for_parser_ids(
+        conn,
+        manifest_id,
+        parser_ids,
+    )?);
+    if verbose_tier3 {
+        Ok(status.with_repo_wide(compute_tier3_status(conn, manifest_id)?.this_query))
+    } else {
+        Ok(status)
+    }
+}
+
+pub(crate) fn compute_tier3_status_for_parser_ids(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+    parser_ids: Option<&BTreeSet<String>>,
+) -> Result<Tier3StatusBody> {
+    compute_tier3_status_body_with_analyzers(
+        conn,
+        manifest_id,
+        all_workspace_analyzers(),
+        parser_ids,
+    )
+}
+
+#[cfg(test)]
 fn compute_tier3_status_with_analyzers(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
 ) -> Result<Tier3Status> {
-    let parser_ids = manifest_parser_ids(conn, manifest_id)?;
+    Ok(Tier3Status::from_body(
+        compute_tier3_status_body_with_analyzers(conn, manifest_id, analyzers, None)?,
+    ))
+}
+
+fn compute_tier3_status_body_with_analyzers(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+    analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
+    relevant_parser_ids: Option<&BTreeSet<String>>,
+) -> Result<Tier3StatusBody> {
+    let manifest_parser_ids = manifest_parser_ids(conn, manifest_id)?;
     let mut expected_ids = analyzers
         .into_iter()
-        .filter(|analyzer| parser_ids.contains(analyzer.parser_id()))
+        .filter(|analyzer| manifest_parser_ids.contains(analyzer.parser_id()))
+        .filter(|analyzer| {
+            relevant_parser_ids.is_none_or(|parser_ids| parser_ids.contains(analyzer.parser_id()))
+        })
         .map(|analyzer| analyzer.id().to_string())
         .collect::<Vec<_>>();
     expected_ids.sort();
     expected_ids.dedup();
 
     if expected_ids.is_empty() {
-        return Ok(Tier3Status::ready());
+        return Ok(Tier3StatusBody::ready());
     }
 
     let mut stmt = conn.prepare(
@@ -173,7 +263,7 @@ fn compute_tier3_status_with_analyzers(
             pending.push(PendingAnalyzer { analyzer_id, state });
         }
     }
-    Ok(Tier3Status {
+    Ok(Tier3StatusBody {
         ready: pending.is_empty(),
         pending_analyzers: pending,
     })
@@ -218,7 +308,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn registered_fixture() -> DataRpcFixture {
-        let (repo, _sha) = init_repo(&[(
+        registered_fixture_with_files(&[(
             "src/lib.rs",
             "use std::fmt;\n\
              use std::fs;\n\
@@ -234,7 +324,11 @@ pub(crate) mod test_support {
              pub fn caller_a() { target(); }\n\
              pub fn caller_b() { target(); }\n\
              pub fn caller_c() { target(); }\n",
-        )]);
+        )])
+    }
+
+    pub(crate) fn registered_fixture_with_files(files: &[(&str, &str)]) -> DataRpcFixture {
+        let (repo, _sha) = init_repo(files);
         let data = tempfile::tempdir().unwrap();
         let cas = CasDataDir::with_root(data.path().to_path_buf());
         cas.ensure().unwrap();
@@ -403,13 +497,13 @@ mod tests {
 
         assert_eq!(
             status,
-            Tier3Status {
+            Tier3Status::from_body(Tier3StatusBody {
                 ready: false,
                 pending_analyzers: vec![PendingAnalyzer {
                     analyzer_id: "demo-lsp".into(),
                     state: "running".into(),
                 }],
-            }
+            })
         );
     }
 
@@ -429,6 +523,117 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, Tier3Status::ready());
+    }
+
+    #[test]
+    fn tier3_status_parser_filter_excludes_unrelated_language() {
+        let fixture = multi_language_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_run(&conn, manifest_id, "rust-lsp", "running");
+        insert_run(&conn, manifest_id, "python-lsp", "running");
+
+        let parser_ids = BTreeSet::from(["tree-sitter-rust".to_string()]);
+        let status = compute_tier3_status_body_with_analyzers(
+            &conn,
+            manifest_id,
+            multi_language_analyzers(),
+            Some(&parser_ids),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status.pending_analyzers,
+            vec![PendingAnalyzer {
+                analyzer_id: "rust-lsp".into(),
+                state: "running".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tier3_status_parser_filter_keeps_multiple_touched_languages() {
+        let fixture = multi_language_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_run(&conn, manifest_id, "rust-lsp", "running");
+        insert_run(&conn, manifest_id, "python-lsp", "running");
+
+        let parser_ids = BTreeSet::from([
+            "tree-sitter-python".to_string(),
+            "tree-sitter-rust".to_string(),
+        ]);
+        let status = compute_tier3_status_body_with_analyzers(
+            &conn,
+            manifest_id,
+            multi_language_analyzers(),
+            Some(&parser_ids),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status.pending_analyzers,
+            vec![
+                PendingAnalyzer {
+                    analyzer_id: "python-lsp".into(),
+                    state: "running".into(),
+                },
+                PendingAnalyzer {
+                    analyzer_id: "rust-lsp".into(),
+                    state: "running".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tier3_status_response_includes_repo_wide_only_when_verbose() {
+        let fixture = multi_language_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_run(&conn, manifest_id, "rust-lsp", "running");
+        insert_run(&conn, manifest_id, "python-lsp", "running");
+
+        let parser_ids = BTreeSet::from(["tree-sitter-rust".to_string()]);
+        let status = Tier3Status::from_body(
+            compute_tier3_status_body_with_analyzers(
+                &conn,
+                manifest_id,
+                multi_language_analyzers(),
+                Some(&parser_ids),
+            )
+            .unwrap(),
+        );
+        assert!(status.repo_wide.is_none());
+
+        let status = status.with_repo_wide(
+            compute_tier3_status_body_with_analyzers(
+                &conn,
+                manifest_id,
+                multi_language_analyzers(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(status.this_query.pending_analyzers.len(), 1);
+        assert_eq!(status.repo_wide.unwrap().pending_analyzers.len(), 2);
+    }
+
+    fn multi_language_fixture() -> test_support::DataRpcFixture {
+        test_support::registered_fixture_with_files(&[
+            ("src/lib.rs", "pub fn rust_symbol() {}\n"),
+            ("src/app.py", "def python_symbol():\n    pass\n"),
+        ])
+    }
+
+    fn multi_language_analyzers() -> Vec<Box<dyn WorkspaceAnalyzer>> {
+        vec![
+            Box::new(TestAnalyzer {
+                id: "rust-lsp",
+                parser_id: "tree-sitter-rust",
+            }),
+            Box::new(TestAnalyzer {
+                id: "python-lsp",
+                parser_id: "tree-sitter-python",
+            }),
+        ]
     }
 
     fn demo_store(fixture: &test_support::DataRpcFixture) -> (rusqlite::Connection, ManifestId) {

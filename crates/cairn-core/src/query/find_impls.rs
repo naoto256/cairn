@@ -17,6 +17,7 @@ pub struct ImplHit {
     pub kind: String,
     pub path: String,
     pub line: u32,
+    pub parser_id: String,
 }
 
 /// Filters for `find_subtypes`.
@@ -95,7 +96,7 @@ fn run(
     let limit = limit.unwrap_or(100).max(1);
 
     let mut sql = String::from(
-        "SELECT i.type_qualified, i.interface_qualified, i.kind, me.path, i.line
+        "SELECT i.type_qualified, i.interface_qualified, i.kind, me.path, i.line, i.parser_id
            FROM implementations i
            JOIN manifest_entries me
              ON me.manifest_id = ?1
@@ -117,6 +118,7 @@ fn run(
                 kind: row.get(2)?,
                 path: row.get(3)?,
                 line: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                parser_id: row.get(5)?,
             })
         })?
         .collect();

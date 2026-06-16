@@ -13,7 +13,8 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, tier3_status_for_query, with_one_or_all_stores,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
@@ -74,6 +75,7 @@ impl DataMethod for FindSymbols {
             },
         )
         .await?;
+        let parser_ids = parser_id_filter(hits.iter().map(|(_, _, h)| h.parser_id.clone()));
         let items = hits
             .into_iter()
             .map(|(repo, anchor_label, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
@@ -83,6 +85,8 @@ impl DataMethod for FindSymbols {
             args.scope.repo.clone(),
             args.scope.anchor.clone(),
             args.scope.branch.clone(),
+            parser_ids,
+            args.tier3.verbose_tier3,
             "find_symbols",
         )
         .await?;
@@ -173,6 +177,7 @@ mod tests {
             path: "src/lib.rs".into(),
             line: 1,
             blob_sha: "sha".into(),
+            parser_id: "tree-sitter-rust".into(),
             language: Some("rust".into()),
             source_tier: SourceTier::Semantic,
         };

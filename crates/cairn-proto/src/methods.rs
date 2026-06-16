@@ -19,6 +19,10 @@ use crate::control::JobSnapshot;
 
 // ─── shared argument fragments ─────────────────────────────────────────────
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Repository filter shared by query methods.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoScope {
@@ -52,6 +56,16 @@ pub struct PaginationArgs {
     /// reaching the effective limit marks the result as partial with `cap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// Optional Tier-3 diagnostic verbosity shared by query methods.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier3Args {
+    /// Include full repo-wide Tier-3 readiness alongside the query-relevant
+    /// readiness. Defaults to false to keep unrelated analyzer failures out
+    /// of ordinary query confidence checks.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verbose_tier3: bool,
 }
 
 // ─── list_repos ─────────────────────────────────────────────────────────────
@@ -242,6 +256,9 @@ pub struct OutlineArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Result of `get_outline`. Empty `doc`/`signature` fields are omitted on the
@@ -366,6 +383,9 @@ pub struct FindSymbolArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
     /// When true, hits omit the `signature` field. Use for broad
     /// enumerations (e.g. `kind = "function"` over a directory) where
     /// the signature dominates wire/context cost. Named for
@@ -455,6 +475,9 @@ pub struct FindSubtypesArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Arguments to `find_supertypes`. Asks "what does `name` extend /
@@ -471,6 +494,9 @@ pub struct FindSupertypesArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Result of `find_subtypes`.
@@ -546,6 +572,9 @@ pub struct ImportsArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Result of `find_imports`.
@@ -641,6 +670,9 @@ pub struct FindReferencesArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Result of `find_references`.
@@ -713,6 +745,9 @@ pub struct FindCallersArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Arguments to `find_callees`. "What does `name` call?"
@@ -727,6 +762,9 @@ pub struct FindCalleesArgs {
     /// Optional result cap.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Result of `find_callers`.
@@ -824,6 +862,9 @@ pub struct GetSymbolSourceArgs {
     /// 0.2.1 surface completion.
     #[serde(default)]
     pub signature_only: bool,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
 }
 
 /// Result of `get_symbol_source`.
@@ -994,6 +1035,47 @@ mod tests {
                 "fuzzy": false,
                 "signature_only": false
             })
+        );
+    }
+
+    #[test]
+    fn tier3_status_keeps_legacy_flat_wire_shape_by_default() {
+        let status = Tier3Status::ready();
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized, json!({"ready": true}));
+
+        let parsed: Tier3Status = serde_json::from_value(json!({
+            "ready": false,
+            "pending_analyzers": [
+                {"analyzer_id": "rust-analyzer-lsp", "state": "running"}
+            ]
+        }))
+        .unwrap();
+        assert!(!parsed.this_query.ready);
+        assert_eq!(parsed.this_query.pending_analyzers.len(), 1);
+        assert!(parsed.repo_wide.is_none());
+    }
+
+    #[test]
+    fn tier3_status_serializes_repo_wide_only_when_present() {
+        let status = Tier3Status::from_body(crate::Tier3StatusBody {
+            ready: true,
+            pending_analyzers: Vec::new(),
+        })
+        .with_repo_wide(crate::Tier3StatusBody {
+            ready: false,
+            pending_analyzers: vec![crate::PendingAnalyzer {
+                analyzer_id: "sourcekit-lsp".into(),
+                state: "binary missing".into(),
+            }],
+        });
+
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized["ready"], true);
+        assert_eq!(serialized["repo_wide"]["ready"], false);
+        assert_eq!(
+            serialized["repo_wide"]["pending_analyzers"][0]["analyzer_id"],
+            "sourcekit-lsp"
         );
     }
 

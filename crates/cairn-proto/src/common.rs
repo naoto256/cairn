@@ -143,20 +143,57 @@ pub enum RefKind {
     Annotation,
 }
 
-/// Tier-3 workspace analyzer readiness for the snapshots a query touched.
+/// Tier-3 workspace analyzer readiness body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tier3Status {
+pub struct Tier3StatusBody {
     /// True when every Tier-3 analyzer relevant to the query reached a
     /// positive terminal state.
     pub ready: bool,
-    /// Analyzer runs that kept [`Self::ready`] false. Omitted on the wire
+    /// Analyzer runs that kept readiness false. Omitted on the wire
     /// when there is nothing pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_analyzers: Vec<PendingAnalyzer>,
 }
 
+/// Tier-3 workspace analyzer readiness for the snapshots a query touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier3Status {
+    /// Readiness for analyzers relevant to this query. Flattening keeps the
+    /// legacy wire shape (`ready`, `pending_analyzers`) stable; `repo_wide`
+    /// below is opt-in diagnostic context.
+    #[serde(flatten)]
+    pub this_query: Tier3StatusBody,
+    /// Full repository readiness, included only when `verbose_tier3=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_wide: Option<Tier3StatusBody>,
+}
+
 impl Tier3Status {
     /// Build the default "Tier-3 was ready or not required" status.
+    #[must_use]
+    pub fn ready() -> Self {
+        Self {
+            this_query: Tier3StatusBody::ready(),
+            repo_wide: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_body(this_query: Tier3StatusBody) -> Self {
+        Self {
+            this_query,
+            repo_wide: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_repo_wide(mut self, repo_wide: Tier3StatusBody) -> Self {
+        self.repo_wide = Some(repo_wide);
+        self
+    }
+}
+
+impl Tier3StatusBody {
     #[must_use]
     pub fn ready() -> Self {
         Self {

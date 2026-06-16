@@ -31,5 +31,5 @@ pub mod version;
 
 pub use common::{
     Completeness, LanguageEnrichment, MissingTier, PartialReason, PendingAnalyzer, Position, Range,
-    RefKind, SourceTier, SymbolKind, Tier3Status, TypeRole,
+    RefKind, SourceTier, SymbolKind, Tier3Status, Tier3StatusBody, TypeRole,
 };
