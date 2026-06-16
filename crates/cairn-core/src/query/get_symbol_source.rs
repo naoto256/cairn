@@ -21,6 +21,7 @@ pub struct SymbolSourceRow {
     pub byte_end: usize,
     pub line_start: u32,
     pub line_end: u32,
+    pub parser_id: String,
 }
 
 /// Look up a symbol by its qualified name in the manifest at `anchor`
@@ -45,7 +46,7 @@ pub fn get_symbol_source_row(
     let mut sql = String::from(
         "SELECT s.name, s.kind, s.signature, s.doc,
                 s.byte_start, s.byte_end, s.line_start, s.line_end,
-                me.path, s.blob_sha
+                me.path, s.blob_sha, s.parser_id
            FROM symbols s
            JOIN manifest_entries me
              ON me.manifest_id = ?1
@@ -76,6 +77,7 @@ pub fn get_symbol_source_row(
                 line_end: u32::try_from(r.get::<_, i64>(7)?).unwrap_or(0),
                 path: r.get(8)?,
                 blob_sha: r.get(9)?,
+                parser_id: r.get(10)?,
             })
         })
         .optional()?;

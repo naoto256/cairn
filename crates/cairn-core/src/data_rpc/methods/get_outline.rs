@@ -8,7 +8,8 @@ use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, tier3_status_for_query, with_one_or_all_stores,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
@@ -38,12 +39,12 @@ impl DataMethod for GetOutline {
             max_depth: args.max_depth,
         };
 
-        let (items, capped) = with_one_or_all_stores(
+        let (hits, capped) = with_one_or_all_stores(
             ctx,
             repo_alias,
             "outline",
             effective_limit,
-            move |_entry, conn| -> Result<Vec<OutlineItem>> {
+            move |_entry, conn| -> Result<Vec<(OutlineItem, String)>> {
                 let anchor = crate::anchor::resolve_explicit_or_default(conn, None, None)?;
                 if let Some(file) = file.as_deref() {
                     let raw = match query::get_outline(conn, &anchor, file, None) {
@@ -54,7 +55,10 @@ impl DataMethod for GetOutline {
                     let filtered: Vec<_> = raw
                         .into_iter()
                         .filter(|i| filter.kind.as_ref().is_none_or(|k| &i.kind == k))
-                        .map(into_wire_item)
+                        .map(|item| {
+                            let parser_id = item.parser_id.clone();
+                            (into_wire_item(item), parser_id)
+                        })
                         .collect();
                     return Ok(filtered);
                 }
@@ -72,11 +76,19 @@ impl DataMethod for GetOutline {
                     Err(Error::AnchorNotFound { .. }) => Vec::new(),
                     Err(other) => return Err(other),
                 };
-                Ok(raw.into_iter().map(into_wire_item).collect())
+                Ok(raw
+                    .into_iter()
+                    .map(|item| {
+                        let parser_id = item.parser_id.clone();
+                        (into_wire_item(item), parser_id)
+                    })
+                    .collect())
             },
-            |_out: &mut Vec<OutlineItem>| {},
+            |_out: &mut Vec<(OutlineItem, String)>| {},
         )
         .await?;
+        let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
+        let items: Vec<OutlineItem> = hits.into_iter().map(|(item, _)| item).collect();
 
         debug!(
             repo = ?args.scope.repo,
@@ -85,8 +97,16 @@ impl DataMethod for GetOutline {
             count = items.len(),
             "outline served"
         );
-        let tier3_status =
-            tier3_status_for_query(ctx, args.scope.repo.clone(), None, None, "get_outline").await?;
+        let tier3_status = tier3_status_for_query(
+            ctx,
+            args.scope.repo.clone(),
+            None,
+            None,
+            parser_ids,
+            args.tier3.verbose_tier3,
+            "get_outline",
+        )
+        .await?;
         Ok(serde_json::to_value(OutlineResult {
             items,
             completeness: completeness_for_cap(capped),

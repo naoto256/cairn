@@ -22,6 +22,7 @@ pub struct ReferenceHit {
     /// the indexer parsed), with the worktree as a fallback for
     /// uncommitted state.
     pub blob_sha: String,
+    pub parser_id: String,
 }
 
 /// Filters for `find_references`. `symbol` is required and non-empty.
@@ -76,11 +77,11 @@ fn run_find_references(
     // LEFT for incoming (top-level refs have no enclosing).
     let run = |where_col: &str, value: &str, outgoing: bool| -> Result<Vec<ReferenceHit>> {
         let mut sql = String::from(
-            "SELECT target_name, target_qualified, kind, enclosing, path, line, blob_sha
+            "SELECT target_name, target_qualified, kind, enclosing, path, line, blob_sha, parser_id
                FROM (
                  SELECT r.target_name, r.target_qualified, r.kind,
                         enc.qualified AS enclosing,
-                        me.path, r.line, r.blob_sha, r.byte_start, r.byte_end,
+                        me.path, r.line, r.blob_sha, r.parser_id, r.byte_start, r.byte_end,
                         CASE
                           WHEN r.source LIKE 'tier3-%' THEN 0
                           WHEN r.source = 'rust-syn' THEN 1
@@ -158,6 +159,7 @@ fn run_find_references(
                 path: row.get(4)?,
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
                 blob_sha: row.get(6)?,
+                parser_id: row.get(7)?,
             })
         };
         let rows: rusqlite::Result<Vec<ReferenceHit>> = match &kind_str {

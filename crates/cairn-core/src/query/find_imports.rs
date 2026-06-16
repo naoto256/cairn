@@ -13,6 +13,7 @@ pub struct ImportHit {
     pub alias: Option<String>,
     pub is_reexport: bool,
     pub line: u32,
+    pub parser_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,7 +42,7 @@ pub fn find_imports(
     let limit = args.limit.unwrap_or(200).max(1);
 
     let mut sql = String::from(
-        "SELECT me.path, i.to_module, i.imported, i.alias, i.is_reexport, i.line
+        "SELECT me.path, i.to_module, i.imported, i.alias, i.is_reexport, i.line, i.parser_id
            FROM imports i
            JOIN manifest_entries me
              ON me.manifest_id = ?1
@@ -69,6 +70,7 @@ pub fn find_imports(
                 alias: row.get(3)?,
                 is_reexport: row.get::<_, i64>(4)? != 0,
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                parser_id: row.get(6)?,
             })
         })?
         .collect();

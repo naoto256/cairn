@@ -21,6 +21,7 @@ pub struct SymbolHit {
     pub path: String,
     pub line: u32,
     pub blob_sha: String,
+    pub parser_id: String,
     pub language: Option<String>,
     pub source_tier: SourceTier,
 }
@@ -82,7 +83,7 @@ fn run_find_symbols(
     // file path the blob was mounted at.
     let mut sql = String::from(
         "SELECT s.id, s.name, s.qualified, s.kind, s.signature, s.visibility,
-                 me.path, s.line_start, s.blob_sha,
+                 me.path, s.line_start, s.blob_sha, s.parser_id,
                  CASE
                    WHEN b.analyzer_id IS NULL THEN NULL
                    WHEN b.parser_id LIKE 'tree-sitter-%@%' THEN
@@ -165,8 +166,9 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
         path: row.get(6)?,
         line: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
         blob_sha: row.get(8)?,
-        language: row.get(9)?,
-        source_tier: if row.get::<_, bool>(10)? {
+        parser_id: row.get(9)?,
+        language: row.get(10)?,
+        source_tier: if row.get::<_, bool>(11)? {
             SourceTier::Semantic
         } else {
             SourceTier::Syntactic

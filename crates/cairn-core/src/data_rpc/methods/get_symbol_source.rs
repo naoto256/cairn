@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::data_rpc::helpers::compute_tier3_status;
+use crate::data_rpc::helpers::{compute_tier3_status_response, parser_id_filter};
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -109,7 +109,12 @@ impl DataMethod for GetSymbolSource {
                     // Until rows carry their originating analyzer tier,
                     // report the source text itself as syntactic.
                     source_tier: SourceTier::Syntactic,
-                    tier3_status: compute_tier3_status(&conn, manifest_id)?,
+                    tier3_status: compute_tier3_status_response(
+                        &conn,
+                        manifest_id,
+                        parser_id_filter(std::iter::once(row.parser_id.clone())).as_ref(),
+                        args.tier3.verbose_tier3,
+                    )?,
                 });
             }
 

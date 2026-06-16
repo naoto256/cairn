@@ -15,6 +15,7 @@ pub struct OutlineItem {
     pub signature: Option<String>,
     pub doc: Option<String>,
     pub line: u32,
+    pub parser_id: String,
 }
 
 /// Return every symbol in `file` from the manifest at `anchor`, in
@@ -48,7 +49,7 @@ pub fn get_outline(
     };
 
     let mut sql = String::from(
-        "SELECT name, qualified, kind, signature, doc, line_start
+        "SELECT name, qualified, kind, signature, doc, line_start, parser_id
            FROM symbols
           WHERE blob_sha = ?1",
     );
@@ -71,6 +72,7 @@ pub fn get_outline(
                 signature: row.get(3)?,
                 doc: row.get(4)?,
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                parser_id: row.get(6)?,
             })
         })?
         .collect();
@@ -109,7 +111,8 @@ pub fn get_outline_under_path(
     let limit = limit.max(1);
 
     let mut sql = String::from(
-        "SELECT me.path, s.name, s.qualified, s.kind, s.signature, s.doc, s.line_start
+        "SELECT me.path, s.name, s.qualified, s.kind, s.signature, s.doc, s.line_start,
+                s.parser_id
           FROM manifest_entries me
            JOIN symbols s
              ON s.blob_sha = me.blob_sha
@@ -154,6 +157,7 @@ pub fn get_outline_under_path(
                 signature: row.get(4)?,
                 doc: row.get(5)?,
                 line: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                parser_id: row.get(7)?,
             })
         })?
         .collect();
