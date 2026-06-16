@@ -6,7 +6,7 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{COMPLETENESS_REASON_DESC, SYMBOL_KIND_DESC};
+use super::{COMPLETENESS_REASON_DESC, SYMBOL_KIND_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
@@ -23,6 +23,7 @@ fn spec() -> ToolSpec {
                 "kind": {"type": "string", "description": SYMBOL_KIND_DESC},
                 "max_depth": {"type": "integer", "minimum": 1, "description": "Directory-mode cap on directory depth relative to `path`, counted by `/` separators after the prefix. `1` keeps items from files directly under the prefix (module-level summary); `2` adds one nested level. Omit for unlimited depth. Ignored in single-file mode."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Directory-mode cap on items. Defaults to 200; `completeness: partial` with reason `cap` means more items matched."},
+                "verbose_tier3": {"type": "boolean", "description": VERBOSE_TIER3_DESC},
             },
             "additionalProperties": false,
         }),

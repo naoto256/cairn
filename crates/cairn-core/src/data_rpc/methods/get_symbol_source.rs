@@ -86,6 +86,7 @@ impl DataMethod for GetSymbolSource {
                 } else {
                     materialise(&worktree_root, &row)?
                 };
+                let parser_ids = parser_id_filter(std::iter::once(row.parser_id.clone()));
 
                 return Ok(GetSymbolSourceResult {
                     qualified: row.qualified,
@@ -112,7 +113,7 @@ impl DataMethod for GetSymbolSource {
                     tier3_status: compute_tier3_status_response(
                         &conn,
                         manifest_id,
-                        parser_id_filter(std::iter::once(row.parser_id.clone())).as_ref(),
+                        Some(&parser_ids),
                         args.tier3.verbose_tier3,
                     )?,
                 });
