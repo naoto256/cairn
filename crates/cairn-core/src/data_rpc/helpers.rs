@@ -1,6 +1,6 @@
 //! Shared blocking helpers for data-RPC methods.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use cairn_proto::{
     AnalyzerState, Completeness, PartialReason, ReasonCode, Tier3AnalyzerStatus, Tier3Status,
@@ -11,7 +11,9 @@ use rusqlite::{OptionalExtension, params};
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::manifest::ManifestId;
-use crate::workspace_analyzer::{WorkspaceAnalyzer, all_workspace_analyzers};
+use crate::workspace_analyzer::{
+    WorkspaceAnalyzer, expected_analyzers_for_manifest, manifest_parser_ids,
+};
 use crate::{Error, Result};
 
 use super::DataCtx;
@@ -177,7 +179,7 @@ pub(crate) fn compute_tier3_status(
         compute_tier3_status_body_with_analyzers(
             conn,
             manifest_id,
-            all_workspace_analyzers(),
+            expected_analyzers_for_manifest(conn, manifest_id)?,
             None,
         )?,
     ))
@@ -209,7 +211,7 @@ pub(crate) fn compute_tier3_status_for_parser_ids(
     compute_tier3_status_body_with_analyzers(
         conn,
         manifest_id,
-        all_workspace_analyzers(),
+        expected_analyzers_for_manifest(conn, manifest_id)?,
         parser_ids,
     )
 }
@@ -354,22 +356,6 @@ fn language_from_parser_id(parser_id: &str) -> String {
         return "markdown".into();
     }
     language.strip_suffix("-ng").unwrap_or(language).to_string()
-}
-
-fn manifest_parser_ids(
-    conn: &rusqlite::Connection,
-    manifest_id: ManifestId,
-) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT b.parser_id
-           FROM blobs b
-           JOIN manifest_entries me ON me.blob_sha = b.blob_sha
-          WHERE me.manifest_id = ?1",
-    )?;
-    let parser_ids = stmt
-        .query_map(params![manifest_id.0], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    Ok(parser_ids)
 }
 
 #[cfg(test)]
@@ -789,6 +775,38 @@ mod tests {
                 reason: Some("no tier3 analyzer for language".into()),
             }]
         );
+    }
+
+    #[test]
+    fn expected_analyzers_matches_status_callsite() {
+        let fixture = test_support::registered_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+        insert_manifest_parser(
+            &conn,
+            manifest_id,
+            "fake.rs",
+            "fake-fixture-sha",
+            "fake-parser",
+        );
+
+        let mut expected_ids = expected_analyzers_for_manifest(&conn, manifest_id)
+            .unwrap()
+            .into_iter()
+            .map(|analyzer| analyzer.id().to_string())
+            .collect::<Vec<_>>();
+        expected_ids.sort();
+
+        let mut status_ids = compute_tier3_status(&conn, manifest_id)
+            .unwrap()
+            .this_query
+            .analyzers
+            .into_iter()
+            .filter_map(|status| status.id)
+            .collect::<Vec<_>>();
+        status_ids.sort();
+
+        assert_eq!(status_ids, expected_ids);
+        assert!(status_ids.contains(&"fake-workspace".to_string()));
     }
 
     fn multi_language_fixture() -> test_support::DataRpcFixture {

@@ -30,11 +30,14 @@ use crate::workspace_analyzer::run::{
     run_workspace_analyzers, run_workspace_analyzers_with_timeout,
 };
 
+mod expected;
 mod lsp_pass;
 mod path;
 mod persist;
 mod run;
 
+pub use expected::expected_analyzers_for_manifest;
+pub(crate) use expected::manifest_parser_ids;
 pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
     LspMultiKindDefinitionPass, run_lsp_definition_pass, run_lsp_multi_kind_definition_pass,
