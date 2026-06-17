@@ -95,6 +95,7 @@ impl DataMethod for FindSymbols {
             items,
             completeness: completeness_for_cap(capped),
             tier3_status,
+            timing: cairn_proto::Timing::default(),
         })
         .unwrap())
     }

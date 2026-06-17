@@ -93,6 +93,7 @@ impl DataMethod for FindReferences {
             items,
             completeness: completeness_for_cap(capped),
             tier3_status,
+            timing: cairn_proto::Timing::default(),
         })
         .unwrap())
     }
