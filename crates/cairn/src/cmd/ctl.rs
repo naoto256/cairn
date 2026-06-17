@@ -531,38 +531,15 @@ fn render_repo_list(r: &ListReposResult) {
         return;
     }
     for repo in &r.repos {
-        let languages = repo.languages();
-        let snapshots = repo.snapshots.len();
-        let ready = repo
-            .snapshots
-            .iter()
-            .filter(|snapshot| snapshot.status == "ready")
-            .count();
-        let stale = repo
-            .snapshots
-            .iter()
-            .filter(|snapshot| snapshot.status == "stale")
-            .count();
-        let files = repo
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.file_count)
-            .sum::<u64>();
-        let symbols = repo
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.symbol_count)
-            .sum::<u64>();
         println!(
-            "{}\t{}\t[{}]\tsnapshots={} ready={} stale={} files={} symbols={}",
+            "{}\t{}\t[{}]\tstatus={:?} snapshots={} files={} symbols={}",
             repo.alias,
             repo.root,
-            languages.iter().copied().collect::<Vec<_>>().join(","),
-            snapshots,
-            ready,
-            stale,
-            files,
-            symbols
+            repo.languages.join(","),
+            repo.status,
+            repo.snapshot_count,
+            repo.current_file_count,
+            repo.current_symbol_count
         );
     }
 }

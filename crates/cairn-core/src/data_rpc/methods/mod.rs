@@ -16,4 +16,6 @@ mod find_supertypes;
 mod find_symbols;
 mod get_outline;
 mod get_symbol_source;
+mod list_jobs;
 mod list_repos;
+mod repo_status;

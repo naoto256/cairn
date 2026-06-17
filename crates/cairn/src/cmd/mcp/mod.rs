@@ -503,6 +503,8 @@ mod tests {
             names,
             vec![
                 "list_repos",
+                "repo_status",
+                "list_jobs",
                 "get_outline",
                 "get_symbol_source",
                 "find_symbols",
@@ -522,14 +524,9 @@ mod tests {
     fn tool_specs_describe_snapshot_and_kind_filters_precisely() {
         let specs = dispatcher().tool_specs();
         let list_repos = specs.iter().find(|spec| spec.name == "list_repos").unwrap();
-        assert!(list_repos.description.contains("Start here"));
-        assert!(
-            list_repos
-                .description
-                .contains("language enrichment matrix")
-        );
-        assert!(list_repos.description.contains("`stale`"));
-        assert!(list_repos.description.contains("`reindex_repo`"));
+        assert!(list_repos.description.contains("registered repos"));
+        assert!(list_repos.description.contains("repo_status"));
+        assert!(list_repos.description.contains("list_jobs"));
 
         let get_outline = specs
             .iter()
