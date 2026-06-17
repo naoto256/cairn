@@ -10,7 +10,7 @@ use super::forwarding::ForwardingTool;
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "list_repos".into(),
-        description: "List registered repos with alias, root, language coverage, and aggregate status. Use this to pick a repo alias before query tools. For per-repo snapshot/analyzer detail use `repo_status`; for background analyzer jobs use `list_jobs`.".into(),
+        description: "List registered repos with alias, root, language coverage, and aggregate status (ready / indexing / partial / error).\n\nWHEN: You need to know which repos cairn covers, or to pick an alias for query tools.\nNOT FOR: Per-repo snapshot / analyzer detail; use repo_status. Job-level status; use list_jobs.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

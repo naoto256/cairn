@@ -6,14 +6,12 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, VERBOSE_TIER3_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "find_callers".into(),
-        description: format!(
-            "Default tool for \"who calls `name`?\" — every resolved call site whose target is `name`. Use when answering \"is anything still calling this function?\", \"where does `parse_args` get used?\", \"who would I have to update if I changed this signature?\". Omit `repo` to search every registered repo; each hit carries its repo in the `location` prefix (`repo:branch:file:line`). Each hit gives the caller's qualified name (`enclosing_qualified`), the call target (`target_qualified` resolved when known, `target_name` always), the call-site location, and a single-line `snippet` so you can read each call without an extra round trip. Backed by `find_references` with `direction=incoming` and `kind=call`; reach for `find_references` directly when you need other ref kinds (`type`, `import`, `read`, `write`, `annotation`) or to inspect unresolved method-call noise. For React/JSX component usage such as `<LineageFlow />`, use `find_references` with `kind=instantiate` instead of `find_callers`. {COMPLETENESS_REASON_DESC} Items already returned are valid."
-        ),
+        description: "Find functions that call the given function/method by resolved name.\n\nWHEN: You want who invokes this code.\nNOT FOR: React/JSX component usage; use find_references kind=instantiate. The TSX hint will surface this when applicable.\n\nRecovery: empty + uppercase symbol in TSX/JSX file triggers tsx_callers_use_instantiate hint. tier3_status warning often means the call graph is still warming up.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

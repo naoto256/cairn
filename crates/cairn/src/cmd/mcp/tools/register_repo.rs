@@ -10,7 +10,7 @@ use super::forwarding::ForwardingTool;
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "register_repo".into(),
-        description: "Add a repository to cairn's index so `get_outline` and `find_symbols` can see it. Use proactively the first time you start navigating an unfamiliar codebase: one call pays for the initial full index, after which the daemon's file watcher keeps the index in sync with the working tree automatically — no need to re-register on edits or branch switches. Idempotent on alias for the same path.".into(),
+        description: "Register a repo path under an alias so cairn can index it.\n\nWHEN: list_repos does not include the repo you need, or repo_status by path cannot resolve it.\nNOT FOR: Refreshing an already registered repo after edits; the watcher handles that. Use reindex_repo only for suspected missed changes.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
