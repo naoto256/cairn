@@ -14,8 +14,9 @@ use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::lsp_discovery::{
     discover_lsp_binary, discover_lsp_binary_candidates, discover_sourcekit_lsp,
 };
+use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
-use crate::workspace_analyzer::all_workspace_analyzers;
+use crate::workspace_analyzer::{all_workspace_analyzers, expected_analyzers_for_manifest};
 
 include!(concat!(env!("OUT_DIR"), "/expected_backend_crates.rs"));
 
@@ -275,12 +276,11 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
     };
     let (tier3_runs, expected_tier3_analyzer_ids) = match tentative_manifest_id {
         Some(manifest_id) => {
-            let parser_ids = manifest_parser_ids(&conn, manifest_id)?;
-            let mut expected_tier3_analyzer_ids = all_workspace_analyzers()
-                .into_iter()
-                .filter(|analyzer| parser_ids.contains(analyzer.parser_id()))
-                .map(|analyzer| analyzer.id().to_string())
-                .collect::<Vec<_>>();
+            let mut expected_tier3_analyzer_ids =
+                expected_analyzers_for_manifest(&conn, ManifestId(manifest_id))?
+                    .into_iter()
+                    .map(|analyzer| analyzer.id().to_string())
+                    .collect::<Vec<_>>();
             expected_tier3_analyzer_ids.sort();
 
             let mut stmt = conn.prepare(
@@ -307,19 +307,6 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
         tier3_runs,
         expected_tier3_analyzer_ids,
     })
-}
-
-fn manifest_parser_ids(conn: &rusqlite::Connection, manifest_id: i64) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT b.parser_id
-           FROM blobs b
-           JOIN manifest_entries me ON me.blob_sha = b.blob_sha
-          WHERE me.manifest_id = ?1",
-    )?;
-    let parser_ids = stmt
-        .query_map(params![manifest_id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    Ok(parser_ids)
 }
 
 fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
