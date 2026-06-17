@@ -12,8 +12,8 @@ use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
+    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::register::load_blob_or_worktree;
@@ -77,7 +77,7 @@ impl DataMethod for FindReferences {
         )
         .await?;
         let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
-        let items = hits.into_iter().map(|(item, _)| item).collect();
+        let items: Vec<_> = hits.into_iter().map(|(item, _)| item).collect();
         let tier3_status = tier3_status_for_query(
             ctx,
             args.scope.repo.clone(),
@@ -88,11 +88,28 @@ impl DataMethod for FindReferences {
             "find_references",
         )
         .await?;
+        let completeness = completeness_for_cap(capped);
+        let emission_ctx = EmissionContext {
+            items_empty: items.is_empty(),
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: args.scope.repo.as_deref(),
+                fuzzy: true,
+                kind: args.kind.is_some(),
+                container: None,
+                path: None,
+            },
+        };
+        let diagnostics = build_diagnostics(&emission_ctx);
+        let hints = build_hints(&emission_ctx);
 
         Ok(serde_json::to_value(FindReferencesResult {
             items,
-            completeness: completeness_for_cap(capped),
+            completeness,
             tier3_status,
+            diagnostics,
+            hints,
             timing: cairn_proto::Timing::default(),
         })
         .unwrap())

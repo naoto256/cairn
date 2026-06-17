@@ -14,7 +14,10 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::data_rpc::helpers::{compute_tier3_status_response, parser_id_filter};
+use crate::data_rpc::helpers::{
+    EmissionContext, QueryArgsView, build_diagnostics, build_hints, compute_tier3_status_response,
+    parser_id_filter,
+};
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
@@ -41,6 +44,7 @@ impl DataMethod for GetSymbolSource {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
+        let verbose_tier3 = args.tier3.verbose_tier3;
         let cas_data_dir = ctx.cas_data_dir.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {
@@ -87,6 +91,27 @@ impl DataMethod for GetSymbolSource {
                     materialise(&worktree_root, &row)?
                 };
                 let parser_ids = parser_id_filter(std::iter::once(row.parser_id.clone()));
+                let tier3_status = compute_tier3_status_response(
+                    &conn,
+                    manifest_id,
+                    Some(&parser_ids),
+                    verbose_tier3,
+                )?;
+                let completeness = cairn_proto::Completeness::complete();
+                let emission_ctx = EmissionContext {
+                    items_empty: false,
+                    completeness: &completeness,
+                    tier3_status: &tier3_status,
+                    query_args: QueryArgsView {
+                        repo: requested_repo.as_deref(),
+                        fuzzy: true,
+                        kind: false,
+                        container: None,
+                        path: file_filter.as_deref(),
+                    },
+                };
+                let diagnostics = build_diagnostics(&emission_ctx);
+                let hints = build_hints(&emission_ctx);
 
                 return Ok(GetSymbolSourceResult {
                     qualified: row.qualified,
@@ -110,12 +135,9 @@ impl DataMethod for GetSymbolSource {
                     // Until rows carry their originating analyzer tier,
                     // report the source text itself as syntactic.
                     source_tier: SourceTier::Syntactic,
-                    tier3_status: compute_tier3_status_response(
-                        &conn,
-                        manifest_id,
-                        Some(&parser_ids),
-                        args.tier3.verbose_tier3,
-                    )?,
+                    tier3_status,
+                    diagnostics,
+                    hints,
                     timing: cairn_proto::Timing::default(),
                 });
             }

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use cairn_proto::common::RefKind;
+use cairn_proto::common::{Hint, HintAction, HintCode, RefKind};
 use cairn_proto::methods::{CallHit, FindCallersArgs, FindCallersResult, ReferenceDirection};
 use linkme::distributed_slice;
 use serde_json::Value;
@@ -11,8 +11,8 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_references::SnippetCache;
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
+    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::{Error, Result};
@@ -75,7 +75,7 @@ impl DataMethod for FindCallers {
         )
         .await?;
         let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
-        let items = hits.into_iter().map(|(item, _)| item).collect();
+        let items: Vec<_> = hits.into_iter().map(|(item, _)| item).collect();
         let tier3_status = tier3_status_for_query(
             ctx,
             args.scope.repo.clone(),
@@ -86,11 +86,41 @@ impl DataMethod for FindCallers {
             "find_callers",
         )
         .await?;
+        let completeness = completeness_for_cap(capped);
+        let emission_ctx = EmissionContext {
+            items_empty: items.is_empty(),
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: args.scope.repo.as_deref(),
+                fuzzy: true,
+                kind: true,
+                container: None,
+                path: None,
+            },
+        };
+        let diagnostics = build_diagnostics(&emission_ctx);
+        let mut hints = build_hints(&emission_ctx);
+        if items.is_empty()
+            && is_component_name(&args.name)
+            && symbol_defined_in_jsx_file(
+                ctx,
+                args.scope.repo.clone(),
+                args.scope.anchor.clone(),
+                args.scope.branch.clone(),
+                args.name.clone(),
+            )
+            .await?
+        {
+            hints.push(tsx_component_usage_hint());
+        }
 
         Ok(serde_json::to_value(FindCallersResult {
             items,
-            completeness: completeness_for_cap(capped),
+            completeness,
             tier3_status,
+            diagnostics,
+            hints,
             timing: cairn_proto::Timing::default(),
         })
         .unwrap())
@@ -117,6 +147,64 @@ pub(super) fn into_call_hit(
         location,
         snippet,
     }
+}
+
+fn is_component_name(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn tsx_component_usage_hint() -> Hint {
+    Hint {
+        code: HintCode::TsxCallersUseInstantiate,
+        message: "JSX component usage doesn't show in find_callers; use find_references kind=instantiate.".into(),
+        action: Some(HintAction::TryAlternativeQuery),
+        tool: Some("find_references".into()),
+        params: Some(serde_json::json!({ "kind": "instantiate" })),
+        drop_params: Vec::new(),
+        target: None,
+    }
+}
+
+async fn symbol_defined_in_jsx_file(
+    ctx: &DataCtx,
+    requested_repo: Option<String>,
+    anchor_arg: Option<String>,
+    branch_arg: Option<String>,
+    name: String,
+) -> Result<bool> {
+    let q = crate::query::FindSymbolsArgs {
+        query: Some(name.clone()),
+        fuzzy: false,
+        kind: None,
+        container: None,
+        path_prefix: None,
+        limit: Some(20),
+    };
+    let (matches, _) = with_one_or_all_stores(
+        ctx,
+        requested_repo,
+        "find_callers tsx hint",
+        1,
+        move |_entry, conn| {
+            let anchor = crate::anchor::resolve_explicit_or_default(
+                conn,
+                anchor_arg.as_deref(),
+                branch_arg.as_deref(),
+            )?;
+            let hits = query::find_symbols(conn, &anchor, &q)?;
+            Ok(hits
+                .into_iter()
+                .filter(|hit| {
+                    (hit.name == name || hit.qualified.rsplit("::").next() == Some(name.as_str()))
+                        && (hit.path.ends_with(".tsx") || hit.path.ends_with(".jsx"))
+                })
+                .map(|_| ())
+                .collect())
+        },
+        |_out: &mut Vec<()>| {},
+    )
+    .await?;
+    Ok(!matches.is_empty())
 }
 
 #[cfg(test)]
@@ -166,6 +254,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_callers_emits_tsx_hint_when_symbol_is_tsx_component() {
+        let fixture = fixture_from_files(&[(
+            "src/App.tsx",
+            "export function LineageFlow() { return <div />; }\n",
+        )]);
+        let result = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "LineageFlow", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        let hints = result["hints"].as_array().unwrap();
+        assert!(hints.iter().any(|hint| {
+            hint["code"] == "tsx_callers_use_instantiate"
+                && hint["tool"] == "find_references"
+                && hint["params"] == json!({"kind": "instantiate"})
+        }));
+    }
+
+    #[tokio::test]
+    async fn find_callers_does_not_emit_tsx_hint_when_lowercase_symbol() {
+        let fixture = fixture_from_files(&[(
+            "src/App.tsx",
+            "export function lineWidget() { return <div />; }\n",
+        )]);
+        let result = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "lineWidget", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        let hints = result["hints"].as_array().unwrap();
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint["code"] != "tsx_callers_use_instantiate")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_callers_does_not_emit_tsx_hint_when_definition_not_tsx() {
+        let fixture = fixture_from_files(&[("src/app.ts", "export function LineageFlow() {}\n")]);
+        let result = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "LineageFlow", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        let hints = result["hints"].as_array().unwrap();
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint["code"] != "tsx_callers_use_instantiate")
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_empty_name() {
         let fixture = call_graph_fixture();
         let err = FindCallers
@@ -182,11 +336,15 @@ mod tests {
     }
 
     pub(super) fn call_graph_fixture() -> Fixture {
-        let (repo, _sha) = init_repo(&[(
+        fixture_from_files(&[(
             "src/lib.rs",
             "pub fn resolved() {}\n\
              pub fn caller() { resolved(); }\n",
-        )]);
+        )])
+    }
+
+    fn fixture_from_files(files: &[(&str, &str)]) -> Fixture {
+        let (repo, _sha) = init_repo(files);
         let data = tempfile::tempdir().unwrap();
         let cas = CasDataDir::with_root(data.path().to_path_buf());
         cas.ensure().unwrap();
