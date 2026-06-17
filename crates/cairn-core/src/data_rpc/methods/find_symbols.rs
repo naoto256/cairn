@@ -13,8 +13,8 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
+    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
 };
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
@@ -76,7 +76,7 @@ impl DataMethod for FindSymbols {
         )
         .await?;
         let parser_ids = parser_id_filter(hits.iter().map(|(_, _, h)| h.parser_id.clone()));
-        let items = hits
+        let items: Vec<_> = hits
             .into_iter()
             .map(|(repo, anchor_label, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
             .collect();
@@ -90,11 +90,28 @@ impl DataMethod for FindSymbols {
             "find_symbols",
         )
         .await?;
+        let completeness = completeness_for_cap(capped);
+        let emission_ctx = EmissionContext {
+            items_empty: items.is_empty(),
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: args.scope.repo.as_deref(),
+                fuzzy: args.fuzzy,
+                kind: args.kind.is_some(),
+                container: args.container.as_deref(),
+                path: args.path.as_deref(),
+            },
+        };
+        let diagnostics = build_diagnostics(&emission_ctx);
+        let hints = build_hints(&emission_ctx);
 
         Ok(serde_json::to_value(FindSymbolResult {
             items,
-            completeness: completeness_for_cap(capped),
+            completeness,
             tier3_status,
+            diagnostics,
+            hints,
             timing: cairn_proto::Timing::default(),
         })
         .unwrap())
@@ -154,7 +171,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::data_rpc::helpers::test_support::assert_limit_probe;
+    use crate::data_rpc::helpers::test_support::{
+        assert_limit_probe, registered_fixture_with_files,
+    };
 
     #[tokio::test]
     async fn exact_limit_is_complete_and_over_limit_is_partial() {
@@ -186,5 +205,55 @@ mod tests {
         let wire = into_wire_hit("demo", "HEAD", hit, false);
         assert_eq!(wire.source, SourceTier::Semantic);
         assert_eq!(wire.language.as_deref(), Some("rust"));
+    }
+
+    #[tokio::test]
+    async fn find_symbols_empty_result_includes_hints() {
+        let fixture = registered_fixture_with_files(&[("README.md", "# Project\n")]);
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "DefinitelyNoSuchSymbol",
+                    "limit": 5,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value["items"], json!([]));
+        let hint_codes = value["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hint| hint["code"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hint_codes,
+            vec!["empty_result_try_fuzzy", "empty_result_widen_scope"]
+        );
+    }
+
+    #[tokio::test]
+    async fn find_symbols_happy_path_omits_envelope_optional_fields() {
+        let fixture = registered_fixture_with_files(&[("README.md", "# Project\n")]);
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "Project",
+                    "limit": 5,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!value["items"].as_array().unwrap().is_empty());
+        assert!(value.get("diagnostics").is_none());
+        assert!(value.get("hints").is_none());
     }
 }

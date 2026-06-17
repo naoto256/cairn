@@ -177,9 +177,99 @@ pub enum ReasonCode {
     AnalyzerFailed,
     TimedOut,
     Stale,
+    StaleRevision,
     NotApplicable,
+    NotRecorded,
     NotScheduled,
     Unknown,
+}
+
+/// Machine-readable diagnostic emitted alongside query results.
+///
+/// Diagnostics describe facts about the result the daemon just produced.
+/// They intentionally avoid prescriptive action so higher-level surfaces can
+/// decide how to plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub code: DiagnosticCode,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+/// Stable diagnostic vocabulary for query response envelopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCode {
+    AnalyzerNotRecorded,
+    AnalyzerNotScheduled,
+    AnalyzerFailed,
+    AnalyzerStale,
+    AnalyzerBinaryMissing,
+    WorkspaceUnsuitable,
+    QueryFailedPartial,
+}
+
+/// Severity for structured diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Machine-readable next-step option emitted alongside query results.
+///
+/// Hints are options, not plans: callers choose whether and how to use them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hint {
+    pub code: HintCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<HintAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+/// Stable hint vocabulary for query response envelopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HintCode {
+    EmptyResultRelaxFilter,
+    EmptyResultTryFuzzy,
+    EmptyResultWidenScope,
+    CappedIncreaseLimit,
+    Tier3IndexingWait,
+    Tier3UnavailableAlternative,
+    TsxCallersUseInstantiate,
+    ReindexViaCli,
+}
+
+/// Optional action category for a hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HintAction {
+    RelaxFilter,
+    WidenScope,
+    IncreaseLimit,
+    WaitForIndex,
+    TryAlternativeQuery,
 }
 
 /// One analyzer's readiness as exposed on query results.
@@ -568,5 +658,99 @@ mod tests {
     fn timing_serializes_server_ms() {
         let value = serde_json::to_value(Timing { server_ms: 42 }).unwrap();
         assert_eq!(value, serde_json::json!({ "server_ms": 42 }));
+    }
+
+    #[test]
+    fn diagnostic_serializes_required_and_optional_fields() {
+        let value = serde_json::to_value(Diagnostic {
+            code: DiagnosticCode::AnalyzerBinaryMissing,
+            severity: DiagnosticSeverity::Warning,
+            message: "clangd binary not found".into(),
+            language: Some("cpp".into()),
+            analyzer_id: Some("clangd-cpp-lsp".into()),
+            repo: Some("demo".into()),
+            file: None,
+            details: Some(serde_json::json!({ "reason_code": "binary_not_found" })),
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "code": "analyzer_binary_missing",
+                "severity": "warning",
+                "message": "clangd binary not found",
+                "language": "cpp",
+                "analyzer_id": "clangd-cpp-lsp",
+                "repo": "demo",
+                "details": { "reason_code": "binary_not_found" },
+            })
+        );
+    }
+
+    #[test]
+    fn hint_serializes_required_and_optional_fields() {
+        let value = serde_json::to_value(Hint {
+            code: HintCode::EmptyResultTryFuzzy,
+            message: "Try fuzzy search for this symbol name.".into(),
+            action: Some(HintAction::TryAlternativeQuery),
+            tool: Some("find_symbols".into()),
+            params: Some(serde_json::json!({ "fuzzy": true })),
+            drop_params: Vec::new(),
+            target: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "code": "empty_result_try_fuzzy",
+                "message": "Try fuzzy search for this symbol name.",
+                "action": "try_alternative_query",
+                "tool": "find_symbols",
+                "params": { "fuzzy": true },
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostic_code_enum_wire_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(DiagnosticCode::WorkspaceUnsuitable).unwrap(),
+            serde_json::json!("workspace_unsuitable")
+        );
+    }
+
+    #[test]
+    fn hint_code_enum_wire_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(HintCode::Tier3UnavailableAlternative).unwrap(),
+            serde_json::json!("tier3_unavailable_alternative")
+        );
+    }
+
+    #[test]
+    fn hint_action_enum_wire_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(HintAction::WaitForIndex).unwrap(),
+            serde_json::json!("wait_for_index")
+        );
+    }
+
+    #[test]
+    fn reindex_via_cli_hint_omits_action_on_wire() {
+        let value = serde_json::to_value(Hint {
+            code: HintCode::ReindexViaCli,
+            message: "Run `cairn ctl repo reindex demo` to refresh Tier-3 status.".into(),
+            action: None,
+            tool: None,
+            params: None,
+            drop_params: Vec::new(),
+            target: Some("demo".into()),
+        })
+        .unwrap();
+
+        assert!(value.get("action").is_none());
+        assert_eq!(value["code"], serde_json::json!("reindex_via_cli"));
     }
 }
