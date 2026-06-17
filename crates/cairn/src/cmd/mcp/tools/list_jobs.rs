@@ -10,7 +10,7 @@ use super::forwarding::ForwardingTool;
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "list_jobs".into(),
-        description: "Background analyzer job status with timing and progress fields. Use this to diagnose slow, stalled, or unscheduled Tier-3 analyzer work for a repo; use `repo_status` for a one-shot index readiness check.".into(),
+        description: "Background analyzer job status: queued / running / terminal, with timing and progress metrics.\n\nWHEN: Diagnosing why a Tier-3 analyzer is slow or stalled.\nNOT FOR: One-shot \"is the index ready\" check; use repo_status.tier3_status.this_repo.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

@@ -6,14 +6,12 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, VERBOSE_TIER3_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "find_subtypes".into(),
-        description: format!(
-            "Default tool for \"who implements / extends / mixes in `name`?\" — every type that names `name` on the supertype side of a type-relation edge. Use for Rust questions like \"what implements `Display`?\", TypeScript \"what classes extend `Animal`?\", Python \"what subclasses `Foo`?\", and ECMAScript mixin / `implements` graphs. Omit `repo` to search every registered repo; each hit carries its repo in the `location` prefix (`repo:branch:file:line`). Returns the subtype's qualified name, the `interface_qualified` it points at (= the queried name, modulo aliasing), the edge `kind` (`trait` for Rust impls, `inherit` for class extends, `implements` for TypeScript implements, `mixin` for mixin classes, `inherent` for Rust inherent impls), and the branch. Reads the same Tier-2 `implementations` table that `find_supertypes` walks from the other side. {COMPLETENESS_REASON_DESC} Items already returned are valid."
-        ),
+        description: "Types that implement / extend / mix in the given name.\n\nWHEN: Finding implementors of a trait/interface, or subclasses.\nNOT FOR: Methods on a type; use find_symbols container=.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
