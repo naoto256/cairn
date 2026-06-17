@@ -24,7 +24,7 @@ This is a **breaking** redesign. cairn has no users to be backward-compatible wi
 
 ---
 
-## 1. Design principles (locked, 7)
+## 1. Design principles (locked, 8)
 
 1. **Tool name encodes intent.** A reader of the tool list should not have to read flags to know what a tool is for.
 2. **Default response is small and query-local.** Repo-wide context, snapshots, and jobs are opt-in or a different tool.
@@ -33,6 +33,7 @@ This is a **breaking** redesign. cairn has no users to be backward-compatible wi
 5. **High-frequency primitives stay stable.** Core query tools (`find_symbols`, `get_outline`, `find_references`, `find_callers`, etc.) keep their names. Only the response envelope and tool descriptions change.
 6. **MCP and CLI may diverge at the surface, not at semantics.** The data RPC layer is shared; presentation, tool grouping, and default verbosity may differ.
 7. **Descriptions teach selection, not document everything.** Each tool description is a cockpit label: intent, when to use, when *not* to use, recovery hint. Details live in schema property descriptions and response fields.
+8. **MCP is the agent-ergonomic layer over precise UDS/CLI primitives.** CLI/UDS remain tool-precise and systematic; MCP may diverge in naming, defaults, response shape, and *selective composition* when it measurably lowers agent cognitive load. Composition tools, when introduced, live MCP-only and orchestrate the precise primitives under the hood — they do not push composition into the CLI or UDS surface.
 
 ## 2. Non-goals
 
@@ -40,6 +41,7 @@ This is a **breaking** redesign. cairn has no users to be backward-compatible wi
 - No MCP spec extensions (no compact mode, no session-aware tool descriptions). Stay inside the spec; rely on concise descriptions instead.
 - CLI is *not* required to mirror the MCP surface. `cairn ctl repo status` may exist alongside `repo_status` MCP, but their flags and defaults can diverge for ergonomics.
 - No Windows-native support in 0.6.0. WSL2 + Linux binary is the supported path. Distribution polish is a separate axis.
+- **No broad multi-step composition tools in 0.6.0** (no `find_definition_with_source`, no `trace_chain`, no `explain_call_path`). Live MCP dogfood showed the primary pain was response interpretation and retry planning, not the number of calls. Per principle #8 composition remains allowed for future MCP-only tools, but only when both Claude and Codex find repeated friction that the primitive surface plus diagnostics/hints does not solve. The only thin composition shipped in 0.6.0 is `repo_status` accepting `path=` for cwd → alias resolution; a dedicated `resolve_repo` / `current_repo` is deferred unless that path-mode is found insufficient.
 
 ## 3. Compatibility stance
 
