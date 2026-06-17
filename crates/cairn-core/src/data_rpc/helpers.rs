@@ -94,10 +94,24 @@ pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
 }
 
 pub(crate) struct EmissionContext<'a> {
+    pub(crate) tool: QueryToolKind,
     pub(crate) items_empty: bool,
     pub(crate) completeness: &'a Completeness,
     pub(crate) tier3_status: &'a Tier3Status,
     pub(crate) query_args: QueryArgsView<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryToolKind {
+    FindSymbols,
+    GetOutline,
+    GetSymbolSource,
+    FindReferences,
+    FindCallers,
+    FindCallees,
+    FindSubtypes,
+    FindSupertypes,
+    FindImports,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -107,25 +121,93 @@ pub(crate) struct QueryArgsView<'a> {
     pub(crate) kind: bool,
     pub(crate) container: Option<&'a str>,
     pub(crate) path: Option<&'a str>,
+    pub(crate) file: Option<&'a str>,
+    pub(crate) max_depth: bool,
+    pub(crate) direction: bool,
 }
 
 impl QueryArgsView<'_> {
-    fn filter_drop_params(&self) -> Vec<String> {
+    fn filter_drop_params(&self, metadata: &ToolHintMetadata) -> Vec<String> {
         let mut params = Vec::new();
-        if self.kind {
-            params.push("kind".to_string());
-        }
-        if self.container.is_some_and(|value| !value.is_empty()) {
-            params.push("container".to_string());
-        }
-        if self.path.is_some_and(|value| !value.is_empty()) {
-            params.push("path".to_string());
+        for candidate in metadata.relax_drop_candidates {
+            let set = match *candidate {
+                "repo" => self.repo.is_some_and(|value| !value.is_empty()),
+                "kind" => self.kind,
+                "container" => self.container.is_some_and(|value| !value.is_empty()),
+                "path" => self.path.is_some_and(|value| !value.is_empty()),
+                "file" => self.file.is_some_and(|value| !value.is_empty()),
+                "max_depth" => self.max_depth,
+                "direction" => self.direction,
+                "fuzzy" => self.fuzzy,
+                _ => false,
+            };
+            if set {
+                params.push((*candidate).to_string());
+            }
         }
         params
     }
 
-    fn has_filters(&self) -> bool {
-        !self.filter_drop_params().is_empty()
+    fn has_relax_filters(&self, metadata: &ToolHintMetadata) -> bool {
+        self.filter_drop_params(metadata)
+            .into_iter()
+            .any(|param| param != "repo")
+    }
+}
+
+struct ToolHintMetadata {
+    tool: &'static str,
+    result_noun: &'static str,
+    relax_drop_candidates: &'static [&'static str],
+}
+
+fn tool_metadata(kind: QueryToolKind) -> ToolHintMetadata {
+    match kind {
+        QueryToolKind::FindSymbols => ToolHintMetadata {
+            tool: "find_symbols",
+            result_noun: "symbols",
+            relax_drop_candidates: &["repo", "kind", "container", "path"],
+        },
+        QueryToolKind::GetOutline => ToolHintMetadata {
+            tool: "get_outline",
+            result_noun: "outline items",
+            relax_drop_candidates: &["kind", "max_depth", "path", "file"],
+        },
+        QueryToolKind::GetSymbolSource => ToolHintMetadata {
+            tool: "get_symbol_source",
+            result_noun: "source results",
+            relax_drop_candidates: &["file"],
+        },
+        QueryToolKind::FindReferences => ToolHintMetadata {
+            tool: "find_references",
+            result_noun: "references",
+            relax_drop_candidates: &["repo", "kind", "direction"],
+        },
+        QueryToolKind::FindCallers => ToolHintMetadata {
+            tool: "find_callers",
+            result_noun: "callers",
+            relax_drop_candidates: &["repo"],
+        },
+        QueryToolKind::FindCallees => ToolHintMetadata {
+            tool: "find_callees",
+            result_noun: "callees",
+            relax_drop_candidates: &["repo"],
+        },
+        QueryToolKind::FindSubtypes => ToolHintMetadata {
+            tool: "find_subtypes",
+            result_noun: "subtypes",
+            relax_drop_candidates: &["repo"],
+        },
+        QueryToolKind::FindSupertypes => ToolHintMetadata {
+            tool: "find_supertypes",
+            result_noun: "supertypes",
+            relax_drop_candidates: &["repo"],
+        },
+        QueryToolKind::FindImports => ToolHintMetadata {
+            tool: "find_imports",
+            result_noun: "imports",
+            relax_drop_candidates: &["file"],
+        },
     }
 }
 
@@ -161,6 +243,7 @@ pub(crate) fn build_diagnostics(ctx: &EmissionContext<'_>) -> Vec<Diagnostic> {
 pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
     let mut hints = Vec::new();
     let analyzers = &ctx.tier3_status.this_query.analyzers;
+    let metadata = tool_metadata(ctx.tool);
 
     if matches!(
         ctx.completeness,
@@ -171,9 +254,9 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
     ) {
         hints.push(Hint {
             code: HintCode::CappedIncreaseLimit,
-            message: "Increase `limit` to inspect more matching symbols.".into(),
+            message: format!("Increase `limit` to see more {}.", metadata.result_noun),
             action: Some(HintAction::IncreaseLimit),
-            tool: Some("find_symbols".into()),
+            tool: Some(metadata.tool.into()),
             params: None,
             drop_params: Vec::new(),
             target: None,
@@ -198,22 +281,30 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
     }
 
     if ctx.items_empty {
-        if ctx.query_args.has_filters() {
+        let drop_params = ctx.query_args.filter_drop_params(&metadata);
+        if ctx.query_args.has_relax_filters(&metadata) {
+            let joined = drop_params.join(", ");
             hints.push(Hint {
                 code: HintCode::EmptyResultRelaxFilter,
-                message: "Relax the applied filters and retry the symbol query.".into(),
+                message: format!(
+                    "No {} matched. Try dropping {joined}.",
+                    metadata.result_noun
+                ),
                 action: Some(HintAction::RelaxFilter),
-                tool: Some("find_symbols".into()),
+                tool: Some(metadata.tool.into()),
                 params: None,
-                drop_params: ctx.query_args.filter_drop_params(),
+                drop_params,
                 target: None,
             });
         } else if !ctx.query_args.fuzzy {
             hints.push(Hint {
                 code: HintCode::EmptyResultTryFuzzy,
-                message: "Retry with fuzzy search enabled.".into(),
+                message: format!(
+                    "No {} matched. Try fuzzy=true or a prefix wildcard.",
+                    metadata.result_noun
+                ),
                 action: Some(HintAction::TryAlternativeQuery),
-                tool: Some("find_symbols".into()),
+                tool: Some(metadata.tool.into()),
                 params: Some(json!({ "fuzzy": true })),
                 drop_params: Vec::new(),
                 target: None,
@@ -223,9 +314,12 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
         if ctx.query_args.repo.is_some() {
             hints.push(Hint {
                 code: HintCode::EmptyResultWidenScope,
-                message: "Search across repositories by dropping the repo scope.".into(),
+                message: format!(
+                    "No {} matched. Try widening repo scope.",
+                    metadata.result_noun
+                ),
                 action: Some(HintAction::WidenScope),
-                tool: Some("find_symbols".into()),
+                tool: Some(metadata.tool.into()),
                 params: None,
                 drop_params: vec!["repo".into()],
                 target: None,
@@ -1108,6 +1202,122 @@ mod tests {
         assert_eq!(hints[0].code, HintCode::EmptyResultRelaxFilter);
         assert_eq!(hints[0].action, Some(HintAction::RelaxFilter));
         assert_eq!(hints[0].drop_params, vec!["kind", "path"]);
+        assert_eq!(hints[0].tool.as_deref(), Some("find_symbols"));
+        assert!(hints[0].message.contains("symbols"));
+    }
+
+    #[test]
+    fn find_symbols_hint_uses_symbols_noun() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::partial_truncated(PartialReason::Cap);
+        let ctx = emission_ctx(
+            false,
+            &completeness,
+            &tier3_status,
+            QueryArgsView::default(),
+        );
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].tool.as_deref(), Some("find_symbols"));
+        assert_eq!(hints[0].message, "Increase `limit` to see more symbols.");
+    }
+
+    #[test]
+    fn get_outline_hint_uses_outline_items_noun_and_outline_tool() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::partial_truncated(PartialReason::Cap);
+        let ctx = EmissionContext {
+            tool: QueryToolKind::GetOutline,
+            items_empty: true,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                kind: true,
+                path: Some("src/"),
+                max_depth: true,
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::CappedIncreaseLimit);
+        assert_eq!(hints[0].tool.as_deref(), Some("get_outline"));
+        assert!(hints[0].message.contains("outline items"));
+        let relax = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::EmptyResultRelaxFilter)
+            .unwrap();
+        assert_eq!(relax.tool.as_deref(), Some("get_outline"));
+        assert_eq!(relax.drop_params, vec!["kind", "max_depth", "path"]);
+        assert!(relax.message.contains("outline items"));
+    }
+
+    #[test]
+    fn find_imports_hint_uses_imports_noun_and_imports_tool() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = EmissionContext {
+            tool: QueryToolKind::FindImports,
+            items_empty: true,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                file: Some("src/lib.rs"),
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::EmptyResultRelaxFilter);
+        assert_eq!(hints[0].tool.as_deref(), Some("find_imports"));
+        assert_eq!(hints[0].drop_params, vec!["file"]);
+        assert!(hints[0].message.contains("imports"));
+    }
+
+    #[test]
+    fn find_references_hint_can_drop_direction_filter() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = EmissionContext {
+            tool: QueryToolKind::FindReferences,
+            items_empty: true,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                direction: true,
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::EmptyResultRelaxFilter);
+        assert_eq!(hints[0].tool.as_deref(), Some("find_references"));
+        assert_eq!(hints[0].drop_params, vec!["direction"]);
+        assert!(hints[0].message.contains("references"));
+    }
+
+    #[test]
+    fn relax_filter_drop_params_only_includes_actually_set_args() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = EmissionContext {
+            tool: QueryToolKind::FindSymbols,
+            items_empty: true,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: Some("demo"),
+                path: Some("src/"),
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        let relax = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::EmptyResultRelaxFilter)
+            .unwrap();
+        assert_eq!(relax.drop_params, vec!["repo", "path"]);
     }
 
     #[test]
@@ -1146,8 +1356,11 @@ mod tests {
         );
 
         let hints = build_hints(&ctx);
-        assert_eq!(hints[0].code, HintCode::EmptyResultWidenScope);
-        assert_eq!(hints[0].drop_params, vec!["repo"]);
+        let widen = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::EmptyResultWidenScope)
+            .unwrap();
+        assert_eq!(widen.drop_params, vec!["repo"]);
     }
 
     #[test]
@@ -1386,6 +1599,7 @@ mod tests {
         query_args: QueryArgsView<'a>,
     ) -> EmissionContext<'a> {
         EmissionContext {
+            tool: QueryToolKind::FindSymbols,
             items_empty,
             completeness,
             tier3_status,

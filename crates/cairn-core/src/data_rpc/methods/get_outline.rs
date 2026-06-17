@@ -8,8 +8,9 @@ use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
-    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
@@ -110,6 +111,7 @@ impl DataMethod for GetOutline {
         .await?;
         let completeness = completeness_for_cap(capped);
         let emission_ctx = EmissionContext {
+            tool: QueryToolKind::GetOutline,
             items_empty: items.is_empty(),
             completeness: &completeness,
             tier3_status: &tier3_status,
@@ -118,7 +120,10 @@ impl DataMethod for GetOutline {
                 fuzzy: true,
                 kind: kind_filter_set,
                 container: None,
-                path: args.path.as_deref().or(args.file.as_deref()),
+                path: args.path.as_deref(),
+                file: args.file.as_deref(),
+                max_depth: args.max_depth.is_some(),
+                ..QueryArgsView::default()
             },
         };
         let diagnostics = build_diagnostics(&emission_ctx);

@@ -5,15 +5,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use cairn_proto::methods::{FindReferenceHit, FindReferencesArgs, FindReferencesResult};
+use cairn_proto::methods::{
+    FindReferenceHit, FindReferencesArgs, FindReferencesResult, ReferenceDirection,
+};
 use linkme::distributed_slice;
 use serde_json::Value;
 use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
-    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::register::load_blob_or_worktree;
@@ -90,6 +93,7 @@ impl DataMethod for FindReferences {
         .await?;
         let completeness = completeness_for_cap(capped);
         let emission_ctx = EmissionContext {
+            tool: QueryToolKind::FindReferences,
             items_empty: items.is_empty(),
             completeness: &completeness,
             tier3_status: &tier3_status,
@@ -99,6 +103,8 @@ impl DataMethod for FindReferences {
                 kind: args.kind.is_some(),
                 container: None,
                 path: None,
+                direction: args.direction != ReferenceDirection::Incoming,
+                ..QueryArgsView::default()
             },
         };
         let diagnostics = build_diagnostics(&emission_ctx);

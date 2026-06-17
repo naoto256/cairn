@@ -13,8 +13,9 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
-    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
@@ -92,6 +93,7 @@ impl DataMethod for FindSymbols {
         .await?;
         let completeness = completeness_for_cap(capped);
         let emission_ctx = EmissionContext {
+            tool: QueryToolKind::FindSymbols,
             items_empty: items.is_empty(),
             completeness: &completeness,
             tier3_status: &tier3_status,
@@ -101,6 +103,7 @@ impl DataMethod for FindSymbols {
                 kind: args.kind.is_some(),
                 container: args.container.as_deref(),
                 path: args.path.as_deref(),
+                ..QueryArgsView::default()
             },
         };
         let diagnostics = build_diagnostics(&emission_ctx);
@@ -148,6 +151,8 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit, signature_only: bool) -
         repo: repo.to_string(),
         branch: anchor.to_string(),
         location,
+        file: h.path,
+        line: h.line,
         language: h.language,
         // `signature_only=true` drops the heaviest field. The naming
         // mirrors `GetSymbolSourceArgs.signature_only`; here the
@@ -205,6 +210,51 @@ mod tests {
         let wire = into_wire_hit("demo", "HEAD", hit, false);
         assert_eq!(wire.source, SourceTier::Semantic);
         assert_eq!(wire.language.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn find_symbols_hit_includes_file_and_line_alongside_location() {
+        let hit = SymbolHit {
+            id: 1,
+            name: "semantic_fn".into(),
+            qualified: "semantic_fn".into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            visibility: None,
+            path: "src/lib.rs".into(),
+            line: 7,
+            blob_sha: "sha".into(),
+            parser_id: "tree-sitter-rust".into(),
+            language: Some("rust".into()),
+            source_tier: SourceTier::Semantic,
+        };
+
+        let wire = into_wire_hit("demo", "HEAD", hit, false);
+        assert_eq!(wire.location, "demo:HEAD:src/lib.rs:7");
+        assert_eq!(wire.file, "src/lib.rs");
+        assert_eq!(wire.line, 7);
+    }
+
+    #[test]
+    fn find_symbols_hit_file_matches_location_path_component() {
+        let hit = SymbolHit {
+            id: 1,
+            name: "Intro".into(),
+            qualified: "Intro".into(),
+            kind: SymbolKind::Section,
+            signature: None,
+            visibility: None,
+            path: "README.md".into(),
+            line: 1,
+            blob_sha: "sha".into(),
+            parser_id: "tree-sitter-md".into(),
+            language: Some("markdown".into()),
+            source_tier: SourceTier::Syntactic,
+        };
+
+        let wire = into_wire_hit("demo", "HEAD", hit, false);
+        let location_path = wire.location.rsplit_once(':').unwrap().0;
+        assert!(location_path.ends_with(&wire.file));
     }
 
     #[tokio::test]
