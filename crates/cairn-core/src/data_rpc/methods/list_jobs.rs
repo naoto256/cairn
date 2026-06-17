@@ -120,6 +120,7 @@ fn job_entry(alias: &str, r: &rusqlite::Row<'_>) -> rusqlite::Result<JobEntry> {
         job_id: r.get(0)?,
         alias: alias.to_string(),
         analyzer_id: r.get(1)?,
+        state: status.clone(),
         scheduler_state: status,
         pool_group: None,
         queued_ms: 0,
@@ -174,6 +175,7 @@ mod tests {
         let result: ListJobsResult = serde_json::from_value(value).unwrap();
         assert_eq!(result.jobs.len(), 1);
         assert_eq!(result.jobs[0].job_id, 42);
+        assert_eq!(result.jobs[0].state, "running");
         assert_eq!(result.jobs[0].scheduler_state, "running");
     }
 }

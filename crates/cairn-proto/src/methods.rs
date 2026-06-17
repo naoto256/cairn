@@ -313,6 +313,7 @@ pub struct JobEntry {
     pub job_id: i64,
     pub alias: String,
     pub analyzer_id: String,
+    pub state: String,
     pub scheduler_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_group: Option<String>,
@@ -558,6 +559,12 @@ pub struct FindSymbolHit {
     pub branch: String,
     /// `repo:branch:file:line` string, clickable in Claude Code UI.
     pub location: String,
+    /// Repo-relative path, split out so agents do not need to parse
+    /// `location` before calling `get_symbol_source(file=...)`.
+    pub file: String,
+    /// 1-based line number, split out alongside the human-facing
+    /// `location` string.
+    pub line: u32,
     /// Short language tag (`rust`, `python`, ...), when a semantic
     /// analyzer has enriched the blob. Omitted for syntactic-only hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1143,11 +1150,15 @@ mod tests {
             "repo": "demo",
             "branch": "HEAD",
             "location": "demo:HEAD:src/lib.rs:1",
+            "file": "src/lib.rs",
+            "line": 1,
             "language": "rust",
             "source": "semantic"
         });
         let hit: FindSymbolHit = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(hit.language.as_deref(), Some("rust"));
+        assert_eq!(hit.file, "src/lib.rs");
+        assert_eq!(hit.line, 1);
         assert_eq!(serde_json::to_value(hit).unwrap()["language"], "rust");
     }
 
@@ -1161,6 +1172,8 @@ mod tests {
             "repo": "demo",
             "branch": "HEAD",
             "location": "demo:HEAD:README.md:1",
+            "file": "README.md",
+            "line": 1,
             "source": "syntactic"
         });
         let hit: FindSymbolHit = serde_json::from_value(value).unwrap();
@@ -1327,6 +1340,7 @@ mod tests {
             job_id: 7,
             alias: "cairn".into(),
             analyzer_id: "rust-analyzer-lsp".into(),
+            state: "running".into(),
             scheduler_state: "running".into(),
             pool_group: None,
             queued_ms: 1,
@@ -1337,8 +1351,29 @@ mod tests {
         };
         let serialized = serde_json::to_value(entry).unwrap();
         assert_eq!(serialized["job_id"], 7);
+        assert_eq!(serialized["state"], "running");
         assert_eq!(serialized["scheduler_state"], "running");
         assert!(serialized.get("pool_group").is_none());
+    }
+
+    #[test]
+    fn job_entry_state_and_scheduler_state_can_differ_on_wire() {
+        let entry = JobEntry {
+            job_id: 8,
+            alias: "cairn".into(),
+            analyzer_id: "rust-analyzer-lsp".into(),
+            state: "running".into(),
+            scheduler_state: "pool_waiting".into(),
+            pool_group: Some("rust-analyzer-lsp".into()),
+            queued_ms: 10,
+            pool_wait_ms: 5,
+            run_ms: 0,
+            progress_ticks: 0,
+            rate: None,
+        };
+        let serialized = serde_json::to_value(entry).unwrap();
+        assert_eq!(serialized["state"], "running");
+        assert_eq!(serialized["scheduler_state"], "pool_waiting");
     }
 
     #[test]

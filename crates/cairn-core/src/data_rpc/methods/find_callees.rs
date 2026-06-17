@@ -12,8 +12,9 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_callers::into_call_hit;
 use super::find_references::SnippetCache;
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
-    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs};
 use crate::{Error, Result};
@@ -89,6 +90,7 @@ impl DataMethod for FindCallees {
         .await?;
         let completeness = completeness_for_cap(capped);
         let emission_ctx = EmissionContext {
+            tool: QueryToolKind::FindCallees,
             items_empty: items.is_empty(),
             completeness: &completeness,
             tier3_status: &tier3_status,
@@ -98,6 +100,7 @@ impl DataMethod for FindCallees {
                 kind: true,
                 container: None,
                 path: None,
+                ..QueryArgsView::default()
             },
         };
         let diagnostics = build_diagnostics(&emission_ctx);

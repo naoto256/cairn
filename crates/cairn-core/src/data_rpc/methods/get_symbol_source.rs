@@ -15,8 +15,8 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, compute_tier3_status_response,
-    parser_id_filter,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    compute_tier3_status_response, parser_id_filter,
 };
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
@@ -99,6 +99,7 @@ impl DataMethod for GetSymbolSource {
                 )?;
                 let completeness = cairn_proto::Completeness::complete();
                 let emission_ctx = EmissionContext {
+                    tool: QueryToolKind::GetSymbolSource,
                     items_empty: false,
                     completeness: &completeness,
                     tier3_status: &tier3_status,
@@ -107,7 +108,8 @@ impl DataMethod for GetSymbolSource {
                         fuzzy: true,
                         kind: false,
                         container: None,
-                        path: file_filter.as_deref(),
+                        file: file_filter.as_deref(),
+                        ..QueryArgsView::default()
                     },
                 };
                 let diagnostics = build_diagnostics(&emission_ctx);

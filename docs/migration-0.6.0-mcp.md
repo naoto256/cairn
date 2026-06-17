@@ -138,7 +138,7 @@ One line per repo, summary counts only. `status` is an aggregate (`ready` / `ind
 
 `include_snapshots=true` adds the per-snapshot detail. `repo_status` does *not* return jobs — use `list_jobs(repo="cairn")`.
 
-`repo_status` also accepts `path=` instead of `repo=` (mutually exclusive). Pass a working-directory path; the daemon resolves the registered repo.
+`repo_status` also accepts `path=` instead of `repo=` (mutually exclusive). Pass a working-directory path; the daemon resolves the registered repo. In MCP, `repo_status({})` is a shorthand for the server current working directory and is expanded to `path` before the data RPC call.
 
 ### Diagnose Tier-3 analyzer status
 
