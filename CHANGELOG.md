@@ -5,6 +5,162 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.6.0] — 2026-06-18
+
+The MCP surface is redesigned around AI coding agents: smaller default
+responses, structured confidence/diagnostics/hints, a cwd-aware
+entrypoint, and a tighter Core/Surface split between the CLI/UDS
+primitives and the agent-facing MCP layer. The design and migration
+guides ship alongside the binary at `docs/mcp-redesign-0.6.0.md` and
+`docs/migration-0.6.0-mcp.md`.
+
+### Added
+
+- **Inventory split: `list_repos` / `repo_status` / `list_jobs`.**
+  `list_repos` is now a 1-line-per-repo inventory (alias, root,
+  languages, aggregate status, snapshot/file/symbol counts) — a
+  21-repo registry returns roughly 6 KB instead of the previous
+  14 KB blob. New MCP tool `repo_status({ repo | path })` returns
+  per-repo detail (summary, current snapshot,
+  `tier3_status.this_repo`, optional snapshot list via
+  `include_snapshots`). New MCP tool
+  `list_jobs({ repo, state, include_terminal })` exposes background
+  analyzer job lifecycle (`state`), scheduler position
+  (`scheduler_state`), pool group, queued / pool-wait / run
+  milliseconds, progress, and rate. `list_repos` aggregate `status`
+  is one of `ready / indexing / partial / error` (priority
+  `error > indexing > partial > ready`) (#177).
+- **Common response envelope: `diagnostics[]` + `hints[]` +
+  `timing`.** All MCP query tools now return a shared envelope.
+  `diagnostics[]` reports facts that reduce confidence (each entry
+  carries a stable `code`, `severity`, `message`, plus optional
+  `language` / `analyzer_id` / `repo` / `file` / `details`).
+  `hints[]` is an array of next-move options (each carries a stable
+  `code`, `message`, optional `action` from `relax_filter` /
+  `widen_scope` / `increase_limit` / `wait_for_index` /
+  `try_alternative_query`, plus `tool` / `params` / `drop_params` /
+  `target`). Hints are deliberately options, never instructions —
+  `reindex_via_cli` omits its `action` field so agents never chain
+  a reindex automatically. Both arrays are omitted from the wire
+  when empty so happy-path responses stay small (#179, #180).
+- **`tier3_status.reason_code` gains `not_scheduled`.** Distinguishes
+  a routing gap (the scheduler never enqueued the expected
+  analyzer) from indexing latency (`not_recorded`, the run hasn't
+  completed yet). With `not_recorded` the agent's correct move is
+  "wait or reindex"; with `not_scheduled` the correct move is
+  "don't loop — this is a routing or coverage gap." Backed by a
+  shared `expected_analyzers_for_manifest()` source of truth that
+  query readiness, doctor remediation, and `enqueue_reindex` all
+  consume, so the three paths can no longer drift (fixes the
+  EVAL-001 remediation loop) (#176).
+- **`timing.server_ms` on every MCP response.** Daemon-side wall
+  time the data plane spent producing the response, measured at
+  the dispatch layer immediately before the method body. Lets
+  agents triage "is cairn slow or is the MCP bridge slow?" without
+  external tooling — proved decisive for separating EVAL-002
+  (Codex sandbox overhead) from genuine daemon latency. `phases`
+  is reserved for a future stable per-phase breakdown (#178).
+- **TSX caller hint.** `find_callers` for an uppercase symbol
+  defined in a `.tsx`/`.jsx` file now emits the
+  `tsx_callers_use_instantiate` hint with `tool=find_references`,
+  `params={"kind":"instantiate"}`, so React/JSX component usage
+  routes to the correct primitive in one read. When this hint
+  fires, unrelated generic hints (`empty_result_relax_filter` /
+  `empty_result_widen_scope`) are suppressed so the recovery path
+  stays clear (#180, #182).
+- **Zero-arg `repo_status({})` in MCP.** Omitting both `repo` and
+  `path` resolves the path from the MCP server's current working
+  directory and is expanded into `path` before the data RPC call.
+  The data RPC contract remains the strict "exactly one of `repo`
+  or `path`" — composition lives only at the MCP layer, per
+  Core/Surface design principle #8 (#182).
+- **MCP server instructions and tool descriptions rewritten as
+  cockpit labels.** The MCP `initialize` reply now teaches agents
+  via five short sections (First move / Core workflow / Retry
+  rules / JSX caveat / Composition stance). Each tool description
+  follows a `WHEN: … / NOT FOR: … / Recovery: …` cockpit format
+  and is capped at roughly 60-120 tokens so the standing context
+  cost stays predictable while still preserving the caveats agents
+  actually need (#181).
+- **`find_symbols` hits include split `file` / `line`.** Alongside
+  the existing `location` string, `find_symbols` hits now carry
+  separate `file` and `line` fields so agents can feed them
+  straight into `get_symbol_source` without parsing a
+  colon-separated string (#182).
+- **0.6.0 design and migration guides.** `docs/mcp-redesign-0.6.0.md`
+  and `docs/migration-0.6.0-mcp.md` ship in-tree as the canonical
+  source for the redesign principles, schemas, diagnostic/hint
+  taxonomy, dogfood acceptance gates, and the 0.5.x → 0.6.0
+  migration path. `docs/design-philosophy.md` (project-agnostic)
+  is referenced from the design doc as the lens on the
+  Core/Surface separation and directional-refactor rule that drove
+  this release.
+
+### Changed
+
+- **Breaking: MCP wire is redesigned for agents.** Inventory tools,
+  query response envelopes, and most tool descriptions all change
+  shape; details are in `docs/migration-0.6.0-mcp.md`. The data
+  RPC layer keeps its primitive contracts (no composition pushed
+  down into the core); MCP is now the surface where agent
+  ergonomics live, with selective MCP-only composition allowed
+  (Design principle #8). cairn has no production users, so
+  backward-compatibility shims are deliberately not provided.
+- **Breaking: `list_repos` no longer returns snapshots or jobs.**
+  Per-snapshot detail moves to
+  `repo_status(include_snapshots=true)`; job inventory moves to
+  `list_jobs`. The pre-0.6.0 inventory-plus-detail-plus-jobs shape
+  is gone.
+- **`hints[]` are method-aware.** Each hint carries the invoking
+  tool's name and a result-noun appropriate to that tool (e.g.
+  `capped_increase_limit` from `get_outline` reports
+  `tool="get_outline"` and "outline items", not the previous
+  `find_symbols` / "matching symbols" default). `drop_params` lists
+  only filters actually set on the call. This fixes the dogfood
+  EVAL-0600-001 mis-routing where every method's hints pointed at
+  `find_symbols` (#182).
+- **`list_jobs` items carry both `state` and `scheduler_state`.**
+  `state` is the analyzer-run lifecycle
+  (`queued / running / succeeded / failed / cancelled / timed_out /
+  skipped`); `scheduler_state` retains its
+  scheduler-pool-position meaning. The two axes can legitimately
+  differ during transients.
+- **Composition non-goal locked.** 0.6.0 does not introduce broad
+  multi-step composition tools (no `find_definition_with_source`,
+  no `trace_chain`, no `explain_call_path`). Live dogfood with
+  Claude and Codex on the redesigned surface showed the primary
+  pain was response interpretation and retry planning, not the
+  number of calls. The single thin composition shipped is
+  `repo_status` accepting `path=` plus its MCP-only zero-arg form.
+
+### Fixed
+
+- **Expected-analyzer drift across query readiness / doctor /
+  scheduler.** `tier3_status`, `cairn ctl daemon doctor`, and
+  `enqueue_reindex` previously each computed "which analyzers does
+  this manifest expect?" independently, so a manifest could be
+  reported as missing an analyzer that the scheduler had silently
+  skipped. They now share `expected_analyzers_for_manifest()`. As
+  an observable side effect, `enqueue_reindex` only queues
+  analyzers whose `parser_id` is actually present in the manifest,
+  so `list_jobs` no longer surfaces "skipped" rows for unrelated
+  analyzers and doctor no longer suggests reindex for analyzers
+  the routing layer never intended to run (#176).
+- **Daemon-side `server_ms` exposes MCP-bridge latency.** Where
+  the previous evaluator saw 150-second MCP `find_symbols` calls,
+  the same call now reports `server_ms ≈ 10 ms`, attributing the
+  gap to the client-side MCP transport rather than the daemon —
+  closing the EVAL-002 investigation that motivated this field
+  (#178).
+
+### Performance
+
+- **Hint emission is allocation-conscious on the happy path.**
+  Default-empty `diagnostics` and `hints` arrays are
+  `skip_serializing_if = "Vec::is_empty"`, so the most frequent
+  case (items non-empty, complete, Tier-3 ready) adds no envelope
+  noise to the wire and no array allocations to ignore.
+
 ## [0.5.0] — 2026-06-16
 
 ### Added
