@@ -294,8 +294,8 @@ fn analyzer_status_from_run(
             id: Some(analyzer_id.into()),
             language: language.into(),
             state: AnalyzerState::Missing,
-            reason_code: Some(ReasonCode::Unknown),
-            reason: Some("analyzer run not recorded".into()),
+            reason_code: Some(ReasonCode::NotScheduled),
+            reason: Some("expected analyzer was not scheduled for this manifest".into()),
         };
     };
     if revision != i64::from(expected_revision) {
@@ -807,6 +807,35 @@ mod tests {
 
         assert_eq!(status_ids, expected_ids);
         assert!(status_ids.contains(&"fake-workspace".to_string()));
+    }
+
+    #[test]
+    fn not_scheduled_when_expected_but_no_run_row() {
+        let fixture = test_support::registered_fixture();
+        let (conn, manifest_id) = demo_store(&fixture);
+
+        let status = compute_tier3_status_body_with_analyzers(
+            &conn,
+            manifest_id,
+            vec![Box::new(TestAnalyzer {
+                id: "rust-lsp",
+                parser_id: "tree-sitter-rust",
+                language: "rust",
+            })],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status.analyzers,
+            vec![Tier3AnalyzerStatus {
+                id: Some("rust-lsp".into()),
+                language: "rust".into(),
+                state: AnalyzerState::Missing,
+                reason_code: Some(ReasonCode::NotScheduled),
+                reason: Some("expected analyzer was not scheduled for this manifest".into()),
+            }]
+        );
     }
 
     fn multi_language_fixture() -> test_support::DataRpcFixture {

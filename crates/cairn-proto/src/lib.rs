@@ -31,6 +31,6 @@ pub mod version;
 
 pub use common::{
     AnalyzerState, Completeness, LanguageEnrichment, MissingTier, PartialReason, Position, Range,
-    ReasonCode, RefKind, SourceTier, SymbolKind, Tier3AnalyzerStatus, Tier3Status, Tier3StatusBody,
-    TypeRole,
+    ReasonCode, RefKind, SourceTier, SymbolKind, Tier3AnalyzerStatus, Tier3RepoStatus, Tier3Status,
+    Tier3StatusBody, TypeRole,
 };

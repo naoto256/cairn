@@ -1,0 +1,134 @@
+//! `repo_status` — detailed status for one registered repository.
+
+use cairn_lang_api::all_backends;
+use cairn_proto::common::{Tier3RepoStatus, Tier3StatusBody};
+use cairn_proto::methods::{RepoStatusArgs, RepoStatusEntry, RepoStatusResult};
+use linkme::distributed_slice;
+use serde_json::Value;
+
+use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
+use super::list_repos::{collect_repo_snapshot_summary, resolve_repo_by_path};
+use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::data_rpc::helpers::compute_tier3_status;
+use crate::{Error, Result};
+
+pub struct RepoStatus;
+
+#[async_trait::async_trait]
+impl DataMethod for RepoStatus {
+    fn name(&self) -> &'static str {
+        "repo_status"
+    }
+
+    async fn dispatch(&self, ctx: &DataCtx, params: Value) -> Result<Value> {
+        let args: RepoStatusArgs = parse_params(params)?;
+        validate_repo_status_args(&args)?;
+        let cas_data_dir = ctx.cas_data_dir.clone();
+
+        let repo = tokio::task::spawn_blocking(move || -> Result<RepoStatusEntry> {
+            let backends = all_backends();
+            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let entry =
+                match (args.repo.as_deref(), args.path.as_deref()) {
+                    (Some(alias), None) => cas_registry::lookup_by_alias(&index, alias)?
+                        .ok_or_else(|| Error::RepoNotFound {
+                            alias: alias.to_string(),
+                        })?,
+                    (None, Some(path)) => resolve_repo_by_path(&index, std::path::Path::new(path))?
+                        .ok_or_else(|| Error::RepoNotFound {
+                            alias: path.to_string(),
+                        })?,
+                    _ => unreachable!("validated above"),
+                };
+            let conn = cas_store::open(&cas_data_dir.store_db_path(&entry.repo_hash))?;
+            let summary = collect_repo_snapshot_summary(&conn, &backends)?;
+            let tier3_status = match summary.current_manifest_id {
+                Some(manifest_id) => {
+                    let status = compute_tier3_status(&conn, manifest_id)?;
+                    Tier3RepoStatus {
+                        this_repo: status.this_query.clone(),
+                        repo_wide: args.tier3.verbose_tier3.then_some(status.this_query),
+                    }
+                }
+                None => Tier3RepoStatus {
+                    this_repo: Tier3StatusBody::ready(),
+                    repo_wide: args.tier3.verbose_tier3.then_some(Tier3StatusBody::ready()),
+                },
+            };
+            Ok(RepoStatusEntry {
+                alias: entry.alias,
+                root: entry.root_path,
+                languages: summary.languages,
+                summary: summary.summary,
+                current: summary.current,
+                tier3_status,
+                snapshots: if args.include_snapshots {
+                    summary.snapshots
+                } else {
+                    Vec::new()
+                },
+            })
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("repo_status", e))??;
+
+        Ok(serde_json::to_value(RepoStatusResult { repo }).unwrap())
+    }
+}
+
+fn validate_repo_status_args(args: &RepoStatusArgs) -> Result<()> {
+    match (args.repo.as_ref(), args.path.as_ref()) {
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        (None, None) => Err(Error::InvalidParams(
+            "repo_status requires exactly one of `repo` or `path`".into(),
+        )),
+        (Some(_), Some(_)) => Err(Error::InvalidParams(
+            "repo_status accepts `repo` or `path`, not both".into(),
+        )),
+    }
+}
+
+#[allow(unsafe_code)]
+#[distributed_slice(DATA_METHODS)]
+static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(RepoStatus);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_rpc::helpers::test_support;
+
+    #[test]
+    fn repo_status_requires_exactly_one_of_repo_or_path() {
+        assert!(validate_repo_status_args(&RepoStatusArgs::default()).is_err());
+        assert!(
+            validate_repo_status_args(&RepoStatusArgs {
+                repo: Some("demo".into()),
+                path: Some("/tmp/demo".into()),
+                ..RepoStatusArgs::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_repo_status_args(&RepoStatusArgs {
+                repo: Some("demo".into()),
+                ..RepoStatusArgs::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_status_path_resolves_to_alias() {
+        let fixture = test_support::registered_fixture();
+        let repo_path = fixture._repo.path().join("src");
+        let result = RepoStatus
+            .dispatch(
+                &fixture.ctx,
+                serde_json::json!({"path": repo_path.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        let result: RepoStatusResult = serde_json::from_value(result).unwrap();
+        assert_eq!(result.repo.alias, "demo");
+    }
+}

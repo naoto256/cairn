@@ -17,9 +17,11 @@ mod find_symbols;
 mod forwarding;
 mod get_outline;
 mod get_symbol_source;
+mod list_jobs;
 mod list_repos;
 mod register_repo;
 mod reindex_repo;
+mod repo_status;
 
 pub(super) const BRANCH_PARAM_DESC: &str = "Restrict to a single snapshot by bare branch name (for example `main` or `release/0.1.0`). Do not pass `HEAD`, `tag/<v>`, or `tentative/<id>` here; those are anchor names. Omit both `branch` and `anchor` to default to the registered worktree's `tentative/<id>` snapshot (= committed HEAD plus uncommitted edits), falling back to `HEAD` when no tentative snapshot exists yet.";
 
