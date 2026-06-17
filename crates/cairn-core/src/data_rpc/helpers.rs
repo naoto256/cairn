@@ -3,10 +3,11 @@
 use std::collections::BTreeSet;
 
 use cairn_proto::{
-    AnalyzerState, Completeness, PartialReason, ReasonCode, Tier3AnalyzerStatus, Tier3Status,
-    Tier3StatusBody,
+    AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,
+    HintCode, PartialReason, ReasonCode, Tier3AnalyzerStatus, Tier3Status, Tier3StatusBody,
 };
 use rusqlite::{OptionalExtension, params};
+use serde_json::json;
 
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
@@ -90,6 +91,235 @@ pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
     } else {
         Completeness::complete()
     }
+}
+
+pub(crate) struct EmissionContext<'a> {
+    pub(crate) items_empty: bool,
+    pub(crate) completeness: &'a Completeness,
+    pub(crate) tier3_status: &'a Tier3Status,
+    pub(crate) query_args: QueryArgsView<'a>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct QueryArgsView<'a> {
+    pub(crate) repo: Option<&'a str>,
+    pub(crate) fuzzy: bool,
+    pub(crate) kind: bool,
+    pub(crate) container: Option<&'a str>,
+    pub(crate) path: Option<&'a str>,
+}
+
+impl QueryArgsView<'_> {
+    fn filter_drop_params(&self) -> Vec<String> {
+        let mut params = Vec::new();
+        if self.kind {
+            params.push("kind".to_string());
+        }
+        if self.container.is_some_and(|value| !value.is_empty()) {
+            params.push("container".to_string());
+        }
+        if self.path.is_some_and(|value| !value.is_empty()) {
+            params.push("path".to_string());
+        }
+        params
+    }
+
+    fn has_filters(&self) -> bool {
+        !self.filter_drop_params().is_empty()
+    }
+}
+
+pub(crate) fn build_diagnostics(ctx: &EmissionContext<'_>) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Completeness::Partial { reason, .. } = ctx.completeness
+        && !matches!(reason, Some(PartialReason::Cap))
+    {
+        diagnostics.push(Diagnostic {
+            code: DiagnosticCode::QueryFailedPartial,
+            severity: DiagnosticSeverity::Error,
+            message: "query returned partial results".into(),
+            language: None,
+            analyzer_id: None,
+            repo: ctx.query_args.repo.map(str::to_string),
+            file: None,
+            details: reason
+                .as_ref()
+                .map(|reason| json!({ "reason": reason.as_str() })),
+        });
+    }
+
+    diagnostics.extend(
+        ctx.tier3_status
+            .this_query
+            .analyzers
+            .iter()
+            .filter_map(diagnostic_for_analyzer),
+    );
+    diagnostics
+}
+
+pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
+    let mut hints = Vec::new();
+    let analyzers = &ctx.tier3_status.this_query.analyzers;
+
+    if matches!(
+        ctx.completeness,
+        Completeness::Partial {
+            reason: Some(PartialReason::Cap),
+            ..
+        }
+    ) {
+        hints.push(Hint {
+            code: HintCode::CappedIncreaseLimit,
+            message: "Increase `limit` to inspect more matching symbols.".into(),
+            action: Some(HintAction::IncreaseLimit),
+            tool: Some("find_symbols".into()),
+            params: None,
+            drop_params: Vec::new(),
+            target: None,
+        });
+    }
+
+    if analyzers.iter().any(|analyzer| {
+        matches!(
+            analyzer.state,
+            AnalyzerState::Queued | AnalyzerState::Running
+        )
+    }) {
+        hints.push(Hint {
+            code: HintCode::Tier3IndexingWait,
+            message: "Tier-3 indexing is still running for this query.".into(),
+            action: Some(HintAction::WaitForIndex),
+            tool: None,
+            params: None,
+            drop_params: Vec::new(),
+            target: Some("tier3".into()),
+        });
+    }
+
+    if ctx.items_empty {
+        if ctx.query_args.has_filters() {
+            hints.push(Hint {
+                code: HintCode::EmptyResultRelaxFilter,
+                message: "Relax the applied filters and retry the symbol query.".into(),
+                action: Some(HintAction::RelaxFilter),
+                tool: Some("find_symbols".into()),
+                params: None,
+                drop_params: ctx.query_args.filter_drop_params(),
+                target: None,
+            });
+        } else if !ctx.query_args.fuzzy {
+            hints.push(Hint {
+                code: HintCode::EmptyResultTryFuzzy,
+                message: "Retry with fuzzy search enabled.".into(),
+                action: Some(HintAction::TryAlternativeQuery),
+                tool: Some("find_symbols".into()),
+                params: Some(json!({ "fuzzy": true })),
+                drop_params: Vec::new(),
+                target: None,
+            });
+        }
+
+        if ctx.query_args.repo.is_some() {
+            hints.push(Hint {
+                code: HintCode::EmptyResultWidenScope,
+                message: "Search across repositories by dropping the repo scope.".into(),
+                action: Some(HintAction::WidenScope),
+                tool: Some("find_symbols".into()),
+                params: None,
+                drop_params: vec!["repo".into()],
+                target: None,
+            });
+        }
+    }
+
+    if analyzers.iter().any(|analyzer| {
+        analyzer.state == AnalyzerState::Missing
+            && analyzer.reason_code == Some(ReasonCode::NotScheduled)
+    }) {
+        hints.push(Hint {
+            code: HintCode::Tier3UnavailableAlternative,
+            message: "Tier-3 data is unavailable for this query; use syntactic results or try a broader query.".into(),
+            action: Some(HintAction::TryAlternativeQuery),
+            tool: None,
+            params: None,
+            drop_params: Vec::new(),
+            target: Some("tier3".into()),
+        });
+    }
+
+    if analyzers.iter().any(|analyzer| {
+        analyzer.state == AnalyzerState::Missing
+            && analyzer.reason_code == Some(ReasonCode::NotRecorded)
+    }) && let Some(repo) = ctx.query_args.repo
+    {
+        hints.push(Hint {
+            code: HintCode::ReindexViaCli,
+            message: format!("Run `cairn ctl repo reindex {repo}` to refresh Tier-3 status."),
+            action: None,
+            tool: None,
+            params: None,
+            drop_params: Vec::new(),
+            target: Some(repo.to_string()),
+        });
+    }
+
+    hints
+}
+
+fn diagnostic_for_analyzer(analyzer: &Tier3AnalyzerStatus) -> Option<Diagnostic> {
+    let (code, severity, fallback_message) = match (analyzer.state, analyzer.reason_code) {
+        (AnalyzerState::Missing, Some(ReasonCode::NotRecorded)) => (
+            DiagnosticCode::AnalyzerNotRecorded,
+            DiagnosticSeverity::Warning,
+            "analyzer run was not recorded",
+        ),
+        (AnalyzerState::Missing, Some(ReasonCode::NotScheduled)) => (
+            DiagnosticCode::AnalyzerNotScheduled,
+            DiagnosticSeverity::Warning,
+            "expected analyzer was not scheduled",
+        ),
+        (AnalyzerState::Missing, Some(ReasonCode::AnalyzerFailed)) | (AnalyzerState::Failed, _) => {
+            (
+                DiagnosticCode::AnalyzerFailed,
+                DiagnosticSeverity::Warning,
+                "analyzer failed",
+            )
+        }
+        (AnalyzerState::Missing, Some(ReasonCode::BinaryNotFound)) => (
+            DiagnosticCode::AnalyzerBinaryMissing,
+            DiagnosticSeverity::Warning,
+            "analyzer binary is missing",
+        ),
+        (AnalyzerState::Stale, Some(ReasonCode::Stale | ReasonCode::StaleRevision))
+        | (AnalyzerState::Stale, _) => (
+            DiagnosticCode::AnalyzerStale,
+            DiagnosticSeverity::Info,
+            "analyzer result is stale",
+        ),
+        (AnalyzerState::Skipped, Some(ReasonCode::WorkspaceUnsuitable)) => (
+            DiagnosticCode::WorkspaceUnsuitable,
+            DiagnosticSeverity::Info,
+            "workspace is unsuitable for this analyzer",
+        ),
+        _ => return None,
+    };
+
+    Some(Diagnostic {
+        code,
+        severity,
+        message: analyzer
+            .reason
+            .clone()
+            .unwrap_or_else(|| fallback_message.to_string()),
+        language: Some(analyzer.language.clone()),
+        analyzer_id: analyzer.id.clone(),
+        repo: None,
+        file: None,
+        details: analyzer
+            .reason_code
+            .map(|reason_code| json!({ "reason_code": reason_code })),
+    })
 }
 
 pub(crate) fn parser_id_filter<I>(parser_ids: I) -> BTreeSet<String>
@@ -838,6 +1068,241 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_hints_omits_all_when_happy_path() {
+        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+            id: Some("rust-lsp".into()),
+            language: "rust".into(),
+            state: AnalyzerState::Ready,
+            reason_code: None,
+            reason: None,
+        }]);
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            false,
+            &completeness,
+            &tier3_status,
+            QueryArgsView::default(),
+        );
+
+        assert!(build_hints(&ctx).is_empty());
+        assert!(build_diagnostics(&ctx).is_empty());
+    }
+
+    #[test]
+    fn build_hints_emits_relax_filter_when_filters_applied() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            true,
+            &completeness,
+            &tier3_status,
+            QueryArgsView {
+                kind: true,
+                path: Some("src/"),
+                ..QueryArgsView::default()
+            },
+        );
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::EmptyResultRelaxFilter);
+        assert_eq!(hints[0].action, Some(HintAction::RelaxFilter));
+        assert_eq!(hints[0].drop_params, vec!["kind", "path"]);
+    }
+
+    #[test]
+    fn build_hints_emits_try_fuzzy_when_exact_no_filter() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            true,
+            &completeness,
+            &tier3_status,
+            QueryArgsView {
+                fuzzy: false,
+                ..QueryArgsView::default()
+            },
+        );
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::EmptyResultTryFuzzy);
+        assert_eq!(hints[0].action, Some(HintAction::TryAlternativeQuery));
+        assert_eq!(hints[0].params, Some(serde_json::json!({ "fuzzy": true })));
+    }
+
+    #[test]
+    fn build_hints_emits_widen_scope_when_repo_specified() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            true,
+            &completeness,
+            &tier3_status,
+            QueryArgsView {
+                repo: Some("demo"),
+                fuzzy: true,
+                ..QueryArgsView::default()
+            },
+        );
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::EmptyResultWidenScope);
+        assert_eq!(hints[0].drop_params, vec!["repo"]);
+    }
+
+    #[test]
+    fn build_hints_emits_capped_increase_limit() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::partial_truncated(PartialReason::Cap);
+        let ctx = emission_ctx(
+            false,
+            &completeness,
+            &tier3_status,
+            QueryArgsView::default(),
+        );
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::CappedIncreaseLimit);
+        assert_eq!(hints[0].action, Some(HintAction::IncreaseLimit));
+    }
+
+    #[test]
+    fn build_hints_emits_tier3_indexing_wait_when_running() {
+        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+            id: Some("rust-lsp".into()),
+            language: "rust".into(),
+            state: AnalyzerState::Running,
+            reason_code: None,
+            reason: None,
+        }]);
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            false,
+            &completeness,
+            &tier3_status,
+            QueryArgsView::default(),
+        );
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::Tier3IndexingWait);
+        assert_eq!(hints[0].target.as_deref(), Some("tier3"));
+    }
+
+    #[test]
+    fn build_hints_emits_reindex_via_cli_when_not_recorded_no_active_job() {
+        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+            id: Some("rust-lsp".into()),
+            language: "rust".into(),
+            state: AnalyzerState::Missing,
+            reason_code: Some(ReasonCode::NotRecorded),
+            reason: Some("analyzer run not recorded".into()),
+        }]);
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            false,
+            &completeness,
+            &tier3_status,
+            QueryArgsView {
+                repo: Some("demo"),
+                ..QueryArgsView::default()
+            },
+        );
+
+        let hints = build_hints(&ctx);
+        let hint = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::ReindexViaCli)
+            .unwrap();
+        assert!(hint.message.contains("cairn ctl repo reindex demo"));
+        assert!(hint.action.is_none());
+    }
+
+    #[test]
+    fn build_diagnostics_from_tier3_analyzer_states() {
+        let tier3_status = status_from_analyzers(vec![
+            Tier3AnalyzerStatus {
+                id: Some("missing-lsp".into()),
+                language: "rust".into(),
+                state: AnalyzerState::Missing,
+                reason_code: Some(ReasonCode::BinaryNotFound),
+                reason: Some("binary missing".into()),
+            },
+            Tier3AnalyzerStatus {
+                id: Some("stale-lsp".into()),
+                language: "python".into(),
+                state: AnalyzerState::Stale,
+                reason_code: Some(ReasonCode::StaleRevision),
+                reason: Some("revision changed".into()),
+            },
+            Tier3AnalyzerStatus {
+                id: Some("ruby-lsp".into()),
+                language: "ruby".into(),
+                state: AnalyzerState::Skipped,
+                reason_code: Some(ReasonCode::WorkspaceUnsuitable),
+                reason: Some("Gemfile without Gemfile.lock".into()),
+            },
+        ]);
+        let completeness = Completeness::complete();
+        let ctx = emission_ctx(
+            false,
+            &completeness,
+            &tier3_status,
+            QueryArgsView::default(),
+        );
+
+        let diagnostics = build_diagnostics(&ctx);
+        let codes = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                DiagnosticCode::AnalyzerBinaryMissing,
+                DiagnosticCode::AnalyzerStale,
+                DiagnosticCode::WorkspaceUnsuitable,
+            ]
+        );
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(diagnostics[1].severity, DiagnosticSeverity::Info);
+    }
+
+    #[test]
+    fn hints_priority_order_is_array_order() {
+        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+            id: Some("rust-lsp".into()),
+            language: "rust".into(),
+            state: AnalyzerState::Running,
+            reason_code: None,
+            reason: None,
+        }]);
+        let completeness = Completeness::partial_truncated(PartialReason::Cap);
+        let ctx = emission_ctx(
+            true,
+            &completeness,
+            &tier3_status,
+            QueryArgsView {
+                repo: Some("demo"),
+                kind: true,
+                ..QueryArgsView::default()
+            },
+        );
+
+        let codes = build_hints(&ctx)
+            .into_iter()
+            .map(|hint| hint.code)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                HintCode::CappedIncreaseLimit,
+                HintCode::Tier3IndexingWait,
+                HintCode::EmptyResultRelaxFilter,
+                HintCode::EmptyResultWidenScope,
+            ]
+        );
+    }
+
     fn multi_language_fixture() -> test_support::DataRpcFixture {
         test_support::registered_fixture_with_files(&[
             ("src/lib.rs", "pub fn rust_symbol() {}\n"),
@@ -908,5 +1373,23 @@ mod tests {
             params![manifest_id.0, path, blob_sha],
         )
         .unwrap();
+    }
+
+    fn status_from_analyzers(analyzers: Vec<Tier3AnalyzerStatus>) -> Tier3Status {
+        Tier3Status::from_body(Tier3StatusBody::from_analyzers(analyzers))
+    }
+
+    fn emission_ctx<'a>(
+        items_empty: bool,
+        completeness: &'a Completeness,
+        tier3_status: &'a Tier3Status,
+        query_args: QueryArgsView<'a>,
+    ) -> EmissionContext<'a> {
+        EmissionContext {
+            items_empty,
+            completeness,
+            tier3_status,
+            query_args,
+        }
     }
 }
