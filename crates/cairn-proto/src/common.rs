@@ -54,6 +54,15 @@ pub struct LanguageEnrichment {
     pub has_analyzer: bool,
 }
 
+/// Wall time the daemon spent producing a response.
+///
+/// `server_ms` is always present. Per-phase breakdowns are intentionally not
+/// part of this v1 wire shape because the phase taxonomy is still unstable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timing {
+    pub server_ms: u64,
+}
+
 /// Open-ended kind tag for a defined symbol. Backends are free to add
 /// their own values; the strings below are the canonical names cairn
 /// reasons about. This enum is the single source of truth — both wire
@@ -548,5 +557,16 @@ mod tests {
         );
         let back: LanguageEnrichment = serde_json::from_value(v).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn timing_struct_default_is_zero() {
+        assert_eq!(Timing::default(), Timing { server_ms: 0 });
+    }
+
+    #[test]
+    fn timing_serializes_server_ms() {
+        let value = serde_json::to_value(Timing { server_ms: 42 }).unwrap();
+        assert_eq!(value, serde_json::json!({ "server_ms": 42 }));
     }
 }

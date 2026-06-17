@@ -116,6 +116,7 @@ impl DataMethod for GetSymbolSource {
                         Some(&parser_ids),
                         args.tier3.verbose_tier3,
                     )?,
+                    timing: cairn_proto::Timing::default(),
                 });
             }
 

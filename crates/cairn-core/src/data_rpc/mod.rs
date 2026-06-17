@@ -112,7 +112,15 @@ impl DataRpc {
 #[async_trait::async_trait]
 impl LineHandler for DataRpc {
     async fn handle(&self, line: &str) -> Option<String> {
-        Some(jsonrpc_dispatch::handle_line("data", &self.methods, &self.ctx, line).await)
+        Some(
+            jsonrpc_dispatch::handle_line_with_result_timing(
+                "data",
+                &self.methods,
+                &self.ctx,
+                line,
+            )
+            .await,
+        )
     }
 }
 

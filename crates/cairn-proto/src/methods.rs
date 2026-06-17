@@ -11,7 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind, Tier3RepoStatus, Tier3Status,
+    Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind, Tier3RepoStatus,
+    Tier3Status, Timing,
 };
 
 // ─── shared argument fragments ─────────────────────────────────────────────
@@ -86,6 +87,9 @@ pub struct ListReposResult {
     /// Completeness of the inventory. `Partial` when `limit` truncated rows.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One repository returned by `list_repos`.
@@ -138,6 +142,9 @@ pub struct RepoStatusArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusResult {
     pub repo: RepoStatusEntry,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// Detailed status for one repository.
@@ -255,6 +262,7 @@ mod list_repos_tests {
                 current_symbol_count: 3,
             }],
             completeness: Completeness::complete(),
+            timing: Timing::default(),
         };
         let value = serde_json::to_value(&result).unwrap();
         let repo = &value["repos"][0];
@@ -295,6 +303,9 @@ pub struct ListJobsResult {
     pub jobs: Vec<JobEntry>,
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +382,9 @@ pub struct OutlineResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One symbol-like entry returned by `get_outline`.
@@ -502,6 +516,9 @@ pub struct FindSymbolResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One symbol returned by `find_symbols`.
@@ -606,6 +623,9 @@ pub struct FindSubtypesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// Result of `find_supertypes`.
@@ -622,6 +642,9 @@ pub struct FindSupertypesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One type-relation edge — the data shape behind both
@@ -682,6 +705,9 @@ pub struct ImportsResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One import edge returned by `find_imports`.
@@ -783,6 +809,9 @@ pub struct FindReferencesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One reference site returned by `find_references`.
@@ -872,6 +901,9 @@ pub struct FindCallersResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// Result of `find_callees`.
@@ -886,6 +918,9 @@ pub struct FindCalleesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// One call edge — shared by `find_callers` and `find_callees`.
@@ -994,6 +1029,9 @@ pub struct GetSymbolSourceResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Server-side wall time spent producing this response.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 // ─── register_repo / reindex ────────────────────────────────────────────────

@@ -83,6 +83,7 @@ impl DataMethod for ListRepos {
             } else {
                 cairn_proto::Completeness::complete()
             },
+            timing: cairn_proto::Timing::default(),
         })
         .unwrap())
     }
