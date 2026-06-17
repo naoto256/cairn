@@ -92,6 +92,7 @@ impl DataMethod for FindCallees {
             items,
             completeness: completeness_for_cap(capped),
             tier3_status,
+            timing: cairn_proto::Timing::default(),
         })
         .unwrap())
     }

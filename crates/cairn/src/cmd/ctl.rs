@@ -530,18 +530,27 @@ fn render_repo_list(r: &ListReposResult) {
         println!("no repositories registered");
         return;
     }
-    for repo in &r.repos {
-        println!(
-            "{}\t{}\t[{}]\tstatus={:?} snapshots={} files={} symbols={}",
-            repo.alias,
-            repo.root,
-            repo.languages.join(","),
-            repo.status,
-            repo.snapshot_count,
-            repo.current_file_count,
-            repo.current_symbol_count
-        );
+    for line in format_repo_list_lines(r) {
+        println!("{line}");
     }
+}
+
+fn format_repo_list_lines(r: &ListReposResult) -> Vec<String> {
+    r.repos
+        .iter()
+        .map(|repo| {
+            format!(
+                "{}\t{}\t[{}]\tstatus={:?} snapshots={} files={} symbols={}",
+                repo.alias,
+                repo.root,
+                repo.languages.join(","),
+                repo.status,
+                repo.snapshot_count,
+                repo.current_file_count,
+                repo.current_symbol_count
+            )
+        })
+        .collect()
 }
 
 fn render_status(r: &StatusReport, snapshots: bool) {
@@ -694,6 +703,28 @@ mod tests {
             serde_json::json!({"include_jobs": false})
         );
         assert!(invocation.json_output);
+    }
+
+    #[test]
+    fn repo_list_render_hides_timing_from_human_output() {
+        let report = ListReposResult {
+            repos: vec![cairn_proto::methods::RepoListEntry {
+                alias: "demo".into(),
+                root: "/repo/demo".into(),
+                languages: vec!["rust".into()],
+                status: cairn_proto::methods::RepoAggregateStatus::Ready,
+                snapshot_count: 1,
+                current_file_count: 3,
+                current_symbol_count: 10,
+            }],
+            completeness: cairn_proto::Completeness::complete(),
+            timing: cairn_proto::Timing { server_ms: 123 },
+        };
+
+        let output = format_repo_list_lines(&report).join("\n");
+        assert!(output.contains("demo"));
+        assert!(!output.contains("timing"));
+        assert!(!output.contains("server_ms"));
     }
 
     #[test]

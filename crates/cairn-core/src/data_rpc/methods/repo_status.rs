@@ -72,7 +72,11 @@ impl DataMethod for RepoStatus {
         .await
         .map_err(|e| Error::internal_task_panic("repo_status", e))??;
 
-        Ok(serde_json::to_value(RepoStatusResult { repo }).unwrap())
+        Ok(serde_json::to_value(RepoStatusResult {
+            repo,
+            timing: cairn_proto::Timing::default(),
+        })
+        .unwrap())
     }
 }
 
