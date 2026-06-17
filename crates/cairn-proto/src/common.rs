@@ -169,6 +169,7 @@ pub enum ReasonCode {
     TimedOut,
     Stale,
     NotApplicable,
+    NotScheduled,
     Unknown,
 }
 
@@ -216,6 +217,19 @@ pub struct Tier3Status {
     /// Readiness for analyzers relevant to this query.
     pub this_query: Tier3StatusBody,
     /// Full repository readiness, included only when `verbose_tier3=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_wide: Option<Tier3StatusBody>,
+}
+
+/// Tier-3 workspace analyzer readiness for a whole repository view.
+///
+/// Query results use `this_query`; inventory/status tools use `this_repo`
+/// because their confidence is about the repository snapshot, not one query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier3RepoStatus {
+    /// Readiness for analyzers expected for this repository's current view.
+    pub this_repo: Tier3StatusBody,
+    /// Full repository readiness, included only when requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_wide: Option<Tier3StatusBody>,
 }

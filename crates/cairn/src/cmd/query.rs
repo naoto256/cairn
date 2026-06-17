@@ -645,25 +645,15 @@ fn render(method: &str, value: &Value) {
         "list_repos" => {
             if let Ok(r) = serde_json::from_value::<ListReposResult>(value.clone()) {
                 for repo in &r.repos {
-                    let languages = repo.languages();
                     println!(
-                        "{}\t{}\t[{}]",
+                        "{}\t{}\t[{}]\t{:?}\tfiles={}\tsymbols={}",
                         repo.alias,
                         repo.root,
-                        languages.iter().copied().collect::<Vec<_>>().join(",")
+                        repo.languages.join(","),
+                        repo.status,
+                        repo.current_file_count,
+                        repo.current_symbol_count
                     );
-                    for snap in &repo.snapshots {
-                        println!(
-                            "    {}\t{}\tfiles={}\tsymbols={}",
-                            snap.branches.join("/"),
-                            snap.status,
-                            snap.file_count,
-                            snap.symbol_count
-                        );
-                    }
-                    for job in &repo.jobs {
-                        println!("    job {}\t{}\t{}", job.job_id, job.analyzer_id, job.state);
-                    }
                 }
                 return;
             }

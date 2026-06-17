@@ -1,12 +1,14 @@
-//! `list_repos` — enumerate every registered repo with the anchors
-//! its CAS store knows about.
+//! `list_repos` — lightweight registered repository inventory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use cairn_lang_api::{LanguageBackend, all_backends};
 use cairn_proto::common::LanguageEnrichment;
-use cairn_proto::control::JobSnapshot;
-use cairn_proto::methods::{ListReposArgs, ListReposResult, RepoEntry, SnapshotEntry};
+use cairn_proto::methods::{
+    ListReposArgs, ListReposResult, RepoAggregateStatus, RepoListEntry, RepoSnapshotEntry,
+    RepoStatusCurrent, RepoStatusSummary,
+};
 use linkme::distributed_slice;
 use rusqlite::params;
 use serde_json::Value;
@@ -15,6 +17,7 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::enrichment::collect_enrichment;
+use crate::manifest::ManifestId;
 use crate::{Error, Result};
 
 pub struct ListRepos;
@@ -33,86 +36,169 @@ impl DataMethod for ListRepos {
         };
         let cas_data_dir = ctx.cas_data_dir.clone();
 
-        let repos = tokio::task::spawn_blocking(move || -> Result<Vec<RepoEntry>> {
+        let (repos, capped) = tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool)> {
             let backends = all_backends();
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
             let entries = cas_registry::list_all(&index)?;
             let mut out = Vec::with_capacity(entries.len());
             for entry in entries {
-                let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                let conn = cas_store::open(&store_path)?;
-                let snapshots = collect_snapshots(&conn, &backends)?;
-                let jobs = if args.include_jobs {
-                    collect_jobs(&conn, &entry.alias)?
-                } else {
-                    Vec::new()
-                };
-                out.push(RepoEntry {
+                if let Some(query) = args.query.as_deref()
+                    && !entry.alias.contains(query)
+                    && !entry.root_path.contains(query)
+                {
+                    continue;
+                }
+                let conn = cas_store::open(&cas_data_dir.store_db_path(&entry.repo_hash))?;
+                let snapshot_summary = collect_repo_snapshot_summary(&conn, &backends)?;
+                out.push(RepoListEntry {
                     alias: entry.alias,
                     root: entry.root_path,
-                    snapshots,
-                    jobs,
+                    languages: snapshot_summary.languages,
+                    status: snapshot_summary.aggregate_status,
+                    snapshot_count: snapshot_summary.summary.snapshot_count,
+                    current_file_count: snapshot_summary.summary.current_file_count,
+                    current_symbol_count: snapshot_summary.summary.current_symbol_count,
                 });
             }
-            Ok(out)
+            let capped = if let Some(limit) = args.limit {
+                let limit = limit as usize;
+                if out.len() > limit {
+                    out.truncate(limit);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            Ok((out, capped))
         })
         .await
         .map_err(|e| Error::internal_task_panic("list_repos", e))??;
 
-        Ok(serde_json::to_value(ListReposResult { repos }).unwrap())
+        Ok(serde_json::to_value(ListReposResult {
+            repos,
+            completeness: if capped {
+                cairn_proto::Completeness::partial_truncated("cap")
+            } else {
+                cairn_proto::Completeness::complete()
+            },
+        })
+        .unwrap())
     }
-}
-
-fn collect_jobs(conn: &rusqlite::Connection, alias: &str) -> Result<Vec<JobSnapshot>> {
-    let mut stmt = conn.prepare(
-        "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
-         FROM workspace_analysis_runs
-         WHERE job_id IS NOT NULL
-         ORDER BY job_id DESC",
-    )?;
-    let jobs = stmt
-        .query_map([], |r| {
-            Ok(JobSnapshot {
-                job_id: r.get(0)?,
-                alias: alias.to_string(),
-                analyzer_id: r.get(1)?,
-                state: r.get(2)?,
-                created_at: r.get(3)?,
-                started_at: None,
-                finished_at: r.get(4)?,
-                error: r.get(5)?,
-                pool_group: None,
-                scheduler_state: None,
-                enqueued_at: None,
-                run_started_at: None,
-                queued_ms: None,
-                pool_wait_ms: None,
-                run_ms: None,
-                progress_ticks: None,
-                last_progress_at: None,
-                progress_per_minute: None,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(jobs)
 }
 
 #[allow(unsafe_code)]
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(ListRepos);
 
+#[derive(Debug, Clone)]
+pub(super) struct RepoSnapshotSummary {
+    pub(super) languages: Vec<String>,
+    pub(super) summary: RepoStatusSummary,
+    pub(super) current: RepoStatusCurrent,
+    pub(super) aggregate_status: RepoAggregateStatus,
+    pub(super) snapshots: Vec<RepoSnapshotEntry>,
+    pub(super) current_manifest_id: Option<ManifestId>,
+}
+
 struct SnapshotAcc {
     internal_names: Vec<String>,
     last_updated_ns: i64,
 }
 
-/// Build one `SnapshotEntry` per manifest. Anchor names become labels
-/// in `branches`; branch-style names lose the `branch/` prefix while
-/// `HEAD` and `tentative/<id>` come through verbatim.
-fn collect_snapshots(
+struct SnapshotRecord {
+    manifest_id: ManifestId,
+    sort_internal: String,
+    entry: RepoSnapshotEntry,
+}
+
+/// Build one snapshot summary per manifest. This remains the shared source for
+/// inventory and repo_status so their aggregate counts cannot drift.
+pub(super) fn collect_repo_snapshot_summary(
     conn: &rusqlite::Connection,
     backends: &[Box<dyn LanguageBackend>],
-) -> Result<Vec<SnapshotEntry>> {
+) -> Result<RepoSnapshotSummary> {
+    let records = collect_snapshot_records(conn, backends)?;
+    let current_manifest_id = resolve_current_manifest(conn)?;
+    let current = current_snapshot(&records, current_manifest_id);
+    let snapshots = records
+        .iter()
+        .map(|record| record.entry.clone())
+        .collect::<Vec<_>>();
+    let languages = snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.enrichment.iter().map(|e| e.language.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let ready_snapshot_count = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == "ready")
+        .count() as u32;
+    let stale_snapshot_count = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == "stale")
+        .count() as u32;
+    let active_jobs = count_active_jobs(conn)?;
+    let aggregate_status = derive_aggregate_status(&snapshots, active_jobs);
+    Ok(RepoSnapshotSummary {
+        languages,
+        summary: RepoStatusSummary {
+            snapshot_count: snapshots.len() as u32,
+            ready_snapshot_count,
+            stale_snapshot_count,
+            current_file_count: current
+                .as_ref()
+                .map(|snapshot| snapshot.file_count)
+                .unwrap_or_default(),
+            current_symbol_count: current
+                .as_ref()
+                .map(|snapshot| snapshot.symbol_count)
+                .unwrap_or_default(),
+        },
+        current: RepoStatusCurrent {
+            anchor: current
+                .as_ref()
+                .and_then(|snapshot| snapshot.primary_label())
+                .unwrap_or("HEAD")
+                .to_string(),
+            status: current
+                .as_ref()
+                .map(|snapshot| snapshot.status.clone())
+                .unwrap_or_else(|| "missing".into()),
+        },
+        aggregate_status,
+        snapshots,
+        current_manifest_id,
+    })
+}
+
+pub(super) fn resolve_repo_by_path(
+    index: &rusqlite::Connection,
+    path: &Path,
+) -> Result<Option<cas_registry::AliasEntry>> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<cas_registry::AliasEntry> = None;
+    for entry in cas_registry::list_all(index)? {
+        let root = Path::new(&entry.root_path);
+        if canonical.starts_with(root) {
+            let replace = best
+                .as_ref()
+                .map(|current| entry.root_path.len() > current.root_path.len())
+                .unwrap_or(true);
+            if replace {
+                best = Some(entry);
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn collect_snapshot_records(
+    conn: &rusqlite::Connection,
+    backends: &[Box<dyn LanguageBackend>],
+) -> Result<Vec<SnapshotRecord>> {
     let mut stmt = conn.prepare(
         "SELECT anchor_name, manifest_id, last_updated_ns
            FROM anchors ORDER BY anchor_name",
@@ -139,7 +225,7 @@ fn collect_snapshots(
         }
     }
 
-    let mut entries: Vec<(String, SnapshotEntry)> = Vec::with_capacity(groups.len());
+    let mut entries: Vec<SnapshotRecord> = Vec::with_capacity(groups.len());
     for (manifest_id, mut acc) in groups {
         acc.internal_names.sort_by_key(|a| anchor::order_key(a));
         let sort_internal = acc.internal_names.first().cloned().unwrap_or_default();
@@ -148,27 +234,14 @@ fn collect_snapshots(
             .iter()
             .map(|n| n.strip_prefix("branch/").unwrap_or(n).to_string())
             .collect();
-        let file_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM manifest_entries WHERE manifest_id = ?1",
-                params![manifest_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        let symbol_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM symbols s
-                   JOIN manifest_entries me ON me.blob_sha = s.blob_sha
-                  WHERE me.manifest_id = ?1",
-                params![manifest_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        let file_count = count_manifest_files(conn, manifest_id)?;
+        let symbol_count = count_manifest_symbols(conn, manifest_id)?;
         let enrichment = collect_enrichment(conn, manifest_id, backends)?;
         let status = derive_status(file_count, symbol_count, &enrichment);
-        entries.push((
+        entries.push(SnapshotRecord {
+            manifest_id: ManifestId(manifest_id),
             sort_internal,
-            SnapshotEntry {
+            entry: RepoSnapshotEntry {
                 branches,
                 status,
                 enrichment,
@@ -176,20 +249,94 @@ fn collect_snapshots(
                 file_count: u64::try_from(file_count).unwrap_or(0),
                 symbol_count: u64::try_from(symbol_count).unwrap_or(0),
             },
-        ));
+        });
     }
-    entries.sort_by_key(|(a, _)| anchor::order_key(a));
-    Ok(entries.into_iter().map(|(_, e)| e).collect())
+    entries.sort_by_key(|record| anchor::order_key(&record.sort_internal));
+    Ok(entries)
 }
 
-/// Snapshot status derived from manifest + symbol counts.
-///
-/// Distinguishes the three "empty-looking" cases callers used to
-/// conflate: `empty` (no files in the manifest), `no_analyzer` (only
-/// languages without a semantic backend, e.g. all-markdown repo), and
-/// `stale` (analyzer-capable files exist but produced zero symbols —
-/// typically the index hasn't caught up yet and `reindex_repo` is the
-/// fix). `ready` is the steady state.
+#[cfg(test)]
+fn collect_snapshots(
+    conn: &rusqlite::Connection,
+    backends: &[Box<dyn LanguageBackend>],
+) -> Result<Vec<RepoSnapshotEntry>> {
+    Ok(collect_snapshot_records(conn, backends)?
+        .into_iter()
+        .map(|record| record.entry)
+        .collect())
+}
+
+fn current_snapshot(
+    snapshots: &[SnapshotRecord],
+    current_manifest_id: Option<ManifestId>,
+) -> Option<RepoSnapshotEntry> {
+    let current = current_manifest_id?;
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.manifest_id == current)
+        .map(|snapshot| snapshot.entry.clone())
+}
+
+fn resolve_current_manifest(conn: &rusqlite::Connection) -> Result<Option<ManifestId>> {
+    let anchor = anchor::resolve_explicit_or_default(conn, None, None)?;
+    anchor::resolve(conn, &anchor)
+}
+
+fn count_manifest_files(conn: &rusqlite::Connection, manifest_id: i64) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT COUNT(*) FROM manifest_entries WHERE manifest_id = ?1",
+            params![manifest_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0))
+}
+
+fn count_manifest_symbols(conn: &rusqlite::Connection, manifest_id: i64) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols s
+               JOIN manifest_entries me ON me.blob_sha = s.blob_sha
+              WHERE me.manifest_id = ?1",
+            params![manifest_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0))
+}
+
+fn count_active_jobs(conn: &rusqlite::Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM workspace_analysis_runs
+         WHERE job_id IS NOT NULL
+           AND manifest_id IN (SELECT DISTINCT manifest_id FROM anchors)
+           AND status IN ('queued', 'running')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+fn derive_aggregate_status(
+    snapshots: &[RepoSnapshotEntry],
+    active_jobs: i64,
+) -> RepoAggregateStatus {
+    if snapshots.is_empty()
+        || snapshots
+            .iter()
+            .any(|snapshot| snapshot.status == "missing")
+    {
+        RepoAggregateStatus::Error
+    } else if active_jobs > 0 {
+        RepoAggregateStatus::Indexing
+    } else if snapshots
+        .iter()
+        .any(|snapshot| snapshot.status == "stale" || snapshot.status == "no_analyzer")
+    {
+        RepoAggregateStatus::Partial
+    } else {
+        RepoAggregateStatus::Ready
+    }
+}
+
 fn derive_status(file_count: i64, symbol_count: i64, enrichment: &[LanguageEnrichment]) -> String {
     if file_count == 0 {
         return "empty".into();
@@ -207,7 +354,6 @@ fn derive_status(file_count: i64, symbol_count: i64, enrichment: &[LanguageEnric
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_lang_api::all_backends;
     use cairn_lang_markdown as _;
     use cairn_lang_python as _;
     use cairn_lang_rust as _;
@@ -218,12 +364,9 @@ mod tests {
     use crate::testutil::init_repo;
 
     #[test]
-    fn list_repos_emits_per_language_enrichment_matrix() {
+    fn list_repos_emits_lightweight_inventory() {
         let (repo, _sha) = init_repo(&[
-            (
-                "src/lib.rs",
-                "pub trait T {}\npub struct S;\nimpl T for S {}\n",
-            ),
+            ("src/lib.rs", "pub fn f() {}\n"),
             ("script.py", "def greet():\n    return 'hi'\n"),
             ("README.md", "# Hi\n"),
         ]);
@@ -231,8 +374,26 @@ mod tests {
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
         register_repo(&mut conn, repo.path(), 1000).unwrap();
 
-        let backends = all_backends();
-        let snapshots = collect_snapshots(&conn, &backends).unwrap();
+        let summary = collect_repo_snapshot_summary(&conn, &all_backends()).unwrap();
+
+        assert_eq!(summary.languages, vec!["markdown", "python", "rust"]);
+        assert_eq!(summary.summary.snapshot_count, 2);
+        assert!(summary.summary.current_file_count > 0);
+        assert_eq!(summary.aggregate_status, RepoAggregateStatus::Ready);
+    }
+
+    #[test]
+    fn list_repos_snapshot_summary_keeps_enrichment_matrix() {
+        let (repo, _sha) = init_repo(&[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            ("script.py", "def greet():\n    return 'hi'\n"),
+            ("README.md", "# Hi\n"),
+        ]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        register_repo(&mut conn, repo.path(), 1000).unwrap();
+
+        let snapshots = collect_snapshots(&conn, &all_backends()).unwrap();
         let snapshot = snapshots.iter().find(|s| s.has_head()).unwrap();
         let languages: Vec<&str> = snapshot
             .enrichment
@@ -248,63 +409,5 @@ mod tests {
             .unwrap();
         assert!(rust.has_analyzer);
         assert_eq!(rust.tier, SourceTier::Semantic);
-
-        let python = snapshot
-            .enrichment
-            .iter()
-            .find(|e| e.language == "python")
-            .unwrap();
-        assert!(python.has_analyzer);
-
-        let markdown = snapshot
-            .enrichment
-            .iter()
-            .find(|e| e.language == "markdown")
-            .unwrap();
-        assert!(!markdown.has_analyzer);
-        assert_eq!(markdown.tier, SourceTier::Syntactic);
-    }
-
-    #[test]
-    fn derive_status_distinguishes_empty_stale_and_ready() {
-        let none: Vec<LanguageEnrichment> = vec![];
-        assert_eq!(derive_status(0, 0, &none), "empty");
-
-        let md_only = vec![LanguageEnrichment {
-            language: "markdown".into(),
-            tier: SourceTier::Syntactic,
-            has_analyzer: false,
-        }];
-        assert_eq!(derive_status(3, 0, &md_only), "no_analyzer");
-
-        let rust = vec![LanguageEnrichment {
-            language: "rust".into(),
-            tier: SourceTier::Semantic,
-            has_analyzer: true,
-        }];
-        assert_eq!(derive_status(3, 0, &rust), "stale");
-        assert_eq!(derive_status(3, 7, &rust), "ready");
-    }
-
-    #[test]
-    fn list_repos_dedups_anchors_by_manifest_id() {
-        let (repo, _sha) = init_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
-        let db_tmp = tempfile::tempdir().unwrap();
-        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
-        register_repo(&mut conn, repo.path(), 1000).unwrap();
-
-        let backends = all_backends();
-        let snapshots = collect_snapshots(&conn, &backends).unwrap();
-
-        let head_main = snapshots.iter().find(|s| s.has_head()).unwrap();
-        assert_eq!(head_main.branches, vec!["HEAD", "main"]);
-
-        let tentative = snapshots
-            .iter()
-            .find(|s| s.branches.iter().any(|b| b.starts_with("tentative/")))
-            .unwrap();
-        assert_eq!(tentative.branches.len(), 1);
-        assert_eq!(snapshots.len(), 2);
-        assert!(snapshots[0].has_head());
     }
 }

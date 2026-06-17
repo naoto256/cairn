@@ -8,14 +8,11 @@
 //! and a plain `{"method":"get_outline"}` JSON-RPC both deserialize into
 //! [`OutlineArgs`] and return [`OutlineResult`].
 
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind, Tier3Status,
+    Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind, Tier3RepoStatus, Tier3Status,
 };
-use crate::control::JobSnapshot;
 
 // ─── shared argument fragments ─────────────────────────────────────────────
 
@@ -73,49 +70,107 @@ pub struct Tier3Args {
 /// Arguments to `list_repos`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListReposArgs {
-    /// Include analyzer job details. Defaults to false because job history can
-    /// be much larger than the repository inventory.
-    #[serde(default)]
-    pub include_jobs: bool,
+    /// Optional substring filter matched against alias and root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Maximum number of repositories to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// Result of `list_repos`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListReposResult {
-    /// Registered repositories visible to the daemon. Empty when the
-    /// registry has no entries.
-    pub repos: Vec<RepoEntry>,
+    /// Registered repository summaries visible to the daemon.
+    pub repos: Vec<RepoListEntry>,
+    /// Completeness of the inventory. `Partial` when `limit` truncated rows.
+    #[serde(default = "Completeness::complete")]
+    pub completeness: Completeness,
 }
 
 /// One repository returned by `list_repos`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoEntry {
+pub struct RepoListEntry {
     /// Short alias used by query arguments.
     pub alias: String,
     /// Registered repository root path.
     pub root: String,
-    /// Snapshot manifests reachable through this repository's anchors.
-    pub snapshots: Vec<SnapshotEntry>,
-    /// Analyzer jobs associated with this repo. Empty lists are omitted on
-    /// the wire.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub jobs: Vec<JobSnapshot>,
+    /// Distinct language tags present in current snapshots.
+    pub languages: Vec<String>,
+    /// Aggregate repository readiness.
+    pub status: RepoAggregateStatus,
+    /// Number of snapshot manifests reachable through anchors.
+    pub snapshot_count: u32,
+    /// File count across the current repo view.
+    pub current_file_count: u64,
+    /// Symbol count across the current repo view.
+    pub current_symbol_count: u64,
 }
 
-impl RepoEntry {
-    /// Distinct language tags present in this repo's snapshots.
-    #[must_use]
-    pub fn languages(&self) -> BTreeSet<&str> {
-        self.snapshots
-            .iter()
-            .flat_map(|s| s.enrichment.iter().map(|e| e.language.as_str()))
-            .collect()
-    }
+/// Aggregate repository status used by inventory views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoAggregateStatus {
+    Ready,
+    Indexing,
+    Partial,
+    Error,
 }
 
-/// Snapshot entry returned by `list_repos`.
+/// Arguments to `repo_status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoStatusArgs {
+    /// Repository alias. Exactly one of `repo` or `path` is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Filesystem path under a registered repository. Exclusive with `repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Include per-snapshot detail. Defaults to false.
+    #[serde(default)]
+    pub include_snapshots: bool,
+    /// Tier-3 status verbosity.
+    #[serde(flatten)]
+    pub tier3: Tier3Args,
+}
+
+/// Result of `repo_status`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotEntry {
+pub struct RepoStatusResult {
+    pub repo: RepoStatusEntry,
+}
+
+/// Detailed status for one repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoStatusEntry {
+    pub alias: String,
+    pub root: String,
+    pub languages: Vec<String>,
+    pub summary: RepoStatusSummary,
+    pub current: RepoStatusCurrent,
+    pub tier3_status: Tier3RepoStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<RepoSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoStatusSummary {
+    pub snapshot_count: u32,
+    pub ready_snapshot_count: u32,
+    pub stale_snapshot_count: u32,
+    pub current_file_count: u64,
+    pub current_symbol_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoStatusCurrent {
+    pub anchor: String,
+    pub status: String,
+}
+
+/// Snapshot entry returned by `repo_status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoSnapshotEntry {
     /// User-facing anchor labels pointing at this manifest. `branch/<name>`
     /// anchors are rendered as `<name>`; `HEAD` and `tentative/<id>` remain
     /// explicit.
@@ -133,7 +188,7 @@ pub struct SnapshotEntry {
     pub symbol_count: u64,
 }
 
-impl SnapshotEntry {
+impl RepoSnapshotEntry {
     /// First branch label in `branches` ordering (`HEAD` if present).
     #[must_use]
     pub fn primary_label(&self) -> Option<&str> {
@@ -152,8 +207,8 @@ mod list_repos_tests {
     use super::*;
 
     #[test]
-    fn snapshot_entry_serializes_enrichment_matrix() {
-        let entry = SnapshotEntry {
+    fn repo_snapshot_entry_serializes_enrichment_matrix() {
+        let entry = RepoSnapshotEntry {
             branches: vec!["HEAD".into(), "main".into()],
             status: "ready".into(),
             enrichment: vec![LanguageEnrichment {
@@ -181,43 +236,81 @@ mod list_repos_tests {
                 "symbol_count": 2
             })
         );
-        let back: SnapshotEntry = serde_json::from_value(v).unwrap();
+        let back: RepoSnapshotEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back.enrichment[0].language, "rust");
         assert_eq!(back.primary_label(), Some("HEAD"));
         assert!(back.has_head());
     }
 
     #[test]
-    fn repo_entry_derives_languages_from_snapshots() {
-        let repo = RepoEntry {
-            alias: "cairn".into(),
-            root: "/tmp/cairn".into(),
-            snapshots: vec![SnapshotEntry {
-                branches: vec!["main".into()],
-                status: "ready".into(),
-                enrichment: vec![
-                    LanguageEnrichment {
-                        language: "rust".into(),
-                        tier: SourceTier::Semantic,
-                        has_analyzer: true,
-                    },
-                    LanguageEnrichment {
-                        language: "markdown".into(),
-                        tier: SourceTier::Syntactic,
-                        has_analyzer: false,
-                    },
-                ],
-                last_accessed: None,
-                file_count: 2,
-                symbol_count: 3,
+    fn list_repos_default_omits_snapshots_and_jobs() {
+        let result = ListReposResult {
+            repos: vec![RepoListEntry {
+                alias: "cairn".into(),
+                root: "/tmp/cairn".into(),
+                languages: vec!["markdown".into(), "rust".into()],
+                status: RepoAggregateStatus::Ready,
+                snapshot_count: 1,
+                current_file_count: 2,
+                current_symbol_count: 3,
             }],
-            jobs: Vec::new(),
+            completeness: Completeness::complete(),
         };
-        assert_eq!(
-            repo.languages().into_iter().collect::<Vec<_>>(),
-            vec!["markdown", "rust"]
-        );
+        let value = serde_json::to_value(&result).unwrap();
+        let repo = &value["repos"][0];
+        assert!(repo.get("snapshots").is_none());
+        assert!(repo.get("jobs").is_none());
     }
+
+    #[test]
+    fn repo_status_requires_exactly_one_of_repo_or_path() {
+        let neither = RepoStatusArgs::default();
+        assert!(neither.repo.is_none() && neither.path.is_none());
+
+        let both = RepoStatusArgs {
+            repo: Some("cairn".into()),
+            path: Some("/tmp/cairn".into()),
+            ..RepoStatusArgs::default()
+        };
+        assert!(both.repo.is_some() && both.path.is_some());
+    }
+}
+
+// ─── list_jobs ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListJobsArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub include_terminal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListJobsResult {
+    pub jobs: Vec<JobEntry>,
+    #[serde(default = "Completeness::complete")]
+    pub completeness: Completeness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobEntry {
+    pub job_id: i64,
+    pub alias: String,
+    pub analyzer_id: String,
+    pub scheduler_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_group: Option<String>,
+    pub queued_ms: u64,
+    pub pool_wait_ms: u64,
+    pub run_ms: u64,
+    pub progress_ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<f64>,
 }
 
 // ─── get_outline ────────────────────────────────────────────────────────────
@@ -1109,6 +1202,51 @@ mod tests {
             serde_json::to_value(crate::ReasonCode::BinaryNotFound).unwrap(),
             json!("binary_not_found")
         );
+    }
+
+    #[test]
+    fn reason_code_includes_not_scheduled() {
+        assert_eq!(
+            serde_json::to_value(crate::ReasonCode::NotScheduled).unwrap(),
+            json!("not_scheduled")
+        );
+    }
+
+    #[test]
+    fn tier3_repo_status_serializes_this_repo() {
+        let status = crate::Tier3RepoStatus {
+            this_repo: crate::Tier3StatusBody::from_analyzers(vec![crate::Tier3AnalyzerStatus {
+                id: Some("rust-analyzer-lsp".into()),
+                language: "rust".into(),
+                state: crate::AnalyzerState::Ready,
+                reason_code: None,
+                reason: None,
+            }]),
+            repo_wide: None,
+        };
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized["this_repo"]["ready"], true);
+        assert!(serialized.get("repo_wide").is_none());
+    }
+
+    #[test]
+    fn job_entry_canonical_shape() {
+        let entry = JobEntry {
+            job_id: 7,
+            alias: "cairn".into(),
+            analyzer_id: "rust-analyzer-lsp".into(),
+            scheduler_state: "running".into(),
+            pool_group: None,
+            queued_ms: 1,
+            pool_wait_ms: 0,
+            run_ms: 2,
+            progress_ticks: 3,
+            rate: Some(4.0),
+        };
+        let serialized = serde_json::to_value(entry).unwrap();
+        assert_eq!(serialized["job_id"], 7);
+        assert_eq!(serialized["scheduler_state"], "running");
+        assert!(serialized.get("pool_group").is_none());
     }
 
     #[test]
