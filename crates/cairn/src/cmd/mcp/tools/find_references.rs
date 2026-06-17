@@ -6,16 +6,14 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, VERBOSE_TIER3_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, VERBOSE_TIER3_DESC};
 
 const REF_KIND_DESC: &str = "Restrict to one RefKind. Use snake_case strings: `call`, `type`, `import`, `instantiate`, `read`, `write`, `override`, `macro_invoke`, or `annotation`. Omit for every kind.";
 
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "find_references".into(),
-        description: format!(
-            "Symmetric reference tool — both directions of the call/use graph in one primitive. Omit `repo` to search every registered repo; each hit carries its repo in the `location` prefix (`repo:branch:file:line`).\n\n  • `direction=incoming` (default) — \"who references `symbol`\". Each hit is a use site whose target is `symbol`; the hit carries the enclosing function's qualified name + `repo:branch:file:line`.\n  • `direction=outgoing` — \"what does `symbol` reference\". By default this returns only resolved call refs (`kind=call` with non-empty `target_qualified`) so it can map a function's call graph without unresolved method-call, type-ref, or annotation noise. Set `include_noise=true` to return the full legacy ref set.\n\nWhen Tier-3 data is available for a call site, bare-name Tier-2 refs at that same byte range are suppressed in the default view; if Tier-3 is unavailable, Tier-2 refs remain as fallback. `include_noise=true` shows both rows for inspection.\n\nA `::`-bearing symbol matches the fully-qualified path first and falls back to the bare last segment if nothing matches; bare names skip straight to the name index. Pass `kind` to restrict to a single RefKind; for outgoing type/unresolved refs also set `include_noise=true`. For React/JSX component instantiation such as `<LineageFlow />`, use `direction=incoming` with `kind=instantiate`. Available wherever cairn has run its Tier-2 analyzer (Rust + Python today), with Tier-3 enrichment preferred when present. {COMPLETENESS_REASON_DESC}"
-        ),
+        description: "Find usage sites of a symbol: calls, type references, imports, reads, writes, annotations.\n\nWHEN: You know a symbol exists and want all places using it.\nNOT FOR: JSX component instantiation only; use `kind=instantiate`. Plain \"who calls this function\"; find_callers is tighter.\n\nRecovery: hints suggest direction / kind / scope adjustments.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

@@ -6,14 +6,12 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{COMPLETENESS_REASON_DESC, SYMBOL_KIND_DESC, VERBOSE_TIER3_DESC};
+use super::{SYMBOL_KIND_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "get_outline".into(),
-        description: format!(
-            "Default tool for 'what does this file or directory contain?' questions. Pass `file` for a single-file outline (the current behavior; `file` is omitted on each item because the request names it) or pass `path` to enumerate outlines across every file under that repo-root-relative string prefix in one call (each item carries `file`). Directory-mode items are returned in file → line order. Returns functions, classes, methods, and (for markdown) headings with signatures and doc strings — without loading file bodies. On wide paths (a crate or package root) narrow before raising `limit`: `kind` keeps one symbol kind, and `max_depth: 1` keeps files directly under the prefix — the module-level summary shape. Default limit is 200 and maximum limit is 1000. {COMPLETENESS_REASON_DESC} Items already returned are valid."
-        ),
+        description: "Structural outline of a file or directory: functions, classes, methods, headings, signatures, doc strings, without loading bodies.\n\nWHEN: You need the shape of code before reading. `file=` for one file; `path=` for a directory.\nNOT FOR: Symbol-name lookup across repo; use find_symbols.\n\nRecovery: capped results are signaled by completeness + hints; widen `max_depth` or narrow `path`.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

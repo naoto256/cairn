@@ -10,7 +10,7 @@ use super::forwarding::ForwardingTool;
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "reindex_repo".into(),
-        description: "Force a full rebuild of a registered repository's index. Rare — only needed when the file watcher might have missed changes (e.g. the daemon was down during a large `git restore` / rebase / sparse-checkout, or a snapshot DB has been manually deleted). Day-to-day edits do not need this.".into(),
+        description: "Force a full rebuild of a registered repo's index.\n\nWHEN: diagnostics or repo_status indicate analyzer work was not recorded after the watcher should have run.\nNOT FOR: Day-to-day edits or normal branch switches; the daemon watcher keeps those indexed.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

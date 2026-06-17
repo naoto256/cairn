@@ -11,9 +11,7 @@ use super::forwarding::ForwardingTool;
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "repo_status".into(),
-        description: format!(
-            "Status of one registered repo: language coverage, snapshot summary, current anchor, and Tier-3 analyzer readiness. Use when you have a repo alias or path and need to verify it is indexed before querying. {VERBOSE_TIER3_DESC}"
-        ),
+        description: "Entry-point status for one repo or path: resolves to alias, reports current snapshot readiness, and shows whether symbol-aware queries are usable.\n\nWHEN: You have a repo alias (or a path under one) and need to verify cairn covers it before querying.\nNOT FOR: Multi-repo inventory; use list_repos. Job-level diagnostics; use list_jobs.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

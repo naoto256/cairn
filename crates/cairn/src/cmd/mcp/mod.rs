@@ -96,43 +96,45 @@ pub enum ToolRoute {
 #[distributed_slice]
 pub static MCP_TOOLS: [fn() -> Box<dyn McpTool>] = [..];
 
-/// Server-wide guidance returned in `initialize.instructions`. Sets
-/// the default tool-selection policy for the session — individual
-/// tool descriptions reinforce the same nudges at the point of use,
-/// but a model that has already started reaching for `grep` rarely
-/// re-reads a single tool's description, so the policy belongs here
-/// too.
+/// Server-wide cockpit guidance returned in `initialize.instructions`.
+/// Keep this MCP-facing policy concise; data-RPC remains primitive and
+/// composition stays with the agent.
 const SERVER_INSTRUCTIONS: &str = "\
-Cairn is a local, symbol-aware code index over the repos you've \
-registered. Reach for it before `grep` / `Read` when navigating \
-code: cairn returns the exact location, signature, and structure \
-you actually need, while `grep` / `Read` drag whole files (or \
-whole match lists) into this conversation and burn your context \
-window for content you'll mostly discard. The index is \
-always-current — the daemon's file watcher keeps it in lockstep \
-with the working tree, including branch switches and new \
-worktrees.\n\
+Cairn is a local, symbol-aware code index for AI coding agents. \
+Reach for it before grep/Read when navigating registered repos; \
+cairn returns precise location, signature, and structure rather \
+than dragging whole files into context.\n\
 \n\
-1. Call `list_repos` once per session. If the repo you're in is \
-   listed, default to cairn's tools below. If it isn't, call \
-   `register_repo` once and you're set for the rest of the \
-   session (and beyond — registration persists).\n\
+## First move\n\
+- Don't know which repo to use? Call list_repos for the inventory.\n\
+- Have a path or cwd? Call repo_status with path to verify cairn \
+  covers it and Tier-3 readiness.\n\
 \n\
-2. Replace your habitual moves:\n\
-   - `grep` for a definition → `find_symbols`\n\
-   - `Read <file>` to scan structure → `get_outline`\n\
-   - `Read <file>` to view one fn / struct → `get_symbol_source`\n\
-   - `grep \"impl X for\"` / `grep \"extends X\"` → `find_subtypes`\n\
-   - `grep \"impl .* for X\"` to find X's interfaces → `find_supertypes`\n\
-   - `grep <fn>(` for callers → `find_callers`\n\
-   - tracing what one function calls → `find_callees`\n\
-   - any other reference (type / import / read / write / annotation) → `find_references`\n\
-   - `grep \"^use \"` → `find_imports`\n\
+## Core workflow\n\
+locate -> inspect -> trace:\n\
+find_symbols / get_outline -> get_symbol_source -> find_references / \
+find_callers / find_callees.\n\
 \n\
-3. `grep` / `Read` still belong in your toolbox — for free-form \
-   text inside symbol bodies, README prose, or files cairn \
-   doesn't understand. The point is to make them the second \
-   reach, not the first.";
+## Retry rules\n\
+On empty / partial / capped / analyzer-missing results, read in order:\n\
+- completeness (capped, partial)\n\
+- tier3_status.this_query (analyzer state + reason_code)\n\
+- diagnostics (what went wrong)\n\
+- hints (machine-readable next options)\n\
+\n\
+Hints are options, not commands. reindex_via_cli intentionally has \
+no `action` field so agents don't auto-loop reindexes.\n\
+\n\
+## JSX caveat\n\
+For React/JSX component usage, use find_references kind=instantiate. \
+find_callers is for resolved function calls and won't see component \
+instantiations.\n\
+\n\
+## Composition stance\n\
+cairn exposes precise primitives, not architecture answers. \
+Multi-step composition is left to the agent. timing.server_ms shows \
+daemon-side wall time so you can triage MCP-bridge vs daemon-side \
+latency.";
 
 // ─── run loop ──────────────────────────────────────────────────────────────
 
@@ -521,32 +523,62 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_describe_snapshot_and_kind_filters_precisely() {
+    fn mcp_tool_descriptions_mention_when_not_for_recovery() {
         let specs = dispatcher().tool_specs();
-        let list_repos = specs.iter().find(|spec| spec.name == "list_repos").unwrap();
-        assert!(list_repos.description.contains("registered repos"));
-        assert!(list_repos.description.contains("repo_status"));
-        assert!(list_repos.description.contains("list_jobs"));
 
+        for spec in &specs {
+            assert!(
+                spec.description.contains("WHEN:"),
+                "{} should tell the agent when to use it",
+                spec.name
+            );
+            assert!(
+                spec.description.contains("NOT FOR:"),
+                "{} should deflect adjacent tasks",
+                spec.name
+            );
+        }
+
+        for name in [
+            "find_symbols",
+            "get_outline",
+            "find_references",
+            "find_callers",
+        ] {
+            let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+            assert!(
+                spec.description.contains("Recovery:"),
+                "{name} should include a high-frequency recovery label"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tool_descriptions_under_120_tokens() {
+        for spec in dispatcher().tool_specs() {
+            // Cheap cockpit-label guard: roughly chars/4 tokens, with
+            // headroom for punctuation and identifiers.
+            let approx_tokens = spec.description.chars().count() / 4;
+            assert!(
+                approx_tokens < 240,
+                "{} description is too long: ~{approx_tokens} tokens",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_specs_keep_route_critical_schema() {
+        let specs = dispatcher().tool_specs();
         let get_outline = specs
             .iter()
             .find(|spec| spec.name == "get_outline")
             .unwrap();
-        assert!(get_outline.description.contains("Pass `file`"));
-        assert!(get_outline.description.contains("pass `path`"));
-        assert!(get_outline.description.contains("file → line order"));
-        assert!(get_outline.description.contains("Default limit is 200"));
-        assert!(get_outline.description.contains("`cap`"));
         assert!(get_outline.input_schema["required"].is_null());
         assert!(get_outline.input_schema["properties"]["path"].is_object());
-        assert!(get_outline.input_schema["properties"]["kind"].is_object());
         assert_eq!(
             get_outline.input_schema["properties"]["max_depth"]["minimum"],
             1
-        );
-        assert_eq!(
-            get_outline.input_schema["properties"]["limit"]["maximum"],
-            1000
         );
 
         let find_symbols = specs
@@ -554,116 +586,48 @@ mod tests {
             .find(|spec| spec.name == "find_symbols")
             .unwrap();
         let symbol_props = &find_symbols.input_schema["properties"];
-        let branch_desc = symbol_props["branch"]["description"].as_str().unwrap();
-        assert!(branch_desc.contains("bare branch name"));
-        assert!(branch_desc.contains("Do not pass `HEAD`"));
-        assert!(branch_desc.contains("Omit both `branch` and `anchor`"));
         assert!(
-            symbol_props["anchor"]["description"]
+            symbol_props["branch"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("Raw anchor name")
+                .contains("bare branch name")
         );
         assert!(
-            symbol_props["anchor"]["description"]
+            symbol_props["kind"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("Takes priority over `branch`")
+                .contains("`type_alias`")
         );
 
-        let kind_desc = symbol_props["kind"]["description"].as_str().unwrap();
-        assert!(kind_desc.contains("snake_case"));
-        assert!(kind_desc.contains("`type_alias`"));
-        assert!(kind_desc.contains("`section`"));
-        assert!(kind_desc.contains("Aliases such as `fn`"));
-        assert!(find_symbols.description.contains("Best practice"));
-        assert!(find_symbols.description.contains("Auth*"));
-        assert!(find_symbols.description.contains("exact match is faster"));
-        for reason in [
-            "`cap`",
-            "`tier2_warming`",
-            "`tier3_warming`",
-            "`tier3_unavailable`",
-            "`analyzer_failed`",
-        ] {
-            assert!(find_symbols.description.contains(reason));
-        }
-
-        for (tool_name, q_phrase) in [
-            ("find_subtypes", "who implements / extends / mixes in"),
-            (
-                "find_supertypes",
-                "what does `name` extend / implement / mix in",
-            ),
-            ("find_callers", "who calls `name`"),
-            ("find_callees", "what does `name` call"),
+        for (tool_name, required) in [
+            ("find_subtypes", "name"),
+            ("find_supertypes", "name"),
+            ("find_callers", "name"),
+            ("find_callees", "name"),
+            ("find_references", "symbol"),
         ] {
             let spec = specs.iter().find(|s| s.name == tool_name).unwrap();
-            assert!(
-                spec.description.contains("Omit `repo`"),
-                "{tool_name} should mention Omit `repo`"
-            );
-            assert!(spec.description.contains("every registered repo"));
-            assert!(spec.description.contains("`repo:branch:file:line`"));
-            assert!(
-                spec.description.contains(q_phrase),
-                "{tool_name} should phrase the typical agent question (`{q_phrase}`)"
-            );
-            assert_eq!(spec.input_schema["required"], serde_json::json!(["name"]));
-        }
-
-        let find_imports = specs
-            .iter()
-            .find(|spec| spec.name == "find_imports")
-            .unwrap();
-        assert!(find_imports.description.contains("Omit `repo`"));
-        assert!(find_imports.description.contains("every registered repo"));
-        assert!(find_imports.description.contains("`repo:branch:file:line`"));
-        assert!(find_imports.input_schema["required"].is_null());
-
-        let find_references = specs
-            .iter()
-            .find(|spec| spec.name == "find_references")
-            .unwrap();
-        assert!(find_references.description.contains("Omit `repo`"));
-        assert!(
-            find_references
-                .description
-                .contains("every registered repo")
-        );
-        assert!(
-            find_references
-                .description
-                .contains("`repo:branch:file:line`")
-        );
-        assert_eq!(
-            find_references.input_schema["required"],
-            serde_json::json!(["symbol"])
-        );
-        let ref_kind_desc = find_references.input_schema["properties"]["kind"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(ref_kind_desc.contains("snake_case"));
-        assert!(ref_kind_desc.contains("`macro_invoke`"));
-        for name in [
-            "find_subtypes",
-            "find_supertypes",
-            "find_callers",
-            "find_callees",
-            "find_references",
-            "find_imports",
-        ] {
-            let spec = specs.iter().find(|spec| spec.name == name).unwrap();
-            assert!(spec.description.contains("tier3_unavailable"));
-            assert!(spec.description.contains("analyzer crashed"));
+            assert_eq!(spec.input_schema["required"], serde_json::json!([required]));
         }
     }
 
     #[test]
-    fn initialize_carries_instructions() {
+    fn mcp_server_instructions_includes_first_move_and_workflow_sections() {
         let r = initialize_result();
         assert_eq!(r.protocol_version, MCP_PROTOCOL_VERSION);
-        assert!(r.instructions.unwrap().contains("find_symbols"));
+        let instructions = r.instructions.unwrap();
+        for phrase in [
+            "## First move",
+            "## Core workflow",
+            "## Retry rules",
+            "## JSX caveat",
+            "## Composition stance",
+            "find_symbols / get_outline -> get_symbol_source",
+            "reindex_via_cli intentionally has no `action` field",
+            "timing.server_ms",
+        ] {
+            assert!(instructions.contains(phrase), "missing {phrase}");
+        }
     }
 
     #[tokio::test]

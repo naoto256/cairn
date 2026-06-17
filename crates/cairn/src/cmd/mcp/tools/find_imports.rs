@@ -6,14 +6,12 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, COMPLETENESS_REASON_DESC, VERBOSE_TIER3_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
         name: "find_imports".into(),
-        description: format!(
-            "List `use` statements across registered repo snapshots. Omit `repo` to search every registered repo; each hit carries its repo in the `location` prefix (`repo:branch:file:line`). Pass `file` to see exactly what one file depends on; omit it to enumerate every import in the snapshot (useful for dependency-shape questions). Each hit carries the path, the dotted module on the left of the final `::`, the imported name (or `*` for globs), an optional `as` alias, and a `is_reexport` flag set for `pub use`. Sourced from the syn semantic layer. {COMPLETENESS_REASON_DESC}"
-        ),
+        description: "Imports declared in a file or matched by path prefix.\n\nWHEN: Discovering a file's dependencies, or finding usage of an external module.\nNOT FOR: Symbol lookup; use find_symbols.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
