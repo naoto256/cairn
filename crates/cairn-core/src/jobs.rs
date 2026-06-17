@@ -22,7 +22,8 @@ use crate::manifest::{self, ManifestEntry, ManifestId};
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::{
     ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, all_workspace_analyzers,
-    config_hash, mark_run, run_one_workspace_analyzer_with_timeout,
+    config_hash, expected_analyzers_for_manifest, mark_run,
+    run_one_workspace_analyzer_with_timeout,
 };
 use crate::{Error, Result};
 
@@ -562,7 +563,9 @@ impl JobManager {
         } = request;
         let first_id = next_job_id(conn)?.max(now_ns);
         let mut jobs = Vec::new();
-        for (job_id, analyzer) in (first_id..).zip(all_workspace_analyzers()) {
+        for (job_id, analyzer) in
+            (first_id..).zip(expected_analyzers_for_manifest(conn, manifest_id)?)
+        {
             let analyzer_id = analyzer.id();
             let analyzer_revision = analyzer.revision();
             let pool_group = analyzer.pool_group();
@@ -1440,6 +1443,7 @@ mod tests {
     use crate::manifest::ManifestId;
     use crate::paths::CasDataDir;
     use crate::workspace_analyzer::RunStatus;
+    use crate::workspace_analyzer::expected_analyzers_for_manifest;
 
     use super::{
         DispatchJob, Job, JobId, JobIndex, JobListOptions, JobManager, JobRuntimeMetricsStore,
@@ -1804,6 +1808,61 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_reindex_queues_only_expected_manifest_analyzers() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        let manager = JobManager::new(Arc::clone(&cas_data_dir));
+        let repo_hash = "repo-hash";
+        let manifest_id = ManifestId(1);
+        let mut conn = cas_store::open(&cas_data_dir.store_db_path(repo_hash)).unwrap();
+        insert_manifest(&conn, manifest_id.0);
+        insert_manifest_parser(&conn, manifest_id, "src/fake.rs", "fake-sha", "fake-parser");
+        insert_manifest_parser(
+            &conn,
+            manifest_id,
+            "src/unknown.rs",
+            "unknown-sha",
+            "unknown-parser",
+        );
+
+        let expected_ids = expected_analyzers_for_manifest(&conn, manifest_id)
+            .unwrap()
+            .into_iter()
+            .map(|analyzer| analyzer.id().to_string())
+            .collect::<Vec<_>>();
+
+        let jobs = manager
+            .enqueue_reindex(super::EnqueueReindex {
+                conn: &mut conn,
+                alias: "repo",
+                repo_hash,
+                repo_root: repo.path(),
+                manifest_id,
+                entries: &[],
+                now_ns: 1,
+            })
+            .unwrap();
+
+        let queued_ids = jobs
+            .iter()
+            .map(|job| job.analyzer_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(queued_ids, expected_ids);
+        assert_eq!(queued_ids, vec!["fake-workspace"]);
+
+        let db_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_analysis_runs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            db_count, 1,
+            "reindex now creates jobs only for expected analyzers instead of recording no-match skips"
+        );
+    }
+
+    #[test]
     fn runtime_metrics_decorate_pool_waiting_job() {
         let metrics = JobRuntimeMetricsStore::default();
         metrics.mark_enqueued(42, Some("clangd-lsp"), 1_000_000_000);
@@ -2023,6 +2082,27 @@ mod tests {
             "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
              VALUES (?1, ?2, 0)",
             rusqlite::params![anchor_name, manifest_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_manifest_parser(
+        conn: &rusqlite::Connection,
+        manifest_id: ManifestId,
+        path: &str,
+        blob_sha: &str,
+        parser_id: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            rusqlite::params![blob_sha, parser_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![manifest_id.0, path, blob_sha],
         )
         .unwrap();
     }
