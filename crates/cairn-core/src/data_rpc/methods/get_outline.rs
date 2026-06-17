@@ -8,8 +8,8 @@ use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
+    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
 };
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
@@ -34,6 +34,7 @@ impl DataMethod for GetOutline {
         let file = args.file.clone();
         let path = args.path.clone();
         let effective_limit = args.pagination.limit.unwrap_or(200).clamp(1, 1000);
+        let kind_filter_set = args.kind.is_some();
         let filter = OutlineFilter {
             kind: args.kind,
             max_depth: args.max_depth,
@@ -107,10 +108,27 @@ impl DataMethod for GetOutline {
             "get_outline",
         )
         .await?;
+        let completeness = completeness_for_cap(capped);
+        let emission_ctx = EmissionContext {
+            items_empty: items.is_empty(),
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: args.scope.repo.as_deref(),
+                fuzzy: true,
+                kind: kind_filter_set,
+                container: None,
+                path: args.path.as_deref().or(args.file.as_deref()),
+            },
+        };
+        let diagnostics = build_diagnostics(&emission_ctx);
+        let hints = build_hints(&emission_ctx);
         Ok(serde_json::to_value(OutlineResult {
             items,
-            completeness: completeness_for_cap(capped),
+            completeness,
             tier3_status,
+            diagnostics,
+            hints,
             timing: cairn_proto::Timing::default(),
         })
         .unwrap())
@@ -169,6 +187,7 @@ mod tests {
             serde_json::from_value::<Completeness>(result["completeness"].clone()).unwrap(),
             Completeness::partial_truncated("cap")
         );
+        assert_eq!(result["hints"][0]["code"], "capped_increase_limit");
     }
 
     #[tokio::test]
@@ -183,6 +202,8 @@ mod tests {
             .unwrap();
         let items = result["items"].as_array().unwrap();
         assert!(!items.is_empty());
+        assert!(result.get("diagnostics").is_none());
+        assert!(result.get("hints").is_none());
         for item in items {
             assert_eq!(item["kind"], "function");
         }

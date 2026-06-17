@@ -382,6 +382,12 @@ pub struct OutlineResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -629,6 +635,12 @@ pub struct FindSubtypesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -648,6 +660,12 @@ pub struct FindSupertypesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -711,6 +729,12 @@ pub struct ImportsResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -815,6 +839,12 @@ pub struct FindReferencesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -907,6 +937,12 @@ pub struct FindCallersResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -924,6 +960,12 @@ pub struct FindCalleesResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -1035,6 +1077,12 @@ pub struct GetSymbolSourceResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -1326,5 +1374,63 @@ mod tests {
                 .get("file")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn query_results_round_trip_diagnostics_and_hints_when_present() {
+        fn assert_query_envelope<T>(value: serde_json::Value)
+        where
+            T: serde::de::DeserializeOwned + serde::Serialize,
+        {
+            let parsed: T = serde_json::from_value(value).unwrap();
+            let serialized = serde_json::to_value(parsed).unwrap();
+            assert_eq!(
+                serialized["diagnostics"][0]["code"],
+                "analyzer_not_scheduled"
+            );
+            assert_eq!(serialized["hints"][0]["code"], "empty_result_widen_scope");
+        }
+
+        let envelope = json!({
+            "diagnostics": [{
+                "code": "analyzer_not_scheduled",
+                "severity": "warning",
+                "message": "expected analyzer was not scheduled"
+            }],
+            "hints": [{
+                "code": "empty_result_widen_scope",
+                "message": "drop repo scope",
+                "action": "widen_scope",
+                "drop_params": ["repo"]
+            }]
+        });
+        let with_items = |mut value: serde_json::Value| {
+            let object = value.as_object_mut().unwrap();
+            object.insert("items".into(), json!([]));
+            value
+        };
+
+        assert_query_envelope::<OutlineResult>(with_items(envelope.clone()));
+        assert_query_envelope::<FindSubtypesResult>(with_items(envelope.clone()));
+        assert_query_envelope::<FindSupertypesResult>(with_items(envelope.clone()));
+        assert_query_envelope::<ImportsResult>(with_items(envelope.clone()));
+        assert_query_envelope::<FindReferencesResult>(with_items(envelope.clone()));
+        assert_query_envelope::<FindCallersResult>(with_items(envelope.clone()));
+        assert_query_envelope::<FindCalleesResult>(with_items(envelope.clone()));
+
+        let mut source = envelope;
+        let object = source.as_object_mut().unwrap();
+        object.extend([
+            ("qualified".into(), json!("demo::target")),
+            ("name".into(), json!("target")),
+            ("kind".into(), json!("function")),
+            ("branch".into(), json!("HEAD")),
+            ("location".into(), json!("demo:HEAD:src/lib.rs:1")),
+            ("line_start".into(), json!(1)),
+            ("line_end".into(), json!(1)),
+            ("source".into(), json!("pub fn target() {}")),
+            ("source_tier".into(), json!("syntactic")),
+        ]);
+        assert_query_envelope::<GetSymbolSourceResult>(source);
     }
 }
