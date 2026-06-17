@@ -11,8 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    Completeness, LanguageEnrichment, RefKind, SourceTier, SymbolKind, Tier3RepoStatus,
-    Tier3Status, Timing,
+    Completeness, Diagnostic, Hint, LanguageEnrichment, RefKind, SourceTier, SymbolKind,
+    Tier3RepoStatus, Tier3Status, Timing,
 };
 
 // ─── shared argument fragments ─────────────────────────────────────────────
@@ -516,6 +516,12 @@ pub struct FindSymbolResult {
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "Tier3Status::ready")]
     pub tier3_status: Tier3Status,
+    /// Structured facts about partial confidence or analyzer state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step options for empty or incomplete results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
