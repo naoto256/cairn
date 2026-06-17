@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
-    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindSubtypesArgs as QueryArgs, ImplHit as QueryHit};
 use crate::{Error, Result};
@@ -75,6 +76,7 @@ impl DataMethod for FindSubtypes {
         .await?;
         let completeness = completeness_for_cap(capped);
         let emission_ctx = EmissionContext {
+            tool: QueryToolKind::FindSubtypes,
             items_empty: items.is_empty(),
             completeness: &completeness,
             tier3_status: &tier3_status,
@@ -84,6 +86,7 @@ impl DataMethod for FindSubtypes {
                 kind: false,
                 container: None,
                 path: None,
+                ..QueryArgsView::default()
             },
         };
         let diagnostics = build_diagnostics(&emission_ctx);

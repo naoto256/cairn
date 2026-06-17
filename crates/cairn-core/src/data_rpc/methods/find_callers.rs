@@ -11,8 +11,9 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_references::SnippetCache;
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, build_diagnostics, build_hints, completeness_for_cap,
-    limit_with_probe, parser_id_filter, tier3_status_for_query, with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    with_one_or_all_stores,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::{Error, Result};
@@ -88,6 +89,7 @@ impl DataMethod for FindCallers {
         .await?;
         let completeness = completeness_for_cap(capped);
         let emission_ctx = EmissionContext {
+            tool: QueryToolKind::FindCallers,
             items_empty: items.is_empty(),
             completeness: &completeness,
             tier3_status: &tier3_status,
@@ -97,6 +99,7 @@ impl DataMethod for FindCallers {
                 kind: true,
                 container: None,
                 path: None,
+                ..QueryArgsView::default()
             },
         };
         let diagnostics = build_diagnostics(&emission_ctx);
@@ -112,6 +115,12 @@ impl DataMethod for FindCallers {
             )
             .await?
         {
+            hints.retain(|hint| {
+                !matches!(
+                    hint.code,
+                    HintCode::EmptyResultRelaxFilter | HintCode::EmptyResultWidenScope
+                )
+            });
             hints.push(tsx_component_usage_hint());
         }
 
@@ -273,6 +282,10 @@ mod tests {
             hint["code"] == "tsx_callers_use_instantiate"
                 && hint["tool"] == "find_references"
                 && hint["params"] == json!({"kind": "instantiate"})
+        }));
+        assert!(hints.iter().all(|hint| {
+            hint["code"] != "empty_result_relax_filter"
+                && hint["code"] != "empty_result_widen_scope"
         }));
     }
 

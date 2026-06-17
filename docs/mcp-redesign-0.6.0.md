@@ -41,7 +41,7 @@ This is a **breaking** redesign. cairn has no users to be backward-compatible wi
 - No MCP spec extensions (no compact mode, no session-aware tool descriptions). Stay inside the spec; rely on concise descriptions instead.
 - CLI is *not* required to mirror the MCP surface. `cairn ctl repo status` may exist alongside `repo_status` MCP, but their flags and defaults can diverge for ergonomics.
 - No Windows-native support in 0.6.0. WSL2 + Linux binary is the supported path. Distribution polish is a separate axis.
-- **No broad multi-step composition tools in 0.6.0** (no `find_definition_with_source`, no `trace_chain`, no `explain_call_path`). Live MCP dogfood showed the primary pain was response interpretation and retry planning, not the number of calls. Per principle #8 composition remains allowed for future MCP-only tools, but only when both Claude and Codex find repeated friction that the primitive surface plus diagnostics/hints does not solve. The only thin composition shipped in 0.6.0 is `repo_status` accepting `path=` for cwd → alias resolution; a dedicated `resolve_repo` / `current_repo` is deferred unless that path-mode is found insufficient.
+- **No broad multi-step composition tools in 0.6.0** (no `find_definition_with_source`, no `trace_chain`, no `explain_call_path`). Live MCP dogfood showed the primary pain was response interpretation and retry planning, not the number of calls. Per principle #8 composition remains allowed for future MCP-only tools, but only when both Claude and Codex find repeated friction that the primitive surface plus diagnostics/hints does not solve. The only thin composition shipped in 0.6.0 is `repo_status` accepting `path=` for cwd → alias resolution, plus MCP-only zero-arg `repo_status({})` that injects the server cwd as `path`; a dedicated `resolve_repo` / `current_repo` is deferred unless that path-mode is found insufficient.
 
 ## 3. Compatibility stance
 
@@ -95,7 +95,7 @@ The primary collection uses a noun, not `items`. This makes the response self-de
 }
 ```
 
-`repo_status` returns a single `repo` object (not a collection) plus optional `diagnostics` / `hints` / `timing`.
+`repo_status` returns a single `repo` object (not a collection) plus optional `diagnostics` / `hints` / `timing`. In MCP, omitting both `repo` and `path` injects the server current working directory as `path`; the data RPC contract remains exactly-one `repo` or `path`.
 
 ---
 
