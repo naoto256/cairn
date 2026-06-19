@@ -5,6 +5,67 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.6.1] — 2026-06-18
+
+Patch release addressing hint polish from the 0.6.0 dogfood pass and
+reshaping the MCP server instructions around the agent pains the new
+surface was designed to relieve.
+
+### Added
+
+- **`hints[]` envelope on `repo_status` for degraded paths.** When a
+  `repo_status` call resolves to a not-fully-clean state, the response
+  now carries a `hints[]` array describing the recovery move:
+  - `daemon_not_ready` — the daemon socket is missing or refusing
+    connections (injected from the MCP transport layer; works even
+    when the data RPC itself can't be reached).
+  - `repo_not_registered` — `path=` resolves outside any registered
+    repository; carried in the JSON-RPC error `data.hints[]`.
+  - `snapshot_stale` — the current snapshot is stale relative to the
+    working tree.
+  - `tier3_indexing_wait` — Tier-3 analyzer is `queued` or `running`
+    for the current view (existing hint code, now also emitted from
+    `repo_status`).
+  All four hints intentionally omit `action`: cairn describes the
+  state, agents decide the next move (#185).
+- **`capped_narrow_filter` hint on directory `get_outline`.** When a
+  directory-mode `get_outline` is capped by `limit`, the response now
+  emits `capped_narrow_filter` ahead of the existing
+  `capped_increase_limit`, with
+  `params={"narrow_candidates":["kind","max_depth"]}` so agents reach
+  for a narrower query before reaching for a wider response (#185).
+- **MCP server instructions rewritten around the agent pain the
+  redesign relieves.** The `initialize.instructions` reply now opens
+  with six concrete failure modes you hit when you reach for grep/Read
+  on structural questions (50+ matches, file-named-differently,
+  type-hierarchy invisible to text, zero-result-vs-index-not-ready,
+  JSX-call-not-a-call, …), then closes with the recovery signal
+  ("reading >2 files to locate one definition" or "concluding no such
+  symbol without checking tier3 readiness"). Roughly 100 fewer tokens
+  than the 0.6.0 cockpit-label form; per-tool intent lives in each
+  tool's description instead (#186).
+
+### Changed
+
+- **`relax_filter.drop_params` no longer suggests dropping `repo`.**
+  When a query hits zero results with filters and a repo scope set,
+  the `empty_result_relax_filter` hint suggests dropping the filters
+  only; widening the repo scope remains the job of the separate
+  `empty_result_widen_scope` hint. This fixes the redundancy where
+  `repo` appeared in both hints' `drop_params` arrays (#185).
+
+### Fixed
+
+- **Codex plugin loader rejected the bundled hooks config.** The
+  cairn plugin's `plugin/hooks/hooks.json` carried a top-level
+  `description` field used as documentation; Codex's plugin loader
+  enforces a strict schema and rejected the file with
+  `unknown field 'description', expected 'hooks'` at startup, which
+  surfaced to the operator on every Codex.app launch in a
+  cairn-installed environment. The field is dropped; the
+  documentation moves to the maintainer comment in the source tree
+  (#186).
+
 ## [0.6.0] — 2026-06-18
 
 The MCP surface is redesigned around AI coding agents: smaller default
