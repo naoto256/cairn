@@ -255,10 +255,14 @@ pub enum HintCode {
     EmptyResultTryFuzzy,
     EmptyResultWidenScope,
     CappedIncreaseLimit,
+    CappedNarrowFilter,
     Tier3IndexingWait,
     Tier3UnavailableAlternative,
     TsxCallersUseInstantiate,
     ReindexViaCli,
+    DaemonNotReady,
+    RepoNotRegistered,
+    SnapshotStale,
 }
 
 /// Optional action category for a hint.
@@ -726,6 +730,26 @@ mod tests {
         assert_eq!(
             serde_json::to_value(HintCode::Tier3UnavailableAlternative).unwrap(),
             serde_json::json!("tier3_unavailable_alternative")
+        );
+    }
+
+    #[test]
+    fn hint_code_new_recovery_variants_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_value(HintCode::CappedNarrowFilter).unwrap(),
+            serde_json::json!("capped_narrow_filter")
+        );
+        assert_eq!(
+            serde_json::to_value(HintCode::DaemonNotReady).unwrap(),
+            serde_json::json!("daemon_not_ready")
+        );
+        assert_eq!(
+            serde_json::to_value(HintCode::RepoNotRegistered).unwrap(),
+            serde_json::json!("repo_not_registered")
+        );
+        assert_eq!(
+            serde_json::to_value(HintCode::SnapshotStale).unwrap(),
+            serde_json::json!("snapshot_stale")
         );
     }
 

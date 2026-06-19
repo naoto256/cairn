@@ -142,6 +142,10 @@ pub struct RepoStatusArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusResult {
     pub repo: RepoStatusEntry,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
     #[serde(default)]
     pub timing: Timing,
@@ -281,6 +285,91 @@ mod list_repos_tests {
             ..RepoStatusArgs::default()
         };
         assert!(both.repo.is_some() && both.path.is_some());
+    }
+
+    #[test]
+    fn repo_status_result_serializes_diagnostics_and_hints_when_present() {
+        let result = RepoStatusResult {
+            repo: RepoStatusEntry {
+                alias: "demo".into(),
+                root: "/tmp/demo".into(),
+                languages: vec!["rust".into()],
+                summary: RepoStatusSummary {
+                    snapshot_count: 1,
+                    ready_snapshot_count: 0,
+                    stale_snapshot_count: 1,
+                    current_file_count: 1,
+                    current_symbol_count: 0,
+                },
+                current: RepoStatusCurrent {
+                    anchor: "HEAD".into(),
+                    status: "stale".into(),
+                },
+                tier3_status: Tier3RepoStatus {
+                    this_repo: crate::Tier3StatusBody::ready(),
+                    repo_wide: None,
+                },
+                snapshots: Vec::new(),
+            },
+            diagnostics: vec![Diagnostic {
+                code: crate::DiagnosticCode::AnalyzerStale,
+                severity: crate::DiagnosticSeverity::Info,
+                message: "stale".into(),
+                language: Some("rust".into()),
+                analyzer_id: None,
+                repo: Some("demo".into()),
+                file: None,
+                details: None,
+            }],
+            hints: vec![Hint {
+                code: crate::HintCode::SnapshotStale,
+                message: "Current snapshot is stale.".into(),
+                action: None,
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: Some("demo".into()),
+            }],
+            timing: Timing::default(),
+        };
+
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["diagnostics"][0]["code"], "analyzer_stale");
+        assert_eq!(value["hints"][0]["code"], "snapshot_stale");
+    }
+
+    #[test]
+    fn repo_status_result_omits_envelope_optional_fields_on_happy_path() {
+        let result = RepoStatusResult {
+            repo: RepoStatusEntry {
+                alias: "demo".into(),
+                root: "/tmp/demo".into(),
+                languages: vec!["rust".into()],
+                summary: RepoStatusSummary {
+                    snapshot_count: 1,
+                    ready_snapshot_count: 1,
+                    stale_snapshot_count: 0,
+                    current_file_count: 1,
+                    current_symbol_count: 1,
+                },
+                current: RepoStatusCurrent {
+                    anchor: "HEAD".into(),
+                    status: "ready".into(),
+                },
+                tier3_status: Tier3RepoStatus {
+                    this_repo: crate::Tier3StatusBody::ready(),
+                    repo_wide: None,
+                },
+                snapshots: Vec::new(),
+            },
+            diagnostics: Vec::new(),
+            hints: Vec::new(),
+            timing: Timing::default(),
+        };
+
+        let value = serde_json::to_value(result).unwrap();
+        assert!(value.get("diagnostics").is_none());
+        assert!(value.get("hints").is_none());
     }
 }
 
