@@ -101,41 +101,35 @@ pub static MCP_TOOLS: [fn() -> Box<dyn McpTool>] = [..];
 /// Keep this MCP-facing policy concise; data-RPC remains primitive and
 /// composition stays with the agent.
 const SERVER_INSTRUCTIONS: &str = "\
-Cairn is a local, symbol-aware code index for AI coding agents. \
-Reach for it before grep/Read when navigating registered repos; \
-cairn returns precise location, signature, and structure rather \
-than dragging whole files into context.\n\
+As you navigate code, you will hit recurring failures when you reach \
+for grep/Read on structural questions:\n\
 \n\
-## First move\n\
-- Don't know which repo to use? Call list_repos for the inventory.\n\
-- Have a path or cwd? Call repo_status with path to verify cairn \
-  covers it and Tier-3 readiness.\n\
+- grep on a name returns 50+ matches mixing definition, uses, \
+  comments, and same-name shadows in other modules\n\
+- the file you need is named differently than you'd guess, so \
+  locating one definition costs a whole-repo scan\n\
+- \"who calls this?\" can't be separated from comments and unrelated \
+  same-name functions by text alone\n\
+- extends / implements / mixins / protocol conformance aren't \
+  text-shaped; grep can't model type hierarchies\n\
+- zero results doesn't mean the symbol doesn't exist — the Tier-3 \
+  index might not be ready yet\n\
+- JSX `<Foo />` semantically calls Foo but doesn't grep as a call\n\
 \n\
-## Core workflow\n\
-locate -> inspect -> trace:\n\
-find_symbols / get_outline -> get_symbol_source -> find_references / \
-find_callers / find_callees.\n\
+These fire hardest on *structure*, not *text*. On a question about \
+where a definition lives, who calls / extends / implements something, \
+what's in a file or directory, or what depends on what — grep loses \
+it by construction. Reach for cairn before you grep.\n\
 \n\
-## Retry rules\n\
-On empty / partial / capped / analyzer-missing results, read in order:\n\
-- completeness (capped, partial)\n\
-- tier3_status.this_query (analyzer state + reason_code)\n\
-- diagnostics (what went wrong)\n\
-- hints (machine-readable next options)\n\
+What comes back: precise location, kind, signature, doc — with \
+`tier3_status` so you can tell \"doesn't exist\" from \"index not \
+ready\", `completeness` for truncation, and `hints` for empty-result \
+recovery.\n\
 \n\
-Hints are options, not commands. reindex_via_cli intentionally has \
-no `action` field so agents don't auto-loop reindexes.\n\
-\n\
-## JSX caveat\n\
-For React/JSX component usage, use find_references kind=instantiate. \
-find_callers is for resolved function calls and won't see component \
-instantiations.\n\
-\n\
-## Composition stance\n\
-cairn exposes precise primitives, not architecture answers. \
-Multi-step composition is left to the agent. timing.server_ms shows \
-daemon-side wall time so you can triage MCP-bridge vs daemon-side \
-latency.";
+You will sometimes grep first anyway — the reflex is faster than this \
+text. Recovery is one call: when you're reading >2 files to locate \
+one definition, or about to conclude \"no such symbol\" without \
+checking tier3 readiness, that is the signal to reach for cairn.";
 
 // ─── run loop ──────────────────────────────────────────────────────────────
 
@@ -637,19 +631,21 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_instructions_includes_first_move_and_workflow_sections() {
+    fn mcp_server_instructions_frames_structural_pain_and_recovery() {
         let r = initialize_result();
         assert_eq!(r.protocol_version, MCP_PROTOCOL_VERSION);
         let instructions = r.instructions.unwrap();
         for phrase in [
-            "## First move",
-            "## Core workflow",
-            "## Retry rules",
-            "## JSX caveat",
-            "## Composition stance",
-            "find_symbols / get_outline -> get_symbol_source",
-            "reindex_via_cli intentionally has no `action` field",
-            "timing.server_ms",
+            "recurring failures when you reach",
+            "grep on a name returns 50+",
+            "Tier-3 index might not be ready yet",
+            "JSX `<Foo />` semantically calls Foo",
+            "fire hardest on *structure*, not *text*",
+            "Reach for cairn before you grep",
+            "tier3_status",
+            "completeness",
+            "hints",
+            "Recovery is one call",
         ] {
             assert!(instructions.contains(phrase), "missing {phrase}");
         }
