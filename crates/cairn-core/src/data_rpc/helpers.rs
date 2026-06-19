@@ -149,9 +149,11 @@ impl QueryArgsView<'_> {
     }
 
     fn has_relax_filters(&self, metadata: &ToolHintMetadata) -> bool {
-        self.filter_drop_params(metadata)
-            .into_iter()
-            .any(|param| param != "repo")
+        !self.filter_drop_params(metadata).is_empty()
+    }
+
+    fn is_directory_outline(&self) -> bool {
+        self.path.is_some_and(|value| !value.is_empty()) && self.file.is_none()
     }
 }
 
@@ -166,7 +168,7 @@ fn tool_metadata(kind: QueryToolKind) -> ToolHintMetadata {
         QueryToolKind::FindSymbols => ToolHintMetadata {
             tool: "find_symbols",
             result_noun: "symbols",
-            relax_drop_candidates: &["repo", "kind", "container", "path"],
+            relax_drop_candidates: &["kind", "container", "path"],
         },
         QueryToolKind::GetOutline => ToolHintMetadata {
             tool: "get_outline",
@@ -181,27 +183,27 @@ fn tool_metadata(kind: QueryToolKind) -> ToolHintMetadata {
         QueryToolKind::FindReferences => ToolHintMetadata {
             tool: "find_references",
             result_noun: "references",
-            relax_drop_candidates: &["repo", "kind", "direction"],
+            relax_drop_candidates: &["kind", "direction"],
         },
         QueryToolKind::FindCallers => ToolHintMetadata {
             tool: "find_callers",
             result_noun: "callers",
-            relax_drop_candidates: &["repo"],
+            relax_drop_candidates: &[],
         },
         QueryToolKind::FindCallees => ToolHintMetadata {
             tool: "find_callees",
             result_noun: "callees",
-            relax_drop_candidates: &["repo"],
+            relax_drop_candidates: &[],
         },
         QueryToolKind::FindSubtypes => ToolHintMetadata {
             tool: "find_subtypes",
             result_noun: "subtypes",
-            relax_drop_candidates: &["repo"],
+            relax_drop_candidates: &[],
         },
         QueryToolKind::FindSupertypes => ToolHintMetadata {
             tool: "find_supertypes",
             result_noun: "supertypes",
-            relax_drop_candidates: &["repo"],
+            relax_drop_candidates: &[],
         },
         QueryToolKind::FindImports => ToolHintMetadata {
             tool: "find_imports",
@@ -252,6 +254,19 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
             ..
         }
     ) {
+        if ctx.tool == QueryToolKind::GetOutline && ctx.query_args.is_directory_outline() {
+            hints.push(Hint {
+                code: HintCode::CappedNarrowFilter,
+                message:
+                    "Outline result was capped. Try narrowing with kind=... or reducing max_depth."
+                        .into(),
+                action: None,
+                tool: Some(metadata.tool.into()),
+                params: Some(json!({ "narrow_candidates": ["kind", "max_depth"] })),
+                drop_params: Vec::new(),
+                target: None,
+            });
+        }
         hints.push(Hint {
             code: HintCode::CappedIncreaseLimit,
             message: format!("Increase `limit` to see more {}.", metadata.result_noun),
@@ -1240,9 +1255,12 @@ mod tests {
         };
 
         let hints = build_hints(&ctx);
-        assert_eq!(hints[0].code, HintCode::CappedIncreaseLimit);
-        assert_eq!(hints[0].tool.as_deref(), Some("get_outline"));
-        assert!(hints[0].message.contains("outline items"));
+        let increase = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::CappedIncreaseLimit)
+            .unwrap();
+        assert_eq!(increase.tool.as_deref(), Some("get_outline"));
+        assert!(increase.message.contains("outline items"));
         let relax = hints
             .iter()
             .find(|hint| hint.code == HintCode::EmptyResultRelaxFilter)
@@ -1317,7 +1335,37 @@ mod tests {
             .iter()
             .find(|hint| hint.code == HintCode::EmptyResultRelaxFilter)
             .unwrap();
-        assert_eq!(relax.drop_params, vec!["repo", "path"]);
+        assert_eq!(relax.drop_params, vec!["path"]);
+    }
+
+    #[test]
+    fn relax_filter_does_not_include_repo_in_drop_params() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::complete();
+        let ctx = EmissionContext {
+            tool: QueryToolKind::FindReferences,
+            items_empty: true,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: Some("demo"),
+                kind: true,
+                direction: true,
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        let relax = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::EmptyResultRelaxFilter)
+            .unwrap();
+        assert_eq!(relax.drop_params, vec!["kind", "direction"]);
+        let widen = hints
+            .iter()
+            .find(|hint| hint.code == HintCode::EmptyResultWidenScope)
+            .unwrap();
+        assert_eq!(widen.drop_params, vec!["repo"]);
     }
 
     #[test]
@@ -1377,6 +1425,55 @@ mod tests {
         let hints = build_hints(&ctx);
         assert_eq!(hints[0].code, HintCode::CappedIncreaseLimit);
         assert_eq!(hints[0].action, Some(HintAction::IncreaseLimit));
+    }
+
+    #[test]
+    fn directory_outline_cap_emits_capped_narrow_filter_first_then_capped_increase_limit() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::partial_truncated(PartialReason::Cap);
+        let ctx = EmissionContext {
+            tool: QueryToolKind::GetOutline,
+            items_empty: false,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                path: Some("src/"),
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        assert_eq!(hints[0].code, HintCode::CappedNarrowFilter);
+        assert_eq!(hints[0].tool.as_deref(), Some("get_outline"));
+        assert_eq!(
+            hints[0].params,
+            Some(serde_json::json!({ "narrow_candidates": ["kind", "max_depth"] }))
+        );
+        assert_eq!(hints[1].code, HintCode::CappedIncreaseLimit);
+    }
+
+    #[test]
+    fn file_mode_outline_cap_does_not_emit_capped_narrow_filter() {
+        let tier3_status = Tier3Status::ready();
+        let completeness = Completeness::partial_truncated(PartialReason::Cap);
+        let ctx = EmissionContext {
+            tool: QueryToolKind::GetOutline,
+            items_empty: false,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                file: Some("src/lib.rs"),
+                ..QueryArgsView::default()
+            },
+        };
+
+        let hints = build_hints(&ctx);
+        assert!(
+            !hints
+                .iter()
+                .any(|hint| hint.code == HintCode::CappedNarrowFilter)
+        );
+        assert_eq!(hints[0].code, HintCode::CappedIncreaseLimit);
     }
 
     #[test]
