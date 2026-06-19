@@ -192,7 +192,8 @@ mod tests {
             serde_json::from_value::<Completeness>(result["completeness"].clone()).unwrap(),
             Completeness::partial_truncated("cap")
         );
-        assert_eq!(result["hints"][0]["code"], "capped_increase_limit");
+        assert_eq!(result["hints"][0]["code"], "capped_narrow_filter");
+        assert_eq!(result["hints"][1]["code"], "capped_increase_limit");
     }
 
     #[tokio::test]

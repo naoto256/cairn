@@ -37,6 +37,7 @@ use cairn_proto::jsonrpc::{
     JsonRpcVersion, Request as RpcRequest, RequestId, Response as RpcResponse, error_code,
     error_response as error_resp, serialize_response as serialize,
 };
+use cairn_proto::{Hint, HintCode};
 use clap::Args as ClapArgs;
 use linkme::distributed_slice;
 use serde::Serialize;
@@ -323,6 +324,7 @@ impl Dispatcher {
         };
         match route {
             ToolRoute::DataPlane { method, params } => {
+                let is_repo_status = method == "repo_status";
                 let req = RpcRequest {
                     jsonrpc: JsonRpcVersion::V2,
                     id: RequestId::Number(1),
@@ -331,6 +333,7 @@ impl Dispatcher {
                 };
                 match rpc_client::send_request(&self.paths.cairn, &req).await {
                     Ok(resp) => mcp_wrap_rpc_response(id, resp),
+                    Err(e) if is_repo_status => repo_status_daemon_not_ready_error(id, e),
                     Err(e) => {
                         error_resp(id, error_code::INTERNAL_ERROR, format!("data socket: {e}"))
                     }
@@ -354,6 +357,28 @@ impl Dispatcher {
             }
         }
     }
+}
+
+fn repo_status_daemon_not_ready_error(id: RequestId, err: anyhow::Error) -> RpcResponse {
+    let mut response = error_resp(
+        id,
+        error_code::INTERNAL_ERROR,
+        format!("data socket: {err}"),
+    );
+    if let Some(error) = response.error.as_mut() {
+        error.data = Some(serde_json::json!({
+            "hints": [Hint {
+                code: HintCode::DaemonNotReady,
+                message: "Daemon is not running. Start it with `brew services start cairn` or `cairn daemon`.".to_string(),
+                action: None,
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: None,
+            }]
+        }));
+    }
+    response
 }
 
 // ─── wire IO ───────────────────────────────────────────────────────────────
