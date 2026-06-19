@@ -10,7 +10,7 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.6.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.6.1**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
 
@@ -273,7 +273,7 @@ script needs to block until the current jobs finish.
 
 Tier-1 is the tree-sitter syntax floor: symbols, outlines, imports,
 and other facts that can be extracted from one file. Fourteen
-first-class language backends ship with 0.6.0, plus a generic
+first-class language backends ship with 0.6.1, plus a generic
 tree-sitter fallback for additional grammars.
 
 Tier-2 adds language-specific semantic facts from one file —
