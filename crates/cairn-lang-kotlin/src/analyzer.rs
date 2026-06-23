@@ -135,6 +135,7 @@ impl KtSemanticWalker {
             let Some(base_name) = user_type_name(base, source) else {
                 continue;
             };
+            let br = base.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: type_qualified.to_string(),
                 interface_qualified: Some(base_name),
@@ -144,6 +145,7 @@ impl KtSemanticWalker {
                 // `Colon` regardless of which semantic kind we resolve.
                 syntactic_kind: Some(SyntacticKind::Colon),
                 line: line_of(base),
+                interface_byte_range: Some((br.start as u32, br.end as u32)),
             });
         }
     }

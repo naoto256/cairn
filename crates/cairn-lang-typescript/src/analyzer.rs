@@ -180,12 +180,14 @@ impl TsSemanticWalker {
         };
         for child in clause.named_children(&mut cursor) {
             if let Some((interface_qualified, name_node)) = heritage_name(child, source) {
+                let nr = name_node.byte_range();
                 self.facts.impls.push(ImplFact {
                     type_qualified: type_qualified.to_string(),
                     interface_qualified: Some(interface_qualified),
                     kind: kind.to_string(),
                     syntactic_kind: Some(syntactic),
                     line: line_of(name_node),
+                    interface_byte_range: Some((nr.start as u32, nr.end as u32)),
                 });
             }
         }

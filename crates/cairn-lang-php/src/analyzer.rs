@@ -222,12 +222,14 @@ impl PhpSemanticWalker {
                 if interface.is_empty() {
                     continue;
                 }
+                let br = base.byte_range();
                 self.facts.impls.push(ImplFact {
                     type_qualified: type_qualified.to_string(),
                     interface_qualified: Some(interface),
                     kind: kind.to_string(),
                     syntactic_kind: Some(syntactic),
                     line,
+                    interface_byte_range: Some((br.start as u32, br.end as u32)),
                 });
             }
         }
@@ -250,12 +252,14 @@ impl PhpSemanticWalker {
             if interface.is_empty() {
                 continue;
             }
+            let cr = child.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: type_qualified.clone(),
                 interface_qualified: Some(interface),
                 kind: "mixin".to_string(),
                 syntactic_kind: Some(SyntacticKind::TraitUse),
                 line,
+                interface_byte_range: Some((cr.start as u32, cr.end as u32)),
             });
         }
     }

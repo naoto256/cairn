@@ -393,12 +393,14 @@ impl Walker {
             if base.is_empty() {
                 continue;
             }
+            let cr = child.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: type_qualified.to_string(),
                 interface_qualified: Some(base),
                 kind: "inherit".to_string(),
                 syntactic_kind: Some(current_kind),
                 line,
+                interface_byte_range: Some((cr.start as u32, cr.end as u32)),
             });
             // Per-base access spec stops applying after its own type;
             // subsequent bases without their own keyword fall back to
