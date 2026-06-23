@@ -348,11 +348,18 @@ fn insert_impl(
         .as_ref()
         .and_then(|k| serde_json::to_value(k).ok())
         .and_then(|v| v.as_str().map(str::to_owned));
+    // `interface_byte_range` (added to `ImplFact` in Phase 2) is mirrored
+    // into the row in Phase 4 so the query layer can JOIN against the
+    // `resolutions` table on the same `(blob, byte_range)` tuple the
+    // resolution writer uses. Backends that ship no range write NULL.
+    let (iface_start, iface_end) = imp.interface_byte_range.map_or((None, None), |(s, e)| {
+        (Some(i64::from(s)), Some(i64::from(e)))
+    });
     tx.execute(
         "INSERT INTO implementations
            (blob_sha, parser_id, type_qualified, interface_qualified, kind,
-            syntactic_kind, line)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            syntactic_kind, line, interface_byte_start, interface_byte_end)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             blob_sha,
             parser_id,
@@ -361,6 +368,8 @@ fn insert_impl(
             imp.kind,
             syntactic_kind,
             line,
+            iface_start,
+            iface_end,
         ],
     )?;
     Ok(())
