@@ -263,4 +263,151 @@ CREATE INDEX idx_workspace_analysis_runs_job_id
     ON workspace_analysis_runs(job_id);
 "#,
     },
+    Migration {
+        version: 6,
+        sql: r#"
+-- Resolution layer (Tier-2.5 prep, Phase 1: schema only, empty operation).
+--
+-- Separates "what the language grammar literally says" (kept on
+-- `implementations.kind` etc. — fact layer) from "what a name actually
+-- resolves to" (this table — semantic layer). Phase 1 only installs the
+-- schema; no reader or writer wires it up. Phase 2+ will populate it
+-- from Tier-2.5 / Tier-3 passes and migrate selected query paths over.
+--
+-- Why no `files(id)` column: cairn has no file table. Paths live in
+-- `manifest_entries`, and every per-blob artefact is keyed by
+-- `(blob_sha, parser_id)`. We follow that convention so resolutions
+-- cascade-delete with their owning blob, exactly like symbols/refs/
+-- imports/implementations do.
+CREATE TABLE resolutions (
+    id                INTEGER PRIMARY KEY,
+    site_blob_sha     TEXT NOT NULL,
+    site_parser_id    TEXT NOT NULL,
+    site_byte_start   INTEGER NOT NULL,
+    site_byte_end     INTEGER NOT NULL,
+    -- ResolutionKind: "type" | "call" | "import" (extensible).
+    kind              TEXT NOT NULL,
+    -- SemanticKind, only set when `kind = "type"` and the edge is an
+    -- inheritance/conformance relation: "inherit" | "implement" |
+    -- "mixin" | "extension". NULL otherwise.
+    semantic_kind     TEXT,
+    -- FK to symbols(id). NULL means "site observed, target unresolved"
+    -- (e.g. Tier-2.5 saw the token but couldn't pin a definition).
+    target_symbol_id  INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+    -- Provenance, e.g. 'tier3-pyright-lsp', 'tier25-py-resolver',
+    -- 'tier2-direct-java'. Must match the WORKSPACE_TIER_PREFIXES
+    -- convention so the existing source-rank SQL keeps working.
+    source            TEXT NOT NULL,
+    FOREIGN KEY (site_blob_sha, site_parser_id)
+        REFERENCES blobs(blob_sha, parser_id) ON DELETE CASCADE
+);
+
+-- "What's resolved at this token" — incremental rebuild lookup keyed by
+-- the (blob, offset) tuple a writer naturally has.
+CREATE INDEX idx_resolutions_site
+    ON resolutions(site_blob_sha, site_byte_start);
+
+-- "Who resolves to this symbol" — Phase 2 successor for find_subtypes /
+-- find_callers when they switch off the fact layer.
+CREATE INDEX idx_resolutions_target
+    ON resolutions(target_symbol_id)
+    WHERE target_symbol_id IS NOT NULL;
+
+-- Provenance filter / dedup, mirroring the refs.source pattern.
+CREATE INDEX idx_resolutions_source ON resolutions(source);
+"#,
+    },
 ];
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::MIGRATIONS;
+    use crate::migration::{apply, apply_standard_pragmas};
+
+    /// Schema v6 should apply cleanly on top of all prior migrations
+    /// and the `resolutions` table should accept a representative row
+    /// (including the `target_symbol_id = NULL` "site observed, target
+    /// unresolved" case) without touching any of the existing tables.
+    #[test]
+    fn resolutions_table_smoke() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        // Migration applied to the latest version.
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 6);
+
+        // Need a parent blob row because of the FK on
+        // (site_blob_sha, site_parser_id).
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            ("deadbeef", "test-parser"),
+        )
+        .unwrap();
+
+        // Resolved row.
+        conn.execute(
+            "INSERT INTO resolutions
+             (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+              kind, semantic_kind, target_symbol_id, source)
+             VALUES (?1, ?2, 10, 13, 'type', 'inherit', NULL, 'tier25-py-resolver')",
+            ("deadbeef", "test-parser"),
+        )
+        .unwrap();
+
+        // Unresolved row (target_symbol_id NULL, semantic_kind NULL).
+        conn.execute(
+            "INSERT INTO resolutions
+             (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+              kind, semantic_kind, target_symbol_id, source)
+             VALUES (?1, ?2, 42, 50, 'call', NULL, NULL, 'tier3-pyright-lsp')",
+            ("deadbeef", "test-parser"),
+        )
+        .unwrap();
+
+        // Read back through the site index.
+        let (kind, sem, target, source): (String, Option<String>, Option<i64>, String) = conn
+            .query_row(
+                "SELECT kind, semantic_kind, target_symbol_id, source
+                 FROM resolutions
+                 WHERE site_blob_sha = ?1 AND site_byte_start = 10",
+                ["deadbeef"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "type");
+        assert_eq!(sem.as_deref(), Some("inherit"));
+        assert!(target.is_none());
+        assert_eq!(source, "tier25-py-resolver");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resolutions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Pre-existing tables are untouched and still functional.
+        let symbols_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbols_count, 0);
+        let impls_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM implementations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(impls_count, 0);
+
+        // Cascade-on-blob-delete keeps the new table consistent with
+        // the rest of the per-blob artefacts.
+        conn.execute("DELETE FROM blobs WHERE blob_sha = ?1", ["deadbeef"])
+            .unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resolutions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0);
+    }
+}

@@ -27,12 +27,12 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_to_version_5() {
+    fn migrations_run_to_latest_version() {
         let (_tmp, c) = fresh();
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
@@ -58,6 +58,7 @@ mod tests {
             "anchors",
             "worktrees",
             "workspace_analysis_runs",
+            "resolutions",
             "symbols_fts",
         ] {
             assert!(table_exists(&c, t), "missing table: {t}");
@@ -141,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_to_version_5_from_v3() {
+    fn migrations_run_to_latest_from_v3() {
         let mut c = Connection::open_in_memory().unwrap();
         crate::migration::apply(&mut c, &crate::cas::schema::MIGRATIONS[..2]).unwrap();
         c.execute_batch("PRAGMA user_version = 3").unwrap();
@@ -151,8 +152,9 @@ mod tests {
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
         assert!(table_exists(&c, "workspace_analysis_runs"));
+        assert!(table_exists(&c, "resolutions"));
     }
 
     #[test]
