@@ -317,6 +317,22 @@ CREATE INDEX idx_resolutions_target
 CREATE INDEX idx_resolutions_source ON resolutions(source);
 "#,
     },
+    Migration {
+        version: 7,
+        sql: r#"
+-- Tier-2.5 prep, Phase 2: grammar-direct classification for impl edges.
+--
+-- `implementations.kind` stays the semantic label ("inherit" /
+-- "implement" / "mixin" / "extension") that the existing query layer
+-- consumes; the new column carries the syntactic shape ("extends",
+-- "implements", "colon", "less_than", "include", "trait_use",
+-- "impl_for", "public_base", "interface_colon", "protocol_list",
+-- "category", "extension", ...) the resolution layer will read in
+-- Phase 3 to derive a per-language `semantic_kind`. NULL is allowed
+-- for rows written before Phase 2 wired the field.
+ALTER TABLE implementations ADD COLUMN syntactic_kind TEXT;
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -340,7 +356,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, 7);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).

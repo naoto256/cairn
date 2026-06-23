@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, TypeRole};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind, TypeRole,
+};
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -169,12 +171,20 @@ impl TsSemanticWalker {
         kind: &str,
     ) {
         let mut cursor = clause.walk();
+        // The two callers pass `"inherit"` for `extends` clauses and
+        // `"implement"` for `implements` clauses; the syntactic shape
+        // follows the same split.
+        let syntactic = match kind {
+            "implement" => SyntacticKind::Implements,
+            _ => SyntacticKind::Extends,
+        };
         for child in clause.named_children(&mut cursor) {
             if let Some((interface_qualified, name_node)) = heritage_name(child, source) {
                 self.facts.impls.push(ImplFact {
                     type_qualified: type_qualified.to_string(),
                     interface_qualified: Some(interface_qualified),
                     kind: kind.to_string(),
+                    syntactic_kind: Some(syntactic),
                     line: line_of(name_node),
                 });
             }

@@ -36,7 +36,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -206,9 +208,9 @@ impl PhpSemanticWalker {
         let line = line_of(node);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            let kind = match child.kind() {
-                "base_clause" => "inherit",
-                "class_interface_clause" => "implement",
+            let (kind, syntactic) = match child.kind() {
+                "base_clause" => ("inherit", SyntacticKind::Extends),
+                "class_interface_clause" => ("implement", SyntacticKind::Implements),
                 _ => continue,
             };
             let mut names = child.walk();
@@ -224,6 +226,7 @@ impl PhpSemanticWalker {
                     type_qualified: type_qualified.to_string(),
                     interface_qualified: Some(interface),
                     kind: kind.to_string(),
+                    syntactic_kind: Some(syntactic),
                     line,
                 });
             }
@@ -251,6 +254,7 @@ impl PhpSemanticWalker {
                 type_qualified: type_qualified.clone(),
                 interface_qualified: Some(interface),
                 kind: "mixin".to_string(),
+                syntactic_kind: Some(SyntacticKind::TraitUse),
                 line,
             });
         }
@@ -604,5 +608,16 @@ class External {
     fn mixin_inside_namespace_uses_qualified_container() {
         let f = semantic("<?php\nnamespace App;\nclass C {\n    use Timestamps;\n}\n");
         assert_eq!(edges(&f, "mixin"), [("App\\C", "Timestamps")]);
+    }
+
+    #[test]
+    fn trait_use_emits_syntactic_trait_use() {
+        let f = semantic("<?php\nclass C {\n    use TraitName;\n}\n");
+        let mixin = f
+            .impls
+            .iter()
+            .find(|i| i.kind == "mixin")
+            .expect("trait use mixin missing");
+        assert_eq!(mixin.syntactic_kind, Some(SyntacticKind::TraitUse));
     }
 }
