@@ -30,6 +30,7 @@ pub mod migration;
 pub mod paths;
 pub mod query;
 pub mod register;
+pub mod resolution;
 pub mod sockets;
 #[cfg(test)]
 pub(crate) mod testutil;
