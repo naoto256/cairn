@@ -32,6 +32,7 @@ members = [
     "crates/cairn-lang-swift-tier3",
     "crates/cairn-lang-objc",
     "crates/cairn-watch",
+    "crates/cairn-resolver-eval",
 ]
 
 [workspace.package]
