@@ -143,6 +143,16 @@ pub struct ImplFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syntactic_kind: Option<SyntacticKind>,
     pub line: u32,
+    /// Byte range of the *base / interface token* (e.g. the `Foo` in
+    /// `extends Foo`, the `Bar` in `class X < Bar`, the `Mod` in
+    /// `include Mod`). Used by the resolution layer (Phase 3) as the
+    /// `site_byte_start` / `site_byte_end` of the direct-translation
+    /// `resolutions` row. `None` is allowed for backends or call
+    /// sites that have not been migrated yet, or where no single base
+    /// token applies; persistence treats `None` as "do not emit a
+    /// direct-translation resolution".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_byte_range: Option<(u32, u32)>,
 }
 
 /// Grammar-shaped classification of an inheritance / conformance /

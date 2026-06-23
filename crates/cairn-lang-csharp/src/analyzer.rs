@@ -248,12 +248,14 @@ impl CsSemanticWalker {
             if base.is_empty() {
                 continue;
             }
+            let br = base_node.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: type_qualified.to_string(),
                 interface_qualified: Some(base),
                 kind: "inherit".to_string(),
                 syntactic_kind: Some(SyntacticKind::Colon),
                 line: line_of(base_node),
+                interface_byte_range: Some((br.start as u32, br.end as u32)),
             });
         }
     }

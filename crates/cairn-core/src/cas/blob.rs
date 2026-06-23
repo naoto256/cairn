@@ -10,13 +10,16 @@
 
 use std::collections::HashMap;
 
-use cairn_lang_api::{ImplFact, ImportFact, RefFact, SemanticFacts, SymbolFact, SyntacticFacts};
+use cairn_lang_api::{
+    ImplFact, ImportFact, RefFact, SemanticFacts, SymbolFact, SyntacticFacts, SyntacticKind,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::Result;
 use crate::cas::kind_conv::{
     ref_kind_to_str, symbol_kind_to_str, type_role_to_str, visibility_to_str,
 };
+use crate::resolution::{ResolutionKind, SemanticKind};
 
 /// Everything one parser produces for one blob.
 #[derive(Debug, Clone, Default)]
@@ -133,10 +136,15 @@ pub fn insert(
     }
 
     // impls (semantic only — syntactic-only backends don't emit
-    // impl edges).
+    // impl edges). For each impl we additionally emit a Tier-2
+    // direct-translation Resolution row when the grammar shape maps
+    // unambiguously to a semantic_kind (see
+    // `tier2_direct_resolution`). The two writes share this
+    // transaction so a Resolution can never outlive its fact.
     if let Some(sem) = &data.semantic {
         for imp in &sem.impls {
             insert_impl(tx, blob_sha, parser_id, imp)?;
+            insert_direct_resolution(tx, blob_sha, parser_id, imp)?;
         }
     }
 
@@ -353,6 +361,123 @@ fn insert_impl(
             imp.kind,
             syntactic_kind,
             line,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Map (parser_id, syntactic_kind) to a Tier-2 direct-translation
+/// `(SemanticKind, source)` pair, or `None` when no direct
+/// translation is defined.
+///
+/// "Direct translation" means the grammar shape determines the
+/// semantic kind unambiguously without Tier-2.5 / Tier-3 context.
+/// Ambiguous cases (Python `BaseArg`, Kotlin / Swift class / C# `Colon`)
+/// are deliberately omitted — they will be resolved by Tier-2.5.
+///
+/// `<lang>` in the source string follows the backend crate identifier
+/// convention used by `WORKSPACE_TIER_PREFIXES`. `tree-sitter-tsx` is
+/// mapped to `typescript` because the TSX backend shares the
+/// TypeScript analyzer and its impl edges are TS-shaped; the `.tsx`
+/// dialect difference is purely about JSX-in-expression positions.
+fn tier2_direct_resolution(
+    parser_id: &str,
+    syntactic_kind: SyntacticKind,
+) -> Option<(SemanticKind, &'static str)> {
+    let lang = match parser_id {
+        "tree-sitter-java" => "java",
+        "tree-sitter-typescript" | "tree-sitter-tsx" => "typescript",
+        "tree-sitter-javascript" => "javascript",
+        "tree-sitter-php" => "php",
+        "tree-sitter-ruby" => "ruby",
+        "tree-sitter-rust" => "rust",
+        "tree-sitter-cpp" => "cpp",
+        "tree-sitter-objc" => "objc",
+        "tree-sitter-swift" => "swift",
+        _ => return None,
+    };
+    let sem = match (lang, syntactic_kind) {
+        // extends → inherit for Java / TS / JS / PHP.
+        ("java" | "typescript" | "javascript" | "php", SyntacticKind::Extends) => {
+            SemanticKind::Inherit
+        }
+        // implements → implement for Java / TS / PHP.
+        ("java" | "typescript" | "php", SyntacticKind::Implements) => SemanticKind::Implement,
+        // Ruby class < Base.
+        ("ruby", SyntacticKind::LessThan) => SemanticKind::Inherit,
+        // Ruby include / extend / prepend → mixin.
+        ("ruby", SyntacticKind::Include | SyntacticKind::ExtendKw | SyntacticKind::Prepend) => {
+            SemanticKind::Mixin
+        }
+        // PHP `use Trait;` inside a class body.
+        ("php", SyntacticKind::TraitUse) => SemanticKind::Mixin,
+        // Rust impl block. (Rust currently ships no byte range, so the
+        // caller will skip emission — keeping the entry here documents
+        // intent and makes it cheap to wire once syn spans are bridged
+        // to byte offsets.)
+        ("rust", SyntacticKind::ImplFor) => SemanticKind::Implement,
+        // C++ public/private/protected base.
+        (
+            "cpp",
+            SyntacticKind::PublicBase | SyntacticKind::PrivateBase | SyntacticKind::ProtectedBase,
+        ) => SemanticKind::Inherit,
+        // Objective-C `: Super`, `<Protocol>`, `(Category)`.
+        ("objc", SyntacticKind::InterfaceColon) => SemanticKind::Inherit,
+        ("objc", SyntacticKind::ProtocolList) => SemanticKind::Implement,
+        ("objc", SyntacticKind::Category) => SemanticKind::Extension,
+        // Swift `extension Foo { ... }` self-edge.
+        ("swift", SyntacticKind::Extension) => SemanticKind::Extension,
+        // Everything else — including the ambiguous cases (BaseArg,
+        // Colon, Supertrait, Embed) — is left to Tier-2.5+.
+        _ => return None,
+    };
+    let source = match lang {
+        "java" => "tier2-direct-java",
+        "typescript" => "tier2-direct-typescript",
+        "javascript" => "tier2-direct-javascript",
+        "php" => "tier2-direct-php",
+        "ruby" => "tier2-direct-ruby",
+        "rust" => "tier2-direct-rust",
+        "cpp" => "tier2-direct-cpp",
+        "objc" => "tier2-direct-objc",
+        "swift" => "tier2-direct-swift",
+        _ => return None,
+    };
+    Some((sem, source))
+}
+
+/// Emit a Tier-2 direct-translation `resolutions` row for `imp` when
+/// the (parser_id, syntactic_kind) pair has an unambiguous mapping
+/// *and* the backend supplied a site byte range. The row carries
+/// `target_symbol_id = NULL` — Tier-2 does no cross-file resolution.
+fn insert_direct_resolution(
+    tx: &Transaction<'_>,
+    blob_sha: &str,
+    parser_id: &str,
+    imp: &ImplFact,
+) -> Result<()> {
+    let Some(syntactic) = imp.syntactic_kind else {
+        return Ok(());
+    };
+    let Some((sem, source)) = tier2_direct_resolution(parser_id, syntactic) else {
+        return Ok(());
+    };
+    let Some((start, end)) = imp.interface_byte_range else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO resolutions
+           (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+            kind, semantic_kind, target_symbol_id, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+        params![
+            blob_sha,
+            parser_id,
+            i64::from(start),
+            i64::from(end),
+            ResolutionKind::Type.as_str(),
+            sem.as_str(),
+            source,
         ],
     )?;
     Ok(())
@@ -865,5 +990,396 @@ mod tests {
         assert!(first_fresh);
         assert!(!second_fresh);
         assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ─── Tier-2 direct-translation resolution emission (Phase 3) ─────────
+
+    fn impl_fact(
+        type_q: &str,
+        iface: Option<&str>,
+        kind: &str,
+        syntactic: SyntacticKind,
+        byte_range: Option<(u32, u32)>,
+    ) -> ImplFact {
+        ImplFact {
+            type_qualified: type_q.into(),
+            interface_qualified: iface.map(str::to_string),
+            kind: kind.into(),
+            syntactic_kind: Some(syntactic),
+            line: 1,
+            interface_byte_range: byte_range,
+        }
+    }
+
+    fn insert_one_impl(c: &mut Connection, sha: &str, parser_id: &str, imp: ImplFact) {
+        let data = ParsedData {
+            syntactic: SyntacticFacts::default(),
+            semantic: Some(SemanticFacts {
+                impls: vec![imp],
+                ..Default::default()
+            }),
+        };
+        let tx = c.transaction().unwrap();
+        insert(&tx, sha, parser_id, 1, 0, None, &data).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn resolutions_for(
+        c: &Connection,
+        sha: &str,
+    ) -> Vec<(String, Option<String>, String, i64, i64)> {
+        c.prepare(
+            "SELECT kind, semantic_kind, source, site_byte_start, site_byte_end
+             FROM resolutions WHERE site_blob_sha = ?1 ORDER BY site_byte_start",
+        )
+        .unwrap()
+        .query_map([sha], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn tier2_direct_emits_java_extends_implements() {
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "j1",
+            "tree-sitter-java",
+            impl_fact(
+                "p.Dog",
+                Some("p.Animal"),
+                "inherit",
+                SyntacticKind::Extends,
+                Some((10, 16)),
+            ),
+        );
+        // reuse same connection for subsequent shas
+        insert_one_impl(
+            &mut c,
+            "j2",
+            "tree-sitter-java",
+            impl_fact(
+                "p.Dog",
+                Some("p.Walker"),
+                "implement",
+                SyntacticKind::Implements,
+                Some((20, 26)),
+            ),
+        );
+        let r1 = resolutions_for(&c, "j1");
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].0, "type");
+        assert_eq!(r1[0].1.as_deref(), Some("inherit"));
+        assert_eq!(r1[0].2, "tier2-direct-java");
+        assert_eq!((r1[0].3, r1[0].4), (10, 16));
+
+        let r2 = resolutions_for(&c, "j2");
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].1.as_deref(), Some("implement"));
+        assert_eq!(r2[0].2, "tier2-direct-java");
+    }
+
+    #[test]
+    fn tier2_direct_emits_ruby_less_than_and_mixins() {
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "rb1",
+            "tree-sitter-ruby",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::LessThan,
+                Some((5, 11)),
+            ),
+        );
+        // reuse same connection for subsequent shas
+        insert_one_impl(
+            &mut c,
+            "rb2",
+            "tree-sitter-ruby",
+            impl_fact(
+                "Dog",
+                Some("Walkable"),
+                "include",
+                SyntacticKind::Include,
+                Some((30, 38)),
+            ),
+        );
+        // reuse
+        insert_one_impl(
+            &mut c,
+            "rb3",
+            "tree-sitter-ruby",
+            impl_fact(
+                "Dog",
+                Some("Hooks"),
+                "extend",
+                SyntacticKind::ExtendKw,
+                Some((40, 45)),
+            ),
+        );
+        // reuse
+        insert_one_impl(
+            &mut c,
+            "rb4",
+            "tree-sitter-ruby",
+            impl_fact(
+                "Dog",
+                Some("Tracer"),
+                "prepend",
+                SyntacticKind::Prepend,
+                Some((50, 56)),
+            ),
+        );
+
+        let r1 = resolutions_for(&c, "rb1");
+        assert_eq!(r1[0].1.as_deref(), Some("inherit"));
+        assert_eq!(r1[0].2, "tier2-direct-ruby");
+        for sha in ["rb2", "rb3", "rb4"] {
+            let r = resolutions_for(&c, sha);
+            assert_eq!(r.len(), 1, "sha={sha}");
+            assert_eq!(r[0].1.as_deref(), Some("mixin"), "sha={sha}");
+            assert_eq!(r[0].2, "tier2-direct-ruby");
+        }
+    }
+
+    #[test]
+    fn tier2_direct_emits_php_extends_implements_trait_use() {
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "p1",
+            "tree-sitter-php",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::Extends,
+                Some((10, 16)),
+            ),
+        );
+        // reuse same connection for subsequent shas
+        insert_one_impl(
+            &mut c,
+            "p2",
+            "tree-sitter-php",
+            impl_fact(
+                "Dog",
+                Some("I"),
+                "implement",
+                SyntacticKind::Implements,
+                Some((20, 21)),
+            ),
+        );
+        // reuse
+        insert_one_impl(
+            &mut c,
+            "p3",
+            "tree-sitter-php",
+            impl_fact(
+                "Dog",
+                Some("T"),
+                "mixin",
+                SyntacticKind::TraitUse,
+                Some((30, 31)),
+            ),
+        );
+
+        assert_eq!(resolutions_for(&c, "p1")[0].1.as_deref(), Some("inherit"));
+        assert_eq!(resolutions_for(&c, "p2")[0].1.as_deref(), Some("implement"));
+        let r3 = resolutions_for(&c, "p3");
+        assert_eq!(r3[0].1.as_deref(), Some("mixin"));
+        assert_eq!(r3[0].2, "tier2-direct-php");
+    }
+
+    #[test]
+    fn tier2_direct_emits_objc_super_protocol_category() {
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "o1",
+            "tree-sitter-objc",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::InterfaceColon,
+                Some((10, 16)),
+            ),
+        );
+        // reuse same connection for subsequent shas
+        insert_one_impl(
+            &mut c,
+            "o2",
+            "tree-sitter-objc",
+            impl_fact(
+                "Dog",
+                Some("P"),
+                "implement",
+                SyntacticKind::ProtocolList,
+                Some((20, 21)),
+            ),
+        );
+        // reuse
+        insert_one_impl(
+            &mut c,
+            "o3",
+            "tree-sitter-objc",
+            impl_fact(
+                "Dog",
+                None,
+                "extension",
+                SyntacticKind::Category,
+                Some((30, 40)),
+            ),
+        );
+
+        assert_eq!(resolutions_for(&c, "o1")[0].1.as_deref(), Some("inherit"));
+        assert_eq!(resolutions_for(&c, "o2")[0].1.as_deref(), Some("implement"));
+        let r3 = resolutions_for(&c, "o3");
+        assert_eq!(r3[0].1.as_deref(), Some("extension"));
+        assert_eq!(r3[0].2, "tier2-direct-objc");
+    }
+
+    #[test]
+    fn tier2_direct_skips_ambiguous_python_basearg() {
+        // Python `class Dog(Animal):` is BaseArg — ambiguous between
+        // inherit and mixin in the multi-base case; Tier-2 must not
+        // write a resolution.
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "py1",
+            "tree-sitter-python",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::BaseArg,
+                Some((10, 16)),
+            ),
+        );
+        assert!(resolutions_for(&c, "py1").is_empty());
+    }
+
+    #[test]
+    fn tier2_direct_skips_ambiguous_kotlin_csharp_swift_colon() {
+        for parser in [
+            "tree-sitter-kotlin",
+            "tree-sitter-c-sharp",
+            "tree-sitter-swift",
+        ] {
+            let (_tmp, mut c) = fresh();
+            insert_one_impl(
+                &mut c,
+                "k1",
+                parser,
+                impl_fact(
+                    "Dog",
+                    Some("Animal"),
+                    "inherit",
+                    SyntacticKind::Colon,
+                    Some((5, 11)),
+                ),
+            );
+            assert!(
+                resolutions_for(&c, "k1").is_empty(),
+                "parser={parser} should not emit direct resolution for Colon"
+            );
+        }
+    }
+
+    #[test]
+    fn tier2_direct_skips_rust_when_byte_range_missing() {
+        // Rust analyzer ships `None` for interface_byte_range; the
+        // mapping exists but persistence skips emission. Smoke this
+        // so the "Rust direct row absent today" contract is explicit.
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "rs1",
+            "tree-sitter-rust",
+            impl_fact("Dog", Some("Animal"), "trait", SyntacticKind::ImplFor, None),
+        );
+        assert!(resolutions_for(&c, "rs1").is_empty());
+    }
+
+    #[test]
+    fn tier2_direct_emits_typescript_tsx_javascript() {
+        let (_tmp, mut c) = fresh();
+        // tsx maps to typescript source.
+        insert_one_impl(
+            &mut c,
+            "tsx1",
+            "tree-sitter-tsx",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::Extends,
+                Some((5, 11)),
+            ),
+        );
+        // reuse same connection for subsequent shas
+        insert_one_impl(
+            &mut c,
+            "js1",
+            "tree-sitter-javascript",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::Extends,
+                Some((5, 11)),
+            ),
+        );
+        assert_eq!(resolutions_for(&c, "tsx1")[0].2, "tier2-direct-typescript");
+        assert_eq!(resolutions_for(&c, "js1")[0].2, "tier2-direct-javascript");
+    }
+
+    #[test]
+    fn tier2_direct_emits_cpp_swift_extension() {
+        let (_tmp, mut c) = fresh();
+        insert_one_impl(
+            &mut c,
+            "cpp1",
+            "tree-sitter-cpp",
+            impl_fact(
+                "Dog",
+                Some("Animal"),
+                "inherit",
+                SyntacticKind::PublicBase,
+                Some((5, 11)),
+            ),
+        );
+        // reuse same connection for subsequent shas
+        insert_one_impl(
+            &mut c,
+            "sw1",
+            "tree-sitter-swift",
+            impl_fact(
+                "Dog",
+                None,
+                "extension",
+                SyntacticKind::Extension,
+                Some((0, 30)),
+            ),
+        );
+        assert_eq!(resolutions_for(&c, "cpp1")[0].1.as_deref(), Some("inherit"));
+        assert_eq!(resolutions_for(&c, "cpp1")[0].2, "tier2-direct-cpp");
+        let sw = resolutions_for(&c, "sw1");
+        assert_eq!(sw[0].1.as_deref(), Some("extension"));
+        assert_eq!(sw[0].2, "tier2-direct-swift");
     }
 }

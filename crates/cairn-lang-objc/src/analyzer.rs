@@ -128,42 +128,50 @@ impl ObjcSemanticWalker {
         let qualified = self.qualify(&name);
 
         if is_category {
+            let cat_range = node.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: qualified.clone(),
                 interface_qualified: None,
                 kind: "extension".to_string(),
                 syntactic_kind: Some(SyntacticKind::Category),
                 line: line_of(node),
+                interface_byte_range: Some((cat_range.start as u32, cat_range.end as u32)),
             });
             // Categories never carry an inherit edge; conformance
             // protocols become `implement` rows.
             for (proto, proto_node) in protocol_list_entries(node, source) {
+                let pr = proto_node.byte_range();
                 self.facts.impls.push(ImplFact {
                     type_qualified: qualified.clone(),
                     interface_qualified: Some(proto),
                     kind: "implement".to_string(),
                     syntactic_kind: Some(SyntacticKind::ProtocolList),
                     line: line_of(proto_node),
+                    interface_byte_range: Some((pr.start as u32, pr.end as u32)),
                 });
             }
         } else {
             if let Some(super_node) = child_by_field(node, "superclass") {
                 let super_name = node_text(super_node, source).to_string();
+                let sr = super_node.byte_range();
                 self.facts.impls.push(ImplFact {
                     type_qualified: qualified.clone(),
                     interface_qualified: Some(super_name),
                     kind: "inherit".to_string(),
                     syntactic_kind: Some(SyntacticKind::InterfaceColon),
                     line: line_of(super_node),
+                    interface_byte_range: Some((sr.start as u32, sr.end as u32)),
                 });
             }
             for (proto, proto_node) in protocol_list_entries(node, source) {
+                let pr = proto_node.byte_range();
                 self.facts.impls.push(ImplFact {
                     type_qualified: qualified.clone(),
                     interface_qualified: Some(proto),
                     kind: "implement".to_string(),
                     syntactic_kind: Some(SyntacticKind::ProtocolList),
                     line: line_of(proto_node),
+                    interface_byte_range: Some((pr.start as u32, pr.end as u32)),
                 });
             }
         }
@@ -183,6 +191,7 @@ impl ObjcSemanticWalker {
         let qualified = self.qualify(&name);
 
         for (parent, parent_node) in protocol_list_entries(node, source) {
+            let pr = parent_node.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: qualified.clone(),
                 interface_qualified: Some(parent),
@@ -192,6 +201,7 @@ impl ObjcSemanticWalker {
                 // class adoption, so it maps to `ProtocolList` too.
                 syntactic_kind: Some(SyntacticKind::ProtocolList),
                 line: line_of(parent_node),
+                interface_byte_range: Some((pr.start as u32, pr.end as u32)),
             });
         }
 

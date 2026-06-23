@@ -132,17 +132,23 @@ impl SwiftSemanticWalker {
         let qualified = self.qualify(&name);
 
         if is_extension {
+            let er = node.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: qualified.clone(),
                 interface_qualified: None,
                 kind: "extension".to_string(),
                 // Bare `extension Foo {}` (no conformance clause) —
-                // the declaration itself is the syntactic shape.
+                // the declaration itself is the syntactic shape. The
+                // resolution layer uses the extension declaration's
+                // byte range as the site since there is no single
+                // base token to point at.
                 syntactic_kind: Some(SyntacticKind::Extension),
                 line: line_of(node),
+                interface_byte_range: Some((er.start as u32, er.end as u32)),
             });
         }
         for (base, base_node) in inheritance_entries(node, source) {
+            let br = base_node.byte_range();
             self.facts.impls.push(ImplFact {
                 type_qualified: qualified.clone(),
                 interface_qualified: Some(base),
@@ -152,6 +158,7 @@ impl SwiftSemanticWalker {
                 // regardless of which semantic kind we settle on.
                 syntactic_kind: Some(SyntacticKind::Colon),
                 line: line_of(base_node),
+                interface_byte_range: Some((br.start as u32, br.end as u32)),
             });
         }
 
