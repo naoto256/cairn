@@ -333,6 +333,23 @@ CREATE INDEX idx_resolutions_source ON resolutions(source);
 ALTER TABLE implementations ADD COLUMN syntactic_kind TEXT;
 "#,
     },
+    Migration {
+        version: 8,
+        sql: r#"
+-- Tier-2.5 prep, Phase 4: carry the site byte range so query paths can
+-- join `implementations` rows to `resolutions` rows written by the
+-- direct-translation pass (and, eventually, Tier-2.5 / Tier-3).
+--
+-- Both columns are NULL for legacy rows and for backends that do not
+-- yet ship a token range (e.g. Rust, where proc-macro2 exposes only
+-- line/col). The query layer LEFT JOINs on
+-- `(blob_sha, parser_id, interface_byte_start, interface_byte_end)`
+-- and falls back to `implementations.kind` when no resolution exists
+-- for the site.
+ALTER TABLE implementations ADD COLUMN interface_byte_start INTEGER;
+ALTER TABLE implementations ADD COLUMN interface_byte_end INTEGER;
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -356,7 +373,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, 8);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).
