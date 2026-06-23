@@ -40,7 +40,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, collapse_ws, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -326,18 +328,58 @@ impl Walker {
     }
 
     /// `class Dog : public Animal, IBark` → one edge per base type, all
-    /// `kind = "inherit"`.
+    /// `kind = "inherit"`. `syntactic_kind` reflects the per-base access
+    /// specifier (`public` / `private` / `protected`); when omitted the
+    /// language default applies — `private` for `class`, `public` for
+    /// `struct`/`union`.
     fn emit_base_edges(&mut self, node: Node<'_>, source: &[u8], type_qualified: &str) {
         let Some(clause) = first_child_of_kind(node, "base_class_clause") else {
             return;
         };
         let line = line_of(clause);
+        // C++ inheritance access default: `class` ⇒ private, `struct` /
+        // `union` ⇒ public. The specifier on each base overrides the
+        // default for that base only.
+        let default_kind = match node.kind() {
+            "class_specifier" => SyntacticKind::PrivateBase,
+            _ => SyntacticKind::PublicBase,
+        };
+        let mut current_kind = default_kind;
+        // Walk *all* children (not just named) so we observe the
+        // `public` / `private` / `protected` keyword tokens that
+        // tree-sitter-cpp emits as anonymous nodes immediately before
+        // the type. `virtual` and `,` are passed through unchanged.
         let mut cursor = clause.walk();
-        for child in clause.named_children(&mut cursor) {
-            // Skip access specifier tokens (anonymous "public" etc.) and
-            // any non-type bookkeeping; type references show up as
-            // `type_identifier`, `qualified_identifier`, or
-            // `template_type`.
+        for child in clause.children(&mut cursor) {
+            // Access specifier tokens are anonymous (unnamed); their
+            // `kind()` is the literal keyword.
+            match child.kind() {
+                "public" => {
+                    current_kind = SyntacticKind::PublicBase;
+                    continue;
+                }
+                "private" => {
+                    current_kind = SyntacticKind::PrivateBase;
+                    continue;
+                }
+                "protected" => {
+                    current_kind = SyntacticKind::ProtectedBase;
+                    continue;
+                }
+                "access_specifier" => {
+                    // Older grammar revs wrap the keyword in a named
+                    // `access_specifier` node — read its text instead.
+                    let kw = node_text(child, source);
+                    current_kind = match kw {
+                        "public" => SyntacticKind::PublicBase,
+                        "private" => SyntacticKind::PrivateBase,
+                        "protected" => SyntacticKind::ProtectedBase,
+                        _ => current_kind,
+                    };
+                    continue;
+                }
+                _ => {}
+            }
             if !matches!(
                 child.kind(),
                 "type_identifier"
@@ -355,8 +397,13 @@ impl Walker {
                 type_qualified: type_qualified.to_string(),
                 interface_qualified: Some(base),
                 kind: "inherit".to_string(),
+                syntactic_kind: Some(current_kind),
                 line,
             });
+            // Per-base access spec stops applying after its own type;
+            // subsequent bases without their own keyword fall back to
+            // the language default.
+            current_kind = default_kind;
         }
     }
 

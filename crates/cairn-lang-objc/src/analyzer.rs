@@ -19,7 +19,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -130,6 +132,7 @@ impl ObjcSemanticWalker {
                 type_qualified: qualified.clone(),
                 interface_qualified: None,
                 kind: "extension".to_string(),
+                syntactic_kind: Some(SyntacticKind::Category),
                 line: line_of(node),
             });
             // Categories never carry an inherit edge; conformance
@@ -139,6 +142,7 @@ impl ObjcSemanticWalker {
                     type_qualified: qualified.clone(),
                     interface_qualified: Some(proto),
                     kind: "implement".to_string(),
+                    syntactic_kind: Some(SyntacticKind::ProtocolList),
                     line: line_of(proto_node),
                 });
             }
@@ -149,6 +153,7 @@ impl ObjcSemanticWalker {
                     type_qualified: qualified.clone(),
                     interface_qualified: Some(super_name),
                     kind: "inherit".to_string(),
+                    syntactic_kind: Some(SyntacticKind::InterfaceColon),
                     line: line_of(super_node),
                 });
             }
@@ -157,6 +162,7 @@ impl ObjcSemanticWalker {
                     type_qualified: qualified.clone(),
                     interface_qualified: Some(proto),
                     kind: "implement".to_string(),
+                    syntactic_kind: Some(SyntacticKind::ProtocolList),
                     line: line_of(proto_node),
                 });
             }
@@ -181,6 +187,10 @@ impl ObjcSemanticWalker {
                 type_qualified: qualified.clone(),
                 interface_qualified: Some(parent),
                 kind: "inherit".to_string(),
+                // `@protocol Foo <Bar>` — protocol-to-protocol
+                // inheritance reuses the same `<…>` lexical shape as
+                // class adoption, so it maps to `ProtocolList` too.
+                syntactic_kind: Some(SyntacticKind::ProtocolList),
                 line: line_of(parent_node),
             });
         }
@@ -532,5 +542,19 @@ mod tests {
         assert!(semantic("").refs.is_empty());
         let facts = semantic("@interface Broken : ");
         assert!(facts.impls.is_empty() || facts.impls.iter().all(|i| i.type_qualified == "Broken"));
+    }
+
+    #[test]
+    fn category_emits_syntactic_category() {
+        let impls = impls(
+            "@interface Foo (CatName)
+@end
+",
+        );
+        let ext = impls
+            .iter()
+            .find(|i| i.kind == "extension")
+            .expect("category extension edge missing");
+        assert_eq!(ext.syntactic_kind, Some(SyntacticKind::Category));
     }
 }
