@@ -547,6 +547,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-resolver-eval"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "cairn-core",
+ "cairn-lang-api",
+ "cairn-lang-java",
+ "cairn-lang-python",
+ "cairn-lang-rust",
+ "cairn-lang-typescript",
+ "cairn-proto",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "cairn-watch"
 version = "0.6.1"
 dependencies = [
