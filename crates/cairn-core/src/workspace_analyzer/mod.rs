@@ -1,10 +1,15 @@
 //! Workspace-level analyzer boundary.
 //!
 //! Per-language [`cairn_lang_api::Analyzer`] implementations operate
-//! on one source blob at a time. LSP-class analyzers such as
-//! rust-analyzer need a wider view: a repository root, a manifest, and
-//! the set of files visible in that snapshot. This module defines that
-//! boundary and persists facts emitted by registered workspace analyzers.
+//! on one source blob at a time. Workspace-scoped analyzers need a
+//! wider view: a repository root, a manifest, and the set of files
+//! visible in that snapshot. This module defines that boundary and
+//! persists facts emitted by registered workspace analyzers.
+//!
+//! Concrete backends span the spectrum from a tree-sitter-driven
+//! cross-file pass that runs entirely in-process to an LSP-class
+//! analyzer such as rust-analyzer that talks to a long-lived language
+//! server; both implement the same [`WorkspaceAnalyzer`] trait.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,12 +136,69 @@ impl AnalyzerProgress {
     }
 }
 
+/// Stable provenance prefixes recorded in `refs.source` for facts emitted by
+/// registered workspace analyzers.
+///
+/// The first character of `refs.source` selects the tier: `tier3-<analyzer_id>`
+/// for LSP-class analyzers, `tier25-<analyzer_id>` once the tree-sitter-based
+/// cross-file pass lands, and so on. Listing the known prefixes here lets SQL
+/// helpers ([`source_rank_case_sql`], [`source_is_workspace_tier_sql`]) and
+/// dedup/noise-suppression code stay tier-agnostic — a new tier only needs to
+/// (a) extend this constant and (b) point its analyzer at the new prefix via
+/// [`WorkspaceAnalyzer::tier_prefix`].
+pub const WORKSPACE_TIER_PREFIXES: &[&str] = &["tier3"];
+
+/// Source string written by tree-sitter Tier-1 passes for backends that ship
+/// a single-file semantic enricher (`'rust-syn'` etc.). Workspace-analyzer
+/// output ranks ahead of this; we hardcode the known one for now and can lift
+/// it into the same tier-prefix table once a Tier-2.5 analyzer registers.
+const TIER2_NATIVE_SOURCES: &[&str] = &["rust-syn"];
+
+/// Builds an SQL `CASE` expression that ranks `refs.source` provenance from
+/// most authoritative (lowest number) to least.
+///
+/// `column` is interpolated as-is into the SQL; only pass a static identifier
+/// (e.g. `"r.source"`), never user input.
+#[must_use]
+pub fn source_rank_case_sql(column: &str) -> String {
+    let mut sql = String::from("CASE");
+    for prefix in WORKSPACE_TIER_PREFIXES {
+        sql.push_str(&format!(" WHEN {column} LIKE '{prefix}-%' THEN 0"));
+    }
+    for source in TIER2_NATIVE_SOURCES {
+        sql.push_str(&format!(" WHEN {column} = '{source}' THEN 1"));
+    }
+    sql.push_str(" ELSE 2 END");
+    sql
+}
+
+/// Builds an SQL predicate matching any workspace-tier provenance prefix.
+///
+/// `column` is interpolated as-is; only pass a static identifier.
+#[must_use]
+pub fn source_is_workspace_tier_sql(column: &str) -> String {
+    WORKSPACE_TIER_PREFIXES
+        .iter()
+        .map(|prefix| format!("{column} LIKE '{prefix}-%'"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 /// Analyzer that can derive facts from a repository snapshot.
 pub trait WorkspaceAnalyzer: Send + Sync {
     /// Stable analyzer identifier, e.g. `"rust-analyzer-lsp"`.
     /// This value keys run records, pool groups, and persisted provenance, so
     /// it must only change when the old output should be abandoned.
     fn id(&self) -> &'static str;
+
+    /// Tier prefix used when persisting facts emitted by this analyzer.
+    /// Defaults to `"tier3"` so existing LSP-class analyzers keep writing
+    /// `tier3-<analyzer_id>` into `refs.source`. A future tree-sitter-based
+    /// cross-file pass overrides this with `"tier25"` (or similar) and gets
+    /// listed in [`WORKSPACE_TIER_PREFIXES`].
+    fn tier_prefix(&self) -> &'static str {
+        "tier3"
+    }
 
     /// Monotonic revision for this analyzer's output.
     /// Bump it when persisted facts need to be recomputed even if inputs and
@@ -528,6 +590,7 @@ mod tests {
             &mut conn,
             ManifestId(1),
             "rust-analyzer-lsp",
+            "tier3",
             "tree-sitter-rust",
             &facts,
         )
@@ -617,6 +680,7 @@ mod tests {
             &mut conn,
             ManifestId(1),
             "rust-analyzer-lsp",
+            "tier3",
             "tree-sitter-rust",
             &facts,
         )
@@ -703,6 +767,7 @@ mod tests {
             &mut conn,
             ManifestId(1),
             "pyright-lsp",
+            "tier3",
             "tree-sitter-python",
             &facts,
         )

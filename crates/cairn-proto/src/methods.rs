@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     Completeness, Diagnostic, Hint, LanguageEnrichment, RefKind, SourceTier, SymbolKind,
-    Tier3RepoStatus, Tier3Status, Timing,
+    TierRepoStatus, TierStatus, Timing,
 };
 
 // ─── shared argument fragments ─────────────────────────────────────────────
@@ -159,7 +159,7 @@ pub struct RepoStatusEntry {
     pub languages: Vec<String>,
     pub summary: RepoStatusSummary,
     pub current: RepoStatusCurrent,
-    pub tier3_status: Tier3RepoStatus,
+    pub tier3_status: TierRepoStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshots: Vec<RepoSnapshotEntry>,
 }
@@ -305,8 +305,8 @@ mod list_repos_tests {
                     anchor: "HEAD".into(),
                     status: "stale".into(),
                 },
-                tier3_status: Tier3RepoStatus {
-                    this_repo: crate::Tier3StatusBody::ready(),
+                tier3_status: TierRepoStatus {
+                    this_repo: crate::TierStatusBody::ready(),
                     repo_wide: None,
                 },
                 snapshots: Vec::new(),
@@ -356,8 +356,8 @@ mod list_repos_tests {
                     anchor: "HEAD".into(),
                     status: "ready".into(),
                 },
-                tier3_status: Tier3RepoStatus {
-                    this_repo: crate::Tier3StatusBody::ready(),
+                tier3_status: TierRepoStatus {
+                    this_repo: crate::TierStatusBody::ready(),
                     repo_wide: None,
                 },
                 snapshots: Vec::new(),
@@ -470,8 +470,8 @@ pub struct OutlineResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -610,8 +610,8 @@ pub struct FindSymbolResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -729,8 +729,8 @@ pub struct FindSubtypesResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -754,8 +754,8 @@ pub struct FindSupertypesResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -823,8 +823,8 @@ pub struct ImportsResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -933,8 +933,8 @@ pub struct FindReferencesResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -1031,8 +1031,8 @@ pub struct FindCallersResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -1054,8 +1054,8 @@ pub struct FindCalleesResult {
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -1171,8 +1171,8 @@ pub struct GetSymbolSourceResult {
     /// Index tier that produced the returned source metadata.
     pub source_tier: SourceTier,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
-    #[serde(default = "Tier3Status::ready")]
-    pub tier3_status: Tier3Status,
+    #[serde(default = "TierStatus::ready")]
+    pub tier3_status: TierStatus,
     /// Structured facts about partial confidence or analyzer state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
@@ -1228,6 +1228,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::common::default_tier;
 
     #[test]
     fn find_symbol_hit_round_trips_language_some() {
@@ -1327,7 +1328,7 @@ mod tests {
 
     #[test]
     fn tier3_status_this_query_field_explicit_in_wire() {
-        let status = Tier3Status::ready();
+        let status = TierStatus::ready();
         let serialized = serde_json::to_value(status).unwrap();
         assert_eq!(
             serialized,
@@ -1339,7 +1340,7 @@ mod tests {
             })
         );
 
-        let parsed: Tier3Status = serde_json::from_value(json!({
+        let parsed: TierStatus = serde_json::from_value(json!({
             "this_query": {
                 "ready": false,
                 "analyzers": [
@@ -1355,22 +1356,23 @@ mod tests {
 
     #[test]
     fn tier3_status_default_omits_repo_wide() {
-        let status = Tier3Status::ready();
+        let status = TierStatus::ready();
         let serialized = serde_json::to_value(status).unwrap();
         assert!(serialized.get("repo_wide").is_none());
     }
 
     #[test]
     fn tier3_status_verbose_includes_repo_wide() {
-        let status = Tier3Status::from_body(crate::Tier3StatusBody {
+        let status = TierStatus::from_body(crate::TierStatusBody {
             ready: true,
             analyzers: Vec::new(),
         })
-        .with_repo_wide(crate::Tier3StatusBody {
+        .with_repo_wide(crate::TierStatusBody {
             ready: false,
-            analyzers: vec![crate::Tier3AnalyzerStatus {
+            analyzers: vec![crate::TierAnalyzerStatus {
                 id: Some("sourcekit-lsp".into()),
                 language: "swift".into(),
+                tier: default_tier(),
                 state: crate::AnalyzerState::Missing,
                 reason_code: Some(crate::ReasonCode::BinaryNotFound),
                 reason: Some("sourcekit-lsp binary not found in PATH".into()),
@@ -1408,10 +1410,11 @@ mod tests {
 
     #[test]
     fn tier3_repo_status_serializes_this_repo() {
-        let status = crate::Tier3RepoStatus {
-            this_repo: crate::Tier3StatusBody::from_analyzers(vec![crate::Tier3AnalyzerStatus {
+        let status = crate::TierRepoStatus {
+            this_repo: crate::TierStatusBody::from_analyzers(vec![crate::TierAnalyzerStatus {
                 id: Some("rust-analyzer-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: crate::AnalyzerState::Ready,
                 reason_code: None,
                 reason: None,

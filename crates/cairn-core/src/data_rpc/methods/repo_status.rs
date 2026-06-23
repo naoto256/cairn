@@ -2,7 +2,7 @@
 
 use cairn_lang_api::all_backends;
 use cairn_proto::common::{
-    AnalyzerState, Diagnostic, Hint, HintAction, HintCode, Tier3RepoStatus, Tier3StatusBody,
+    AnalyzerState, Diagnostic, Hint, HintAction, HintCode, TierRepoStatus, TierStatusBody,
 };
 use cairn_proto::methods::{RepoStatusArgs, RepoStatusEntry, RepoStatusResult};
 use linkme::distributed_slice;
@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::list_repos::{collect_repo_snapshot_summary, resolve_repo_by_path};
 use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::data_rpc::helpers::compute_tier3_status;
+use crate::data_rpc::helpers::compute_tier_status;
 use crate::{Error, Result};
 
 pub struct RepoStatus;
@@ -46,15 +46,15 @@ impl DataMethod for RepoStatus {
             let summary = collect_repo_snapshot_summary(&conn, &backends)?;
             let tier3_status = match summary.current_manifest_id {
                 Some(manifest_id) => {
-                    let status = compute_tier3_status(&conn, manifest_id)?;
-                    Tier3RepoStatus {
+                    let status = compute_tier_status(&conn, manifest_id)?;
+                    TierRepoStatus {
                         this_repo: status.this_query.clone(),
                         repo_wide: args.tier3.verbose_tier3.then_some(status.this_query),
                     }
                 }
-                None => Tier3RepoStatus {
-                    this_repo: Tier3StatusBody::ready(),
-                    repo_wide: args.tier3.verbose_tier3.then_some(Tier3StatusBody::ready()),
+                None => TierRepoStatus {
+                    this_repo: TierStatusBody::ready(),
+                    repo_wide: args.tier3.verbose_tier3.then_some(TierStatusBody::ready()),
                 },
             };
             Ok(RepoStatusEntry {
@@ -147,7 +147,7 @@ static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(RepoStatus);
 mod tests {
     use super::*;
     use crate::data_rpc::helpers::test_support;
-    use cairn_proto::common::Tier3AnalyzerStatus;
+    use cairn_proto::common::{TierAnalyzerStatus, default_tier};
 
     #[test]
     fn repo_status_requires_exactly_one_of_repo_or_path() {
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn repo_status_emits_snapshot_stale_when_current_is_stale() {
-        let repo = repo_status_entry("stale", Tier3StatusBody::ready());
+        let repo = repo_status_entry("stale", TierStatusBody::ready());
 
         let hints = repo_status_hints(&repo);
         let hint = hints
@@ -201,9 +201,10 @@ mod tests {
     fn repo_status_emits_tier3_indexing_wait_when_analyzer_running() {
         let repo = repo_status_entry(
             "ready",
-            Tier3StatusBody::from_analyzers(vec![Tier3AnalyzerStatus {
+            TierStatusBody::from_analyzers(vec![TierAnalyzerStatus {
                 id: Some("rust-analyzer-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Running,
                 reason_code: None,
                 reason: None,
@@ -233,7 +234,7 @@ mod tests {
         assert!(matches!(err, crate::Error::RepoNotFound { .. }));
     }
 
-    fn repo_status_entry(current_status: &str, this_repo: Tier3StatusBody) -> RepoStatusEntry {
+    fn repo_status_entry(current_status: &str, this_repo: TierStatusBody) -> RepoStatusEntry {
         RepoStatusEntry {
             alias: "demo".into(),
             root: "/tmp/demo".into(),
@@ -249,7 +250,7 @@ mod tests {
                 anchor: "HEAD".into(),
                 status: current_status.into(),
             },
-            tier3_status: Tier3RepoStatus {
+            tier3_status: TierRepoStatus {
                 this_repo,
                 repo_wide: None,
             },

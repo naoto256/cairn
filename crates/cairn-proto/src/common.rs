@@ -276,14 +276,29 @@ pub enum HintAction {
     TryAlternativeQuery,
 }
 
+/// Default tier identifier used when an older client wrote a status row
+/// without one. Kept as a free function so it can serve as a `serde(default)`.
+#[must_use]
+pub fn default_tier() -> String {
+    "tier3".to_string()
+}
+
 /// One analyzer's readiness as exposed on query results.
+///
+/// Historically this type was named `Tier3AnalyzerStatus`; the rename is
+/// purely Rust-side. Wire field names are unchanged so existing JSON
+/// consumers keep working.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Tier3AnalyzerStatus {
+pub struct TierAnalyzerStatus {
     /// Stable analyzer identifier, e.g. a workspace analyzer name. `None`
-    /// means the language has no Tier-3 analyzer.
+    /// means the language has no workspace analyzer of the relevant tier.
     pub id: Option<String>,
     /// Primary language this entry describes.
     pub language: String,
+    /// Workspace tier this analyzer belongs to. Defaults to `"tier3"` for
+    /// compatibility with clients that pre-date the multi-tier wire surface.
+    #[serde(default = "default_tier")]
+    pub tier: String,
     /// Normalized wire state. Internal `succeeded` rows become `ready`.
     pub state: AnalyzerState,
     /// Machine-readable reason for non-ready states.
@@ -294,7 +309,7 @@ pub struct Tier3AnalyzerStatus {
     pub reason: Option<String>,
 }
 
-impl Tier3AnalyzerStatus {
+impl TierAnalyzerStatus {
     #[must_use]
     pub fn is_positive(&self) -> bool {
         matches!(
@@ -304,51 +319,51 @@ impl Tier3AnalyzerStatus {
     }
 }
 
-/// Tier-3 workspace analyzer readiness body.
+/// Workspace-analyzer readiness body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tier3StatusBody {
-    /// True when every Tier-3 analyzer relevant to the query reached a
+pub struct TierStatusBody {
+    /// True when every workspace analyzer relevant to the query reached a
     /// positive terminal state.
     pub ready: bool,
     /// Analyzer entries relevant to this view.
-    pub analyzers: Vec<Tier3AnalyzerStatus>,
+    pub analyzers: Vec<TierAnalyzerStatus>,
 }
 
-/// Tier-3 workspace analyzer readiness for the snapshots a query touched.
+/// Workspace-analyzer readiness for the snapshots a query touched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tier3Status {
+pub struct TierStatus {
     /// Readiness for analyzers relevant to this query.
-    pub this_query: Tier3StatusBody,
+    pub this_query: TierStatusBody,
     /// Full repository readiness, included only when `verbose_tier3=true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo_wide: Option<Tier3StatusBody>,
+    pub repo_wide: Option<TierStatusBody>,
 }
 
-/// Tier-3 workspace analyzer readiness for a whole repository view.
+/// Workspace-analyzer readiness for a whole repository view.
 ///
 /// Query results use `this_query`; inventory/status tools use `this_repo`
 /// because their confidence is about the repository snapshot, not one query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tier3RepoStatus {
+pub struct TierRepoStatus {
     /// Readiness for analyzers expected for this repository's current view.
-    pub this_repo: Tier3StatusBody,
+    pub this_repo: TierStatusBody,
     /// Full repository readiness, included only when requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo_wide: Option<Tier3StatusBody>,
+    pub repo_wide: Option<TierStatusBody>,
 }
 
-impl Tier3Status {
-    /// Build the default "Tier-3 was ready or not required" status.
+impl TierStatus {
+    /// Build the default "workspace tier was ready or not required" status.
     #[must_use]
     pub fn ready() -> Self {
         Self {
-            this_query: Tier3StatusBody::ready(),
+            this_query: TierStatusBody::ready(),
             repo_wide: None,
         }
     }
 
     #[must_use]
-    pub fn from_body(this_query: Tier3StatusBody) -> Self {
+    pub fn from_body(this_query: TierStatusBody) -> Self {
         Self {
             this_query,
             repo_wide: None,
@@ -356,13 +371,13 @@ impl Tier3Status {
     }
 
     #[must_use]
-    pub fn with_repo_wide(mut self, repo_wide: Tier3StatusBody) -> Self {
+    pub fn with_repo_wide(mut self, repo_wide: TierStatusBody) -> Self {
         self.repo_wide = Some(repo_wide);
         self
     }
 }
 
-impl Tier3StatusBody {
+impl TierStatusBody {
     #[must_use]
     pub fn ready() -> Self {
         Self {
@@ -372,9 +387,9 @@ impl Tier3StatusBody {
     }
 
     #[must_use]
-    pub fn from_analyzers(analyzers: Vec<Tier3AnalyzerStatus>) -> Self {
+    pub fn from_analyzers(analyzers: Vec<TierAnalyzerStatus>) -> Self {
         Self {
-            ready: analyzers.iter().all(Tier3AnalyzerStatus::is_positive),
+            ready: analyzers.iter().all(TierAnalyzerStatus::is_positive),
             analyzers,
         }
     }
