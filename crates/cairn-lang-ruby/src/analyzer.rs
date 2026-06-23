@@ -256,12 +256,14 @@ fn emit_superclass(
     if base.is_empty() {
         return;
     }
+    let range = expr.byte_range();
     facts.impls.push(ImplFact {
         type_qualified: type_qualified.to_string(),
         interface_qualified: Some(base),
         kind: "inherit".to_string(),
         syntactic_kind: Some(SyntacticKind::LessThan),
         line: line_of(class_node),
+        interface_byte_range: Some((range.start as u32, range.end as u32)),
     });
 }
 
@@ -344,12 +346,14 @@ fn emit_mixins(
             // `Include` rather than panic.
             _ => SyntacticKind::Include,
         };
+        let range = arg.byte_range();
         facts.impls.push(ImplFact {
             type_qualified: type_qualified.clone(),
             interface_qualified: Some(module),
             kind: verb.to_string(),
             syntactic_kind: Some(syntactic),
             line,
+            interface_byte_range: Some((range.start as u32, range.end as u32)),
         });
     }
 }

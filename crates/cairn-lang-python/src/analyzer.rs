@@ -181,12 +181,14 @@ fn emit_base_classes(
         if base.is_empty() {
             continue;
         }
+        let cr = child.byte_range();
         facts.impls.push(ImplFact {
             type_qualified: type_qualified.to_string(),
             interface_qualified: Some(base),
             kind: "inherit".to_string(),
             syntactic_kind: Some(SyntacticKind::BaseArg),
             line,
+            interface_byte_range: Some((cr.start as u32, cr.end as u32)),
         });
     }
 }

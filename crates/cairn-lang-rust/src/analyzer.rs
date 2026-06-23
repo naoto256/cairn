@@ -182,6 +182,14 @@ impl<'a> Walker<'a> {
             kind,
             syntactic_kind: Some(SyntacticKind::ImplFor),
             line,
+            // `syn` spans are line/column-based (proc-macro2's
+            // `span-locations` feature); converting to byte offsets
+            // would require maintaining a line-start table for every
+            // parse. Leaving `None` keeps the Rust analyzer cost
+            // unchanged; persistence skips Resolution emission for
+            // this row, which is acceptable while no Rust query path
+            // consumes Tier-2 direct-translation resolutions.
+            interface_byte_range: None,
         });
         // Walk each method's body for call refs. Methods qualify
         // under the type they impl on (matching how the syntactic

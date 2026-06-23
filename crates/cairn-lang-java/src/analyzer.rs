@@ -328,12 +328,14 @@ fn push_edge(
     if base.is_empty() {
         return;
     }
+    let range = ty.byte_range();
     facts.impls.push(ImplFact {
         type_qualified: type_qualified.to_string(),
         interface_qualified: Some(base),
         kind: kind.to_string(),
         syntactic_kind: Some(syntactic_kind),
         line,
+        interface_byte_range: Some((range.start as u32, range.end as u32)),
     });
 }
 
