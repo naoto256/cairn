@@ -154,8 +154,19 @@ pub const WORKSPACE_TIER_PREFIXES: &[&str] = &["tier3"];
 /// it into the same tier-prefix table once a Tier-2.5 analyzer registers.
 const TIER2_NATIVE_SOURCES: &[&str] = &["rust-syn"];
 
-/// Builds an SQL `CASE` expression that ranks `refs.source` provenance from
+/// Builds an SQL `CASE` expression that ranks provenance strings from
 /// most authoritative (lowest number) to least.
+///
+/// Rank order:
+/// 0. `tier3-*` — LSP / full resolver output (most authoritative).
+/// 1. `tier25-*` — tree-sitter-based cross-file Tier-2.5 pass.
+/// 2. `tier2-direct-*` — Tier-2 backends emitting resolutions where the
+///    grammar shape unambiguously implies the semantic kind
+///    (Phase 3 of the Tier-2.5 prep work).
+/// 3. `rust-syn` and other [`TIER2_NATIVE_SOURCES`] — Tier-1 / Tier-2
+///    enrichers.
+/// 4. Everything else, including fact-layer fallbacks read from
+///    `implementations.kind` without a resolution row.
 ///
 /// `column` is interpolated as-is into the SQL; only pass a static identifier
 /// (e.g. `"r.source"`), never user input.
@@ -165,10 +176,12 @@ pub fn source_rank_case_sql(column: &str) -> String {
     for prefix in WORKSPACE_TIER_PREFIXES {
         sql.push_str(&format!(" WHEN {column} LIKE '{prefix}-%' THEN 0"));
     }
+    sql.push_str(&format!(" WHEN {column} LIKE 'tier25-%' THEN 1"));
+    sql.push_str(&format!(" WHEN {column} LIKE 'tier2-direct-%' THEN 2"));
     for source in TIER2_NATIVE_SOURCES {
-        sql.push_str(&format!(" WHEN {column} = '{source}' THEN 1"));
+        sql.push_str(&format!(" WHEN {column} = '{source}' THEN 3"));
     }
-    sql.push_str(" ELSE 2 END");
+    sql.push_str(" ELSE 4 END");
     sql
 }
 

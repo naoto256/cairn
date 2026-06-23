@@ -12,7 +12,7 @@ mod get_outline;
 mod get_symbol_source;
 
 pub use find_impls::{
-    FindSubtypesArgs, FindSupertypesArgs, ImplHit, find_subtypes, find_supertypes,
+    FindSubtypesArgs, FindSupertypesArgs, ImplHit, KIND_SOURCE_FACT, find_subtypes, find_supertypes,
 };
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};

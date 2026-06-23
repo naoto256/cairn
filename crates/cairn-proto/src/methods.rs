@@ -767,6 +767,14 @@ pub struct FindSupertypesResult {
     pub timing: Timing,
 }
 
+/// Serde default for [`ImplHit::kind_source`] — matches the
+/// `KIND_SOURCE_FACT` constant in `cairn-core::query::find_impls`.
+/// Kept here (rather than referencing the core constant) so the proto
+/// crate stays dependency-free.
+fn default_kind_source() -> String {
+    "tier2-fact".into()
+}
+
 /// One type-relation edge — the data shape behind both
 /// `find_subtypes` and `find_supertypes`. The two methods walk the
 /// same `implementations` table from opposite directions, so the
@@ -788,6 +796,16 @@ pub struct ImplHit {
     /// Python base classes, `"implements"` for TypeScript `implements`,
     /// `"mixin"` for ECMAScript mixin patterns.
     pub kind: String,
+    /// Provenance for [`Self::kind`]. Either a resolution-layer
+    /// `source` string (e.g. `"tier2-direct-java"`,
+    /// `"tier25-py-resolver"`, `"tier3-pyright-lsp"`) when the kind
+    /// came through the `resolutions` table, or `"tier2-fact"` when
+    /// the Tier-2 `implementations.kind` was used as fallback. Older
+    /// daemons that predate Phase 4 of the Tier-2.5 prep work emit no
+    /// resolutions and so always report `"tier2-fact"`; the default
+    /// here keeps deserialization of those payloads green.
+    #[serde(default = "default_kind_source")]
+    pub kind_source: String,
     /// Anchor label the edge came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the subtype-side symbol

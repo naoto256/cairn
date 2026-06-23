@@ -32,7 +32,7 @@ mod tests {
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, 8);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
@@ -152,7 +152,7 @@ mod tests {
         let v: u32 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, 8);
         assert!(table_exists(&c, "workspace_analysis_runs"));
         assert!(table_exists(&c, "resolutions"));
     }
