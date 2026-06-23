@@ -32,6 +32,14 @@ pub mod version;
 pub use common::{
     AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,
     HintCode, LanguageEnrichment, MissingTier, PartialReason, Position, Range, ReasonCode, RefKind,
-    SourceTier, SymbolKind, Tier3AnalyzerStatus, Tier3RepoStatus, Tier3Status, Tier3StatusBody,
-    Timing, TypeRole,
+    SourceTier, SymbolKind, TierAnalyzerStatus, TierRepoStatus, TierStatus, TierStatusBody, Timing,
+    TypeRole, default_tier,
 };
+
+// Back-compat type aliases for the pre-Tier-2.5 names. Out-of-tree consumers
+// that imported `Tier3*` keep compiling; the new tier-neutral names are the
+// preferred surface.
+pub use common::TierAnalyzerStatus as Tier3AnalyzerStatus;
+pub use common::TierRepoStatus as Tier3RepoStatus;
+pub use common::TierStatus as Tier3Status;
+pub use common::TierStatusBody as Tier3StatusBody;

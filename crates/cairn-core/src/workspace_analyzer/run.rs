@@ -153,6 +153,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
     let analyzer_id = analyzer.id();
     let analyzer_revision = analyzer.revision();
     let parser_id = analyzer.parser_id();
+    let tier_prefix = analyzer.tier_prefix();
     let config_hash = config_hash(repo_root, analyzer.config_paths());
     let files = workspace_files_for(conn, parser_id, repo_root, entries)?;
     if files.is_empty() {
@@ -201,8 +202,14 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         progress_observer,
     ) {
         AnalyzerRun::Completed(Ok(facts)) => {
-            let inserted_refs =
-                persist_resolved_refs(conn, manifest_id, analyzer_id, parser_id, &facts)?;
+            let inserted_refs = persist_resolved_refs(
+                conn,
+                manifest_id,
+                analyzer_id,
+                tier_prefix,
+                parser_id,
+                &facts,
+            )?;
             mark_run(
                 conn,
                 RunRecord {

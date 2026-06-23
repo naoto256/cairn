@@ -6,6 +6,7 @@ use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas::kind_conv::{ref_kind_from_str, ref_kind_to_str};
 use crate::manifest::ManifestId;
+use crate::workspace_analyzer::{source_is_workspace_tier_sql, source_rank_case_sql};
 
 /// One reference hit. Mirrors `cairn_proto::methods::FindReferenceHit`
 /// minus the repo / branch / location envelope.
@@ -75,6 +76,10 @@ fn run_find_references(
     // blobs visible from this anchor. The enclosing-symbol JOIN is
     // INNER for outgoing (we need the enclosing name to filter) and
     // LEFT for incoming (top-level refs have no enclosing).
+    // SQL fragments derived from the registered workspace-tier prefixes; they
+    // expand when a new tier (e.g. Tier-2.5) joins WORKSPACE_TIER_PREFIXES.
+    let source_rank_r = source_rank_case_sql("r.source");
+    let workspace_tier_t = source_is_workspace_tier_sql("t.source");
     let run = |where_col: &str, value: &str, outgoing: bool| -> Result<Vec<ReferenceHit>> {
         let mut sql = String::from(
             "SELECT target_name, target_qualified, kind, enclosing, path, line, blob_sha, parser_id
@@ -82,29 +87,25 @@ fn run_find_references(
                  SELECT r.target_name, r.target_qualified, r.kind,
                         enc.qualified AS enclosing,
                         me.path, r.line, r.blob_sha, r.parser_id, r.byte_start, r.byte_end,
-                        CASE
-                          WHEN r.source LIKE 'tier3-%' THEN 0
-                          WHEN r.source = 'rust-syn' THEN 1
-                          ELSE 2
-                        END AS source_rank,
-                        EXISTS (
+                        ",
+        );
+        sql.push_str(&source_rank_r);
+        sql.push_str(" AS source_rank,\n");
+        sql.push_str(&format!(
+            "                        EXISTS (
                           SELECT 1
                             FROM refs t
                            WHERE t.blob_sha = r.blob_sha
-                             AND t.source LIKE 'tier3-%'
+                             AND ({workspace_tier_t})
                              AND t.line = r.line
                              AND t.kind = r.kind
                              AND t.target_name = r.target_name
                              AND t.enclosing_id IS r.enclosing_id
-                        ) AS has_tier3_same_line_target_name,
+                        ) AS has_workspace_tier_same_line_target_name,
                         ROW_NUMBER() OVER (
                           PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
                           ORDER BY
-                            CASE
-                              WHEN r.source LIKE 'tier3-%' THEN 0
-                              WHEN r.source = 'rust-syn' THEN 1
-                              ELSE 2
-                            END,
+                            {source_rank_r},
                             CASE
                               WHEN r.target_qualified IS NOT NULL
                                AND r.target_qualified <> '' THEN 0
@@ -116,8 +117,8 @@ fn run_find_references(
                    JOIN manifest_entries me
                      ON me.manifest_id = ?1
                     AND me.blob_sha = r.blob_sha
-               ",
-        );
+               "
+        ));
         sql.push_str(if outgoing {
             "JOIN symbols enc ON enc.id = r.enclosing_id\n"
         } else {
@@ -142,7 +143,7 @@ fn run_find_references(
                     source_rank > 0
                     AND byte_start = 0
                     AND byte_end = 0
-                    AND has_tier3_same_line_target_name
+                    AND has_workspace_tier_same_line_target_name
                 )",
             );
         }
