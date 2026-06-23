@@ -134,7 +134,72 @@ pub struct ImplFact {
     /// for an inherent impl. Stored verbatim in the data DB's
     /// `implementations.kind` column.
     pub kind: String,
+    /// Grammar-direct classification of the edge — the fact layer's
+    /// "what the source literally says" (e.g. `extends` vs `implements`
+    /// vs `: Base` vs `< Base`). The resolution layer (Tier-2.5+) will
+    /// read this in Phase 3 to derive a `semantic_kind` per language
+    /// rules. Wired in Phase 2; `None` is allowed for backends that
+    /// have not yet been migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntactic_kind: Option<SyntacticKind>,
     pub line: u32,
+}
+
+/// Grammar-shaped classification of an inheritance / conformance /
+/// mixin edge. One variant per distinct syntactic form across the
+/// supported languages; the resolution layer maps it down to a smaller
+/// semantic vocabulary per language.
+///
+/// `#[non_exhaustive]` so new grammar shapes can be added without
+/// breaking downstream matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SyntacticKind {
+    /// Java / TypeScript / JavaScript / PHP `extends Foo`.
+    Extends,
+    /// Java / TypeScript / PHP `implements Foo`.
+    Implements,
+    /// Kotlin / Swift / C# `: Foo` heritage list.
+    Colon,
+    /// Ruby `class Dog < Animal`.
+    LessThan,
+    /// Ruby `include Mod`.
+    Include,
+    /// Ruby `extend Mod`.
+    ExtendKw,
+    /// Ruby `prepend Mod`.
+    Prepend,
+    /// PHP `use TraitName;` inside a class body.
+    TraitUse,
+    /// Python `class Foo(Base, Mixin):` positional base argument.
+    BaseArg,
+    /// Rust `impl Trait for Type` (and inherent `impl Type`).
+    ImplFor,
+    /// Rust `trait T: U` supertrait bound. Reserved — no emitter today
+    /// (supertraits are surfaced through `Bound` refs in the syntactic
+    /// pass, not as `ImplFact`s).
+    Supertrait,
+    /// C++ `class Dog : public Animal` base with `public` access.
+    PublicBase,
+    /// C++ `class Dog : private Animal` base with `private` access.
+    PrivateBase,
+    /// C++ `class Dog : protected Animal` base with `protected` access.
+    ProtectedBase,
+    /// Objective-C `@interface Foo : Bar` superclass.
+    InterfaceColon,
+    /// Objective-C `<Protocol, ...>` conformance list. Used for both
+    /// class adoption and `@protocol Foo <Bar>` protocol-to-protocol
+    /// inheritance — both share the same lexical shape.
+    ProtocolList,
+    /// Objective-C `@interface Foo (CategoryName)` category marker.
+    Category,
+    /// Swift `extension Foo { ... }` declaration self-edge with no
+    /// conformance clause.
+    Extension,
+    /// Go struct embedding (`type S struct { T }`). Reserved — no Go
+    /// analyzer ships impl edges today.
+    Embed,
 }
 
 /// Upgrade the doc string of an already-emitted symbol. Used when the

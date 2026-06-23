@@ -38,7 +38,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, collapse_ws, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -250,6 +252,7 @@ impl CsSemanticWalker {
                 type_qualified: type_qualified.to_string(),
                 interface_qualified: Some(base),
                 kind: "inherit".to_string(),
+                syntactic_kind: Some(SyntacticKind::Colon),
                 line: line_of(base_node),
             });
         }

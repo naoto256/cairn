@@ -40,7 +40,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, collapse_ws, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -258,6 +260,7 @@ fn emit_superclass(
         type_qualified: type_qualified.to_string(),
         interface_qualified: Some(base),
         kind: "inherit".to_string(),
+        syntactic_kind: Some(SyntacticKind::LessThan),
         line: line_of(class_node),
     });
 }
@@ -332,10 +335,20 @@ fn emit_mixins(
         if module.is_empty() {
             continue;
         }
+        let syntactic = match verb {
+            "include" => SyntacticKind::Include,
+            "extend" => SyntacticKind::ExtendKw,
+            "prepend" => SyntacticKind::Prepend,
+            // Caller `handle_call` guards on these three verbs; any
+            // other value reaching here is a bug, so default to
+            // `Include` rather than panic.
+            _ => SyntacticKind::Include,
+        };
         facts.impls.push(ImplFact {
             type_qualified: type_qualified.clone(),
             interface_qualified: Some(module),
             kind: verb.to_string(),
+            syntactic_kind: Some(syntactic),
             line,
         });
     }
@@ -578,5 +591,28 @@ end
     fn imports_left_to_syntactic_pass() {
         let f = semantic("require \"json\"\n");
         assert!(f.imports.is_empty());
+    }
+
+    #[test]
+    fn include_extend_prepend_emit_syntactic_kinds() {
+        let src = "class W\n  include Loggable\n  extend Helpers\n  prepend Patch\nend\n";
+        let f = semantic(src);
+        let by_kind: std::collections::HashMap<&str, Option<SyntacticKind>> = f
+            .impls
+            .iter()
+            .map(|i| (i.kind.as_str(), i.syntactic_kind))
+            .collect();
+        assert_eq!(
+            by_kind.get("include").copied().flatten(),
+            Some(SyntacticKind::Include)
+        );
+        assert_eq!(
+            by_kind.get("extend").copied().flatten(),
+            Some(SyntacticKind::ExtendKw)
+        );
+        assert_eq!(
+            by_kind.get("prepend").copied().flatten(),
+            Some(SyntacticKind::Prepend)
+        );
     }
 }

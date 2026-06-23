@@ -25,7 +25,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -134,6 +136,9 @@ impl SwiftSemanticWalker {
                 type_qualified: qualified.clone(),
                 interface_qualified: None,
                 kind: "extension".to_string(),
+                // Bare `extension Foo {}` (no conformance clause) —
+                // the declaration itself is the syntactic shape.
+                syntactic_kind: Some(SyntacticKind::Extension),
                 line: line_of(node),
             });
         }
@@ -142,6 +147,10 @@ impl SwiftSemanticWalker {
                 type_qualified: qualified.clone(),
                 interface_qualified: Some(base),
                 kind: if is_extension { "implement" } else { "inherit" }.to_string(),
+                // Swift declarations and extensions both use a `:`
+                // heritage list; the syntactic shape is `Colon`
+                // regardless of which semantic kind we settle on.
+                syntactic_kind: Some(SyntacticKind::Colon),
                 line: line_of(base_node),
             });
         }
@@ -559,5 +568,18 @@ mod tests {
         assert!(facts.refs.iter().any(|r| {
             r.target_name == "bar" && r.enclosing_qualified.as_deref() == Some("alsoOk")
         }));
+    }
+
+    #[test]
+    fn bare_extension_emits_syntactic_extension() {
+        let impls = impls(
+            "extension Foo {}
+",
+        );
+        let ext = impls
+            .iter()
+            .find(|i| i.kind == "extension")
+            .expect("extension self-edge missing");
+        assert_eq!(ext.syntactic_kind, Some(SyntacticKind::Extension));
     }
 }

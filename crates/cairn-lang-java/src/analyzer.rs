@@ -40,7 +40,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, collapse_ws, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -243,16 +245,42 @@ fn emit_supertype_edges(
     if let Some(superclass) = child_by_field(node, "superclass") {
         let mut cursor = superclass.walk();
         for ty in superclass.named_children(&mut cursor) {
-            push_edge(facts, type_qualified, ty, source, "inherit", line);
+            push_edge(
+                facts,
+                type_qualified,
+                ty,
+                source,
+                "inherit",
+                SyntacticKind::Extends,
+                line,
+            );
         }
     }
     if let Some(interfaces) = child_by_field(node, "interfaces") {
-        emit_type_list_edges(interfaces, source, type_qualified, "implement", line, facts);
+        emit_type_list_edges(
+            interfaces,
+            source,
+            type_qualified,
+            "implement",
+            SyntacticKind::Implements,
+            line,
+            facts,
+        );
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "extends_interfaces" {
-            emit_type_list_edges(child, source, type_qualified, "inherit", line, facts);
+            // `interface I extends J, K` — syntactically `extends`,
+            // semantically interface-to-interface inheritance.
+            emit_type_list_edges(
+                child,
+                source,
+                type_qualified,
+                "inherit",
+                SyntacticKind::Extends,
+                line,
+                facts,
+            );
         }
     }
 }
@@ -263,6 +291,7 @@ fn emit_type_list_edges(
     source: &[u8],
     type_qualified: &str,
     kind: &str,
+    syntactic_kind: SyntacticKind,
     line: u32,
     facts: &mut SemanticFacts,
 ) {
@@ -273,7 +302,15 @@ fn emit_type_list_edges(
         }
         let mut list_cursor = child.walk();
         for ty in child.named_children(&mut list_cursor) {
-            push_edge(facts, type_qualified, ty, source, kind, line);
+            push_edge(
+                facts,
+                type_qualified,
+                ty,
+                source,
+                kind,
+                syntactic_kind,
+                line,
+            );
         }
     }
 }
@@ -284,6 +321,7 @@ fn push_edge(
     ty: Node<'_>,
     source: &[u8],
     kind: &str,
+    syntactic_kind: SyntacticKind,
     line: u32,
 ) {
     let base = base_type_name(ty, source);
@@ -294,6 +332,7 @@ fn push_edge(
         type_qualified: type_qualified.to_string(),
         interface_qualified: Some(base),
         kind: kind.to_string(),
+        syntactic_kind: Some(syntactic_kind),
         line,
     });
 }

@@ -330,16 +330,28 @@ fn insert_impl(
     imp: &ImplFact,
 ) -> Result<()> {
     let line = i64::from(imp.line);
+    // `syntactic_kind` (added in schema v7) carries the grammar-direct
+    // shape — serialized via the enum's snake_case serde rename so the
+    // string in the DB matches the lang-api `SyntacticKind` mapping
+    // (`extends`, `implements`, `colon`, ...). The resolution layer
+    // will read it in Phase 3; query paths do not touch it yet.
+    let syntactic_kind = imp
+        .syntactic_kind
+        .as_ref()
+        .and_then(|k| serde_json::to_value(k).ok())
+        .and_then(|v| v.as_str().map(str::to_owned));
     tx.execute(
         "INSERT INTO implementations
-           (blob_sha, parser_id, type_qualified, interface_qualified, kind, line)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+           (blob_sha, parser_id, type_qualified, interface_qualified, kind,
+            syntactic_kind, line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             blob_sha,
             parser_id,
             imp.type_qualified,
             imp.interface_qualified,
             imp.kind,
+            syntactic_kind,
             line,
         ],
     )?;

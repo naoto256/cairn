@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_lang_api::{Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts};
+use cairn_lang_api::{
+    Analyzer, ExtractError, ImplFact, RefFact, RefKind, SemanticFacts, SyntacticKind,
+};
 use cairn_lang_treesitter_generic::{child_by_field, line_of, node_text};
 use tree_sitter::{Node, Parser};
 
@@ -137,6 +139,10 @@ impl KtSemanticWalker {
                 type_qualified: type_qualified.to_string(),
                 interface_qualified: Some(base_name),
                 kind: kind.to_string(),
+                // Kotlin uses a single `:` heritage list for both
+                // superclass and interfaces; the syntactic shape is
+                // `Colon` regardless of which semantic kind we resolve.
+                syntactic_kind: Some(SyntacticKind::Colon),
                 line: line_of(base),
             });
         }

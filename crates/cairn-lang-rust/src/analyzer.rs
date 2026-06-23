@@ -28,7 +28,7 @@
 
 use cairn_lang_api::{
     Analyzer, DocOverride, ExtractError, ImplFact, ImportFact, RefFact, RefKind, SemanticFacts,
-    SymbolKind, TypeRole,
+    SymbolKind, SyntacticKind, TypeRole,
 };
 use syn::spanned::Spanned;
 use syn::visit::Visit;
@@ -180,6 +180,7 @@ impl<'a> Walker<'a> {
             type_qualified: type_qualified.clone(),
             interface_qualified,
             kind,
+            syntactic_kind: Some(SyntacticKind::ImplFor),
             line,
         });
         // Walk each method's body for call refs. Methods qualify
