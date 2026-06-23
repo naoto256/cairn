@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use cairn_proto::{
     AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,
-    HintCode, PartialReason, ReasonCode, Tier3AnalyzerStatus, Tier3Status, Tier3StatusBody,
+    HintCode, PartialReason, ReasonCode, TierAnalyzerStatus, TierStatus, TierStatusBody,
+    default_tier,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
@@ -97,7 +98,7 @@ pub(crate) struct EmissionContext<'a> {
     pub(crate) tool: QueryToolKind,
     pub(crate) items_empty: bool,
     pub(crate) completeness: &'a Completeness,
-    pub(crate) tier3_status: &'a Tier3Status,
+    pub(crate) tier3_status: &'a TierStatus,
     pub(crate) query_args: QueryArgsView<'a>,
 }
 
@@ -376,7 +377,7 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
     hints
 }
 
-fn diagnostic_for_analyzer(analyzer: &Tier3AnalyzerStatus) -> Option<Diagnostic> {
+fn diagnostic_for_analyzer(analyzer: &TierAnalyzerStatus) -> Option<Diagnostic> {
     let (code, severity, fallback_message) = match (analyzer.state, analyzer.reason_code) {
         (AnalyzerState::Missing, Some(ReasonCode::NotRecorded)) => (
             DiagnosticCode::AnalyzerNotRecorded,
@@ -441,7 +442,7 @@ where
         .collect::<BTreeSet<_>>()
 }
 
-pub(crate) async fn tier3_status_for_query(
+pub(crate) async fn tier_status_for_query(
     ctx: &DataCtx,
     requested_repo: Option<String>,
     anchor_arg: Option<String>,
@@ -449,9 +450,9 @@ pub(crate) async fn tier3_status_for_query(
     relevant_parser_ids: BTreeSet<String>,
     verbose_tier3: bool,
     method_name: &'static str,
-) -> Result<Tier3Status> {
+) -> Result<TierStatus> {
     let cas_data_dir = ctx.cas_data_dir.clone();
-    tokio::task::spawn_blocking(move || -> Result<Tier3Status> {
+    tokio::task::spawn_blocking(move || -> Result<TierStatus> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
         let aliases = match requested_repo.as_deref() {
             Some(name) => {
@@ -479,16 +480,12 @@ pub(crate) async fn tier3_status_for_query(
                 continue;
             };
             analyzers.extend(
-                compute_tier3_status_for_parser_ids(
-                    &conn,
-                    manifest_id,
-                    Some(&relevant_parser_ids),
-                )?
-                .analyzers,
+                compute_tier_status_for_parser_ids(&conn, manifest_id, Some(&relevant_parser_ids))?
+                    .analyzers,
             );
             if verbose_tier3 {
                 repo_wide_analyzers.extend(
-                    compute_tier3_status(&conn, manifest_id)?
+                    compute_tier_status(&conn, manifest_id)?
                         .this_query
                         .analyzers,
                 );
@@ -496,12 +493,12 @@ pub(crate) async fn tier3_status_for_query(
         }
         analyzers.sort();
         analyzers.dedup();
-        let this_query = Tier3StatusBody::from_analyzers(analyzers);
-        let status = Tier3Status::from_body(this_query);
+        let this_query = TierStatusBody::from_analyzers(analyzers);
+        let status = TierStatus::from_body(this_query);
         if verbose_tier3 {
             repo_wide_analyzers.sort();
             repo_wide_analyzers.dedup();
-            Ok(status.with_repo_wide(Tier3StatusBody::from_analyzers(repo_wide_analyzers)))
+            Ok(status.with_repo_wide(TierStatusBody::from_analyzers(repo_wide_analyzers)))
         } else {
             Ok(status)
         }
@@ -510,12 +507,12 @@ pub(crate) async fn tier3_status_for_query(
     .map_err(|e| Error::internal_task_panic(format!("{method_name} tier3 status"), e))?
 }
 
-pub(crate) fn compute_tier3_status(
+pub(crate) fn compute_tier_status(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
-) -> Result<Tier3Status> {
-    Ok(Tier3Status::from_body(
-        compute_tier3_status_body_with_analyzers(
+) -> Result<TierStatus> {
+    Ok(TierStatus::from_body(
+        compute_tier_status_body_with_analyzers(
             conn,
             manifest_id,
             expected_analyzers_for_manifest(conn, manifest_id)?,
@@ -524,30 +521,30 @@ pub(crate) fn compute_tier3_status(
     ))
 }
 
-pub(crate) fn compute_tier3_status_response(
+pub(crate) fn compute_tier_status_response(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
     parser_ids: Option<&BTreeSet<String>>,
     verbose_tier3: bool,
-) -> Result<Tier3Status> {
-    let status = Tier3Status::from_body(compute_tier3_status_for_parser_ids(
+) -> Result<TierStatus> {
+    let status = TierStatus::from_body(compute_tier_status_for_parser_ids(
         conn,
         manifest_id,
         parser_ids,
     )?);
     if verbose_tier3 {
-        Ok(status.with_repo_wide(compute_tier3_status(conn, manifest_id)?.this_query))
+        Ok(status.with_repo_wide(compute_tier_status(conn, manifest_id)?.this_query))
     } else {
         Ok(status)
     }
 }
 
-pub(crate) fn compute_tier3_status_for_parser_ids(
+pub(crate) fn compute_tier_status_for_parser_ids(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
     parser_ids: Option<&BTreeSet<String>>,
-) -> Result<Tier3StatusBody> {
-    compute_tier3_status_body_with_analyzers(
+) -> Result<TierStatusBody> {
+    compute_tier_status_body_with_analyzers(
         conn,
         manifest_id,
         expected_analyzers_for_manifest(conn, manifest_id)?,
@@ -556,22 +553,22 @@ pub(crate) fn compute_tier3_status_for_parser_ids(
 }
 
 #[cfg(test)]
-fn compute_tier3_status_with_analyzers(
+fn compute_tier_status_with_analyzers(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
-) -> Result<Tier3Status> {
-    Ok(Tier3Status::from_body(
-        compute_tier3_status_body_with_analyzers(conn, manifest_id, analyzers, None)?,
+) -> Result<TierStatus> {
+    Ok(TierStatus::from_body(
+        compute_tier_status_body_with_analyzers(conn, manifest_id, analyzers, None)?,
     ))
 }
 
-fn compute_tier3_status_body_with_analyzers(
+fn compute_tier_status_body_with_analyzers(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
     relevant_parser_ids: Option<&BTreeSet<String>>,
-) -> Result<Tier3StatusBody> {
+) -> Result<TierStatusBody> {
     let manifest_parser_ids = manifest_parser_ids(conn, manifest_id)?;
     let manifest_parser_ids_sorted = manifest_parser_ids.iter().cloned().collect::<BTreeSet<_>>();
     let relevant_parser_ids = relevant_parser_ids.unwrap_or(&manifest_parser_ids_sorted);
@@ -609,9 +606,10 @@ fn compute_tier3_status_body_with_analyzers(
         if !manifest_parser_ids.contains(parser_id) || described_parser_ids.contains(parser_id) {
             continue;
         }
-        statuses.push(Tier3AnalyzerStatus {
+        statuses.push(TierAnalyzerStatus {
             id: None,
             language: language_from_parser_id(parser_id),
+            tier: default_tier(),
             state: AnalyzerState::NotApplicable,
             reason_code: Some(ReasonCode::NotApplicable),
             reason: Some("no tier3 analyzer for language".into()),
@@ -619,7 +617,7 @@ fn compute_tier3_status_body_with_analyzers(
     }
     statuses.sort();
     statuses.dedup();
-    Ok(Tier3StatusBody::from_analyzers(statuses))
+    Ok(TierStatusBody::from_analyzers(statuses))
 }
 
 fn analyzer_status_from_run(
@@ -627,20 +625,22 @@ fn analyzer_status_from_run(
     language: &str,
     expected_revision: u32,
     row: Option<(String, Option<String>, i64)>,
-) -> Tier3AnalyzerStatus {
+) -> TierAnalyzerStatus {
     let Some((status, error, revision)) = row else {
-        return Tier3AnalyzerStatus {
+        return TierAnalyzerStatus {
             id: Some(analyzer_id.into()),
             language: language.into(),
+            tier: default_tier(),
             state: AnalyzerState::Missing,
             reason_code: Some(ReasonCode::NotScheduled),
             reason: Some("expected analyzer was not scheduled for this manifest".into()),
         };
     };
     if revision != i64::from(expected_revision) {
-        return Tier3AnalyzerStatus {
+        return TierAnalyzerStatus {
             id: Some(analyzer_id.into()),
             language: language.into(),
+            tier: default_tier(),
             state: AnalyzerState::Stale,
             reason_code: Some(ReasonCode::Stale),
             reason: Some(format!(
@@ -660,9 +660,10 @@ fn analyzer_status_from_run(
         "failed" => (AnalyzerState::Failed, Some(ReasonCode::AnalyzerFailed)),
         _ => (AnalyzerState::Failed, Some(ReasonCode::Unknown)),
     };
-    Tier3AnalyzerStatus {
+    TierAnalyzerStatus {
         id: Some(analyzer_id.into()),
         language: language.into(),
+        tier: default_tier(),
         state,
         reason_code,
         reason: error.or_else(|| (status == "cancelled").then(|| "cancelled".into())),
@@ -879,7 +880,7 @@ mod tests {
         let (conn, manifest_id) = demo_store(&fixture);
         insert_run(&conn, manifest_id, "demo-lsp", "succeeded");
 
-        let status = compute_tier3_status_with_analyzers(
+        let status = compute_tier_status_with_analyzers(
             &conn,
             manifest_id,
             vec![Box::new(TestAnalyzer {
@@ -893,9 +894,10 @@ mod tests {
         assert!(status.this_query.ready);
         assert_eq!(
             status.this_query.analyzers,
-            vec![Tier3AnalyzerStatus {
+            vec![TierAnalyzerStatus {
                 id: Some("demo-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Ready,
                 reason_code: None,
                 reason: None,
@@ -909,7 +911,7 @@ mod tests {
         let (conn, manifest_id) = demo_store(&fixture);
         insert_run(&conn, manifest_id, "demo-lsp", "running");
 
-        let status = compute_tier3_status_with_analyzers(
+        let status = compute_tier_status_with_analyzers(
             &conn,
             manifest_id,
             vec![Box::new(TestAnalyzer {
@@ -922,9 +924,10 @@ mod tests {
 
         assert_eq!(
             status.this_query.analyzers,
-            vec![Tier3AnalyzerStatus {
+            vec![TierAnalyzerStatus {
                 id: Some("demo-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Running,
                 reason_code: None,
                 reason: None,
@@ -938,7 +941,7 @@ mod tests {
         let fixture = test_support::registered_fixture();
         let (conn, manifest_id) = demo_store(&fixture);
 
-        let status = compute_tier3_status_with_analyzers(
+        let status = compute_tier_status_with_analyzers(
             &conn,
             manifest_id,
             vec![Box::new(TestAnalyzer {
@@ -952,9 +955,10 @@ mod tests {
         assert!(status.this_query.ready);
         assert_eq!(
             status.this_query.analyzers,
-            vec![Tier3AnalyzerStatus {
+            vec![TierAnalyzerStatus {
                 id: None,
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::NotApplicable,
                 reason_code: Some(ReasonCode::NotApplicable),
                 reason: Some("no tier3 analyzer for language".into()),
@@ -970,7 +974,7 @@ mod tests {
         insert_run(&conn, manifest_id, "python-lsp", "running");
 
         let parser_ids = BTreeSet::from(["tree-sitter-rust".to_string()]);
-        let status = compute_tier3_status_body_with_analyzers(
+        let status = compute_tier_status_body_with_analyzers(
             &conn,
             manifest_id,
             multi_language_analyzers(),
@@ -980,9 +984,10 @@ mod tests {
 
         assert_eq!(
             status.analyzers,
-            vec![Tier3AnalyzerStatus {
+            vec![TierAnalyzerStatus {
                 id: Some("rust-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Running,
                 reason_code: None,
                 reason: None,
@@ -998,7 +1003,7 @@ mod tests {
         insert_run(&conn, manifest_id, "python-lsp", "running");
 
         let parser_ids = BTreeSet::new();
-        let status = compute_tier3_status_body_with_analyzers(
+        let status = compute_tier_status_body_with_analyzers(
             &conn,
             manifest_id,
             multi_language_analyzers(),
@@ -1021,7 +1026,7 @@ mod tests {
             "tree-sitter-python".to_string(),
             "tree-sitter-rust".to_string(),
         ]);
-        let status = compute_tier3_status_body_with_analyzers(
+        let status = compute_tier_status_body_with_analyzers(
             &conn,
             manifest_id,
             multi_language_analyzers(),
@@ -1032,16 +1037,18 @@ mod tests {
         assert_eq!(
             status.analyzers,
             vec![
-                Tier3AnalyzerStatus {
+                TierAnalyzerStatus {
                     id: Some("python-lsp".into()),
                     language: "python".into(),
+                    tier: default_tier(),
                     state: AnalyzerState::Running,
                     reason_code: None,
                     reason: None,
                 },
-                Tier3AnalyzerStatus {
+                TierAnalyzerStatus {
                     id: Some("rust-lsp".into()),
                     language: "rust".into(),
+                    tier: default_tier(),
                     state: AnalyzerState::Running,
                     reason_code: None,
                     reason: None,
@@ -1058,8 +1065,8 @@ mod tests {
         insert_run(&conn, manifest_id, "python-lsp", "running");
 
         let parser_ids = BTreeSet::from(["tree-sitter-rust".to_string()]);
-        let status = Tier3Status::from_body(
-            compute_tier3_status_body_with_analyzers(
+        let status = TierStatus::from_body(
+            compute_tier_status_body_with_analyzers(
                 &conn,
                 manifest_id,
                 multi_language_analyzers(),
@@ -1070,7 +1077,7 @@ mod tests {
         assert!(status.repo_wide.is_none());
 
         let status = status.with_repo_wide(
-            compute_tier3_status_body_with_analyzers(
+            compute_tier_status_body_with_analyzers(
                 &conn,
                 manifest_id,
                 multi_language_analyzers(),
@@ -1095,7 +1102,7 @@ mod tests {
         );
         let parser_ids = BTreeSet::from(["tree-sitter-md".to_string()]);
 
-        let status = compute_tier3_status_body_with_analyzers(
+        let status = compute_tier_status_body_with_analyzers(
             &conn,
             manifest_id,
             Vec::new(),
@@ -1106,9 +1113,10 @@ mod tests {
         assert!(status.ready);
         assert_eq!(
             status.analyzers,
-            vec![Tier3AnalyzerStatus {
+            vec![TierAnalyzerStatus {
                 id: None,
                 language: "markdown".into(),
+                tier: default_tier(),
                 state: AnalyzerState::NotApplicable,
                 reason_code: Some(ReasonCode::NotApplicable),
                 reason: Some("no tier3 analyzer for language".into()),
@@ -1135,7 +1143,7 @@ mod tests {
             .collect::<Vec<_>>();
         expected_ids.sort();
 
-        let mut status_ids = compute_tier3_status(&conn, manifest_id)
+        let mut status_ids = compute_tier_status(&conn, manifest_id)
             .unwrap()
             .this_query
             .analyzers
@@ -1153,7 +1161,7 @@ mod tests {
         let fixture = test_support::registered_fixture();
         let (conn, manifest_id) = demo_store(&fixture);
 
-        let status = compute_tier3_status_body_with_analyzers(
+        let status = compute_tier_status_body_with_analyzers(
             &conn,
             manifest_id,
             vec![Box::new(TestAnalyzer {
@@ -1167,9 +1175,10 @@ mod tests {
 
         assert_eq!(
             status.analyzers,
-            vec![Tier3AnalyzerStatus {
+            vec![TierAnalyzerStatus {
                 id: Some("rust-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Missing,
                 reason_code: Some(ReasonCode::NotScheduled),
                 reason: Some("expected analyzer was not scheduled for this manifest".into()),
@@ -1179,9 +1188,10 @@ mod tests {
 
     #[test]
     fn build_hints_omits_all_when_happy_path() {
-        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+        let tier3_status = status_from_analyzers(vec![TierAnalyzerStatus {
             id: Some("rust-lsp".into()),
             language: "rust".into(),
+            tier: default_tier(),
             state: AnalyzerState::Ready,
             reason_code: None,
             reason: None,
@@ -1200,7 +1210,7 @@ mod tests {
 
     #[test]
     fn build_hints_emits_relax_filter_when_filters_applied() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = emission_ctx(
             true,
@@ -1223,7 +1233,7 @@ mod tests {
 
     #[test]
     fn find_symbols_hint_uses_symbols_noun() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::partial_truncated(PartialReason::Cap);
         let ctx = emission_ctx(
             false,
@@ -1239,7 +1249,7 @@ mod tests {
 
     #[test]
     fn get_outline_hint_uses_outline_items_noun_and_outline_tool() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::partial_truncated(PartialReason::Cap);
         let ctx = EmissionContext {
             tool: QueryToolKind::GetOutline,
@@ -1272,7 +1282,7 @@ mod tests {
 
     #[test]
     fn find_imports_hint_uses_imports_noun_and_imports_tool() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = EmissionContext {
             tool: QueryToolKind::FindImports,
@@ -1294,7 +1304,7 @@ mod tests {
 
     #[test]
     fn find_references_hint_can_drop_direction_filter() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = EmissionContext {
             tool: QueryToolKind::FindReferences,
@@ -1316,7 +1326,7 @@ mod tests {
 
     #[test]
     fn relax_filter_drop_params_only_includes_actually_set_args() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = EmissionContext {
             tool: QueryToolKind::FindSymbols,
@@ -1340,7 +1350,7 @@ mod tests {
 
     #[test]
     fn relax_filter_does_not_include_repo_in_drop_params() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = EmissionContext {
             tool: QueryToolKind::FindReferences,
@@ -1370,7 +1380,7 @@ mod tests {
 
     #[test]
     fn build_hints_emits_try_fuzzy_when_exact_no_filter() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = emission_ctx(
             true,
@@ -1390,7 +1400,7 @@ mod tests {
 
     #[test]
     fn build_hints_emits_widen_scope_when_repo_specified() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::complete();
         let ctx = emission_ctx(
             true,
@@ -1413,7 +1423,7 @@ mod tests {
 
     #[test]
     fn build_hints_emits_capped_increase_limit() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::partial_truncated(PartialReason::Cap);
         let ctx = emission_ctx(
             false,
@@ -1429,7 +1439,7 @@ mod tests {
 
     #[test]
     fn directory_outline_cap_emits_capped_narrow_filter_first_then_capped_increase_limit() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::partial_truncated(PartialReason::Cap);
         let ctx = EmissionContext {
             tool: QueryToolKind::GetOutline,
@@ -1454,7 +1464,7 @@ mod tests {
 
     #[test]
     fn file_mode_outline_cap_does_not_emit_capped_narrow_filter() {
-        let tier3_status = Tier3Status::ready();
+        let tier3_status = TierStatus::ready();
         let completeness = Completeness::partial_truncated(PartialReason::Cap);
         let ctx = EmissionContext {
             tool: QueryToolKind::GetOutline,
@@ -1478,9 +1488,10 @@ mod tests {
 
     #[test]
     fn build_hints_emits_tier3_indexing_wait_when_running() {
-        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+        let tier3_status = status_from_analyzers(vec![TierAnalyzerStatus {
             id: Some("rust-lsp".into()),
             language: "rust".into(),
+            tier: default_tier(),
             state: AnalyzerState::Running,
             reason_code: None,
             reason: None,
@@ -1500,9 +1511,10 @@ mod tests {
 
     #[test]
     fn build_hints_emits_reindex_via_cli_when_not_recorded_no_active_job() {
-        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+        let tier3_status = status_from_analyzers(vec![TierAnalyzerStatus {
             id: Some("rust-lsp".into()),
             language: "rust".into(),
+            tier: default_tier(),
             state: AnalyzerState::Missing,
             reason_code: Some(ReasonCode::NotRecorded),
             reason: Some("analyzer run not recorded".into()),
@@ -1530,23 +1542,26 @@ mod tests {
     #[test]
     fn build_diagnostics_from_tier3_analyzer_states() {
         let tier3_status = status_from_analyzers(vec![
-            Tier3AnalyzerStatus {
+            TierAnalyzerStatus {
                 id: Some("missing-lsp".into()),
                 language: "rust".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Missing,
                 reason_code: Some(ReasonCode::BinaryNotFound),
                 reason: Some("binary missing".into()),
             },
-            Tier3AnalyzerStatus {
+            TierAnalyzerStatus {
                 id: Some("stale-lsp".into()),
                 language: "python".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Stale,
                 reason_code: Some(ReasonCode::StaleRevision),
                 reason: Some("revision changed".into()),
             },
-            Tier3AnalyzerStatus {
+            TierAnalyzerStatus {
                 id: Some("ruby-lsp".into()),
                 language: "ruby".into(),
+                tier: default_tier(),
                 state: AnalyzerState::Skipped,
                 reason_code: Some(ReasonCode::WorkspaceUnsuitable),
                 reason: Some("Gemfile without Gemfile.lock".into()),
@@ -1579,9 +1594,10 @@ mod tests {
 
     #[test]
     fn hints_priority_order_is_array_order() {
-        let tier3_status = status_from_analyzers(vec![Tier3AnalyzerStatus {
+        let tier3_status = status_from_analyzers(vec![TierAnalyzerStatus {
             id: Some("rust-lsp".into()),
             language: "rust".into(),
+            tier: default_tier(),
             state: AnalyzerState::Running,
             reason_code: None,
             reason: None,
@@ -1685,14 +1701,14 @@ mod tests {
         .unwrap();
     }
 
-    fn status_from_analyzers(analyzers: Vec<Tier3AnalyzerStatus>) -> Tier3Status {
-        Tier3Status::from_body(Tier3StatusBody::from_analyzers(analyzers))
+    fn status_from_analyzers(analyzers: Vec<TierAnalyzerStatus>) -> TierStatus {
+        TierStatus::from_body(TierStatusBody::from_analyzers(analyzers))
     }
 
     fn emission_ctx<'a>(
         items_empty: bool,
         completeness: &'a Completeness,
-        tier3_status: &'a Tier3Status,
+        tier3_status: &'a TierStatus,
         query_args: QueryArgsView<'a>,
     ) -> EmissionContext<'a> {
         EmissionContext {

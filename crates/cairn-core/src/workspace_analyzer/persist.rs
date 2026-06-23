@@ -11,20 +11,21 @@ use crate::manifest::ManifestId;
 use super::WorkspaceFacts;
 
 /// 0.1.x persisted rust-analyzer refs under this alias instead of the
-/// uniform `tier3-<analyzer_id>` scheme. Cleared alongside the current
-/// source so reindexing does not leave duplicate rows behind. Remove
-/// this compatibility path after the 0.5.0 migration window closes.
+/// uniform `<tier_prefix>-<analyzer_id>` scheme. Cleared alongside the
+/// current source so reindexing does not leave duplicate rows behind.
+/// Remove this compatibility path after the 0.5.0 migration window closes.
 const LEGACY_RUST_REF_SOURCE: &str = "tier3-rust-analyzer";
 
 pub(super) fn persist_resolved_refs(
     conn: &mut Connection,
     manifest_id: ManifestId,
     analyzer_id: &str,
+    tier_prefix: &str,
     parser_id: &str,
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
     let tx = conn.transaction()?;
-    for source in ref_sources_to_clear(analyzer_id) {
+    for source in ref_sources_to_clear(analyzer_id, tier_prefix) {
         tx.execute(
             "DELETE FROM refs
               WHERE source = ?1
@@ -97,7 +98,7 @@ pub(super) fn persist_resolved_refs(
                 byte_start,
                 byte_end,
                 line,
-                ref_source(analyzer_id),
+                ref_source(tier_prefix, analyzer_id),
             ],
         )?;
         inserted += 1;
@@ -107,12 +108,12 @@ pub(super) fn persist_resolved_refs(
     Ok(inserted)
 }
 
-fn ref_source(analyzer_id: &str) -> String {
-    format!("tier3-{analyzer_id}")
+fn ref_source(tier_prefix: &str, analyzer_id: &str) -> String {
+    format!("{tier_prefix}-{analyzer_id}")
 }
 
-fn ref_sources_to_clear(analyzer_id: &str) -> Vec<String> {
-    let mut sources = vec![ref_source(analyzer_id)];
+fn ref_sources_to_clear(analyzer_id: &str, tier_prefix: &str) -> Vec<String> {
+    let mut sources = vec![ref_source(tier_prefix, analyzer_id)];
     if analyzer_id == "rust-analyzer-lsp" {
         sources.push(LEGACY_RUST_REF_SOURCE.to_string());
     }

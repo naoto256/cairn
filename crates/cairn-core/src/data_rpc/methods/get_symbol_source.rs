@@ -16,7 +16,7 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    compute_tier3_status_response, parser_id_filter,
+    compute_tier_status_response, parser_id_filter,
 };
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
@@ -91,7 +91,7 @@ impl DataMethod for GetSymbolSource {
                     materialise(&worktree_root, &row)?
                 };
                 let parser_ids = parser_id_filter(std::iter::once(row.parser_id.clone()));
-                let tier3_status = compute_tier3_status_response(
+                let tier3_status = compute_tier_status_response(
                     &conn,
                     manifest_id,
                     Some(&parser_ids),

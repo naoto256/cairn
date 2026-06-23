@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier3_status_for_query,
+    completeness_for_cap, limit_with_probe, parser_id_filter, tier_status_for_query,
     with_one_or_all_stores,
 };
 use crate::query::{self, FindSubtypesArgs as QueryArgs, ImplHit as QueryHit};
@@ -64,7 +64,7 @@ impl DataMethod for FindSubtypes {
         .await?;
         let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
         let items: Vec<_> = hits.into_iter().map(|(item, _)| item).collect();
-        let tier3_status = tier3_status_for_query(
+        let tier3_status = tier_status_for_query(
             ctx,
             args.scope.repo.clone(),
             args.scope.anchor.clone(),
