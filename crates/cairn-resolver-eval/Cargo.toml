@@ -1,0 +1,36 @@
+[package]
+name = "cairn-resolver-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Accuracy eval harness: golden Tier-2/Tier-3 expectations over mini-repo fixtures."
+publish = false
+
+[dependencies]
+cairn-core.workspace = true
+cairn-proto.workspace = true
+cairn-lang-api.workspace = true
+# Tier-2 (syntactic) backends — force-linked so their distributed-slice
+# entries reach this crate's binary. Tier-3 (LSP) backends are NOT
+# linked here: their analyzers require external LSP servers which are
+# not guaranteed in CI, so the harness fixes the Tier-2 baseline only
+# and leaves the `Tier3` track as a structural placeholder.
+cairn-lang-rust.workspace = true
+cairn-lang-python.workspace = true
+cairn-lang-typescript.workspace = true
+cairn-lang-java.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow = "1"
+tempfile = "3"
+rusqlite.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
