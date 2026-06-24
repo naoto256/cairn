@@ -24,6 +24,7 @@ cairn-lang-rust.workspace = true
 cairn-lang-python.workspace = true
 cairn-lang-typescript.workspace = true
 cairn-lang-java.workspace = true
+cairn-lang-ruby.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow = "1"

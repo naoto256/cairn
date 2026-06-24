@@ -64,6 +64,12 @@ pub struct GoldenCase {
     pub query: Query,
     /// Hits the Tier-2 (syntactic) resolver is expected to return.
     pub tier2_expected: Vec<ExpectedHit>,
+    /// Hits the Tier-2.5 (cross-file syntactic / direct-translation)
+    /// resolver is expected to return. Tier-2.5 backends emit
+    /// resolution rows with `kind_source = tier25-<lang>-resolver`,
+    /// supplying `target_symbol_id` where Tier-2 leaves the row at
+    /// name-only. Empty for languages without a Tier-2.5 backend.
+    pub tier25_expected: Vec<ExpectedHit>,
     /// Hits the Tier-3 (LSP) resolver is expected to return. Tier-3
     /// is currently not evaluated by the in-process runner (no LSPs
     /// in CI), so this is the future-baseline shape.
