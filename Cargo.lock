@@ -556,6 +556,7 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-java",
  "cairn-lang-python",
+ "cairn-lang-ruby",
  "cairn-lang-rust",
  "cairn-lang-typescript",
  "cairn-proto",

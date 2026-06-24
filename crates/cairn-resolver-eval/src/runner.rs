@@ -44,15 +44,22 @@ pub fn run_case(case: &GoldenCase) -> Result<EvalReport> {
 
     let actual = run_tool(&conn, case)?;
     let tier2 = TierReport::score(&case.tier2_expected, &actual);
+    // Tier-2.5 placeholder: the cross-file syntactic resolver is not
+    // wired into this in-process runner yet (Session B will land
+    // `cairn-lang-ruby-tier25` and its peers). Score against an empty
+    // actual set so cases that pin Tier-2.5 rows surface as `missing`
+    // until the resolver attaches.
+    let tier25 = TierReport::score(&case.tier25_expected, &[]);
     // Tier-3 placeholder: no LSP-driven path yet, so score against an
-    // empty actual set. When a Tier-2.5 / Tier-3 runner lands, swap
-    // `&[]` for its output here.
+    // empty actual set. When a Tier-3 runner lands, swap `&[]` for
+    // its output here.
     let tier3 = TierReport::score(&case.tier3_expected, &[]);
 
     Ok(EvalReport {
         case: case.name,
         language: case.language,
         tier2,
+        tier25,
         tier3,
     })
 }

@@ -104,6 +104,11 @@ pub struct EvalReport {
     pub case: &'static str,
     pub language: &'static str,
     pub tier2: TierReport,
+    /// Score for the Tier-2.5 (cross-file syntactic) resolver. Until
+    /// the per-language Tier-2.5 backend is wired into the runner the
+    /// actual set is empty and recall reflects nothing more than the
+    /// case author's promise.
+    pub tier25: TierReport,
     pub tier3: TierReport,
 }
 

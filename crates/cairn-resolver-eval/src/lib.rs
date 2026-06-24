@@ -40,6 +40,7 @@
 // the "register_repo parsed zero blobs" failure mode.
 use cairn_lang_java as _;
 use cairn_lang_python as _;
+use cairn_lang_ruby as _;
 use cairn_lang_rust as _;
 use cairn_lang_typescript as _;
 

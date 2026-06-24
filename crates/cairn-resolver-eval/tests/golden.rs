@@ -10,7 +10,9 @@
 //! Run `cargo test -p cairn-resolver-eval -- --nocapture` to see the
 //! per-case report.
 
-use cairn_resolver_eval::cases::{java_cases, python_cases, rust_cases, typescript_cases};
+use cairn_resolver_eval::cases::{
+    java_cases, python_cases, ruby_cases, rust_cases, typescript_cases,
+};
 use cairn_resolver_eval::runner::run_case;
 use cairn_resolver_eval::types::GoldenCase;
 
@@ -22,6 +24,12 @@ const RUST_FLOOR: f64 = 0.6;
 const PYTHON_FLOOR: f64 = 0.6;
 const TYPESCRIPT_FLOOR: f64 = 0.6;
 const JAVA_FLOOR: f64 = 0.6;
+// Ruby Tier-2 floor is intentionally 0.0: the Ruby cases are authored
+// against the Tier-2.5 spec, and several of their `tier2_expected`
+// rows are observational placeholders the Tier-2 backend may or may
+// not produce today. They will be tightened (and the floor raised)
+// once Session B's resolver lands and we have a stable joint baseline.
+const RUBY_FLOOR: f64 = 0.0;
 
 fn assert_tier2_floor(cases: Vec<GoldenCase>, floor: f64) {
     let mut total_recall = 0.0;
@@ -84,4 +92,56 @@ fn typescript_tier2_baseline() {
 #[test]
 fn java_tier2_baseline() {
     assert_tier2_floor(java_cases(), JAVA_FLOOR);
+}
+
+/// Ruby Tier-2 smoke: register the fixture and run every case without
+/// panicking. Recall is not gated yet (see `RUBY_FLOOR`); we just
+/// confirm the Tier-2 backend stays able to parse the fixtures and
+/// the queries return without error.
+#[test]
+fn ruby_tier2_baseline() {
+    assert_tier2_floor(ruby_cases(), RUBY_FLOOR);
+}
+
+/// Ruby Tier-2.5 baseline — gated behind `--ignored` because the
+/// `cairn-lang-ruby-tier25` resolver does not exist yet (Session B is
+/// landing it in parallel). The runner currently scores `tier25`
+/// against an empty actual set, so this test is expected to fail with
+/// "missing" rows that mirror `tier25_expected`. Once the resolver
+/// lands the runner gets wired up and this test loses `#[ignore]`.
+#[test]
+#[ignore = "cairn-lang-ruby-tier25 resolver not yet implemented (Session B)"]
+fn ruby_tier25_baseline() {
+    let cases = ruby_cases();
+    let mut total_recall = 0.0;
+    let mut counted = 0;
+    for case in &cases {
+        let report = run_case(case).unwrap_or_else(|e| panic!("case {}: {e}", case.name));
+        eprintln!(
+            "[{}/{}] T2.5 prec={:.2} recall={:.2} matched={} missing={} extra={}",
+            case.language,
+            case.name,
+            report.tier25.precision,
+            report.tier25.recall,
+            report.tier25.matched,
+            report.tier25.missing.len(),
+            report.tier25.extra.len(),
+        );
+        if !report.tier25.missing.is_empty() {
+            eprintln!("  missing: {:#?}", report.tier25.missing);
+        }
+        if !case.tier25_expected.is_empty() {
+            total_recall += report.tier25.recall;
+            counted += 1;
+        }
+    }
+    assert!(counted > 0, "no scoreable tier25 cases");
+    let avg_recall = total_recall / counted as f64;
+    // Tight floor once the resolver lands. Until then this assertion
+    // intentionally fails when `--ignored` is unset off, which is the
+    // signal that Session B has work to do.
+    assert!(
+        avg_recall >= 0.8,
+        "Tier-2.5 recall below floor: avg={avg_recall:.2} (resolver landed yet?)"
+    );
 }
