@@ -180,6 +180,7 @@ dependencies = [
  "cairn-lang-c",
  "cairn-lang-cpp",
  "cairn-lang-markdown",
+ "cairn-lang-objc",
  "cairn-lang-python",
  "cairn-lang-rust",
  "cairn-lang-typescript",
