@@ -500,10 +500,20 @@ fn insert_import(
 ) -> Result<()> {
     let line = i64::from(im.line);
     let reexport = i64::from(im.is_reexport);
+    // Schema v9: byte_range is Option<(u32, u32)> on the wire and
+    // NULL on disk when absent. Backends that don't yet ship a range
+    // (everything but Ruby `require` / `require_relative` today) get
+    // NULL stored, which the `find_imports` LEFT JOIN treats as
+    // "no resolution available".
+    let (byte_start, byte_end) = match im.byte_range {
+        Some((s, e)) => (Some(i64::from(s)), Some(i64::from(e))),
+        None => (None, None),
+    };
     tx.execute(
         "INSERT INTO imports
-           (blob_sha, parser_id, to_module, imported, alias, is_reexport, line)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+           (blob_sha, parser_id, to_module, imported, alias, is_reexport, line,
+            byte_start, byte_end)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             blob_sha,
             parser_id,
@@ -512,6 +522,8 @@ fn insert_import(
             im.alias,
             reexport,
             line,
+            byte_start,
+            byte_end,
         ],
     )?;
     Ok(())
@@ -811,6 +823,8 @@ mod tests {
                     alias: None,
                     is_reexport: false,
                     line: 1,
+
+                    byte_range: None,
                 }],
                 ..Default::default()
             },
@@ -821,6 +835,8 @@ mod tests {
                     alias: Some("mod_alias".into()),
                     is_reexport: true,
                     line: 2,
+
+                    byte_range: None,
                 }],
                 ..Default::default()
             }),
@@ -865,6 +881,8 @@ mod tests {
                     alias: None,
                     is_reexport: false,
                     line: 1,
+
+                    byte_range: None,
                 }],
             },
             semantic: None,

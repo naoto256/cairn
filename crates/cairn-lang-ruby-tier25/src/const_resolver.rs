@@ -366,6 +366,16 @@ impl<'a> Visitor<'a> {
                 let Some(lit) = string_literal(first, self.source) else {
                     return;
                 };
+                // Pin the resolution site at the string_content range
+                // (text between the quotes), matching what the Ruby
+                // syntactic pass emits as `ImportFact::byte_range`.
+                // This is what `find_imports` joins against in schema
+                // v9 — using `first.byte_range()` would include the
+                // quotes and miss every Tier-2 import row.
+                let (byte_start, byte_end) = match string_content_range(first) {
+                    Some(r) => (r.0, r.1),
+                    None => return,
+                };
                 self.facts.requires.push(RequireSite {
                     kind: if method == "require" {
                         RequireKind::Require
@@ -373,8 +383,8 @@ impl<'a> Visitor<'a> {
                         RequireKind::RequireRelative
                     },
                     literal: lit,
-                    byte_start: first.start_byte() as u32,
-                    byte_end: first.end_byte() as u32,
+                    byte_start,
+                    byte_end,
                 });
             }
             _ => {}
@@ -512,6 +522,22 @@ fn walk_scope_parts(node: Node<'_>, source: &[u8], out: &mut Vec<String>) {
             walk_scope_parts(name, source, out);
         }
     }
+}
+
+/// Byte range of the first `string_content` child of a `string` node —
+/// the bytes between the quotes. Mirrors the Ruby syntactic pass so
+/// the require-graph resolution sites line up with `imports.byte_*`.
+fn string_content_range(node: Node<'_>) -> Option<(u32, u32)> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "string_content" {
+            return Some((child.start_byte() as u32, child.end_byte() as u32));
+        }
+    }
+    None
 }
 
 fn string_literal(node: Node<'_>, source: &[u8]) -> Option<String> {

@@ -346,6 +346,8 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
                 alias: Some(default_alias),
                 is_reexport: false,
                 line,
+
+                byte_range: None,
             });
             emitted_any = true;
         }
@@ -367,6 +369,8 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
                                 alias,
                                 is_reexport: false,
                                 line,
+
+                                byte_range: None,
                             });
                             emitted_any = true;
                         }
@@ -380,6 +384,8 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
                             alias: Some(alias),
                             is_reexport: false,
                             line,
+
+                            byte_range: None,
                         });
                         emitted_any = true;
                     }
@@ -398,6 +404,8 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
             alias: None,
             is_reexport: false,
             line,
+
+            byte_range: None,
         });
     }
 }

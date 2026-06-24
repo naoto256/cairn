@@ -479,6 +479,8 @@ fn emit_use_clause(
         alias,
         is_reexport: false,
         line,
+
+        byte_range: None,
     });
 }
 

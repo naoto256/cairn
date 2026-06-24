@@ -61,6 +61,7 @@ impl DataMethod for FindImports {
                                 imported: h.imported,
                                 alias: h.alias,
                                 is_reexport: h.is_reexport,
+                                kind_source: h.kind_source,
                                 branch: anchor_label.clone(),
                                 location,
                                 line: h.line,
