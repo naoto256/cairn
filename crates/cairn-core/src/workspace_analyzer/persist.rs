@@ -8,7 +8,7 @@ use crate::cas::kind_conv::ref_kind_to_str;
 use crate::lsp::Location;
 use crate::manifest::ManifestId;
 
-use super::WorkspaceFacts;
+use super::{WorkspaceFacts, WorkspaceResolution};
 
 /// 0.1.x persisted rust-analyzer refs under this alias instead of the
 /// uniform `<tier_prefix>-<analyzer_id>` scheme. Cleared alongside the
@@ -118,6 +118,92 @@ fn ref_sources_to_clear(analyzer_id: &str, tier_prefix: &str) -> Vec<String> {
         sources.push(LEGACY_RUST_REF_SOURCE.to_string());
     }
     sources
+}
+
+/// Persist resolution-layer rows emitted by a workspace analyzer.
+///
+/// Mirrors [`persist_resolved_refs`]'s delete-then-insert pattern: any
+/// existing rows whose `source` matches `<tier_prefix>-<analyzer_id>` and
+/// whose blob belongs to this manifest are cleared first, then the new rows
+/// are inserted. The target symbol id is resolved lazily here by looking up
+/// `symbols` keyed by `(target_blob, parser_id, target_qualified)`, mirroring
+/// how the refs path maps LSP locations to symbol rows.
+pub(super) fn persist_resolutions(
+    conn: &mut Connection,
+    manifest_id: ManifestId,
+    analyzer_id: &str,
+    tier_prefix: &str,
+    parser_id: &str,
+    facts: &WorkspaceFacts,
+) -> Result<usize> {
+    let source = format!("{tier_prefix}-{analyzer_id}");
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM resolutions
+          WHERE source = ?1
+            AND site_blob_sha IN (
+                SELECT blob_sha FROM manifest_entries WHERE manifest_id = ?2
+            )",
+        params![source, manifest_id.0],
+    )?;
+
+    let mut inserted = 0;
+    for r in &facts.resolutions {
+        let Some(site_blob) = blob_for_path(&tx, manifest_id, &r.source_path)? else {
+            continue;
+        };
+        let Some(site_parser) = parser_for_blob(&tx, &site_blob, parser_id)? else {
+            continue;
+        };
+        let target_symbol_id = resolve_resolution_target(&tx, manifest_id, parser_id, r)?;
+        tx.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                site_blob,
+                site_parser,
+                i64::from(r.site_byte_range.start),
+                i64::from(r.site_byte_range.end),
+                r.kind.as_str(),
+                r.semantic_kind.map(|s| s.as_str()),
+                target_symbol_id,
+                source,
+            ],
+        )?;
+        inserted += 1;
+    }
+
+    tx.commit()?;
+    Ok(inserted)
+}
+
+fn resolve_resolution_target(
+    conn: &Connection,
+    manifest_id: ManifestId,
+    parser_id: &str,
+    r: &WorkspaceResolution,
+) -> Result<Option<i64>> {
+    let (Some(path), Some(qualified)) = (r.target_path.as_deref(), r.target_qualified.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(target_blob) = blob_for_path(conn, manifest_id, path)? else {
+        return Ok(None);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT id FROM symbols
+             WHERE blob_sha = ?1
+               AND parser_id = ?2
+               AND qualified = ?3
+             ORDER BY (byte_end - byte_start) ASC
+             LIMIT 1",
+            params![target_blob, parser_id, qualified],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?)
 }
 
 fn blob_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Result<Option<String>> {

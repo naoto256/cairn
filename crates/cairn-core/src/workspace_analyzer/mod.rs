@@ -21,6 +21,8 @@ pub use cairn_proto::RefKind;
 use linkme::distributed_slice;
 use serde::{Deserialize, Serialize};
 
+pub use crate::resolution::{ResolutionKind, SemanticKind};
+
 #[cfg(test)]
 use crate::Error;
 use crate::Result;
@@ -29,7 +31,7 @@ use crate::lsp::{Location, Position};
 use crate::manifest::ManifestEntry;
 use crate::manifest::ManifestId;
 #[cfg(test)]
-use crate::workspace_analyzer::persist::persist_resolved_refs;
+use crate::workspace_analyzer::persist::{persist_resolutions, persist_resolved_refs};
 #[cfg(test)]
 use crate::workspace_analyzer::run::{
     run_workspace_analyzers, run_workspace_analyzers_with_timeout,
@@ -146,7 +148,7 @@ impl AnalyzerProgress {
 /// dedup/noise-suppression code stay tier-agnostic — a new tier only needs to
 /// (a) extend this constant and (b) point its analyzer at the new prefix via
 /// [`WorkspaceAnalyzer::tier_prefix`].
-pub const WORKSPACE_TIER_PREFIXES: &[&str] = &["tier3"];
+pub const WORKSPACE_TIER_PREFIXES: &[&str] = &["tier3", "tier25"];
 
 /// Source string written by tree-sitter Tier-1 passes for backends that ship
 /// a single-file semantic enricher (`'rust-syn'` etc.). Workspace-analyzer
@@ -173,10 +175,16 @@ const TIER2_NATIVE_SOURCES: &[&str] = &["rust-syn"];
 #[must_use]
 pub fn source_rank_case_sql(column: &str) -> String {
     let mut sql = String::from("CASE");
+    // Tier-3 (LSP-class) is most authoritative; Tier-2.5 (in-process cross-file)
+    // ranks below it. We list tier25 first so its LIKE matches before the
+    // generic tier3 prefix loop below, then exclude tier25 from that loop.
+    sql.push_str(&format!(" WHEN {column} LIKE 'tier25-%' THEN 1"));
     for prefix in WORKSPACE_TIER_PREFIXES {
+        if *prefix == "tier25" {
+            continue;
+        }
         sql.push_str(&format!(" WHEN {column} LIKE '{prefix}-%' THEN 0"));
     }
-    sql.push_str(&format!(" WHEN {column} LIKE 'tier25-%' THEN 1"));
     sql.push_str(&format!(" WHEN {column} LIKE 'tier2-direct-%' THEN 2"));
     for source in TIER2_NATIVE_SOURCES {
         sql.push_str(&format!(" WHEN {column} = '{source}' THEN 3"));
@@ -279,6 +287,38 @@ pub struct WorkspaceFile {
 /// defaults.
 pub struct WorkspaceFacts {
     pub resolved_refs: Vec<ResolvedRef>,
+    /// Resolution-layer rows emitted by Tier-2.5+ analyzers. Persisted into the
+    /// `resolutions` table by [`crate::workspace_analyzer::persist`]. Empty by
+    /// default so existing LSP-class analyzers (Tier-3) keep returning facts
+    /// unchanged.
+    #[serde(default)]
+    pub resolutions: Vec<WorkspaceResolution>,
+}
+
+/// One persistence-shaped resolution emitted by a workspace analyzer.
+///
+/// Cairn has no global symbol-id at fact-emission time; analyzers carry the
+/// resolved target as `(target_path, target_qualified)` and the persist layer
+/// looks the row up in `symbols` keyed by `(blob_sha, parser_id, qualified)`.
+/// When both are `None` the row is recorded as "site observed, target
+/// unresolved" (matching `target_symbol_id = NULL` in the table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceResolution {
+    /// Source path relative to the registered repository root.
+    pub source_path: String,
+    /// Byte range of the site token inside `source_path`'s blob.
+    pub site_byte_range: std::ops::Range<u32>,
+    /// Site class.
+    pub kind: ResolutionKind,
+    /// Inheritance / conformance flavour; only meaningful when
+    /// [`Self::kind`] is [`ResolutionKind::Type`].
+    pub semantic_kind: Option<SemanticKind>,
+    /// Repo-root-relative path of the file containing the resolved target.
+    /// `None` when unresolved.
+    pub target_path: Option<String>,
+    /// Qualified name of the resolved target symbol (looked up against
+    /// `symbols.qualified`). `None` when unresolved.
+    pub target_qualified: Option<String>,
 }
 
 /// A reference resolved by a workspace analyzer.
@@ -574,6 +614,7 @@ mod tests {
         .unwrap();
 
         let facts = WorkspaceFacts {
+            resolutions: Vec::new(),
             resolved_refs: vec![ResolvedRef {
                 source_path: "src/main.rs".to_string(),
                 source_position: Position {
@@ -661,6 +702,7 @@ mod tests {
         .unwrap();
 
         let facts = WorkspaceFacts {
+            resolutions: Vec::new(),
             resolved_refs: vec![ResolvedRef {
                 source_path: "src/main.rs".to_string(),
                 source_position: Position {
@@ -751,6 +793,7 @@ mod tests {
         .unwrap();
 
         let facts = WorkspaceFacts {
+            resolutions: Vec::new(),
             resolved_refs: vec![ResolvedRef {
                 source_path: "pkg/b.py".to_string(),
                 source_position: Position {
@@ -854,6 +897,7 @@ mod tests {
         .unwrap();
 
         let facts = WorkspaceFacts {
+            resolutions: Vec::new(),
             resolved_refs: vec![ResolvedRef {
                 source_path: "src/main.rs".to_string(),
                 source_position: Position {
@@ -1090,6 +1134,139 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, "succeeded");
         assert_eq!(row.1, None);
+    }
+
+    #[test]
+    fn persist_resolutions_roundtrips_resolved_and_unresolved_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        let source_sha = "site-sha";
+        let target_sha = "target-sha";
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'main.rb', ?1), (1, 'foo.rb', ?2)",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'tree-sitter-ruby', 1, 0), (?2, 'tree-sitter-ruby', 1, 0)",
+            params![source_sha, target_sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES (?1, 'tree-sitter-ruby', 'Foo', 'Foo', 'class',
+                     0, 20, 1, 3, 'ruby')",
+            params![target_sha],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![
+                // Resolved type reference: Foo on main.rb resolves to Foo in foo.rb.
+                WorkspaceResolution {
+                    source_path: "main.rb".into(),
+                    site_byte_range: 10..13,
+                    kind: ResolutionKind::Type,
+                    semantic_kind: None,
+                    target_path: Some("foo.rb".into()),
+                    target_qualified: Some("Foo".into()),
+                },
+                // Unresolved: target absent.
+                WorkspaceResolution {
+                    source_path: "main.rb".into(),
+                    site_byte_range: 20..24,
+                    kind: ResolutionKind::Call,
+                    semantic_kind: None,
+                    target_path: None,
+                    target_qualified: None,
+                },
+            ],
+        };
+
+        let inserted = persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-tier25-resolver",
+            "tier25",
+            "tree-sitter-ruby",
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows: Vec<(i64, i64, String, Option<i64>, String)> = conn
+            .prepare(
+                "SELECT site_byte_start, site_byte_end, kind, target_symbol_id, source
+                 FROM resolutions ORDER BY site_byte_start",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].2, "type");
+        assert!(rows[0].3.is_some(), "Foo should resolve to symbol id");
+        assert_eq!(rows[0].4, "tier25-ruby-tier25-resolver");
+        assert_eq!(rows[1].2, "call");
+        assert!(
+            rows[1].3.is_none(),
+            "unresolved row keeps target_symbol_id NULL"
+        );
+
+        // Re-running with one fewer row should delete the existing rows for
+        // this source and reinsert the new set.
+        let facts2 = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "main.rb".into(),
+                site_byte_range: 30..33,
+                kind: ResolutionKind::Type,
+                semantic_kind: Some(SemanticKind::Inherit),
+                target_path: Some("foo.rb".into()),
+                target_qualified: Some("Foo".into()),
+            }],
+        };
+        let inserted = persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-tier25-resolver",
+            "tier25",
+            "tree-sitter-ruby",
+            &facts2,
+        )
+        .unwrap();
+        assert_eq!(inserted, 1);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM resolutions WHERE source = 'tier25-ruby-tier25-resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let semantic: Option<String> = conn
+            .query_row(
+                "SELECT semantic_kind FROM resolutions WHERE source = 'tier25-ruby-tier25-resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic.as_deref(), Some("inherit"));
     }
 
     fn tier3_ref_count(conn: &Connection) -> i64 {

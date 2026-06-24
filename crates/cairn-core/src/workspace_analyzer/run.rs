@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::manifest::{ManifestEntry, ManifestId};
 use crate::{Error, Result};
 
-use super::persist::persist_resolved_refs;
+use super::persist::{persist_resolutions, persist_resolved_refs};
 use super::{
     AnalyzerProgress, AnalyzerProgressObserver, WorkspaceAnalyzer, WorkspaceFile,
     all_workspace_analyzers,
@@ -203,6 +203,14 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
     ) {
         AnalyzerRun::Completed(Ok(facts)) => {
             let inserted_refs = persist_resolved_refs(
+                conn,
+                manifest_id,
+                analyzer_id,
+                tier_prefix,
+                parser_id,
+                &facts,
+            )?;
+            persist_resolutions(
                 conn,
                 manifest_id,
                 analyzer_id,

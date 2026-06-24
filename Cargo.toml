@@ -14,6 +14,7 @@ members = [
     "crates/cairn-lang-php",
     "crates/cairn-lang-php-tier3",
     "crates/cairn-lang-ruby",
+    "crates/cairn-lang-ruby-tier25",
     "crates/cairn-lang-ruby-tier3",
     "crates/cairn-lang-typescript",
     "crates/cairn-lang-typescript-tier3",
