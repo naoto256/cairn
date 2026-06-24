@@ -24,7 +24,7 @@
 /// Extensible: new variants can be added without a schema change since
 /// the column is `TEXT`. Keep [`ResolutionKind::as_str`] and the
 /// [`std::str::FromStr`] implementation in sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResolutionKind {
     /// A type reference: `extends Foo`, `: Protocol`, `Animal` in
     /// `class Dog(Animal)`, etc.
@@ -71,7 +71,7 @@ impl std::str::FromStr for ResolutionKind {
 /// in some backends. Lifting it onto a separately-sourced row lets the
 /// fact layer keep recording what the grammar literally said while the
 /// resolution layer records what it actually meant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SemanticKind {
     /// Class extension / single-parent inheritance.
     Inherit,

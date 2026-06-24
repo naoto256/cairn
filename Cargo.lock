@@ -439,6 +439,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-lang-ruby-tier25"
+version = "0.6.2"
+dependencies = [
+ "cairn-core",
+ "cairn-proto",
+ "linkme",
+ "tempfile",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-ruby",
+]
+
+[[package]]
 name = "cairn-lang-ruby-tier3"
 version = "0.6.2"
 dependencies = [
