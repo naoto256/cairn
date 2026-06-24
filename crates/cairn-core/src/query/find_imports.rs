@@ -1,7 +1,24 @@
+//! `find_imports` — list import edges visible from an anchor, with the
+//! resolution-layer LEFT JOIN that Stage 1 of the Tier-2.5 imports work
+//! introduced.
+//!
+//! Mirrors the find_impls Phase 4 pattern verbatim: the SQL LEFT JOINs
+//! `imports` against `resolutions` on the shared
+//! `(blob_sha, parser_id, byte_start, byte_end)` tuple, picks the
+//! highest-ranked source via `ROW_NUMBER() OVER (PARTITION BY …)`
+//! (there is no UNIQUE on `resolutions`, so multiple writers can land
+//! on the same site), and surfaces a `kind_source` provenance string.
+//! When no resolution covers the site — either because no resolver
+//! has run, or because the row pre-dates schema v9 and `byte_start` /
+//! `byte_end` are NULL — `kind_source` falls back to
+//! [`crate::query::KIND_SOURCE_FACT`] (`"tier2-fact"`).
+
 use rusqlite::{Connection, ToSql};
 
 use crate::Result;
 use crate::anchor::{self, AnchorName};
+use crate::query::KIND_SOURCE_FACT;
+use crate::workspace_analyzer::source_rank_case_sql;
 
 /// One import hit. Mirrors `cairn_proto::methods::ImportHit` minus
 /// the wire envelope (repo / branch).
@@ -14,6 +31,12 @@ pub struct ImportHit {
     pub is_reexport: bool,
     pub line: u32,
     pub parser_id: String,
+    /// Provenance for this import-site resolution. Either a
+    /// resolution-layer `source` string (e.g.
+    /// `"tier25-ruby-tier25-resolver"`) when a Tier-2.5+ resolver
+    /// pinned the site, or [`KIND_SOURCE_FACT`] (`"tier2-fact"`) when
+    /// the bare `imports` row was used as fallback.
+    pub kind_source: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,13 +64,41 @@ pub fn find_imports(
         })?;
     let limit = args.limit.unwrap_or(200).max(1);
 
-    let mut sql = String::from(
-        "SELECT me.path, i.to_module, i.imported, i.alias, i.is_reexport, i.line, i.parser_id
+    // Best-resolution CTE mirrors find_impls.rs verbatim: rank
+    // resolutions on the same site (no UNIQUE in the table, so multiple
+    // writers can land on one (blob, parser, byte_range) tuple) by
+    // `source_rank_case_sql`, then keep only `rn = 1`. The
+    // `kind = 'import'` filter excludes the type / call sites that
+    // share the same byte-range key space in `resolutions`.
+    let source_rank = source_rank_case_sql("source");
+    let mut sql = format!(
+        "WITH best_resolution AS (
+             SELECT site_blob_sha, site_parser_id,
+                    site_byte_start, site_byte_end,
+                    source,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY site_blob_sha, site_parser_id,
+                                     site_byte_start, site_byte_end
+                        ORDER BY {source_rank}, id
+                    ) AS rn
+               FROM resolutions
+              WHERE kind = 'import'
+         )
+         SELECT me.path, i.to_module, i.imported, i.alias, i.is_reexport,
+                i.line, i.parser_id,
+                CASE WHEN r.source IS NOT NULL THEN r.source ELSE '{KIND_SOURCE_FACT}' END
+                    AS kind_source
            FROM imports i
            JOIN manifest_entries me
              ON me.manifest_id = ?1
             AND me.blob_sha = i.blob_sha
-          WHERE 1=1",
+           LEFT JOIN best_resolution r
+             ON r.site_blob_sha = i.blob_sha
+            AND r.site_parser_id = i.parser_id
+            AND r.site_byte_start = i.byte_start
+            AND r.site_byte_end = i.byte_end
+            AND r.rn = 1
+          WHERE 1=1"
     );
     let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0)];
     if let Some(file) = args.file.as_deref()
@@ -71,6 +122,7 @@ pub fn find_imports(
                 is_reexport: row.get::<_, i64>(4)? != 0,
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
                 parser_id: row.get(6)?,
+                kind_source: row.get(7)?,
             })
         })?
         .collect();

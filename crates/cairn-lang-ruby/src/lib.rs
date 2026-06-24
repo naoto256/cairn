@@ -63,11 +63,15 @@ impl LanguageBackend for RubyBackend {
     }
 
     fn parser_revision(&self) -> u32 {
-        // v2: emit Type refs for base class / module / mixin name positions,
-        // stop skipping DECLARATIVE_CALLS (require / require_relative /
-        // autoload). Bumped with the Tier-2 emission policy restoration in
-        // the Stage 1 1st wave bundle.
-        2
+        // v3: ImportFact now carries the argument-string byte range for
+        // `require` / `require_relative`, so the Tier-2.5 require-graph
+        // resolver can pin its `resolutions` row at the exact site and
+        // `find_imports` can LEFT JOIN it. Old v2 rows lack the range
+        // (NULL on disk) and would JOIN to nothing; bumping the revision
+        // forces a re-parse so v3 rows ship with the new column populated.
+        // `load` / `autoload` still emit with no range — they are deferred
+        // to a follow-up bundle.
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -533,25 +537,36 @@ fn match_require(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     if first.kind() != "string" {
         return None;
     }
-    let to_module = string_content(first, source)?;
+    let content = string_content_node(first)?;
+    let to_module = node_text(content, source).to_string();
     if to_module.is_empty() {
         return None;
     }
+    // The argument string's content node (the bytes between the
+    // quotes) is what a require-graph resolver wants to pin its
+    // resolution at — both `require "foo"` and `require_relative
+    // "./foo"` reduce to the same site shape so a single Tier-2.5
+    // resolver can answer either form without re-parsing.
+    let range = content.byte_range();
     Some(ImportFact {
         to_module,
         imported: None,
         alias: None,
         is_reexport: false,
         line: line_of(node),
+        byte_range: Some((range.start as u32, range.end as u32)),
     })
 }
 
-fn string_content(string_node: Node<'_>, source: &[u8]) -> Option<String> {
+fn string_content_node(string_node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = string_node.walk();
     string_node
         .named_children(&mut cursor)
         .find(|c| c.kind() == "string_content")
-        .map(|c| node_text(c, source).to_string())
+}
+
+fn string_content(string_node: Node<'_>, source: &[u8]) -> Option<String> {
+    string_content_node(string_node).map(|c| node_text(c, source).to_string())
 }
 
 // ─── doc comments ──────────────────────────────────────────────────────────

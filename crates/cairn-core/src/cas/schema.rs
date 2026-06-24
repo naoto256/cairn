@@ -350,6 +350,25 @@ ALTER TABLE implementations ADD COLUMN interface_byte_start INTEGER;
 ALTER TABLE implementations ADD COLUMN interface_byte_end INTEGER;
 "#,
     },
+    Migration {
+        version: 9,
+        sql: r#"
+-- Tier-2.5 Stage 1 1st wave (Ruby imports): carry the import-site byte
+-- range so `find_imports` can LEFT JOIN against `resolutions` rows
+-- written by the require-graph resolver on the shared
+-- `(blob_sha, parser_id, byte_start, byte_end)` tuple — matching the
+-- pattern already used for `implementations` in Phase 4.
+--
+-- Both columns are NULL for legacy rows and for backends that do not
+-- yet ship a token range (only Ruby `require` / `require_relative`
+-- emit it today; `load` / `autoload` and the other language backends
+-- stay on the NULL fallback). The query layer's LEFT JOIN treats
+-- NULL as "no resolution available" and falls back to the
+-- `tier2-fact` provenance string, identical to find_impls.
+ALTER TABLE imports ADD COLUMN byte_start INTEGER;
+ALTER TABLE imports ADD COLUMN byte_end INTEGER;
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -373,7 +392,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 8);
+        assert_eq!(v, 9);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).
