@@ -5,6 +5,113 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.6.2] — 2026-06-24
+
+Patch release laying the structural groundwork for Tier-2.5 (a
+fact / resolution layer split) without changing existing wire
+behaviour, plus two Objective-C fixes uncovered in dogfood that
+were blocking the release.
+
+The headline shape is a four-phase walk: a new `resolutions` table
+in the index (Phase 1, empty), `syntactic_kind` emitted on every
+`ImplFact` from all 14 backends (Phase 2), Tier-2 direct
+resolution rows written for 8 languages (Phase 3), and queries
+finally reading from the resolutions table so `find_subtypes` /
+`find_supertypes` return `semantic_kind` ranked by source
+precedence (Phase 4). Existing fields are unchanged; new fields
+are additive with `#[serde(default)]` for old-client
+compatibility.
+
+### Added
+
+- **Resolution table schema.** New `resolutions` table in the
+  on-disk index reserves the storage shape for Tier-2.5; rows are
+  not yet written by the production path. Phase 1 of the Tier-2.5
+  rollout, kept as an empty-operation migration so the schema can
+  ship ahead of the writers (#193).
+- **`syntactic_kind` field on `ImplFact`.** Every Tier-2 fact now
+  carries the grammar-direct token that produced it (`class`,
+  `interface`, `trait`, `struct`, `protocol`, `enum`, …),
+  emitted from all 14 language backends. This is the substrate
+  the Phase 3/4 resolutions read; consumers that only need the
+  existing `kind` field are unaffected (#194).
+- **Tier-2 direct resolution rows for 8 languages.** Java, Ruby,
+  PHP, Objective-C, TypeScript, JavaScript, C++, and Swift now
+  emit `tier2-direct-<lang>` rows into the `resolutions` table
+  alongside their facts. These cover the cases where a single
+  file's grammar is enough to decide the semantic relation
+  (`class Foo extends Bar`, `class Baz implements Qux`,
+  `protocol P : Q`, …) without waiting on a Tier-3 resolver pass
+  (#195).
+- **`find_subtypes` / `find_supertypes` read from resolutions.**
+  Phase 4 wires the query path through the new table: results now
+  carry `semantic_kind` derived from resolutions, and the wire
+  ships an additive `kind_source` field whose value distinguishes
+  `tier2-fact` (existing behaviour), `tier2-direct-<lang>` (new
+  Phase 3 rows), `tier25-*` (reserved), and `tier3-*` (resolver
+  output). The legacy `kind` field is unchanged (#196).
+- **`tier3_status.analyzers[].tier` field (additive).** Per-
+  analyzer status now reports `"tier3"` today, with `"tier25"`
+  reserved for the upcoming Tier-2.5 surface. `#[serde(default)]`
+  keeps old clients reading the response (#191).
+
+### Changed
+
+- **Source provenance generalized from Tier-3 to tiered.** The
+  internal `Tier3Status*` types are renamed to `TierStatus*` and
+  the SQL is stripped of `tier3-` literal prefixes so the same
+  ranking machinery can serve Tier-2.5 sources next. Old type
+  names remain as `pub use` aliases to keep dependents compiling
+  (#191).
+- **`register.rs` split into a `register/` module.** The 1222-line
+  monolith is broken into `register/mod.rs` and
+  `register/header_detect.rs`; the C/C++ header detection that
+  decides whether `.h` is C, C++, or Objective-C now lives in its
+  own file. Behaviour is unchanged (#190).
+- **`cairn-lang-typescript-tier3` `TsSiteCollector` split.** The
+  983-line `src/lib.rs` is reduced to 535 lines by lifting the
+  site collector into its own module. Behaviour is unchanged
+  (#189).
+- **`find_subtypes` / `find_supertypes` ranking.** When the same
+  pair has rows at multiple tiers, results are now returned in
+  source-precedence order: `tier3` > `tier25` > `tier2-direct` >
+  `tier2-fact`. The first observed `kind_source` per (subject,
+  relation, object) wins (#196).
+
+### Fixed
+
+- **`.h` headers routed to the Objective-C backend.** Header
+  dispatch was previously fixed to C/C++ on extension alone, so
+  Apple framework headers were parsed as C++ and surfaced no
+  classes. `.h` is now content-classified, and ObjC `@interface`
+  / `@protocol` declarations in a `.h` file reach the ObjC
+  backend (#197).
+- **Apple `NS_ASSUME_NONNULL_BEGIN` macros no longer suppress
+  Objective-C class extraction.** The ObjC Tier-1 pre-process now
+  neutralizes the common nullability / availability macros
+  (`NS_ASSUME_NONNULL_BEGIN` / `_END`, `NS_SWIFT_NAME(...)`,
+  `NS_DESIGNATED_INITIALIZER`, …) before the grammar runs, so
+  `@interface` declarations in modern Apple headers parse and
+  produce class symbols (#198).
+
+### Tooling
+
+- **`cairn-resolver-eval` golden harness.** A new internal crate
+  exercises `find_subtypes` / `find_supertypes` against language-
+  curated fixtures and a baseline JSON, so changes to Tier-2 and
+  the forthcoming Tier-2.5 / Tier-3 paths can be regressed
+  against a known-good resolution set (#192).
+
+### Notable
+
+- Public Objective-C class hierarchy is visible for the first
+  time when reading modern Apple SDK headers (everything wrapped
+  in `NS_ASSUME_NONNULL_BEGIN`).
+- Cross-language type-relation queries can now distinguish a fact
+  derived directly from the file's own grammar from one resolved
+  by a Tier-3 analyzer, via the additive `kind_source` field on
+  `ImplHit`.
+
 ## [0.6.1] — 2026-06-18
 
 Patch release addressing hint polish from the 0.6.0 dogfood pass and
