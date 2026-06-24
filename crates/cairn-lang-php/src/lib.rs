@@ -58,6 +58,16 @@ impl LanguageBackend for PhpBackend {
         "tree-sitter-php"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // v2: ImportFact now carries the byte range of the imported
+        // `name` / `qualified_name` / `namespace_name` token for `use`
+        // statements (group form joins the prefix range with the suffix
+        // range as a covering span), so the Tier-2.5 require-graph
+        // resolver can pin its `resolutions` row at the exact site and
+        // `find_imports` can LEFT JOIN it.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         // `LANGUAGE_PHP` is the mixed HTML/PHP grammar: a `.php` file is
         // HTML with embedded `<?php ?>` sections, so the pure-PHP
@@ -422,18 +432,30 @@ fn first_string_argument(call: Node<'_>, source: &[u8]) -> Option<String> {
 fn emit_use_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
     let line = line_of(node);
     let mut group_prefix: Option<String> = None;
+    let mut group_prefix_range: Option<(u32, u32)> = None;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             // Group form: `use App\Traits\{...}` — the prefix sits
             // outside the braces as a bare namespace_name.
-            "namespace_name" => group_prefix = Some(node_text(child, source).to_string()),
-            "namespace_use_clause" => emit_use_clause(child, source, None, line, facts),
+            "namespace_name" => {
+                group_prefix = Some(node_text(child, source).to_string());
+                let r = child.byte_range();
+                group_prefix_range = Some((r.start as u32, r.end as u32));
+            }
+            "namespace_use_clause" => emit_use_clause(child, source, None, None, line, facts),
             "namespace_use_group" => {
                 let mut gc = child.walk();
                 for clause in child.named_children(&mut gc) {
                     if clause.kind() == "namespace_use_clause" {
-                        emit_use_clause(clause, source, group_prefix.as_deref(), line, facts);
+                        emit_use_clause(
+                            clause,
+                            source,
+                            group_prefix.as_deref(),
+                            group_prefix_range,
+                            line,
+                            facts,
+                        );
                     }
                 }
             }
@@ -446,6 +468,7 @@ fn emit_use_clause(
     clause: Node<'_>,
     source: &[u8],
     prefix: Option<&str>,
+    prefix_range: Option<(u32, u32)>,
     line: u32,
     facts: &mut SyntacticFacts,
 ) {
@@ -453,6 +476,7 @@ fn emit_use_clause(
     // The imported path is the first non-field name/qualified_name
     // child (the alias `name` carries the `alias` field and is skipped).
     let mut target: Option<String> = None;
+    let mut target_range: Option<(u32, u32)> = None;
     let mut cursor = clause.walk();
     if cursor.goto_first_child() {
         loop {
@@ -461,6 +485,8 @@ fn emit_use_clause(
                 && matches!(child.kind(), "name" | "qualified_name" | "namespace_name")
             {
                 target = Some(node_text(child, source).to_string());
+                let r = child.byte_range();
+                target_range = Some((r.start as u32, r.end as u32));
                 break;
             }
             if !cursor.goto_next_sibling() {
@@ -473,14 +499,23 @@ fn emit_use_clause(
         Some(p) => format!("{p}\\{path}"),
         None => path,
     };
+    // Anchor the import-site token at the imported path. For the group
+    // form (`use App\Traits\{Timestamps, SoftDeletes}`) each clause's
+    // resolution site covers the union of the prefix span and the
+    // clause-target span, so a require-graph resolver can pin its
+    // `resolutions` row on the same range `find_imports` joins against.
+    let byte_range = match (prefix_range, target_range) {
+        (Some((ps, _)), Some((_, te))) => Some((ps, te)),
+        (None, Some(r)) => Some(r),
+        _ => None,
+    };
     facts.imports.push(ImportFact {
         to_module,
         imported: None,
         alias,
         is_reexport: false,
         line,
-
-        byte_range: None,
+        byte_range,
     });
 }
 
