@@ -281,12 +281,14 @@ fn tier3_resolution_beats_tier25() {
     assert_eq!(hit.kind_source, "tier3-ts-lsp");
 }
 
-/// A resolution row with `semantic_kind IS NULL` (e.g. a future
-/// Tier-2.5 pass recording an unresolved site) must not override the
-/// fact-layer `implementations.kind`. Verifies the
-/// `semantic_kind IS NOT NULL` clause in the join CTE.
+/// A resolution row with `semantic_kind IS NULL` is valid as a
+/// provenance upgrade: the higher-rank source wins `kind_source`, and
+/// `kind` falls through to `implementations.kind` via COALESCE. Ruby
+/// Tier-2.5 (and other in-process resolvers) emit Type resolutions
+/// without semantic_kind because impl-edge classification was already
+/// fixed by Tier-2's grammar-direct emission.
 #[test]
-fn null_semantic_kind_resolution_does_not_clobber_tier2_direct() {
+fn null_semantic_kind_resolution_upgrades_kind_source_only() {
     let (_repo, _sha) = init_repo(&[(
         "src/pets.ts",
         "class Animal {}\n\
@@ -298,8 +300,8 @@ fn null_semantic_kind_resolution_does_not_clobber_tier2_direct() {
 
     // Phase 3 already wrote a `tier2-direct-typescript` row with
     // `semantic_kind = "inherit"`. Insert a higher-tier row with
-    // `semantic_kind = NULL`; the CTE filters NULL-semantic-kind rows
-    // out, so the tier2-direct row keeps winning.
+    // `semantic_kind = NULL`. The higher-rank row wins kind_source;
+    // kind value falls through to the existing implementations.kind.
     let (blob_sha, parser_id, start, end) = impl_site(&conn, "pets.ts").expect("pets.ts impl row");
     conn.execute(
         "INSERT INTO resolutions
@@ -324,7 +326,7 @@ fn null_semantic_kind_resolution_does_not_clobber_tier2_direct() {
         .find(|h| h.type_qualified == "Dog")
         .unwrap_or_else(|| panic!("missing Dog→Animal TS edge: {hits:?}"));
     assert_eq!(hit.kind, "inherit");
-    assert_eq!(hit.kind_source, "tier2-direct-typescript");
+    assert_eq!(hit.kind_source, "tier3-ts-lsp");
 }
 
 /// Resolutions whose `kind` is not `"type"` must be ignored — the
