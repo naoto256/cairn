@@ -103,14 +103,18 @@ fn ruby_tier2_baseline() {
     assert_tier2_floor(ruby_cases(), RUBY_FLOOR);
 }
 
-/// Ruby Tier-2.5 baseline — gated behind `--ignored` because the
-/// `cairn-lang-ruby-tier25` resolver does not exist yet (Session B is
-/// landing it in parallel). The runner currently scores `tier25`
-/// against an empty actual set, so this test is expected to fail with
-/// "missing" rows that mirror `tier25_expected`. Once the resolver
-/// lands the runner gets wired up and this test loses `#[ignore]`.
+/// Ruby Tier-2.5 baseline. The `cairn-lang-ruby-tier25` backend is
+/// force-linked from `cairn-resolver-eval` (via `use _` in `lib.rs`)
+/// and runs inside `register_repo`, persisting resolutions into the
+/// CAS store. The scored `actual` set is shared with the Tier-2 path:
+/// `find_subtypes` / `find_supertypes` already LEFT JOIN the
+/// `resolutions` table (Phase 4, see `find_impls.rs`); `find_references`
+/// gained the parallel join in the same pass (see `find_references.rs`),
+/// so cases 4-7 surface Tier-2.5-resolved rows too. Case 8 is the
+/// "retreat line" — dynamic dispatch that Tier-2.5 MUST NOT resolve
+/// — and carries an empty `tier25_expected`, exempting it from the
+/// averaged recall floor.
 #[test]
-#[ignore = "cairn-lang-ruby-tier25 resolver not yet implemented (Session B)"]
 fn ruby_tier25_baseline() {
     let cases = ruby_cases();
     let mut total_recall = 0.0;

@@ -149,6 +149,7 @@ cairn-lang-markdown = { version = "0.6.2", path = "crates/cairn-lang-markdown" }
 cairn-lang-php = { version = "0.6.2", path = "crates/cairn-lang-php" }
 cairn-lang-php-tier3 = { version = "0.6.2", path = "crates/cairn-lang-php-tier3" }
 cairn-lang-ruby = { version = "0.6.2", path = "crates/cairn-lang-ruby" }
+cairn-lang-ruby-tier25 = { version = "0.6.2", path = "crates/cairn-lang-ruby-tier25" }
 cairn-lang-ruby-tier3 = { version = "0.6.2", path = "crates/cairn-lang-ruby-tier3" }
 cairn-lang-typescript = { version = "0.6.2", path = "crates/cairn-lang-typescript" }
 cairn-lang-typescript-tier3 = { version = "0.6.2", path = "crates/cairn-lang-typescript-tier3" }

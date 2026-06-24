@@ -570,6 +570,7 @@ dependencies = [
  "cairn-lang-java",
  "cairn-lang-python",
  "cairn-lang-ruby",
+ "cairn-lang-ruby-tier25",
  "cairn-lang-rust",
  "cairn-lang-typescript",
  "cairn-proto",
