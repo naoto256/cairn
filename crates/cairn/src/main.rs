@@ -29,6 +29,7 @@ use cairn_lang_php_tier3 as _;
 use cairn_lang_php_tier25 as _;
 use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
+use cairn_lang_python_tier25 as _;
 use cairn_lang_ruby as _;
 use cairn_lang_ruby_tier3 as _;
 use cairn_lang_ruby_tier25 as _;
@@ -151,6 +152,7 @@ mod tests {
                 "php-resolver",
                 "phpantom-lsp",
                 "pyright-lsp",
+                "python-resolver",
                 "ruby-lsp",
                 "ruby-resolver",
                 "rust-analyzer-lsp",

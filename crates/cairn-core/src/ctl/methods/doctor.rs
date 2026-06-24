@@ -854,6 +854,7 @@ mod tests {
             "php-resolver",
             "phpantom-lsp",
             "pyright-lsp",
+            "python-resolver",
             "ruby-lsp",
             "ruby-resolver",
             "rust-analyzer-lsp",
