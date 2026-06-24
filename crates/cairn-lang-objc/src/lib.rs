@@ -40,6 +40,7 @@
 #![forbid(unsafe_code)]
 
 mod analyzer;
+mod macros;
 
 use std::sync::Arc;
 
@@ -74,7 +75,14 @@ impl LanguageBackend for ObjcBackend {
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_objc::LANGUAGE.into();
-        let mut facts = extract(source, &language, ObjcVisitor::new())?;
+        // Blank known Apple SDK decoration macros (NS_ASSUME_NONNULL_BEGIN,
+        // NS_SWIFT_NAME(...), __attribute__((...)), etc.) before parsing.
+        // tree-sitter-objc treats these as unknown tokens and folds the
+        // following `@interface` into an ERROR node, so they must be
+        // neutralized for the class extractor to see anything in Apple-
+        // style headers. Whitespace replacement preserves byte offsets.
+        let preprocessed = macros::neutralize_apple_macros(source);
+        let mut facts = extract(&preprocessed, &language, ObjcVisitor::new())?;
         resolve_same_file_callees(&mut facts);
         Ok(facts)
     }
@@ -1207,6 +1215,84 @@ int global = 0;
             .find(|r| r.target_name == "find")
             .expect("find call");
         assert_eq!(call.target_qualified, None);
+    }
+
+    #[test]
+    fn extracts_class_inside_ns_assume_nonnull_wrapper() {
+        // Apple SDK headers (and dependents like AFNetworking) wrap every
+        // declaration in NS_ASSUME_NONNULL_BEGIN/END. tree-sitter-objc
+        // does not model the macro and falls into ERROR recovery, so
+        // without the pre-parse blanking the class symbol is never
+        // emitted. Regression test for the bug fixed in this commit.
+        let src = br#"NS_ASSUME_NONNULL_BEGIN
+
+@interface AFHTTPSessionManager : AFURLSessionManager <NSSecureCoding, NSCopying>
+- (void)foo;
+@end
+
+NS_ASSUME_NONNULL_END
+"#;
+        let facts = facts(src);
+        let cls = find(&facts, "AFHTTPSessionManager");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        // Line range survives the macro blanking unchanged (line 3 of the
+        // source: BEGIN, blank, @interface).
+        assert_eq!(cls.line_range.start, 3);
+        assert_eq!(
+            find(&facts, "AFHTTPSessionManager.foo").kind,
+            SymbolKind::Method
+        );
+    }
+
+    #[test]
+    fn extracts_class_with_swift_name_macro_between_name_and_colon() {
+        let src = br#"
+@interface Foo NS_SWIFT_NAME(BarSwift) : Base
+@end
+"#;
+        let facts = facts(src);
+        let cls = find(&facts, "Foo");
+        assert_eq!(cls.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn extracts_class_with_attribute_decoration() {
+        let src = br#"
+__attribute__((deprecated("use NewFoo"))) @interface Foo : Bar
+@end
+"#;
+        let facts = facts(src);
+        assert_eq!(find(&facts, "Foo").kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn extracts_category_inside_ns_assume_nonnull() {
+        let src = br#"NS_ASSUME_NONNULL_BEGIN
+@interface Foo (Logging)
+- (void)log;
+@end
+NS_ASSUME_NONNULL_END
+"#;
+        let facts = facts(src);
+        let category = facts
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Impl && s.name == "Foo")
+            .expect("category Impl row");
+        assert_eq!(category.kind, SymbolKind::Impl);
+        assert_eq!(find(&facts, "Foo.log").kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn extracts_class_with_class_availability_macro() {
+        // `NS_CLASS_AVAILABLE_IOS(7_0)` is a function-form macro before
+        // `@interface`. Caught by the NS_CLASS_AVAILABLE prefix family.
+        let src = br#"
+NS_CLASS_AVAILABLE_IOS(7_0) @interface Foo : Bar
+@end
+"#;
+        let facts = facts(src);
+        assert_eq!(find(&facts, "Foo").kind, SymbolKind::Class);
     }
 
     #[test]
