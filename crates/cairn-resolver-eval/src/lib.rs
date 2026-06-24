@@ -44,6 +44,13 @@ use cairn_lang_ruby as _;
 use cairn_lang_rust as _;
 use cairn_lang_typescript as _;
 
+// Same trick for the Tier-2.5 cross-file syntactic backend. Without
+// this, `linkme`'s `WORKSPACE_ANALYZERS` slot stays empty in the test
+// binary (the workspace-Cargo dep alone is not enough — DCE drops the
+// crate when nothing references its symbols) and the resolver is
+// silently skipped, leaving `resolutions` rows un-emitted.
+use cairn_lang_ruby_tier25 as _;
+
 pub mod cases;
 pub mod fixture;
 pub mod report;

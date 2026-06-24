@@ -25,6 +25,11 @@ cairn-lang-python.workspace = true
 cairn-lang-typescript.workspace = true
 cairn-lang-java.workspace = true
 cairn-lang-ruby.workspace = true
+# Tier-2.5 (cross-file syntactic) Ruby backend. Force-linked so its
+# `WORKSPACE_ANALYZERS` distributed-slice entry reaches this crate's
+# binary; `register_repo` then invokes it automatically through
+# `run_registered_workspace_analyzers` and persists its resolutions.
+cairn-lang-ruby-tier25.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow = "1"

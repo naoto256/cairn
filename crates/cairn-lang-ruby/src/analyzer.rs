@@ -27,9 +27,26 @@
 //!   dispatch (`send(:name)`, `method_missing`) is not resolved — `send`
 //!   itself appears as the call target.
 //!
-//! `require` / `require_relative` imports are emitted by the
-//! **syntactic** pass (like Go), so this analyzer leaves
-//! `SemanticFacts.imports` empty rather than duplicating rows.
+//! - **type refs** — the base-class name in `class Dog < Animal` and the
+//!   mixin module names in `include M` / `extend M` / `prepend M` are
+//!   emitted as [`RefKind::Type`] rows with `target_qualified = None`
+//!   (the token text lives in `target_name`; Tier-2.5 resolves it into a
+//!   `symbols.qualified`). This is intentional layering: Tier-2 emits
+//!   the syntactic site, Tier-2.5 / Tier-3 resolve the target. Without
+//!   this, `find_callers` over a class name returns nothing for
+//!   base-class / mixin sites.
+//! - **require-family calls** (`require`, `require_relative`, `load`,
+//!   `autoload`) are emitted as [`RefKind::Call`] like any other call.
+//!   The "is this a declaration?" classification belongs to the
+//!   consumer (Tier-2.5 / Tier-3 / the UI), not to the syntactic pass.
+//!   Pure declaration / visibility verbs (`attr_*`, visibility markers,
+//!   `define_method`, and the mixin verbs themselves) remain skipped
+//!   because they are already represented as symbols or impl edges.
+//!
+//! `require` / `require_relative` imports are also emitted by the
+//! **syntactic** pass as import edges (like Go), so this analyzer
+//! leaves `SemanticFacts.imports` empty rather than duplicating rows —
+//! the Call ref above is the *call-site* view, not the import edge.
 //!
 //! Qualified names mirror the syntactic pass exactly: containers join
 //! with `::`, instance methods attach with `#`, singleton methods with
@@ -101,12 +118,18 @@ fn resolve_same_file_callees(methods: &HashMap<String, String>, facts: &mut Sema
     }
 }
 
-/// Declaration-shaped call names the ref pass skips: they are either
-/// represented as symbols / imports / impl edges already, or are
-/// visibility markers rather than meaningful call targets.
+/// Declaration / visibility verbs the ref pass skips: they are either
+/// represented as symbols / impl edges already (mixin verbs, `attr_*`,
+/// `define_method`) or are visibility markers rather than meaningful
+/// call targets (`private` / `protected` / `public` / `module_function`).
+///
+/// The require-family verbs (`require`, `require_relative`, `load`,
+/// `autoload`) are intentionally **not** in this list: they are real
+/// call sites, and downstream tiers (Tier-2.5 require-graph,
+/// `find_callers require_relative`) need them as Call refs. The
+/// "this is a load-time declaration, not a runtime call" judgement
+/// belongs to the consumer, not to the syntactic pass.
 const DECLARATIVE_CALLS: &[&str] = &[
-    "require",
-    "require_relative",
     "attr_accessor",
     "attr_reader",
     "attr_writer",
@@ -257,13 +280,28 @@ fn emit_superclass(
         return;
     }
     let range = expr.byte_range();
+    let line = line_of(class_node);
     facts.impls.push(ImplFact {
         type_qualified: type_qualified.to_string(),
-        interface_qualified: Some(base),
+        interface_qualified: Some(base.clone()),
         kind: "inherit".to_string(),
         syntactic_kind: Some(SyntacticKind::LessThan),
-        line: line_of(class_node),
+        line,
         interface_byte_range: Some((range.start as u32, range.end as u32)),
+    });
+    // Tier-2 also surfaces the base-class name as a Type ref so
+    // `find_callers Animal` returns the `Dog < Animal` site without
+    // a resolution-layer assist. Tier-2.5 fills `target_qualified`
+    // later by joining `resolutions` on `(blob, byte_range, kind)`.
+    facts.refs.push(RefFact {
+        target_name: base,
+        target_qualified: None,
+        kind: RefKind::Type,
+        type_role: None,
+        enclosing_idx: None,
+        enclosing_qualified: Some(type_qualified.to_string()),
+        byte_range: range,
+        line,
     });
 }
 
@@ -349,11 +387,25 @@ fn emit_mixins(
         let range = arg.byte_range();
         facts.impls.push(ImplFact {
             type_qualified: type_qualified.clone(),
-            interface_qualified: Some(module),
+            interface_qualified: Some(module.clone()),
             kind: verb.to_string(),
             syntactic_kind: Some(syntactic),
             line,
             interface_byte_range: Some((range.start as u32, range.end as u32)),
+        });
+        // Same rationale as `emit_superclass`: emit the mixin module
+        // name as a Type ref so cross-file callers ("who mentions
+        // Loggable?") light up at Tier-2 without a resolution-layer
+        // assist.
+        facts.refs.push(RefFact {
+            target_name: module,
+            target_qualified: None,
+            kind: RefKind::Type,
+            type_role: None,
+            enclosing_idx: None,
+            enclosing_qualified: Some(type_qualified.clone()),
+            byte_range: range,
+            line,
         });
     }
 }
@@ -568,10 +620,13 @@ end
     }
 
     #[test]
-    fn declarative_calls_not_emitted_as_refs() {
+    fn declaration_only_calls_not_emitted_as_refs() {
+        // Declaration / visibility verbs are skipped: `include` is an
+        // impl edge, `attr_reader` is a symbol, `private` is a marker.
+        // Require-family calls (`require`, `require_relative`) are NOT
+        // in this list — they emit as Call refs so cross-file callers
+        // can find them. See `require_family_emits_as_call_ref` below.
         let src = "\
-require \"json\"
-
 class C
   include M
   attr_reader :x
@@ -579,7 +634,77 @@ class C
 end
 ";
         let f = semantic(src);
-        assert!(calls(&f).is_empty());
+        assert!(calls(&f).is_empty(), "got {:?}", calls(&f));
+    }
+
+    #[test]
+    fn require_family_emits_as_call_ref() {
+        // The syntactic pass treats `require` / `require_relative` /
+        // `load` / `autoload` as ordinary calls. Whether they are
+        // "really" runtime calls or load-time declarations is a
+        // judgement for Tier-2.5 / Tier-3 / the UI to make.
+        let f = semantic("require \"json\"\nrequire_relative \"util\"\nload \"x.rb\"\n");
+        let names: Vec<&str> = calls(&f).iter().map(|r| r.target_name.as_str()).collect();
+        assert_eq!(names, &["require", "require_relative", "load"]);
+        // Targets are name-only: Tier-2.5 resolves the require graph.
+        assert!(calls(&f).iter().all(|r| r.target_qualified.is_none()));
+    }
+
+    // ─── refs: types ───────────────────────────────────────────────
+
+    #[test]
+    fn superclass_emits_type_ref() {
+        let f = semantic(
+            "class Dog < Animal
+end
+",
+        );
+        let types: Vec<&RefFact> = f.refs.iter().filter(|r| r.kind == RefKind::Type).collect();
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].target_name, "Animal");
+        // Resolution is left to Tier-2.5.
+        assert_eq!(types[0].target_qualified, None);
+        assert_eq!(types[0].enclosing_qualified.as_deref(), Some("Dog"));
+    }
+
+    #[test]
+    fn mixin_modules_emit_type_refs() {
+        let src = "class W
+  include Loggable
+  extend Helpers
+  prepend Patch
+end
+";
+        let f = semantic(src);
+        let names: Vec<&str> = f
+            .refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Type)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert_eq!(names, &["Loggable", "Helpers", "Patch"]);
+        // Enclosing is the class the mixin sits inside.
+        assert!(
+            f.refs
+                .iter()
+                .filter(|r| r.kind == RefKind::Type)
+                .all(|r| r.enclosing_qualified.as_deref() == Some("W"))
+        );
+    }
+
+    #[test]
+    fn scoped_superclass_type_ref_keeps_full_path() {
+        let f = semantic(
+            "class E < Base::Animal
+end
+",
+        );
+        let t = f
+            .refs
+            .iter()
+            .find(|r| r.kind == RefKind::Type)
+            .expect("type ref missing");
+        assert_eq!(t.target_name, "Base::Animal");
     }
 
     #[test]
