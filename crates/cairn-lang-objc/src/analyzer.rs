@@ -38,7 +38,11 @@ impl Analyzer for ObjcAnalyzer {
         if parser.set_language(&language).is_err() {
             return Ok(SemanticFacts::default());
         }
-        let Some(tree) = parser.parse(source, None) else {
+        // Same Apple-macro pre-pass as the Tier-1 extractor — without
+        // it `NS_ASSUME_NONNULL_BEGIN` wrapping breaks `class_interface`
+        // recognition and we never see the inherit / implement edges.
+        let preprocessed = super::macros::neutralize_apple_macros(source);
+        let Some(tree) = parser.parse(&preprocessed, None) else {
             return Ok(SemanticFacts::default());
         };
 
@@ -48,7 +52,7 @@ impl Analyzer for ObjcAnalyzer {
             enclosing: None,
             member_qualifieds: HashMap::new(),
         };
-        walker.walk(tree.root_node(), source);
+        walker.walk(tree.root_node(), &preprocessed);
         walker.resolve_same_file_member_calls();
         Ok(walker.facts)
     }
@@ -552,6 +556,54 @@ mod tests {
         assert!(semantic("").refs.is_empty());
         let facts = semantic("@interface Broken : ");
         assert!(facts.impls.is_empty() || facts.impls.iter().all(|i| i.type_qualified == "Broken"));
+    }
+
+    #[test]
+    fn inherit_edge_emitted_through_ns_assume_nonnull_wrapper() {
+        // Real-world AFNetworking shape: wrapper macros around a class
+        // declaration with superclass + protocol list. Without the
+        // Apple-macro pre-pass tree-sitter-objc fails to produce a
+        // `class_interface` node and no impl rows are emitted.
+        let src = "NS_ASSUME_NONNULL_BEGIN\n\
+                   \n\
+                   @interface AFHTTPSessionManager : AFURLSessionManager <NSSecureCoding, NSCopying>\n\
+                   @end\n\
+                   \n\
+                   NS_ASSUME_NONNULL_END\n";
+        let impls = impls(src);
+        let inherit = impls
+            .iter()
+            .find(|i| i.kind == "inherit")
+            .expect("inherit edge missing");
+        assert_eq!(inherit.type_qualified, "AFHTTPSessionManager");
+        assert_eq!(
+            inherit.interface_qualified.as_deref(),
+            Some("AFURLSessionManager")
+        );
+        assert_eq!(inherit.syntactic_kind, Some(SyntacticKind::InterfaceColon));
+
+        let implement_kinds: Vec<&str> = impls
+            .iter()
+            .filter(|i| i.kind == "implement")
+            .filter_map(|i| i.interface_qualified.as_deref())
+            .collect();
+        assert!(implement_kinds.contains(&"NSSecureCoding"));
+        assert!(implement_kinds.contains(&"NSCopying"));
+    }
+
+    #[test]
+    fn category_inside_ns_assume_nonnull_still_emits_extension() {
+        let src = "NS_ASSUME_NONNULL_BEGIN\n\
+                   @interface Foo (Logging)\n\
+                   @end\n\
+                   NS_ASSUME_NONNULL_END\n";
+        let impls = impls(src);
+        let ext = impls
+            .iter()
+            .find(|i| i.kind == "extension")
+            .expect("category extension edge missing");
+        assert_eq!(ext.type_qualified, "Foo");
+        assert_eq!(ext.syntactic_kind, Some(SyntacticKind::Category));
     }
 
     #[test]
