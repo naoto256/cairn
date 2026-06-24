@@ -31,7 +31,7 @@ pub struct ReferenceHit {
     pub parser_id: String,
     /// Provenance for [`Self::target_qualified`] / [`Self::kind`].
     /// Either a resolution-layer `source` string (e.g.
-    /// `"tier25-ruby-tier25-resolver"`, `"tier3-pyright-lsp"`) when a
+    /// `"tier25-ruby-resolver"`, `"tier3-pyright-lsp"`) when a
     /// `resolutions`-table row covered this site and supplied the
     /// resolved target / kind, or [`KIND_SOURCE_FACT`] (`"tier2-fact"`)
     /// when only the Tier-2 `refs` row was available. Phase 4 of the

@@ -871,7 +871,7 @@ pub struct ImportHit {
     pub is_reexport: bool,
     /// Provenance for the import-site resolution. Either a
     /// resolution-layer `source` string (e.g.
-    /// `"tier25-ruby-tier25-resolver"`, `"tier3-pyright-lsp"`) when
+    /// `"tier25-ruby-resolver"`, `"tier3-pyright-lsp"`) when
     /// a Tier-2.5+ require-graph resolver pinned the site, or
     /// `"tier2-fact"` when the bare Tier-2 `imports` row was used as
     /// fallback. Older daemons that predate Stage 1 of the Tier-2.5
@@ -988,7 +988,7 @@ pub struct FindReferenceHit {
     pub kind: RefKind,
     /// Provenance for [`Self::target_qualified`] / [`Self::kind`].
     /// Either a resolution-layer `source` string (e.g.
-    /// `"tier25-ruby-tier25-resolver"`, `"tier3-pyright-lsp"`) when the
+    /// `"tier25-ruby-resolver"`, `"tier3-pyright-lsp"`) when the
     /// row's qualified target / kind came through the `resolutions`
     /// table, or `"tier2-fact"` when only the Tier-2 `refs` row was
     /// available. Older daemons that predate Phase 4 of the Tier-2.5
@@ -1133,7 +1133,7 @@ pub struct CallHit {
     /// [`FindReferenceHit::kind_source`]. `"tier2-fact"` when the
     /// callee resolution came purely from the Tier-2 `refs` row,
     /// otherwise the resolution-layer `source` string (e.g.
-    /// `"tier25-ruby-tier25-resolver"`).
+    /// `"tier25-ruby-resolver"`).
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
     /// Qualified name of the enclosing function — the caller side of

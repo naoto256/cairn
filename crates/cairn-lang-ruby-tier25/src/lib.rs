@@ -54,9 +54,9 @@ use dispatch::MethodIndex;
 use mro::Mro;
 use require_graph::RequireGraph;
 
-pub const ANALYZER_ID: &str = "ruby-tier25-resolver";
+pub const ANALYZER_ID: &str = "ruby-resolver";
 pub const TIER_PREFIX: &str = "tier25";
-pub const ANALYZER_REVISION: u32 = 1;
+pub const ANALYZER_REVISION: u32 = 2;
 pub const PARSER_ID: &str = "tree-sitter-ruby";
 pub const RESOLUTION_SOURCE: &str = "tier25-ruby-resolver";
 

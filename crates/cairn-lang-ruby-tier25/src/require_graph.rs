@@ -32,7 +32,22 @@ impl RequireGraph {
                     RequireKind::RequireRelative => {
                         resolve_relative(path, &req.literal, file_paths)
                     }
-                    RequireKind::Require => resolve_workspace_require(&req.literal, &workspace),
+                    RequireKind::Require | RequireKind::Autoload => {
+                        // `require "foo"` and `autoload :Foo, "foo"` both
+                        // resolve through the same workspace lookup: bare
+                        // name + optional `lib/` / `app/` prefix, tried
+                        // with the `.rb` suffix.
+                        resolve_workspace_require(&req.literal, &workspace)
+                    }
+                    RequireKind::Load => {
+                        // `load "./foo.rb"` literals are almost always
+                        // path-shaped; try a relative resolve first (so
+                        // `lib/main.rb`'s `load "./sub.rb"` lands on
+                        // `lib/sub.rb`), and fall back to the workspace
+                        // lookup when the literal is a bare name.
+                        resolve_relative(path, &req.literal, file_paths)
+                            .or_else(|| resolve_workspace_require(&req.literal, &workspace))
+                    }
                 };
                 list.push(RequireEdge {
                     site_byte_start: req.byte_start,

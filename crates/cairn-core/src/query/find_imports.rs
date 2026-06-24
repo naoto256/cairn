@@ -33,7 +33,7 @@ pub struct ImportHit {
     pub parser_id: String,
     /// Provenance for this import-site resolution. Either a
     /// resolution-layer `source` string (e.g.
-    /// `"tier25-ruby-tier25-resolver"`) when a Tier-2.5+ resolver
+    /// `"tier25-ruby-resolver"`) when a Tier-2.5+ resolver
     /// pinned the site, or [`KIND_SOURCE_FACT`] (`"tier2-fact"`) when
     /// the bare `imports` row was used as fallback.
     pub kind_source: String,

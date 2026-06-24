@@ -66,12 +66,13 @@ impl LanguageBackend for RubyBackend {
         // v3: ImportFact now carries the argument-string byte range for
         // `require` / `require_relative`, so the Tier-2.5 require-graph
         // resolver can pin its `resolutions` row at the exact site and
-        // `find_imports` can LEFT JOIN it. Old v2 rows lack the range
-        // (NULL on disk) and would JOIN to nothing; bumping the revision
-        // forces a re-parse so v3 rows ship with the new column populated.
-        // `load` / `autoload` still emit with no range — they are deferred
-        // to a follow-up bundle.
-        3
+        // `find_imports` can LEFT JOIN it.
+        // v4: `load "foo.rb"` and `autoload :Foo, "foo"` now emit
+        // ImportFact rows with the same `string_content` byte range as
+        // `require` / `require_relative`, so the Tier-2.5 require-graph
+        // resolver can pin them too. Pre-v4 rows lack these imports
+        // entirely; bumping the revision forces a re-parse.
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -365,8 +366,13 @@ impl RubyVisitor {
             "attr_accessor" | "attr_reader" | "attr_writer" => {
                 self.emit_attrs(node, source, facts);
             }
-            "require" | "require_relative" => {
+            "require" | "require_relative" | "load" => {
                 if let Some(import) = match_require(node, source) {
+                    facts.imports.push(import);
+                }
+            }
+            "autoload" => {
+                if let Some(import) = match_autoload(node, source) {
                     facts.imports.push(import);
                 }
             }
@@ -529,8 +535,10 @@ fn modifier_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
     }
 }
 
-/// `require "json"` / `require_relative "../lib/util"` → one
-/// [`ImportFact`] with the string verbatim as the module path.
+/// `require "json"` / `require_relative "../lib/util"` /
+/// `load "foo.rb"` → one [`ImportFact`] with the string verbatim as the
+/// module path. The first string argument is the file/module literal
+/// for all three verbs, so a single matcher serves them.
 fn match_require(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     let args = child_by_field(node, "arguments")?;
     let first = args.named_child(0)?;
@@ -547,6 +555,32 @@ fn match_require(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     // resolution at — both `require "foo"` and `require_relative
     // "./foo"` reduce to the same site shape so a single Tier-2.5
     // resolver can answer either form without re-parsing.
+    let range = content.byte_range();
+    Some(ImportFact {
+        to_module,
+        imported: None,
+        alias: None,
+        is_reexport: false,
+        line: line_of(node),
+        byte_range: Some((range.start as u32, range.end as u32)),
+    })
+}
+
+/// `autoload :Foo, "path/to/foo"` → one [`ImportFact`] keyed on the
+/// path literal (second argument). The symbol literal is the constant
+/// name and is *not* the import target; the path is what
+/// `find_imports` and the Tier-2.5 require-graph need.
+fn match_autoload(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
+    let args = child_by_field(node, "arguments")?;
+    let path_node = args.named_child(1)?;
+    if path_node.kind() != "string" {
+        return None;
+    }
+    let content = string_content_node(path_node)?;
+    let to_module = node_text(content, source).to_string();
+    if to_module.is_empty() {
+        return None;
+    }
     let range = content.byte_range();
     Some(ImportFact {
         to_module,
@@ -760,6 +794,29 @@ end
         let mods: Vec<&str> = facts.imports.iter().map(|i| i.to_module.as_str()).collect();
         assert_eq!(mods, &["json", "../lib/util"]);
         assert!(facts.imports.iter().all(|i| !i.is_reexport));
+        // Every emitted import row carries a `string_content` byte range
+        // so the Tier-2.5 require-graph can LEFT JOIN on the exact site.
+        assert!(facts.imports.iter().all(|i| i.byte_range.is_some()));
+    }
+
+    #[test]
+    fn extracts_load_and_autoload_as_imports() {
+        let src = "load \"./foo.rb\"\nautoload :Bar, \"./bar\"\n";
+        let facts = syntactic(src);
+        let mods: Vec<&str> = facts.imports.iter().map(|i| i.to_module.as_str()).collect();
+        assert_eq!(mods, &["./foo.rb", "./bar"]);
+        // Same byte-range invariant as require/require_relative: the
+        // range covers the `string_content` (text between the quotes)
+        // so the Tier-2.5 require-graph resolver can pin its
+        // `resolutions` row at the exact site.
+        for imp in &facts.imports {
+            let (s, e) = imp.byte_range.expect("byte_range required");
+            // Cross-check: bytes between the quotes match `to_module`.
+            assert_eq!(
+                &src.as_bytes()[s as usize..e as usize],
+                imp.to_module.as_bytes()
+            );
+        }
     }
 
     #[test]
