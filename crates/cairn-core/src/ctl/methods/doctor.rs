@@ -851,6 +851,7 @@ mod tests {
             "gopls-lsp",
             "jdtls-lsp",
             "kotlin-language-server",
+            "php-resolver",
             "phpantom-lsp",
             "pyright-lsp",
             "ruby-lsp",
