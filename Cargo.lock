@@ -145,6 +145,7 @@ dependencies = [
  "cairn-lang-java",
  "cairn-lang-java-tier3",
  "cairn-lang-kotlin",
+ "cairn-lang-kotlin-tier25",
  "cairn-lang-kotlin-tier3",
  "cairn-lang-markdown",
  "cairn-lang-objc",
@@ -338,6 +339,19 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-kotlin-ng",
+]
+
+[[package]]
+name = "cairn-lang-kotlin-tier25"
+version = "0.6.2"
+dependencies = [
+ "cairn-core",
+ "cairn-proto",
+ "linkme",
+ "tempfile",
+ "tracing",
  "tree-sitter",
  "tree-sitter-kotlin-ng",
 ]
