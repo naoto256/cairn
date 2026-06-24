@@ -62,6 +62,14 @@ impl LanguageBackend for RubyBackend {
         "tree-sitter-ruby"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // v2: emit Type refs for base class / module / mixin name positions,
+        // stop skipping DECLARATIVE_CALLS (require / require_relative /
+        // autoload). Bumped with the Tier-2 emission policy restoration in
+        // the Stage 1 1st wave bundle.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_ruby::LANGUAGE.into();
         extract(source, &language, RubyVisitor::new())

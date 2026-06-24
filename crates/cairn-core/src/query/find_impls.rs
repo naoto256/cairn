@@ -142,7 +142,6 @@ fn run(
                     ) AS rn
                FROM resolutions
               WHERE kind = 'type'
-                AND semantic_kind IS NOT NULL
          )
          SELECT i.type_qualified,
                 i.interface_qualified,

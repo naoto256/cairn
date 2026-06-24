@@ -34,6 +34,7 @@ cairn-lang-php.workspace = true
 cairn-lang-php-tier3.workspace = true
 cairn-lang-ruby.workspace = true
 cairn-lang-ruby-tier3.workspace = true
+cairn-lang-ruby-tier25.workspace = true
 cairn-lang-typescript.workspace = true
 cairn-lang-typescript-tier3.workspace = true
 cairn-lang-go.workspace = true

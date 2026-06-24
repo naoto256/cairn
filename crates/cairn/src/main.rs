@@ -30,6 +30,7 @@ use cairn_lang_python as _;
 use cairn_lang_python_tier3 as _;
 use cairn_lang_ruby as _;
 use cairn_lang_ruby_tier3 as _;
+use cairn_lang_ruby_tier25 as _;
 use cairn_lang_rust as _;
 use cairn_lang_rust_tier3 as _;
 use cairn_lang_swift as _;
@@ -149,6 +150,7 @@ mod tests {
                 "phpantom-lsp",
                 "pyright-lsp",
                 "ruby-lsp",
+                "ruby-tier25-resolver",
                 "rust-analyzer-lsp",
                 "sourcekit-lsp",
                 "typescript-language-server-js-lsp",
