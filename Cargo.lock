@@ -153,6 +153,7 @@ dependencies = [
  "cairn-lang-python",
  "cairn-lang-python-tier3",
  "cairn-lang-ruby",
+ "cairn-lang-ruby-tier25",
  "cairn-lang-ruby-tier3",
  "cairn-lang-rust",
  "cairn-lang-rust-tier3",

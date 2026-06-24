@@ -854,6 +854,7 @@ mod tests {
             "phpantom-lsp",
             "pyright-lsp",
             "ruby-lsp",
+            "ruby-tier25-resolver",
             "rust-analyzer-lsp",
             "sourcekit-lsp",
             "typescript-language-server-js-lsp",
