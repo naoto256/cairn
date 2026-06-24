@@ -975,6 +975,17 @@ pub struct FindReferenceHit {
     pub target_qualified: Option<String>,
     /// Reference kind.
     pub kind: RefKind,
+    /// Provenance for [`Self::target_qualified`] / [`Self::kind`].
+    /// Either a resolution-layer `source` string (e.g.
+    /// `"tier25-ruby-tier25-resolver"`, `"tier3-pyright-lsp"`) when the
+    /// row's qualified target / kind came through the `resolutions`
+    /// table, or `"tier2-fact"` when only the Tier-2 `refs` row was
+    /// available. Older daemons that predate Phase 4 of the Tier-2.5
+    /// prep work emit no resolution-layer joins for refs and so always
+    /// report `"tier2-fact"`; the default here keeps deserialization of
+    /// those payloads green.
+    #[serde(default = "default_kind_source")]
+    pub kind_source: String,
     /// Qualified name of the function / impl block the reference sits
     /// inside. `None` for top-level expressions (rare in Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1107,6 +1118,13 @@ pub struct CallHit {
     /// the call token but could not resolve it to a symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_qualified: Option<String>,
+    /// Provenance for [`Self::target_qualified`]. See
+    /// [`FindReferenceHit::kind_source`]. `"tier2-fact"` when the
+    /// callee resolution came purely from the Tier-2 `refs` row,
+    /// otherwise the resolution-layer `source` string (e.g.
+    /// `"tier25-ruby-tier25-resolver"`).
+    #[serde(default = "default_kind_source")]
+    pub kind_source: String,
     /// Qualified name of the enclosing function — the caller side of
     /// the edge. `None` for top-level expressions (rare in Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]

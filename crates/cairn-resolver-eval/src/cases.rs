@@ -318,18 +318,30 @@ pub fn ruby_cases() -> Vec<GoldenCase> {
         //    name-only refs for both; Tier-2.5 resolves `log` to
         //    `Logging#log` via the mixin chain and `super` to
         //    `Dog#bark` via the inheritance chain.
+        //
+        //    The query uses the qualified caller name (`LoudDog#bark`)
+        //    because `find_callees` matches `symbols.qualified`
+        //    directly — a bare `bark` would also pick up `Dog#bark`.
+        //    Tier-2 alone surfaces `log` only with `include_noise`
+        //    (the same-file callee post-pass can't see Logging#log),
+        //    so the Tier-2 expected stays empty until the Tier-2.5
+        //    resolver fills `target_qualified` cross-file. The Tier-2
+        //    baseline test does not gate this case (its floor is 0.0).
         GoldenCase {
             name: "ruby_find_callees_method_body",
             language: "ruby",
             tool: Tool::FindCallees,
             query: Query {
-                symbol: Some("bark".into()),
+                symbol: Some("LoudDog#bark".into()),
                 kind: None,
                 limit: Some(50),
             },
-            tier2_expected: vec![h("lib/loud_dog.rb", 6, "log")],
-            tier25_expected: vec![h("lib/loud_dog.rb", 6, "log")],
-            tier3_expected: vec![h("lib/loud_dog.rb", 6, "log")],
+            tier2_expected: vec![],
+            // Tier-2.5 promotes the bare `log` call to the qualified
+            // `Logging#log` via the mixin chain (LoudDog includes
+            // Logging). Tier-3 (LSP) gives the same qualified name.
+            tier25_expected: vec![h("lib/loud_dog.rb", 6, "Logging#log")],
+            tier3_expected: vec![h("lib/loud_dog.rb", 6, "Logging#log")],
         },
         // 6) Qualified call site: `Utils::String.shout("hi")` from
         //    app/usage.rb. Tier-2 surfaces the call name `shout`
@@ -345,9 +357,9 @@ pub fn ruby_cases() -> Vec<GoldenCase> {
                 kind: None,
                 limit: Some(50),
             },
-            tier2_expected: vec![h("app/usage.rb", 6, "shout")],
-            tier25_expected: vec![h("app/usage.rb", 6, "shout")],
-            tier3_expected: vec![h("app/usage.rb", 6, "shout")],
+            tier2_expected: vec![h("app/usage.rb", 7, "shout")],
+            tier25_expected: vec![h("app/usage.rb", 7, "shout")],
+            tier3_expected: vec![h("app/usage.rb", 7, "shout")],
         },
         // 7) Imports: app/usage.rb pulls in lib/loud_dog.rb and
         //    lib/utils.rb via `require_relative`. Tier-2 records the

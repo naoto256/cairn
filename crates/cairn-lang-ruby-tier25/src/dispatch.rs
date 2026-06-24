@@ -89,7 +89,22 @@ pub fn resolve_call(
             }
             None
         }
-        CallReceiver::None | CallReceiver::Unknown => None,
+        // Bare `foo(...)` inside a class body — Ruby's implicit self
+        // dispatch. With a known lexical owner we can run the same MRO
+        // walk as `self.foo`; outside any class (top-level scripts)
+        // there is nothing to anchor on and Tier-3 must take over.
+        CallReceiver::None => {
+            if call.lexical_scope.is_empty() {
+                return None;
+            }
+            let owner = call.lexical_scope.join("::");
+            if call.in_singleton_context {
+                resolve_on_singleton_chain(&owner, &call.method, mro, methods)
+            } else {
+                resolve_on_instance_chain(&owner, &call.method, mro, methods)
+            }
+        }
+        CallReceiver::Unknown => None,
     }
 }
 
