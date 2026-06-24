@@ -113,7 +113,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
                 "cairn-lang-java-tier3" => "jdtls-lsp",
                 "cairn-lang-kotlin-tier3" => "kotlin-language-server",
                 "cairn-lang-ruby-tier3" => "ruby-lsp",
-                "cairn-lang-ruby-tier25" => "ruby-tier25-resolver",
+                "cairn-lang-ruby-tier25" => "ruby-resolver",
                 "cairn-lang-swift-tier3" => "sourcekit-lsp",
                 _ => unreachable!(),
             }

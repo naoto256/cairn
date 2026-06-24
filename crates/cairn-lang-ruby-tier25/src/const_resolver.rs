@@ -111,6 +111,17 @@ pub struct RequireSite {
 pub enum RequireKind {
     Require,
     RequireRelative,
+    /// `load "path/to/file.rb"` — Ruby's `load` always takes a path
+    /// literal (typically with `.rb`), resolved at runtime via
+    /// `$LOAD_PATH`. For workspace-local resolution we treat it like
+    /// `require_relative` when the literal is path-shaped, otherwise
+    /// fall back to the same workspace lookup as `require`.
+    Load,
+    /// `autoload :Foo, "path/to/foo"` — the path component (second arg)
+    /// is the import target. Resolution semantics mirror `require`
+    /// (workspace lookup with `.rb` suffix); the symbol-name component
+    /// is recorded separately in `autoloads` for const resolution.
+    Autoload,
 }
 
 /// Parse a single Ruby source blob and extract its facts. Returns `None`
@@ -341,7 +352,13 @@ impl<'a> Visitor<'a> {
                 }
             }
             "autoload" => {
-                // autoload(:Foo, "path/to/foo")
+                // autoload(:Foo, "path/to/foo") — two roles in one call:
+                // (1) declares a deferred constant binding (recorded in
+                // `autoloads` so const-resolution can fall back to it),
+                // and (2) is an import edge from the path literal to its
+                // workspace file (recorded in `requires` so the
+                // require-graph can pin a `resolutions` row at the same
+                // byte range as the Tier-2 `imports` row).
                 let Some(args) = args else { return };
                 let mut cursor = args.walk();
                 let kids: Vec<Node<'_>> = args.named_children(&mut cursor).collect();
@@ -350,15 +367,25 @@ impl<'a> Visitor<'a> {
                 }
                 let sym = self.text(kids[0]);
                 let sym_name = sym.trim_start_matches(':');
-                let lit = string_literal(kids[1], self.source);
-                let Some(lit) = lit else { return };
+                let path_node = kids[1];
+                let Some(lit) = string_literal(path_node, self.source) else {
+                    return;
+                };
                 let qualified = match self.current_qualified() {
                     Some(scope) => format!("{scope}::{sym_name}"),
                     None => sym_name.to_string(),
                 };
-                self.facts.autoloads.push((qualified, lit));
+                self.facts.autoloads.push((qualified, lit.clone()));
+                if let Some((byte_start, byte_end)) = string_content_range(path_node) {
+                    self.facts.requires.push(RequireSite {
+                        kind: RequireKind::Autoload,
+                        literal: lit,
+                        byte_start,
+                        byte_end,
+                    });
+                }
             }
-            "require" | "require_relative" => {
+            "require" | "require_relative" | "load" => {
                 let Some(args) = args else { return };
                 let mut cursor = args.walk();
                 let first = args.named_children(&mut cursor).next();
@@ -376,12 +403,13 @@ impl<'a> Visitor<'a> {
                     Some(r) => (r.0, r.1),
                     None => return,
                 };
+                let kind = match method {
+                    "require" => RequireKind::Require,
+                    "require_relative" => RequireKind::RequireRelative,
+                    _ => RequireKind::Load,
+                };
                 self.facts.requires.push(RequireSite {
-                    kind: if method == "require" {
-                        RequireKind::Require
-                    } else {
-                        RequireKind::RequireRelative
-                    },
+                    kind,
                     literal: lit,
                     byte_start,
                     byte_end,
@@ -399,7 +427,7 @@ impl<'a> Visitor<'a> {
         // Ignore the mixin/require/autoload DSLs — already recorded.
         if matches!(
             method.as_str(),
-            "include" | "extend" | "prepend" | "autoload" | "require" | "require_relative"
+            "include" | "extend" | "prepend" | "autoload" | "require" | "require_relative" | "load"
         ) {
             return;
         }

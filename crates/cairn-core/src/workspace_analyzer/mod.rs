@@ -1198,7 +1198,7 @@ mod tests {
         let inserted = persist_resolutions(
             &mut conn,
             ManifestId(1),
-            "ruby-tier25-resolver",
+            "ruby-resolver",
             "tier25",
             "tree-sitter-ruby",
             &facts,
@@ -1221,7 +1221,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].2, "type");
         assert!(rows[0].3.is_some(), "Foo should resolve to symbol id");
-        assert_eq!(rows[0].4, "tier25-ruby-tier25-resolver");
+        assert_eq!(rows[0].4, "tier25-ruby-resolver");
         assert_eq!(rows[1].2, "call");
         assert!(
             rows[1].3.is_none(),
@@ -1244,7 +1244,7 @@ mod tests {
         let inserted = persist_resolutions(
             &mut conn,
             ManifestId(1),
-            "ruby-tier25-resolver",
+            "ruby-resolver",
             "tier25",
             "tree-sitter-ruby",
             &facts2,
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(inserted, 1);
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM resolutions WHERE source = 'tier25-ruby-tier25-resolver'",
+                "SELECT COUNT(*) FROM resolutions WHERE source = 'tier25-ruby-resolver'",
                 [],
                 |r| r.get(0),
             )
@@ -1261,7 +1261,7 @@ mod tests {
         assert_eq!(count, 1);
         let semantic: Option<String> = conn
             .query_row(
-                "SELECT semantic_kind FROM resolutions WHERE source = 'tier25-ruby-tier25-resolver'",
+                "SELECT semantic_kind FROM resolutions WHERE source = 'tier25-ruby-resolver'",
                 [],
                 |r| r.get(0),
             )
