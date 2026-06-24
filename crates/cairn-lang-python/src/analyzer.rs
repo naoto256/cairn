@@ -350,6 +350,8 @@ fn emit_import_statement(node: Node<'_>, source: &[u8], facts: &mut SemanticFact
                     alias: None,
                     is_reexport: false,
                     line,
+
+                    byte_range: None,
                 });
             }
             "aliased_import" => {
@@ -366,6 +368,8 @@ fn emit_import_statement(node: Node<'_>, source: &[u8], facts: &mut SemanticFact
                         alias,
                         is_reexport: false,
                         line,
+
+                        byte_range: None,
                     });
                 }
             }
@@ -401,6 +405,8 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
                     alias: None,
                     is_reexport: false,
                     line,
+
+                    byte_range: None,
                 });
                 emitted = true;
             } else if field == Some("name") {
@@ -415,6 +421,8 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
                             alias: None,
                             is_reexport: false,
                             line,
+
+                            byte_range: None,
                         });
                         emitted = true;
                     }
@@ -429,6 +437,8 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
                             alias,
                             is_reexport: false,
                             line,
+
+                            byte_range: None,
                         });
                         emitted = true;
                     }
@@ -449,6 +459,8 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
             alias: None,
             is_reexport: false,
             line,
+
+            byte_range: None,
         });
     }
 }

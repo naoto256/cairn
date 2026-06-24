@@ -869,6 +869,17 @@ pub struct ImportHit {
     pub alias: Option<String>,
     /// True when this is a `pub use` re-export.
     pub is_reexport: bool,
+    /// Provenance for the import-site resolution. Either a
+    /// resolution-layer `source` string (e.g.
+    /// `"tier25-ruby-tier25-resolver"`, `"tier3-pyright-lsp"`) when
+    /// a Tier-2.5+ require-graph resolver pinned the site, or
+    /// `"tier2-fact"` when the bare Tier-2 `imports` row was used as
+    /// fallback. Older daemons that predate Stage 1 of the Tier-2.5
+    /// imports work emit no resolution joins and so always report
+    /// `"tier2-fact"`; the default keeps deserialization of those
+    /// payloads green.
+    #[serde(default = "default_kind_source")]
+    pub kind_source: String,
     /// Anchor label the import came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the import statement.

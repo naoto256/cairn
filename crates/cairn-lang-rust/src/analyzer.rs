@@ -751,6 +751,8 @@ fn flatten_use_tree(
                 alias: None,
                 is_reexport,
                 line,
+
+                byte_range: None,
             });
         }
         syn::UseTree::Rename(r) => {
@@ -761,6 +763,8 @@ fn flatten_use_tree(
                 alias: Some(r.rename.to_string()),
                 is_reexport,
                 line,
+
+                byte_range: None,
             });
         }
         syn::UseTree::Glob(_) => {
@@ -771,6 +775,8 @@ fn flatten_use_tree(
                 alias: None,
                 is_reexport,
                 line,
+
+                byte_range: None,
             });
         }
         syn::UseTree::Group(g) => {

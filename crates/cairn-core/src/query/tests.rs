@@ -165,6 +165,7 @@ fn language_fixture() -> (tempfile::TempDir, tempfile::TempDir, Connection) {
 }
 
 mod find_impls;
+mod find_imports;
 mod find_references;
 mod find_symbols;
 mod tentative;

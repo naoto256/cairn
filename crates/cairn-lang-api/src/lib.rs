@@ -95,6 +95,20 @@ pub struct ImportFact {
     pub alias: Option<String>,
     pub is_reexport: bool,
     pub line: u32,
+    /// Byte range of the *import-site token* — for Ruby this is the
+    /// argument string of `require` / `require_relative` (without the
+    /// surrounding quotes), so a Tier-2.5 require-graph resolver can
+    /// pin its `resolutions` row at the exact site the writer already
+    /// saw. Mirrors [`ImplFact::interface_byte_range`]: persistence
+    /// stores `None` as NULL, and `find_imports` LEFT JOINs on the
+    /// `(blob, parser_id, byte_start, byte_end)` tuple, falling back to
+    /// `tier2-fact` when no resolution row covers the site.
+    ///
+    /// Backends that have not yet wired the range (and the syntactic
+    /// pass's `load` / `autoload` paths inside the Ruby backend) leave
+    /// this as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<(u32, u32)>,
 }
 
 /// Facts an [`Analyzer`] emits on top of the syntactic floor.

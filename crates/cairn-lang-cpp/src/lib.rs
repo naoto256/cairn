@@ -851,6 +851,8 @@ fn match_include(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
         alias: None,
         is_reexport: false,
         line: line_of(node),
+
+        byte_range: None,
     })
 }
 
