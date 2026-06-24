@@ -9,6 +9,7 @@ members = [
     "crates/cairn-lang-rust",
     "crates/cairn-lang-rust-tier3",
     "crates/cairn-lang-python",
+    "crates/cairn-lang-python-tier25",
     "crates/cairn-lang-python-tier3",
     "crates/cairn-lang-markdown",
     "crates/cairn-lang-php",
@@ -145,6 +146,7 @@ cairn-lang-treesitter-generic = { version = "0.6.2", path = "crates/cairn-lang-t
 cairn-lang-rust = { version = "0.6.2", path = "crates/cairn-lang-rust" }
 cairn-lang-rust-tier3 = { version = "0.6.2", path = "crates/cairn-lang-rust-tier3" }
 cairn-lang-python = { version = "0.6.2", path = "crates/cairn-lang-python" }
+cairn-lang-python-tier25 = { version = "0.6.2", path = "crates/cairn-lang-python-tier25" }
 cairn-lang-python-tier3 = { version = "0.6.2", path = "crates/cairn-lang-python-tier3" }
 cairn-lang-markdown = { version = "0.6.2", path = "crates/cairn-lang-markdown" }
 cairn-lang-php = { version = "0.6.2", path = "crates/cairn-lang-php" }

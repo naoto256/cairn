@@ -56,6 +56,16 @@ impl LanguageBackend for PythonBackend {
         "tree-sitter-python"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // rev 2: emit byte_range on ImportFact for Tier-2.5 consumption
+        // (the dotted module-name span for `import x` / `import x as y`,
+        // and the module-name span for `from m import …`, including
+        // the leading-dot prefix of `relative_import` nodes). Tier-2.5
+        // require-graph pins its `resolutions` row on the same site so
+        // `find_imports` can LEFT JOIN them.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
         extract(source, &language, PythonVisitor::new())

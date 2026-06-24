@@ -344,6 +344,10 @@ fn emit_import_statement(node: Node<'_>, source: &[u8], facts: &mut SemanticFact
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "dotted_name" => {
+                // rev 2: pin the byte_range at the `dotted_name` span
+                // so the Tier-2.5 resolver's `resolutions` row joins
+                // against the same site in `find_imports`.
+                let r = child.byte_range();
                 facts.imports.push(ImportFact {
                     to_module: node_text(child, source).to_string(),
                     imported: None,
@@ -351,17 +355,22 @@ fn emit_import_statement(node: Node<'_>, source: &[u8], facts: &mut SemanticFact
                     is_reexport: false,
                     line,
 
-                    byte_range: None,
+                    byte_range: Some((r.start as u32, r.end as u32)),
                 });
             }
             "aliased_import" => {
                 // `name` field = dotted_name, `alias` field = identifier.
-                let module = child_by_field(child, "name")
+                let name_node = child_by_field(child, "name");
+                let module = name_node
                     .map(|n| node_text(n, source).to_string())
                     .unwrap_or_default();
                 let alias =
                     child_by_field(child, "alias").map(|n| node_text(n, source).to_string());
                 if !module.is_empty() {
+                    // Anchor on the module-name token (matches Tier-2.5).
+                    let r = name_node
+                        .map(|n| n.byte_range())
+                        .unwrap_or(child.byte_range());
                     facts.imports.push(ImportFact {
                         to_module: module,
                         imported: None,
@@ -369,7 +378,7 @@ fn emit_import_statement(node: Node<'_>, source: &[u8], facts: &mut SemanticFact
                         is_reexport: false,
                         line,
 
-                        byte_range: None,
+                        byte_range: Some((r.start as u32, r.end as u32)),
                     });
                 }
             }
@@ -384,9 +393,18 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
     let line = line_of(node);
     // `module_name` field is the source module (dotted_name or
     // relative_import like `.` / `..pkg`).
-    let module = child_by_field(node, "module_name")
+    let module_node = child_by_field(node, "module_name");
+    let module = module_node
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
+    // rev 2: pin the byte_range at the module-name token (covers
+    // relative_import `.` / `..pkg` as a single node). Every binding
+    // emitted from this statement points at the same span so the
+    // Tier-2.5 require-graph join lines up.
+    let module_range: Option<(u32, u32)> = module_node.map(|n| {
+        let r = n.byte_range();
+        (r.start as u32, r.end as u32)
+    });
 
     // Manual cursor walk so we can read each child's field name
     // (`node.children(&mut cursor)` borrows the cursor for the whole
@@ -406,7 +424,7 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
                     is_reexport: false,
                     line,
 
-                    byte_range: None,
+                    byte_range: module_range,
                 });
                 emitted = true;
             } else if field == Some("name") {
@@ -422,7 +440,7 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
                             is_reexport: false,
                             line,
 
-                            byte_range: None,
+                            byte_range: module_range,
                         });
                         emitted = true;
                     }
@@ -438,7 +456,7 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
                             is_reexport: false,
                             line,
 
-                            byte_range: None,
+                            byte_range: module_range,
                         });
                         emitted = true;
                     }
@@ -460,7 +478,7 @@ fn emit_from_import(node: Node<'_>, source: &[u8], facts: &mut SemanticFacts) {
             is_reexport: false,
             line,
 
-            byte_range: None,
+            byte_range: module_range,
         });
     }
 }

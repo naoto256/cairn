@@ -152,6 +152,7 @@ dependencies = [
  "cairn-lang-php-tier25",
  "cairn-lang-php-tier3",
  "cairn-lang-python",
+ "cairn-lang-python-tier25",
  "cairn-lang-python-tier3",
  "cairn-lang-ruby",
  "cairn-lang-ruby-tier25",
@@ -422,6 +423,19 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-python",
+]
+
+[[package]]
+name = "cairn-lang-python-tier25"
+version = "0.6.2"
+dependencies = [
+ "cairn-core",
+ "cairn-proto",
+ "linkme",
+ "tempfile",
+ "tracing",
  "tree-sitter",
  "tree-sitter-python",
 ]

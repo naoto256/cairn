@@ -28,6 +28,7 @@ cairn-lang-csharp-tier3.workspace = true
 cairn-lang-rust.workspace = true
 cairn-lang-rust-tier3.workspace = true
 cairn-lang-python.workspace = true
+cairn-lang-python-tier25.workspace = true
 cairn-lang-python-tier3.workspace = true
 cairn-lang-markdown.workspace = true
 cairn-lang-php.workspace = true
