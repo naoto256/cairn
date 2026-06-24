@@ -93,19 +93,12 @@ fn tier25_resolution_upgrades_kind_source() {
     // Ruby `require "foo"` — the analyzer emits byte_range covering
     // the argument-string content `foo`.
     insert_import(&conn, blob_sha, parser_id, "foo", 1, Some((9, 12)));
-    insert_import_resolution(
-        &conn,
-        blob_sha,
-        parser_id,
-        9,
-        12,
-        "tier25-ruby-tier25-resolver",
-    );
+    insert_import_resolution(&conn, blob_sha, parser_id, 9, 12, "tier25-ruby-resolver");
 
     let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].to_module, "foo");
-    assert_eq!(hits[0].kind_source, "tier25-ruby-tier25-resolver");
+    assert_eq!(hits[0].kind_source, "tier25-ruby-resolver");
 }
 
 #[test]
@@ -131,14 +124,7 @@ fn legacy_null_byte_range_keeps_tier2_fact_fallback() {
     // unrelated resolution row.
     insert_import(&conn, blob_sha, parser_id, "legacy", 3, None);
     // Decoy resolution at a real byte range (does NOT match NULL).
-    insert_import_resolution(
-        &conn,
-        blob_sha,
-        parser_id,
-        100,
-        110,
-        "tier25-ruby-tier25-resolver",
-    );
+    insert_import_resolution(&conn, blob_sha, parser_id, 100, 110, "tier25-ruby-resolver");
 
     let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
     let hit = hits
