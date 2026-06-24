@@ -548,6 +548,7 @@ mod tests {
     use crate::testutil::{init_repo, run_git};
     use cairn_lang_c as _;
     use cairn_lang_cpp as _;
+    use cairn_lang_objc as _;
     use cairn_lang_python::PythonBackend;
     use cairn_lang_rust as _;
     use std::cell::Cell;
@@ -832,6 +833,76 @@ mod tests {
         assert_eq!(
             parser_ids_for_path(&conn, outcome.tentative_manifest, "include/plain.h"),
             vec!["tree-sitter-c"]
+        );
+    }
+
+    #[test]
+    fn dot_h_with_objc_interface_routes_to_objc_parser() {
+        // AFNetworking-shaped header: ObjC `@interface` with protocol
+        // conformance list. Must route to the objc backend, not cpp /
+        // c, so the type-hierarchy edges are emitted.
+        let repo = init_rust_repo(&[(
+            "AFNetworking/AFHTTPSessionManager.h",
+            "#import <Foundation/Foundation.h>\n\
+             @interface AFHTTPSessionManager : AFURLSessionManager <NSSecureCoding, NSCopying>\n\
+             @end\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        assert_eq!(
+            parser_ids_for_path(
+                &conn,
+                outcome.tentative_manifest,
+                "AFNetworking/AFHTTPSessionManager.h"
+            ),
+            vec!["tree-sitter-objc"]
+        );
+    }
+
+    #[test]
+    fn dot_h_with_objc_import_alone_routes_to_objc_parser() {
+        // `#import "Local.h"` with no `@interface` is still ObjC-idiomatic
+        // (a forward header that just re-exports), and pure C / C++ use
+        // `#include`. Route to objc.
+        let repo = init_rust_repo(&[(
+            "include/forward.h",
+            "#import \"OtherModule.h\"\n#import <UIKit/UIKit.h>\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        assert_eq!(
+            parser_ids_for_path(&conn, outcome.tentative_manifest, "include/forward.h"),
+            vec!["tree-sitter-objc"]
+        );
+    }
+
+    #[test]
+    fn dot_h_objc_priority_beats_cpp_signals() {
+        // A header carrying both ObjC directives and incidental C++ish
+        // identifiers (e.g. a project that uses `class` as a property
+        // name or an inline doc snippet) must route to objc — the ObjC
+        // signal is unambiguous and outranks the heuristic C++ check.
+        let repo = init_rust_repo(&[(
+            "include/Mixed.h",
+            "@interface Foo : NSObject\n\
+             @property (nonatomic, strong) NSString *operatorName;\n\
+             @end\n\
+             // namespace and template appear in comments only\n",
+        )]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+
+        assert_eq!(
+            parser_ids_for_path(&conn, outcome.tentative_manifest, "include/Mixed.h"),
+            vec!["tree-sitter-objc"]
         );
     }
 
