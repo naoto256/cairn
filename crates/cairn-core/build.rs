@@ -100,6 +100,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
         || crate_name == "cairn-lang-ruby-tier3"
         || crate_name == "cairn-lang-ruby-tier25"
         || crate_name == "cairn-lang-php-tier25"
+        || crate_name == "cairn-lang-python-tier25"
         || crate_name == "cairn-lang-swift-tier3"
     {
         return vec![Entry {
@@ -116,6 +117,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
                 "cairn-lang-ruby-tier3" => "ruby-lsp",
                 "cairn-lang-ruby-tier25" => "ruby-resolver",
                 "cairn-lang-php-tier25" => "php-resolver",
+                "cairn-lang-python-tier25" => "python-resolver",
                 "cairn-lang-swift-tier3" => "sourcekit-lsp",
                 _ => unreachable!(),
             }
