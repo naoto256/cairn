@@ -50,6 +50,7 @@ cairn-lang-kotlin.workspace = true
 cairn-lang-kotlin-tier3.workspace = true
 cairn-lang-kotlin-tier25.workspace = true
 cairn-lang-swift.workspace = true
+cairn-lang-swift-tier25.workspace = true
 cairn-lang-swift-tier3.workspace = true
 cairn-lang-objc.workspace = true
 clap.workspace = true
