@@ -61,7 +61,11 @@ use require_graph::RequireGraph;
 
 pub const ANALYZER_ID: &str = "python-resolver";
 pub const TIER_PREFIX: &str = "tier25";
-pub const ANALYZER_REVISION: u32 = 1;
+// Bumped for resolutions.target_path persistence (schema v10): the persist
+// layer now writes target_path directly into resolutions, so existing
+// workspace_analysis_runs need to be invalidated and re-run to populate
+// the new column. Analyzer logic itself is unchanged.
+pub const ANALYZER_REVISION: u32 = 2;
 pub const PARSER_ID: &str = "tree-sitter-python";
 pub const RESOLUTION_SOURCE: &str = "tier25-python-resolver";
 

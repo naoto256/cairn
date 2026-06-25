@@ -551,7 +551,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "csharp-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 1);
+    assert_eq!(ANALYZER_REVISION, 2);
     assert_eq!(PARSER_ID, "tree-sitter-c-sharp");
     assert_eq!(RESOLUTION_SOURCE, "tier25-csharp-resolver");
 }
