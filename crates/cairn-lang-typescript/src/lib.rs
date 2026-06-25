@@ -320,6 +320,16 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
     };
     let to_module = strip_string_literal(node_text(source_node, source));
     let line = line_of(node);
+    // The `from './foo'` source string node. Tier-2.5 (JS) needs this
+    // span aligned so its Import resolutions can pin onto the Tier-1
+    // ImportFact at the path span (mirroring CSharp/Swift/etc.). Emit
+    // for every dialect — TS / TSX / JS share this extractor and TS
+    // tier3 doesn't consume `byte_range` yet, so the wider emit is
+    // forward-compatible.
+    let source_byte_range: (u32, u32) = {
+        let r = source_node.byte_range();
+        (r.start as u32, r.end as u32)
+    };
 
     // tree-sitter-typescript shape:
     //   import_statement
@@ -347,7 +357,7 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
                 is_reexport: false,
                 line,
 
-                byte_range: None,
+                byte_range: Some(source_byte_range),
             });
             emitted_any = true;
         }
@@ -370,7 +380,7 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
                                 is_reexport: false,
                                 line,
 
-                                byte_range: None,
+                                byte_range: Some(source_byte_range),
                             });
                             emitted_any = true;
                         }
@@ -385,7 +395,7 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
                             is_reexport: false,
                             line,
 
-                            byte_range: None,
+                            byte_range: Some(source_byte_range),
                         });
                         emitted_any = true;
                     }
@@ -405,7 +415,7 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
             is_reexport: false,
             line,
 
-            byte_range: None,
+            byte_range: Some(source_byte_range),
         });
     }
 }
