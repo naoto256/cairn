@@ -39,6 +39,17 @@ pub struct ReferenceHit {
     /// so callers can see when a Tier-2.5 resolver promoted a
     /// name-only Tier-2 ref into a resolved cross-file edge.
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the target lives in,
+    /// pulled directly from `resolutions.target_path` (v10+, Phase 2).
+    /// `Some("src/foo.rs")` whenever a Tier-2.5+ resolver pinned the
+    /// site to a workspace-internal target; `None` for unresolved
+    /// sites and for targets that resolved outside the indexed
+    /// workspace. Independent of `target_symbol_id`: cross-parser
+    /// type/call edges may carry `target_path = Some` even when no
+    /// sibling-parser symbol could be uniquely identified, and import
+    /// edges always carry `target_qualified = None` while still
+    /// populating `target_path` for workspace-internal modules.
+    pub target_path: Option<String>,
 }
 
 /// Filters for `find_references`. `symbol` is required and non-empty.
@@ -118,7 +129,7 @@ fn run_find_references(
             "WITH best_resolution AS (
                  SELECT site_blob_sha, site_parser_id,
                         site_byte_start, site_byte_end, kind,
-                        target_symbol_id, source,
+                        target_symbol_id, source, target_path,
                         ROW_NUMBER() OVER (
                             PARTITION BY site_blob_sha, site_parser_id,
                                          site_byte_start, site_byte_end, kind
@@ -131,7 +142,8 @@ fn run_find_references(
                    FROM resolutions
              )
              SELECT target_name, target_qualified, kind, enclosing,
-                    path, line, blob_sha, parser_id, kind_source
+                    path, line, blob_sha, parser_id, kind_source,
+                    target_path
                FROM (
                  SELECT r.target_name,
                         COALESCE(r.target_qualified, sym.qualified)
@@ -140,6 +152,7 @@ fn run_find_references(
                         enc.qualified AS enclosing,
                         me.path, r.line, r.blob_sha, r.parser_id,
                         r.byte_start, r.byte_end,
+                        res.target_path AS target_path,
                         CASE WHEN res.source IS NOT NULL THEN res.source
                              ELSE '",
         );
@@ -232,6 +245,7 @@ fn run_find_references(
                 blob_sha: row.get(6)?,
                 parser_id: row.get(7)?,
                 kind_source: row.get(8)?,
+                target_path: row.get(9)?,
             })
         };
         let rows: rusqlite::Result<Vec<ReferenceHit>> = match &kind_str {

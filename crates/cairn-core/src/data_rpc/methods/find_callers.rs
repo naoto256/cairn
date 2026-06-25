@@ -152,6 +152,7 @@ pub(super) fn into_call_hit(
         target_name: h.target_name,
         target_qualified: h.target_qualified,
         kind_source: h.kind_source,
+        target_path: h.target_path,
         enclosing_qualified: h.enclosing_qualified,
         branch: anchor.to_string(),
         location,
