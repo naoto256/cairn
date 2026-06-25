@@ -145,6 +145,7 @@ dependencies = [
  "cairn-lang-go-tier3",
  "cairn-lang-java",
  "cairn-lang-java-tier3",
+ "cairn-lang-javascript-tier25",
  "cairn-lang-kotlin",
  "cairn-lang-kotlin-tier25",
  "cairn-lang-kotlin-tier3",
@@ -345,6 +346,19 @@ dependencies = [
  "tracing",
  "tree-sitter",
  "tree-sitter-java",
+]
+
+[[package]]
+name = "cairn-lang-javascript-tier25"
+version = "0.6.2"
+dependencies = [
+ "cairn-core",
+ "cairn-proto",
+ "linkme",
+ "tempfile",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-javascript",
 ]
 
 [[package]]

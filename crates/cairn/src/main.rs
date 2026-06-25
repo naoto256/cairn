@@ -21,6 +21,7 @@ use cairn_lang_go as _;
 use cairn_lang_go_tier3 as _;
 use cairn_lang_java as _;
 use cairn_lang_java_tier3 as _;
+use cairn_lang_javascript_tier25 as _;
 use cairn_lang_kotlin as _;
 use cairn_lang_kotlin_tier3 as _;
 use cairn_lang_kotlin_tier25 as _;
@@ -151,6 +152,7 @@ mod tests {
                 "csharp-ls",
                 "csharp-resolver",
                 "gopls-lsp",
+                "javascript-resolver",
                 "jdtls-lsp",
                 "kotlin-language-server",
                 "kotlin-resolver",
