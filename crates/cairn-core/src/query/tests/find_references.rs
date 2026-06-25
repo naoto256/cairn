@@ -6,6 +6,7 @@ use crate::register::register_repo;
 use crate::testutil::init_repo;
 use cairn_proto::common::RefKind;
 use cairn_proto::methods::ReferenceDirection;
+use rusqlite::Connection;
 
 #[test]
 fn references_incoming_finds_callers() {
@@ -390,4 +391,217 @@ fn references_empty_symbol_errors() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("non-empty"));
+}
+
+// ──── P1 read-side side-effect: cross-parser resolution row visibility ────
+//
+// persist.rs cross-parser-id uniqueness fallback (Phase 1) can populate
+// `resolutions.target_symbol_id` for sites where the resolver targets a
+// sibling-parser symbol. find_references' SQL does not change in Phase 1
+// (its target_path surface is Phase 2), but the data it reads does: rows
+// it joins to `resolutions` may now have a non-NULL target_symbol_id, and
+// `COALESCE(refs.target_qualified, sym.qualified)` therefore promotes the
+// surfaced `target_qualified` for cross-parser calls that used to bottom
+// out at None.
+//
+// These tests pin the read-side observability so a Phase 2 refactor of
+// the wire shape doesn't silently lose the upgrade.
+
+/// Build a fixture with:
+///   - 1 Kotlin file containing a `call` ref to `fromJson` (target_qualified NULL)
+///   - 1 Java file defining a `JsonAdapter.fromJson` symbol
+///   - optional 2nd Java file defining the *same* qualified name (for the
+///     ambiguous case)
+///   - 1 Tier-2.5 resolution row pinning the Kotlin call site to the Java
+///     symbol; `target_symbol_id` is filled in directly by the test to
+///     simulate the cross-parser fallback's output (the persist-layer tests
+///     in `workspace_analyzer::tests` already pin that path).
+fn cross_parser_call_fixture(
+    ambiguous: bool,
+) -> (tempfile::TempDir, Connection, Option<i64>, Option<i64>) {
+    let db_tmp = tempfile::tempdir().unwrap();
+    let conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    conn.execute(
+        "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('HEAD', 1, 0)",
+        [],
+    )
+    .unwrap();
+    let kt_parser = "tree-sitter-kotlin-ng";
+    let java_parser = "tree-sitter-java";
+    conn.execute(
+        "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('sha-kt', ?1, 1, 0),
+                    ('sha-java', ?2, 1, 0)",
+        rusqlite::params![kt_parser, java_parser],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/X.kt', 'sha-kt'),
+                    (1, 'src/JsonAdapter.java', 'sha-java')",
+        [],
+    )
+    .unwrap();
+    // Caller symbol in Kotlin file so refs.enclosing_id resolves.
+    conn.execute(
+        "INSERT INTO symbols
+               (id, blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (1, 'sha-kt', ?1, 'caller', 'caller', 'function',
+                0, 200, 1, 10, 'syn')",
+        rusqlite::params![kt_parser],
+    )
+    .unwrap();
+    // Java target symbol (cross-parser).
+    conn.execute(
+        "INSERT INTO symbols
+               (id, blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (2, 'sha-java', ?1, 'fromJson', 'com.x.JsonAdapter.fromJson', 'method',
+                0, 100, 1, 5, 'syn')",
+        rusqlite::params![java_parser],
+    )
+    .unwrap();
+    let java_id: i64 = 2;
+    // Kotlin call site with target_qualified NULL — the resolution layer
+    // is where the cross-parser id lookup would normally fill in
+    // `target_symbol_id`.
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES
+               ('sha-kt', ?1, 1, 'fromJson', NULL, 'call',
+                42, 50, 5, 'tree-sitter-kotlin-ng')",
+        rusqlite::params![kt_parser],
+    )
+    .unwrap();
+    // Optional second Java file with the same qualified — exercises the
+    // uniqueness rejection path. The test then writes target_symbol_id =
+    // NULL on the resolution row to simulate the fallback's None result.
+    let second_java_id = if ambiguous {
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+                 VALUES ('sha-java-2', ?1, 1, 0)",
+            rusqlite::params![java_parser],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+                 VALUES (1, 'src/JsonAdapter2.java', 'sha-java-2')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+                   (id, blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                    line_start, line_end, source)
+                 VALUES
+                   (3, 'sha-java-2', ?1, 'fromJson', 'com.x.JsonAdapter.fromJson', 'method',
+                    0, 100, 1, 5, 'syn')",
+            rusqlite::params![java_parser],
+        )
+        .unwrap();
+        Some(3i64)
+    } else {
+        None
+    };
+    (db_tmp, conn, Some(java_id), second_java_id)
+}
+
+#[test]
+fn find_references_outgoing_picks_up_cross_parser_resolution_post_p1() {
+    // R2 B4 regression pin: `find_callees` (outgoing direction +
+    // include_noise: false) filters refs whose resolved
+    // `sym.qualified` is NULL, so the resolution layer's outcome
+    // *does* change the result set. Without the Phase 1 cross-parser
+    // uniqueness fallback the Kotlin call to `fromJson` has
+    // `target_symbol_id = NULL` → sym is NULL → COALESCE returns
+    // NULL → the row is suppressed by the noise filter. With the
+    // fallback it resolves to the Java symbol, COALESCE surfaces the
+    // FQN, and the row passes.
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "caller".into(),
+            direction: ReferenceDirection::Outgoing,
+            kind: Some(RefKind::Call),
+            include_noise: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hit = hits.iter().find(|h| h.target_name == "fromJson").expect(
+        "cross-parser fromJson call missing from find_callees noise-filtered hits — \
+             the unique-hit fallback should have populated target_symbol_id and let it through",
+    );
+    assert_eq!(
+        hit.target_qualified.as_deref(),
+        Some("com.x.JsonAdapter.fromJson"),
+        "cross-parser fallback should surface sibling-parser qualified via COALESCE"
+    );
+    assert_eq!(hit.kind_source, "tier25-kotlin-resolver");
+}
+
+#[test]
+fn find_references_outgoing_ambiguous_cross_parser_is_filtered_out() {
+    // R2 B4 regression pin: the same `find_callees` noise filter
+    // suppresses the call when the cross-parser fallback was
+    // ambiguous (target_symbol_id NULL). The resolution row exists
+    // (carrying source / target_path) but COALESCE returns NULL for
+    // target_qualified, so the row is filtered out. This pins "no
+    // false positive": a coincidentally-named symbol does not get
+    // adopted.
+    let (_db, conn, _, _) = cross_parser_call_fixture(true);
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, NULL,
+                'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        [],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "caller".into(),
+            direction: ReferenceDirection::Outgoing,
+            kind: Some(RefKind::Call),
+            include_noise: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        hits.iter().all(|h| h.target_name != "fromJson"),
+        "ambiguous cross-parser call must be filtered out by find_callees noise gate; \
+         hits were: {hits:?}"
+    );
 }

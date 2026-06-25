@@ -120,14 +120,43 @@ fn ref_sources_to_clear(analyzer_id: &str, tier_prefix: &str) -> Vec<String> {
     sources
 }
 
+/// Three-way classification of the analyzer-emitted target_path after
+/// the manifest-existence check. The `PhantomDropped` arm is what
+/// guarantees an analyzer bug never escapes via the qualified-only
+/// symbol fallback below: we strip the path but block the fallback
+/// from inventing a different one.
+enum PathOrigin {
+    /// Analyzer did not emit a path (e.g., cross-parser type/call
+    /// where the resolver could not identify the file).
+    None,
+    /// Analyzer emitted a path and it exists in the manifest. The
+    /// String is the same path, ready to land in the row.
+    Valid(String),
+    /// Analyzer emitted a path that is not in the manifest. The path
+    /// is dropped to NULL on the row and the qualified-only fallback
+    /// is skipped so a coincidentally-matching sibling symbol cannot
+    /// hide the analyzer bug.
+    PhantomDropped,
+}
+
 /// Persist resolution-layer rows emitted by a workspace analyzer.
 ///
 /// Mirrors [`persist_resolved_refs`]'s delete-then-insert pattern: any
 /// existing rows whose `source` matches `<tier_prefix>-<analyzer_id>` and
 /// whose blob belongs to this manifest are cleared first, then the new rows
-/// are inserted. The target symbol id is resolved lazily here by looking up
-/// `symbols` keyed by `(target_blob, parser_id, target_qualified)`, mirroring
-/// how the refs path maps LSP locations to symbol rows.
+/// are inserted.
+///
+/// Two target axes are persisted independently (v10+):
+///
+/// - `target_path` is the source of truth for "which workspace file" and is
+///   sanitized against `manifest_entries` here. Analyzer bugs that emit a
+///   phantom path get a `debug!` log and the column drops to NULL — the row
+///   itself is preserved so the site-presence signal is not lost, and the
+///   qualified-only symbol fallback is **skipped** so the bug cannot hide
+///   behind a coincidentally-matching sibling symbol.
+/// - `target_symbol_id` is the source of truth for "which symbol" and is
+///   resolved best-effort by `resolve_resolution_target`. Failure to find a
+///   matching symbol does not affect `target_path` persistence.
 pub(super) fn persist_resolutions(
     conn: &mut Connection,
     manifest_id: ManifestId,
@@ -155,12 +184,83 @@ pub(super) fn persist_resolutions(
         let Some(site_parser) = parser_for_blob(&tx, &site_blob, parser_id)? else {
             continue;
         };
-        let target_symbol_id = resolve_resolution_target(&tx, manifest_id, parser_id, r)?;
+
+        // Sanitize `target_path` against the current manifest. Import
+        // edges and cross-parser type/call edges set
+        // `target_qualified = None`, so they bypass
+        // `resolve_resolution_target`'s path check; this loop is the
+        // only place that guarantees no phantom path reaches the wire
+        // surface. Three states tracked:
+        //
+        //   PathOrigin::None          — analyzer did not emit a path
+        //   PathOrigin::Valid(path)   — analyzer emitted, exists in
+        //                                manifest
+        //   PathOrigin::PhantomDropped — analyzer emitted, but path
+        //                                did NOT exist; dropped here
+        //
+        // Distinguishing PhantomDropped from None matters for the
+        // qualified-only fallback below: phantom-path resolutions must
+        // never be silently re-pointed to a different file via the
+        // qualified-only path. They stay `target_path NULL` /
+        // `target_symbol_id NULL` so analyzer bugs surface rather than
+        // hide behind a coincidentally-matching sibling symbol.
+        let path_origin = match r.target_path.as_deref() {
+            None => PathOrigin::None,
+            Some(path) => match blob_for_path(&tx, manifest_id, path)? {
+                Some(_) => PathOrigin::Valid(path.to_string()),
+                None => {
+                    tracing::debug!(
+                        target: "cairn_core::persist",
+                        source = %source,
+                        source_path = %r.source_path,
+                        site_byte_start = r.site_byte_range.start,
+                        site_byte_end = r.site_byte_range.end,
+                        target_path = %path,
+                        "persist_resolutions: target_path not in manifest, dropping to NULL"
+                    );
+                    PathOrigin::PhantomDropped
+                }
+            },
+        };
+
+        // PathOrigin determines whether the symbol lookup is allowed
+        // to run at all:
+        //   Valid    → path-scoped lookup, then cross-parser fallback
+        //   None     → manifest-wide qualified-only fallback (cross-
+        //              parser type/call where the resolver could not
+        //              identify the target file itself)
+        //   Phantom  → no lookup; the row keeps target_symbol_id NULL
+        //              so the analyzer-bug signal is preserved
+        let (mut sanitized_target_path, target_symbol_id) = match &path_origin {
+            PathOrigin::PhantomDropped => (None, None),
+            PathOrigin::Valid(path) => {
+                let id = resolve_resolution_target(&tx, manifest_id, parser_id, r, Some(path))?;
+                (Some(path.clone()), id)
+            }
+            PathOrigin::None => {
+                let id = resolve_resolution_target(&tx, manifest_id, parser_id, r, None)?;
+                (None, id)
+            }
+        };
+
+        // Symbol-id-derived target_path: only legal when the analyzer
+        // itself did not emit a path AND a qualified-only fallback
+        // adopted a unique sibling-parser symbol. Never run for the
+        // PhantomDropped case (above) — that path is preserved as
+        // analyzer-bug signal — and never overwrite an
+        // analyzer-emitted Valid path.
+        if matches!(path_origin, PathOrigin::None) && sanitized_target_path.is_none() {
+            if let Some(id) = target_symbol_id {
+                if let Some(derived) = path_for_symbol_id(&tx, manifest_id, id)? {
+                    sanitized_target_path = Some(derived);
+                }
+            }
+        }
         tx.execute(
             "INSERT INTO resolutions
                (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
-                kind, semantic_kind, target_symbol_id, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 site_blob,
                 site_parser,
@@ -169,6 +269,7 @@ pub(super) fn persist_resolutions(
                 r.kind.as_str(),
                 r.semantic_kind.map(|s| s.as_str()),
                 target_symbol_id,
+                sanitized_target_path,
                 source,
             ],
         )?;
@@ -179,29 +280,168 @@ pub(super) fn persist_resolutions(
     Ok(inserted)
 }
 
+/// Best-effort symbol-id lookup. Returns `None` for import edges (which set
+/// `target_qualified = None` by contract) and for any other resolution
+/// whose `(blob_sha, qualified)` pair cannot be matched to a row in the
+/// `symbols` table.
+///
+/// `target_path_hint` reflects the **sanitized** path the caller has
+/// already validated against the manifest: `Some(path)` means "the
+/// analyzer emitted this path and it exists in the manifest"; `None`
+/// means either the analyzer did not emit one **or** it emitted a
+/// phantom that the caller dropped (`PathOrigin::PhantomDropped`). The
+/// caller therefore must call this function with `None` for the
+/// phantom case so the manifest-wide qualified-only fallback below is
+/// only allowed for genuine `target_path = None` analyzers (cross-
+/// parser type/call) and never re-points a phantom path to a different
+/// file. Two pathways are tried in order:
+///
+///   1. Path-scoped: same-parser exact match, then path-scoped cross-
+///      parser uniqueness fallback (multiple hits → None).
+///   2. Manifest-wide: only when `target_path_hint == None`, restricted
+///      to symbols whose blob appears in this manifest, with the same
+///      uniqueness check.
+///
+/// Today the cross-parser fallbacks primarily help cross-language
+/// hierarchies (Kotlin extending a Java class, Swift importing an
+/// Objective-C declaration). Future risk: a blob indexed by multiple
+/// parsers (TS/JS overlap, generated files) — the uniqueness check
+/// catches it.
 fn resolve_resolution_target(
     conn: &Connection,
     manifest_id: ManifestId,
     parser_id: &str,
     r: &WorkspaceResolution,
+    target_path_hint: Option<&str>,
 ) -> Result<Option<i64>> {
-    let (Some(path), Some(qualified)) = (r.target_path.as_deref(), r.target_qualified.as_deref())
-    else {
+    let Some(qualified) = r.target_qualified.as_deref() else {
         return Ok(None);
     };
-    let Some(target_blob) = blob_for_path(conn, manifest_id, path)? else {
-        return Ok(None);
+
+    // Path-scoped lookup is the fast path when the resolver already knew
+    // which workspace file holds the target. Failing that we fall through
+    // to qualified-only (manifest-wide) lookups so we can still pin the
+    // symbol id for cross-parser cases where the resolver does not index
+    // the sibling backend's files (e.g. Kotlin → Java).
+    let target_blob_hint = match target_path_hint {
+        Some(path) => blob_for_path(conn, manifest_id, path)?,
+        None => None,
     };
+
+    if let Some(target_blob) = target_blob_hint.as_deref() {
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM symbols
+                 WHERE blob_sha = ?1
+                   AND parser_id = ?2
+                   AND qualified = ?3
+                 ORDER BY (byte_end - byte_start) ASC
+                 LIMIT 1",
+                params![target_blob, parser_id, qualified],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return Ok(Some(id));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, parser_id FROM symbols
+             WHERE blob_sha = ?1 AND qualified = ?2
+             LIMIT 2",
+        )?;
+        let candidates: Vec<(i64, String)> = stmt
+            .query_map(params![target_blob, qualified], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match candidates.as_slice() {
+            [(id, _)] => return Ok(Some(*id)),
+            [] => {}
+            many => {
+                tracing::debug!(
+                    target: "cairn_core::persist",
+                    source_parser_id = parser_id,
+                    target_qualified = %qualified,
+                    target_path = r.target_path.as_deref().unwrap_or(""),
+                    candidate_count = many.len(),
+                    "resolve_resolution_target: cross-parser fallback ambiguous (path-scoped), returning None"
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    // Manifest-wide qualified-only lookup: covers cross-parser type/call
+    // resolution where the resolver returned `(target_path = None,
+    // target_qualified = Some)`. Only adopts unique matches restricted
+    // to blobs that appear in this manifest, mirroring the strictness
+    // of the path-scoped uniqueness check above.
+    //
+    // Gated on `target_path_hint == None`: this branch is *not* allowed
+    // when the analyzer emitted a target_path that the caller dropped
+    // (PathOrigin::PhantomDropped), so a phantom path cannot be
+    // silently re-pointed to a different file by a coincidentally-
+    // matching sibling-parser symbol. Phantom-path analyzer bugs
+    // should surface as `target_symbol_id = NULL` /
+    // `target_path = NULL`, not get hidden behind an unrelated symbol.
+    if target_path_hint.is_some() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.parser_id FROM symbols s
+         WHERE s.qualified = ?1
+           AND EXISTS (
+               SELECT 1 FROM manifest_entries me
+                WHERE me.manifest_id = ?2
+                  AND me.blob_sha = s.blob_sha
+           )
+         LIMIT 2",
+    )?;
+    let candidates: Vec<(i64, String)> = stmt
+        .query_map(params![qualified, manifest_id.0], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match candidates.as_slice() {
+        [(id, _)] => Ok(Some(*id)),
+        [] => Ok(None),
+        many => {
+            tracing::debug!(
+                target: "cairn_core::persist",
+                source_parser_id = parser_id,
+                target_qualified = %qualified,
+                candidate_count = many.len(),
+                "resolve_resolution_target: qualified-only fallback ambiguous, returning None"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Resolve a symbols row id back to its workspace file path in this
+/// manifest. Returns `None` if the symbol's blob is not in the manifest
+/// (which would normally not happen since `resolve_resolution_target`
+/// already filters by manifest membership, but guards against drift).
+fn path_for_symbol_id(
+    conn: &Connection,
+    manifest_id: ManifestId,
+    symbol_id: i64,
+) -> Result<Option<String>> {
+    // `ORDER BY me.path` so the choice is deterministic when the same
+    // blob is referenced from multiple paths in the manifest (rare,
+    // but the manifest schema allows it). Lexicographic order is
+    // arbitrary but stable across runs.
     Ok(conn
         .query_row(
-            "SELECT id FROM symbols
-             WHERE blob_sha = ?1
-               AND parser_id = ?2
-               AND qualified = ?3
-             ORDER BY (byte_end - byte_start) ASC
+            "SELECT me.path FROM symbols s
+             JOIN manifest_entries me
+               ON me.manifest_id = ?1
+              AND me.blob_sha = s.blob_sha
+             WHERE s.id = ?2
+             ORDER BY me.path
              LIMIT 1",
-            params![target_blob, parser_id, qualified],
-            |row| row.get::<_, i64>(0),
+            params![manifest_id.0, symbol_id],
+            |row| row.get::<_, String>(0),
         )
         .optional()?)
 }

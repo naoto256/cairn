@@ -430,3 +430,106 @@ fn inject_synthetic_resolution(
     )
     .unwrap();
 }
+
+/// v10 variant: writes a resolution row that also pins
+/// `target_path` directly (simulating a cross-parser-id type edge
+/// where the resolver knows the workspace file the supertype lives
+/// in, even if `target_symbol_id` is NULL because the symbol lookup
+/// crosses parser_ids without a same-parser match).
+fn inject_synthetic_resolution_with_target_path(
+    conn: &Connection,
+    path_suffix: &str,
+    semantic_kind: &str,
+    source: &str,
+    target_path: &str,
+) {
+    let (blob_sha, parser_id, start, end) = impl_site(conn, path_suffix)
+        .unwrap_or_else(|| panic!("missing impl row for {path_suffix}"));
+    conn.execute(
+        "INSERT INTO resolutions
+           (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+            kind, semantic_kind, target_symbol_id, target_path, source)
+         VALUES (?1, ?2, ?3, ?4, 'type', ?5, NULL, ?6, ?7)",
+        rusqlite::params![
+            blob_sha,
+            parser_id,
+            start,
+            end,
+            semantic_kind,
+            target_path,
+            source
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn find_subtypes_returns_target_path_for_cross_parser_resolution() {
+    // v10 round-trip for find_impls: when a resolver writes a row
+    // with `target_path Some` (cross-parser-id case), the SELECT
+    // surfaces it on `ImplHit.target_path` directly without
+    // chasing through `symbols`.
+    let (_repo, _sha) = init_repo(&[(
+        "src/pets.ts",
+        "class Animal {}\n\
+             class Dog extends Animal {}\n",
+    )]);
+    let db_tmp = tempfile::tempdir().unwrap();
+    let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    register_repo(&mut conn, _repo.path(), 0).unwrap();
+
+    inject_synthetic_resolution_with_target_path(
+        &conn,
+        "pets.ts",
+        "inherit",
+        "tier25-typescript-resolver",
+        "src/animals/animal.ts",
+    );
+
+    let implementors = find_subtypes(
+        &conn,
+        &AnchorName::head(),
+        &FindSubtypesArgs {
+            name: "Animal".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hit = implementors
+        .iter()
+        .find(|h| h.type_qualified == "Dog")
+        .expect("Dog subtype missing");
+    assert_eq!(hit.kind_source, "tier25-typescript-resolver");
+    assert_eq!(hit.target_path.as_deref(), Some("src/animals/animal.ts"));
+}
+
+#[test]
+fn find_subtypes_target_path_none_for_tier2_direct_fallback() {
+    // Tier-2 direct resolution (insert_direct_resolution in cas/blob.rs)
+    // writes target_path NULL by construction. The wire field stays None
+    // even when kind_source is tier2-direct-typescript.
+    let (_repo, _sha) = init_repo(&[(
+        "src/pets.ts",
+        "class Animal {}\n\
+             class Dog extends Animal {}\n",
+    )]);
+    let db_tmp = tempfile::tempdir().unwrap();
+    let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    register_repo(&mut conn, _repo.path(), 0).unwrap();
+
+    let implementors = find_subtypes(
+        &conn,
+        &AnchorName::head(),
+        &FindSubtypesArgs {
+            name: "Animal".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hit = implementors
+        .iter()
+        .find(|h| h.type_qualified == "Dog")
+        .expect("Dog subtype missing");
+    assert_eq!(hit.kind_source, "tier2-direct-typescript");
+    assert!(hit.target_path.is_none());
+}

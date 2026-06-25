@@ -369,6 +369,66 @@ ALTER TABLE imports ADD COLUMN byte_start INTEGER;
 ALTER TABLE imports ADD COLUMN byte_end INTEGER;
 "#,
     },
+    Migration {
+        version: 10,
+        sql: r#"
+-- Tier-2.5 resolution layer: target file path persistence.
+--
+-- Pre-v10 the only way to recover "which workspace file does this
+-- edge resolve to?" from a `resolutions` row was to chase
+-- `target_symbol_id -> symbols.blob_sha -> manifest_entries.path`.
+-- That chain is structurally broken for two cases the resolver
+-- already handles correctly internally:
+--
+--   1. Import edges (`require_relative './db'`, `import './foo'`).
+--      The target is a *file*, not a symbol -- there is no symbol
+--      row with `qualified = '<resolved path>'`, so the chain returns
+--      NULL even when `WorkspaceResolution.target_path` is `Some`.
+--
+--   2. Cross-parser-id type/call edges (Kotlin extending a Java
+--      class, Swift importing an Objective-C category, etc.). The
+--      symbol exists in a sibling backend's `parser_id`, so the
+--      single-parser symbol lookup in `persist_resolutions` misses
+--      it and `target_symbol_id` is NULL.
+--
+-- v10 makes `target_path` the source of truth for "which workspace
+-- file" by persisting it directly. `target_symbol_id` remains the
+-- source of truth for "which symbol" -- both axes are orthogonal,
+-- both may independently be NULL. The wire surface (`ImportHit`,
+-- `ImplHit`, and -- in a follow-up Phase 2 -- `FindReferenceHit` /
+-- `CallHit`) reads `target_path` directly instead of chasing through
+-- `symbols`.
+--
+-- `target_qualified` is intentionally not added as a column in v10:
+-- nothing in the query layer reads `resolutions.target_qualified`
+-- today, so persisting it would be YAGNI. If a future call-graph
+-- rewrite wants qualified-name info from `resolutions` directly,
+-- that work can land in a v11 alongside `target_parser_id` and
+-- `manifest_id` as a single coherent step (see "known limitation"
+-- below).
+--
+-- The partial index supports future reverse lookups ("who resolves
+-- to this file?") without paying for the NULL majority that bare
+-- specifiers and unresolved sites produce.
+--
+-- Known limitation (not fixed in v10): `resolutions` rows are keyed
+-- by `(site_blob_sha, site_parser_id, byte_range, source)` and do
+-- not carry `manifest_id`. The same source blob shared across
+-- branches/tags/manifests will see the last-writer-wins
+-- `target_path` from whichever manifest most recently ran the
+-- analyzer. Pre-v10 this issue already existed for
+-- `target_symbol_id`; v10 exposes the same limitation for
+-- `target_path`, so wrong-manifest reads can now surface
+-- user-visible incorrect paths in addition to incorrect symbol IDs.
+-- Follow-up: a separate PR (planned v11) will add
+-- `resolutions.manifest_id` plus manifest-scoped query joins and
+-- DELETE.
+ALTER TABLE resolutions ADD COLUMN target_path TEXT;
+CREATE INDEX idx_resolutions_target_path
+    ON resolutions(target_path)
+    WHERE target_path IS NOT NULL;
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -392,7 +452,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 9);
+        assert_eq!(v, 10);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).

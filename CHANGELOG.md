@@ -5,6 +5,84 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Tier-2.5 resolution `target_path` persistence (Phase 1).** New
+  schema migration v10 adds `resolutions.target_path TEXT` plus a
+  partial index. Workspace analyzers now persist the file path of the
+  resolved target (import edges, cross-parser type/call edges) as a
+  source of truth that is independent of `target_symbol_id`, so the
+  resolver can pin "which workspace file" even when no symbol-level
+  identity is recoverable. `ImportHit.target_path` (`find_imports`)
+  and `ImplHit.target_path` (`find_subtypes` / `find_supertypes`)
+  surface the new column on the wire as additive `Option<String>`
+  fields. The persist layer additionally gains a cross-parser-id
+  symbol-lookup fallback (unique-hit only, with manifest-wide
+  qualified-only branch gated to analyzer-emitted
+  `target_path = None`) so cross-language hierarchies (Kotlin
+  extending Java, Swift importing Objective-C, etc.) now pin
+  `target_symbol_id` whenever a single sibling-parser symbol
+  matches.
+- **Ruby require-graph contract fix.** `RequireEdge.target_qualified`
+  for `require_relative` edges is now `None` (was a path string,
+  which never matched `symbols.qualified` and silently dropped the
+  lookup). `target_path` remains the source of truth for these
+  edges.
+
+### Changed
+
+- All six Tier-2.5 analyzers currently in `release/0.7.0` had their
+  revisions bumped (Ruby 2→3; PHP / Python / Kotlin / Swift / C#
+  1→2). JavaScript ships on its own branch (PR #212) and is bumped
+  there as part of that PR's rebase onto v10. On upgrade the
+  daemon's CAS treats existing resolutions rows as stale: cached
+  Tier-2.5 facts for the bumped analyzers are dropped on the next
+  analyzer run and rewritten with the new `target_path` column
+  populated. **Existing repositories require a manual nudge** to
+  trigger the rerun; the daemon's watcher does not auto-detect
+  revision bumps as a re-index signal. Run
+  `cairn ctl repo reindex <alias>` (or remove + re-register) once
+  per repo — this re-enqueues the analyzer jobs, the next successful
+  pass replays `persist_resolutions` for the affected source string
+  and the `target_path` column is populated as part of that pass.
+  Newly-registered repositories get the new shape automatically on
+  first index. A scheduler change that detects revision-bump and
+  enqueues automatically is tracked as a follow-up.
+- `find_references` / `find_callers` / `find_callees` results for
+  cross-parser-id codebases (Kotlin → Java, Swift → Objective-C,
+  etc.) may surface previously-missed resolved hits as the
+  cross-parser symbol fallback newly fills in `target_symbol_id`
+  for sites the same-parser lookup used to miss. This is false-
+  negative recovery, not a semantic change.
+
+### Migration notes
+
+- **Schema v10** is applied automatically when the new binary opens
+  an existing index (the migration is an additive `ALTER TABLE` +
+  partial index). No data loss; legacy resolutions rows keep
+  `target_path = NULL` until the analyzer that wrote them re-runs.
+- **`cairn ctl repo reindex <alias>`** is the canonical
+  upgrade-completion command for existing repos; the analyzer
+  revision bump invalidates the cached run, the reindex schedules
+  the rerun, and the new column gets populated on the next
+  successful analyzer pass. A future scheduler change may make this
+  step automatic; for now, surface the command in upgrade docs.
+
+### Known limitations
+
+- Cross-manifest divergence of `resolutions` rows pre-dates this
+  release: the table is keyed by `(site_blob_sha,
+  site_parser_id, byte_range, source)` and does not carry
+  `manifest_id`. The same source blob shared across
+  branches/tags/manifests reads the last-writer-wins
+  `target_symbol_id` / `target_path`. v10 exposes the existing
+  `target_symbol_id` issue for `target_path` as well (wrong-manifest
+  reads can now surface user-visible incorrect file paths in
+  addition to incorrect symbol ids). A follow-up release will add
+  `resolutions.manifest_id` plus manifest-scoped query joins.
+
 ## [0.6.2] — 2026-06-24
 
 Patch release laying the structural groundwork for Tier-2.5 (a

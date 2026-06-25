@@ -37,6 +37,13 @@ pub struct ImportHit {
     /// pinned the site, or [`KIND_SOURCE_FACT`] (`"tier2-fact"`) when
     /// the bare `imports` row was used as fallback.
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the import resolved
+    /// to (v10+). `Some("src/db.js")` when `require_graph` /
+    /// equivalent pinned the import to a workspace-internal file;
+    /// `None` for bare specifiers (`require 'rake'`,
+    /// `import 'lodash'`), node:builtin imports, externals, and any
+    /// site that fell back to `tier2-fact`.
+    pub target_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,7 +82,7 @@ pub fn find_imports(
         "WITH best_resolution AS (
              SELECT site_blob_sha, site_parser_id,
                     site_byte_start, site_byte_end,
-                    source,
+                    source, target_path,
                     ROW_NUMBER() OVER (
                         PARTITION BY site_blob_sha, site_parser_id,
                                      site_byte_start, site_byte_end
@@ -87,7 +94,8 @@ pub fn find_imports(
          SELECT me.path, i.to_module, i.imported, i.alias, i.is_reexport,
                 i.line, i.parser_id,
                 CASE WHEN r.source IS NOT NULL THEN r.source ELSE '{KIND_SOURCE_FACT}' END
-                    AS kind_source
+                    AS kind_source,
+                r.target_path AS target_path
            FROM imports i
            JOIN manifest_entries me
              ON me.manifest_id = ?1
@@ -123,6 +131,7 @@ pub fn find_imports(
                 line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
                 parser_id: row.get(6)?,
                 kind_source: row.get(7)?,
+                target_path: row.get(8)?,
             })
         })?
         .collect();

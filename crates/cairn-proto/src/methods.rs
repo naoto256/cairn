@@ -806,6 +806,20 @@ pub struct ImplHit {
     /// here keeps deserialization of those payloads green.
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the resolved
+    /// supertype lives in (v10+). `Some("src/Foo.java")` when the
+    /// resolver pinned the edge to a workspace-internal definition
+    /// (same row that promoted `kind_source` off `tier2-fact`);
+    /// `None` for unresolved sites and supertypes that live outside
+    /// the indexed workspace. Cross-parser-id hierarchies (Kotlin →
+    /// Java, Swift → Objective-C, etc.) populate `target_path`
+    /// whenever the persist layer's uniqueness-checked symbol
+    /// fallback found a unique sibling-parser match. Additive field
+    /// — older daemons that predate the Phase 1 target_path surface
+    /// omit it and the default `None` keeps deserialization of those
+    /// payloads green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
     /// Anchor label the edge came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the subtype-side symbol
@@ -880,6 +894,17 @@ pub struct ImportHit {
     /// payloads green.
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the import resolved
+    /// to (v10+). `Some("src/db.js")` when the require-graph
+    /// resolver pinned the import to a workspace-internal file
+    /// (`require_relative './db'`, `import './foo'`, etc.); `None`
+    /// for bare specifiers, node:builtin / stdlib imports, external
+    /// packages, and any site that fell back to `tier2-fact`.
+    /// Additive field — older daemons that predate the Phase 1
+    /// target_path surface omit it and the default `None` keeps
+    /// deserialization of those payloads green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
     /// Anchor label the import came from.
     pub branch: String,
     /// `repo:branch:file:line` pointing at the import statement.

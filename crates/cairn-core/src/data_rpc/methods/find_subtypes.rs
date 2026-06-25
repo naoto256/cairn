@@ -114,6 +114,7 @@ pub(super) fn into_wire_hit(repo: &str, anchor: &str, h: QueryHit) -> ImplHit {
         interface_qualified: h.interface_qualified,
         kind: h.kind,
         kind_source: h.kind_source,
+        target_path: h.target_path,
         branch: anchor.to_string(),
         location: format!("{repo}:{anchor}:{}:{}", h.path, h.line),
     }
