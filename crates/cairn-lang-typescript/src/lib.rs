@@ -61,6 +61,14 @@ impl LanguageBackend for TypescriptBackend {
         "tree-sitter-typescript"
     }
 
+    /// Revision 2: CommonJS `require(...)` is now emitted as
+    /// `ImportFact` for all three dialects (Wave 2C follow-up to the
+    /// JavaScript Tier-2.5 backend). Same input yields more facts, so
+    /// the CAS-cached syntactic snapshot must be invalidated.
+    fn parser_revision(&self) -> u32 {
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         extract(
             source,
@@ -93,6 +101,11 @@ impl LanguageBackend for TsxBackend {
 
     fn parser_id(&self) -> &'static str {
         "tree-sitter-tsx"
+    }
+
+    /// See [`TypescriptBackend::parser_revision`].
+    fn parser_revision(&self) -> u32 {
+        2
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -131,6 +144,11 @@ impl LanguageBackend for JavascriptBackend {
         "tree-sitter-javascript"
     }
 
+    /// See [`TypescriptBackend::parser_revision`].
+    fn parser_revision(&self) -> u32 {
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         extract(
             source,
@@ -166,6 +184,17 @@ impl Visitor for TypescriptVisitor {
         if node.kind() == "import_statement" {
             extract_imports(node, source, facts);
             return;
+        }
+
+        // CommonJS `const X = require('./foo')` and friends. tree-sitter
+        // surfaces these as `lexical_declaration` (let/const) or
+        // `variable_declaration` (var). Don't `return` — leaf nodes
+        // underneath still need normal symbol classification (none of
+        // the require shapes themselves carry a SymbolKind, but a
+        // declarator whose RHS is *not* a require call must fall through
+        // unchanged).
+        if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+            extract_cjs_requires(node, source, facts);
         }
 
         let Some((mut kind, name, body_start)) = match_typescript_item(node, source) else {
@@ -417,6 +446,139 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
 
             byte_range: Some(source_byte_range),
         });
+    }
+}
+
+/// Detect CommonJS `require(...)` bindings inside a `lexical_declaration`
+/// or `variable_declaration` and emit `ImportFact`s for each.
+///
+/// Shapes handled (mirrors the Tier-2.5 JavaScript backend's
+/// `try_emit_cjs_require`):
+///   * `const X = require('./foo')`                  → `imported="default"`
+///   * `const X = require('./foo').Y`                → `imported="Y"`
+///   * `const { X, Y: Z } = require('./foo')`        → one fact per binding
+///
+/// `let` / `var` are accepted too — emission policy is shape-driven,
+/// not binding-form-driven, so any rebinding pattern resolves to the
+/// same module. Non-require RHS values are silently ignored.
+///
+/// Emitted on all three dialects (TS / TSX / JS). CommonJS in `.ts`
+/// is rare but valid and shows up in mixed CJS/ESM codebases.
+fn extract_cjs_requires(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
+    let mut cursor = node.walk();
+    for declarator in node.named_children(&mut cursor) {
+        if declarator.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name_node) = child_by_field(declarator, "name") else {
+            continue;
+        };
+        let Some(value_node) = child_by_field(declarator, "value") else {
+            continue;
+        };
+        try_emit_cjs_require(name_node, value_node, source, facts);
+    }
+}
+
+fn try_emit_cjs_require(
+    name_node: Node<'_>,
+    value_node: Node<'_>,
+    source: &[u8],
+    facts: &mut SyntacticFacts,
+) {
+    // RHS shape: `require('./foo')` or `require('./foo').Member`.
+    let (require_call, member): (Node<'_>, Option<String>) = match value_node.kind() {
+        "call_expression" => (value_node, None),
+        "member_expression" => {
+            let Some(obj) = child_by_field(value_node, "object") else {
+                return;
+            };
+            let Some(prop) = child_by_field(value_node, "property") else {
+                return;
+            };
+            if obj.kind() != "call_expression" {
+                return;
+            }
+            (obj, Some(node_text(prop, source).to_string()))
+        }
+        _ => return,
+    };
+
+    let Some(func) = child_by_field(require_call, "function") else {
+        return;
+    };
+    if func.kind() != "identifier" || node_text(func, source) != "require" {
+        return;
+    }
+    let Some(args) = child_by_field(require_call, "arguments") else {
+        return;
+    };
+
+    // First positional argument must be a string literal.
+    let mut arg_cursor = args.walk();
+    let Some(module_node) = args.named_children(&mut arg_cursor).next() else {
+        return;
+    };
+    if module_node.kind() != "string" {
+        return;
+    }
+    let to_module = strip_string_literal(node_text(module_node, source));
+    let module_range = module_node.byte_range();
+    let source_byte_range: (u32, u32) = (module_range.start as u32, module_range.end as u32);
+    let line = line_of(require_call);
+
+    match name_node.kind() {
+        "identifier" => {
+            let alias = node_text(name_node, source).to_string();
+            let imported = member.unwrap_or_else(|| "default".to_string());
+            facts.imports.push(ImportFact {
+                to_module,
+                imported: Some(imported),
+                alias: Some(alias),
+                is_reexport: false,
+                line,
+                byte_range: Some(source_byte_range),
+            });
+        }
+        "object_pattern" => {
+            // `const { X, Y: Z } = require('./foo')`
+            let mut cursor = name_node.walk();
+            for child in name_node.named_children(&mut cursor) {
+                match child.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let n = node_text(child, source).to_string();
+                        facts.imports.push(ImportFact {
+                            to_module: to_module.clone(),
+                            imported: Some(n.clone()),
+                            alias: Some(n),
+                            is_reexport: false,
+                            line,
+                            byte_range: Some(source_byte_range),
+                        });
+                    }
+                    "pair_pattern" => {
+                        let Some(key) = child_by_field(child, "key") else {
+                            continue;
+                        };
+                        let Some(val) = child_by_field(child, "value") else {
+                            continue;
+                        };
+                        let imported = node_text(key, source).to_string();
+                        let alias = node_text(val, source).to_string();
+                        facts.imports.push(ImportFact {
+                            to_module: to_module.clone(),
+                            imported: Some(imported),
+                            alias: Some(alias),
+                            is_reexport: false,
+                            line,
+                            byte_range: Some(source_byte_range),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -725,6 +887,123 @@ class Dog extends Animal {
         assert_eq!(JavascriptBackend.name(), "javascript");
         assert_eq!(JavascriptBackend.parser_id(), "tree-sitter-javascript");
         assert_eq!(JavascriptBackend.shebang_patterns(), &["node"]);
+    }
+
+    #[test]
+    fn javascript_extracts_cjs_require_default() {
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const foo = require('./foo');\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 1);
+        let i = &facts.imports[0];
+        assert_eq!(i.to_module, "./foo");
+        assert_eq!(i.imported.as_deref(), Some("default"));
+        assert_eq!(i.alias.as_deref(), Some("foo"));
+        // byte_range must point at the string literal `'./foo'`
+        // including the quotes — Tier-2.5's resolver anchors on this
+        // span.
+        let (s, e) = i.byte_range.expect("byte_range emitted");
+        let span = &b"const foo = require('./foo');\n"[s as usize..e as usize];
+        assert_eq!(span, b"'./foo'");
+    }
+
+    #[test]
+    fn javascript_extracts_cjs_require_destructured() {
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const { Router, Route: R } = require('./router');\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 2);
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "./router"
+                && i.imported.as_deref() == Some("Router")
+                && i.alias.as_deref() == Some("Router")
+        }));
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "./router"
+                && i.imported.as_deref() == Some("Route")
+                && i.alias.as_deref() == Some("R")
+        }));
+    }
+
+    #[test]
+    fn javascript_extracts_cjs_require_member() {
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const Foo = require('./mod').Bar;\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 1);
+        let i = &facts.imports[0];
+        assert_eq!(i.to_module, "./mod");
+        assert_eq!(i.imported.as_deref(), Some("Bar"));
+        assert_eq!(i.alias.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn javascript_cjs_and_esm_coexist() {
+        let src = br#"
+import { useState } from "react";
+const fs = require('fs');
+const { join } = require('path');
+"#;
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        assert!(
+            facts
+                .imports
+                .iter()
+                .any(|i| { i.to_module == "react" && i.imported.as_deref() == Some("useState") })
+        );
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "fs"
+                && i.imported.as_deref() == Some("default")
+                && i.alias.as_deref() == Some("fs")
+        }));
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "path"
+                && i.imported.as_deref() == Some("join")
+                && i.alias.as_deref() == Some("join")
+        }));
+    }
+
+    #[test]
+    fn javascript_var_and_let_require_also_emit() {
+        // Emission is shape-driven; let/var bindings reach the same path.
+        let facts = JavascriptBackend
+            .extract_syntactic(b"var a = require('./a'); let b = require('./b');\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 2);
+        assert!(facts.imports.iter().any(|i| i.to_module == "./a"));
+        assert!(facts.imports.iter().any(|i| i.to_module == "./b"));
+    }
+
+    #[test]
+    fn javascript_non_require_call_is_ignored() {
+        // RHS is a call but not `require(...)` — must not emit anything.
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const x = compute('./foo');\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 0);
+    }
+
+    #[test]
+    fn typescript_also_emits_cjs_require() {
+        // Mixed CJS/ESM does appear in real .ts code (e.g. type-only
+        // modules wrapped with `require` for runtime), so the emit
+        // policy is dialect-agnostic.
+        let facts = TypescriptBackend
+            .extract_syntactic(b"const fs = require('fs');\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 1);
+        assert_eq!(facts.imports[0].to_module, "fs");
+        assert_eq!(facts.imports[0].imported.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn parser_revision_bumped_for_cjs_emit() {
+        // Bump signals to the CAS-cached syntactic snapshot that the
+        // emission policy changed; without this, stale snapshots would
+        // miss CJS imports until the user manually reindexed.
+        assert_eq!(TypescriptBackend.parser_revision(), 2);
+        assert_eq!(TsxBackend.parser_revision(), 2);
+        assert_eq!(JavascriptBackend.parser_revision(), 2);
     }
 
     #[test]

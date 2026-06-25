@@ -4,14 +4,24 @@
 //!   * relative specifier (`./foo`, `../foo/bar`): normalize against
 //!     the source file's directory, then probe `<p>`, `<p>.js`,
 //!     `<p>.mjs`, `<p>.cjs`, `<p>.jsx`, `<p>/index.js`,
-//!     `<p>/index.mjs`, `<p>/index.cjs` in that order.
-//!   * bare specifier (`express`, `lodash`): no target path; record the
-//!     specifier as `target_qualified` for Tier-2-fact fallback.
-//!   * `node:`-prefixed (`node:fs`): same fallback.
+//!     `<p>/index.mjs`, `<p>/index.cjs` in that order. Hit ⇒
+//!     `RequireEdge.target_path = Some(path)`.
+//!   * bare specifier (`express`, `lodash`): no target path. The
+//!     specifier string is *not* stuffed into
+//!     `RequireEdge.target_qualified` — import edges target a file,
+//!     not a symbol, and Phase 1 settled the contract as
+//!     `target_qualified = None` for all import edges across every
+//!     Tier-2.5 backend.
+//!   * `node:`-prefixed (`node:fs`): same `(None, None)` shape.
 //!   * path-alias (`@/foo`, leading non-relative non-bare): same.
 //!
-//! The graph also produces a flat list of `ResolvedBinding`s the
-//! analyzer uses as the file's alias map for dispatch resolution.
+//! `ResolvedBinding.target_qualified` is a separate concept used
+//! downstream by [`crate::dispatch`] to map local aliases to the
+//! exported FQN they refer to (`const x = require('./util').helper`
+//! → `target_qualified = "util.helper"`); that lives on the binding
+//! map and never reaches the `RequireEdge` ImportFact. Both fields
+//! happen to share a name, but the import-edge axis stays at the
+//! file level only.
 
 use std::collections::{HashMap, HashSet};
 
@@ -71,7 +81,15 @@ impl RequireGraph {
                         site_byte_start: b.site_byte_start,
                         site_byte_end: b.site_byte_end,
                         target_path: target_path.clone(),
-                        target_qualified: Some(b.module.clone()),
+                        // Import edges target a *file*, not a symbol:
+                        // `b.module` is the module specifier (`./db`,
+                        // `lodash`, `node:fs`) and never matches
+                        // `symbols.qualified`. Mirroring Ruby's
+                        // Phase 1 require-graph fix, leave this `None`
+                        // so persist.rs skips the symbol lookup
+                        // entirely and `target_path` remains the
+                        // source of truth on the resolutions row.
+                        target_qualified: None,
                     });
                 }
 

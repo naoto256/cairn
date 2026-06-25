@@ -28,11 +28,18 @@
 //!
 //! Out of scope (Tier-3 / never at 2.5):
 //!
-//! * Bare specifiers (`express`, `lodash`) — npm packages: `target_path`
-//!   stays `None`, `target_qualified` records the specifier string for
-//!   Tier-2 fact fallback.
-//! * `node:fs` and other `node:`-prefixed builtins: same fallback.
+//! * Bare specifiers (`express`, `lodash`) — npm packages: import
+//!   edges record `target_path = None, target_qualified = None` and
+//!   fall through to the Tier-2 fact layer. The specifier string is
+//!   not stuffed into `target_qualified` (Phase 1 contract).
+//! * `node:fs` and other `node:`-prefixed builtins: same shape as
+//!   bare specifiers.
 //! * Bundler / `tsconfig` path aliases (`@/foo`, webpack `resolve.alias`).
+//! * Expression-position / side-effect `require(...)` calls
+//!   (`require('./setup')` as a statement, `app.use(require(...))`,
+//!   `module.exports = require(...)`): the Tier-1 emitter only sees
+//!   binding-form `const X = require(...)` today. Tracked as a
+//!   follow-up to extend `extract_cjs_requires`.
 //! * `obj.method()` where `obj` is a local of unresolved class.
 //! * Mixin factories (`class Foo extends Mixin(Base)`) — base is a call
 //!   expression and we deliberately skip it from MRO.
@@ -67,7 +74,14 @@ use require_graph::RequireGraph;
 
 pub const ANALYZER_ID: &str = "javascript-resolver";
 pub const TIER_PREFIX: &str = "tier25";
-pub const ANALYZER_REVISION: u32 = 1;
+// Bumped for resolutions.target_path persistence (schema v10) and the
+// require-graph hack fix that switches Import-edge target_qualified
+// from a path-shaped module specifier (`./db`) to `None`. Persist now
+// writes target_path directly into the row and the symbol lookup is
+// skipped for import edges, matching the Phase 1 contract the other
+// six Tier-2.5 analyzers adopted at v10 landing. Analyzer logic itself
+// is otherwise unchanged.
+pub const ANALYZER_REVISION: u32 = 2;
 pub const PARSER_ID: &str = "tree-sitter-javascript";
 pub const RESOLUTION_SOURCE: &str = "tier25-javascript-resolver";
 

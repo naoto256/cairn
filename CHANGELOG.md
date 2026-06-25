@@ -9,6 +9,31 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **JavaScript Tier-2.5 backend (Phase 3 integration of the
+  Wave 2B canary).** In-process tree-sitter resolver for JavaScript:
+  binding-form module imports (`const X = require(...)`,
+  `import X from '...'`, named / default / namespace / destructured
+  shapes), ES-class hierarchy, and static call dispatch within the
+  workspace. Adds `cairn-lang-javascript-tier25` (analyzer id
+  `javascript-resolver`), binding-form CommonJS `require()` import
+  emission on the Tier-1 `cairn-lang-typescript` backend across all
+  three dialects, and the same Phase 1 contract on import edges:
+  `target_qualified = None`, `target_path` is the source of truth,
+  persist.rs sanitises the path against the manifest, and the
+  cross-parser-id symbol fallback adopts a sibling-parser symbol
+  whenever a JS analyzer emits a unique qualified target. JS
+  analyzer revision starts at 2 so the same
+  `cairn ctl repo reindex <alias>` migration story applies to
+  JavaScript repos that were registered before this release.
+
+  **Not yet covered (follow-up):** expression-position and
+  side-effect `require()` calls (`require('./setup')` as a
+  statement, `app.use(require('./routes'))`,
+  `module.exports = require('./x')`) are not emitted to ImportFact
+  yet — only binding-form lexical declarations are. Tracked as a
+  Tier-1 `extract_cjs_requires` extension; until that lands these
+  sites fall through to the Tier-2 fact layer with no
+  `target_path`.
 - **Tier-2.5 resolution `target_path` surface on refs / calls
   (Phase 2).** `find_references`, `find_callers` and `find_callees`
   now return `target_path: Option<String>` on `FindReferenceHit` /
@@ -45,10 +70,11 @@ versions follow [SemVer](https://semver.org/).
 
 ### Changed
 
-- All six Tier-2.5 analyzers currently in `release/0.7.0` had their
-  revisions bumped (Ruby 2→3; PHP / Python / Kotlin / Swift / C#
-  1→2). JavaScript ships on its own branch (PR #212) and is bumped
-  there as part of that PR's rebase onto v10. On upgrade the
+- All seven Tier-2.5 analyzers in `release/0.7.0` had their
+  revisions bumped (Ruby 2→3; PHP / Python / Kotlin / Swift / C# /
+  JavaScript 1→2). JavaScript ships in the same release as part of
+  the Phase 3 PR #212 integration, with the same v10 contract
+  applied. On upgrade the
   daemon's CAS treats existing resolutions rows as stale: cached
   Tier-2.5 facts for the bumped analyzers are dropped on the next
   analyzer run and rewritten with the new `target_path` column
