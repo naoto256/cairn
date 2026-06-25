@@ -139,6 +139,7 @@ fn into_wire_hit(
         target_qualified: h.target_qualified,
         kind: h.kind,
         kind_source: h.kind_source,
+        target_path: h.target_path,
         enclosing_qualified: h.enclosing_qualified,
         branch: anchor.to_string(),
         location,

@@ -9,6 +9,18 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **Tier-2.5 resolution `target_path` surface on refs / calls
+  (Phase 2).** `find_references`, `find_callers` and `find_callees`
+  now return `target_path: Option<String>` on `FindReferenceHit` /
+  `CallHit`, sourced directly from `resolutions.target_path` via the
+  same projection added to `find_imports` / `find_subtypes` /
+  `find_supertypes` in Phase 1. Surface-additive: no SQL semantics
+  change for the existing resolved-noise filter, dedup ordering, or
+  `kind_source` precedence — the new column is appended to the
+  `best_resolution` CTE and the inner SELECT, and the resolved /
+  noise gates continue to read `sym.qualified` via `COALESCE`. No
+  new schema migration in Phase 2; the column reads come from
+  Phase 1's v10.
 - **Tier-2.5 resolution `target_path` persistence (Phase 1).** New
   schema migration v10 adds `resolutions.target_path TEXT` plus a
   partial index. Workspace analyzers now persist the file path of the
