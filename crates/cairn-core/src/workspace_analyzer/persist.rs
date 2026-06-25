@@ -143,8 +143,56 @@ enum PathOrigin {
 ///
 /// Mirrors [`persist_resolved_refs`]'s delete-then-insert pattern: any
 /// existing rows whose `source` matches `<tier_prefix>-<analyzer_id>` and
-/// whose blob belongs to this manifest are cleared first, then the new rows
-/// are inserted.
+/// whose `manifest_id` equals this manifest (or whose `manifest_id` is
+/// NULL **and** site_blob belongs to this manifest, see below) are
+/// cleared first, then the new rows are inserted.
+///
+/// # Cross-manifest invariant (v11)
+///
+/// Workspace-aware resolutions are scoped to one manifest by carrying
+/// `manifest_id Some` on every persisted row. The `cas/blob.rs`
+/// Tier-2 direct writer keeps `manifest_id NULL` for blob-scoped
+/// syntactic facts (one row valid across every manifest that contains
+/// the blob). These two roles are kept separate by the `source`
+/// naming convention: any source matching one of
+/// [`super::WORKSPACE_TIER_PREFIXES`] (`tier3-*` / `tier25-*`) is
+/// workspace-aware, everything else (specifically `tier2-direct-*`)
+/// is blob-scoped. The migration `v11` DELETE relies on this exact
+/// boundary; see also the `migration_v11_cleanup_drops_only_workspace_tier_legacy_rows`
+/// test in `cairn_core::cas::schema::tests`.
+///
+/// Cross-manifest correctness depends on a **three-layer defense**
+/// that the v11 design (and reviewer-driven design audit) settled
+/// on. Each layer is independently sufficient under its own
+/// assumptions; together they survive every reasonable failure of
+/// the others. Future maintainers should resist "simplifying" any
+/// one of these away — what looks redundant is the trust we extend
+/// to the layer below.
+///
+///   Layer 1: **migration-time wholesale cleanup.** v11 schema
+///   migration deletes every workspace-aware legacy NULL row
+///   (`tier3-*` / `tier25-*` with `manifest_id IS NULL`) at the
+///   moment the new column lands. New writers use `manifest_id
+///   Some`, so the table is in a known-clean state immediately after
+///   upgrade. This layer assumes the user runs `cairn ctl repo
+///   reindex <alias>` to repopulate.
+///
+///   Layer 2: **per-reindex DELETE expansion.** This function's
+///   DELETE removes (a) rows with `manifest_id = this manifest`
+///   *and* (b) any straggler `manifest_id IS NULL` row whose
+///   site_blob belongs to this manifest, for the same source string.
+///   So if Layer 1 missed something (corrupted DB, partial migration,
+///   manually injected fixture row, future writer bug), the next
+///   reindex catches it. The DELETE never touches Tier-2 direct rows
+///   because `source` differs.
+///
+///   Layer 3: **query ORDER precedence.** The 3 query paths
+///   (find_imports / find_impls / find_references) tie-break ROW_NUMBER
+///   so `manifest_id = ?` rows beat `manifest_id IS NULL` rows when
+///   both cover the same site. Even if both Layer 1 and Layer 2 fail
+///   to clean a workspace-aware NULL row, this layer ensures the
+///   manifest-specific row wins at read time. CASE expression cost
+///   is negligible per SQLite documentation.
 ///
 /// Two target axes are persisted independently (v10+):
 ///
@@ -167,11 +215,26 @@ pub(super) fn persist_resolutions(
 ) -> Result<usize> {
     let source = format!("{tier_prefix}-{analyzer_id}");
     let tx = conn.transaction()?;
+    // v11 DELETE expansion (Layer 2 of the cross-manifest defense
+    // documented on this function): remove rows owned by this
+    // (source, manifest) pair *and* any leftover legacy NULL row
+    // for the same source whose blob is in this manifest. The
+    // legacy branch is the safety net for stragglers that escaped
+    // the v11 migration-time wholesale cleanup. Workspace-aware
+    // sources (`tier3-*`, `tier25-*`) are the only callers of this
+    // function, so the `source = ?1` predicate ensures Tier-2
+    // direct (`tier2-direct-*`) blob-scoped rows are never touched.
     tx.execute(
         "DELETE FROM resolutions
           WHERE source = ?1
-            AND site_blob_sha IN (
-                SELECT blob_sha FROM manifest_entries WHERE manifest_id = ?2
+            AND (
+                manifest_id = ?2
+                OR (
+                    manifest_id IS NULL
+                    AND site_blob_sha IN (
+                        SELECT blob_sha FROM manifest_entries WHERE manifest_id = ?2
+                    )
+                )
             )",
         params![source, manifest_id.0],
     )?;
@@ -290,8 +353,9 @@ pub(super) fn persist_resolutions(
         tx.execute(
             "INSERT INTO resolutions
                (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
-                kind, semantic_kind, target_symbol_id, target_path, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 site_blob,
                 site_parser,
@@ -302,6 +366,7 @@ pub(super) fn persist_resolutions(
                 target_symbol_id,
                 sanitized_target_path,
                 source,
+                manifest_id.0,
             ],
         )?;
         inserted += 1;

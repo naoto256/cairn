@@ -798,3 +798,135 @@ fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
         "PHP-style FQN must not coincidentally match an unrelated cross-parser hit"
     );
 }
+
+// ──── MF-1: cross-manifest isolation for find_references ────
+//
+// Pin that a resolutions row scoped to *another* manifest is invisible
+// to a HEAD-anchored (manifest 1) `find_references` query, even when
+// the underlying blob is shared between both manifests. The shared
+// blob is what makes the test bite: it ensures the
+// `manifest_entries` JOIN cannot be the filter that hides the
+// row, so the v11 CTE predicate `(manifest_id = ?1 OR manifest_id
+// IS NULL)` is what's pinned.
+
+/// Build a single-Rust-file fixture spanning two manifests that map
+/// the same blob. HEAD points at manifest 1. The caller writes the
+/// manifest-2 resolution row.
+fn cross_manifest_ref_fixture() -> (tempfile::TempDir, Connection, i64) {
+    let db_tmp = tempfile::tempdir().unwrap();
+    let conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    // Two manifests; HEAD pinned to manifest 1.
+    conn.execute(
+        "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0), (2, 'tentative', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('HEAD', 1, 0)",
+        [],
+    )
+    .unwrap();
+    // Same blob registered under both manifests at different paths.
+    conn.execute(
+        "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('shared-blob', 'tree-sitter-rust', 1, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/lib.rs', 'shared-blob'),
+                    (2, 'lib/other-manifest.rs', 'shared-blob')",
+        [],
+    )
+    .unwrap();
+    // Caller symbol + a target symbol both in the shared blob, plus a
+    // single ref row at byte 42..50. The ref's target_qualified is
+    // NULL so a resolution row would normally upgrade kind_source /
+    // target_path; the manifest-2 row must NOT do so.
+    conn.execute(
+        "INSERT INTO symbols
+               (id, blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (1, 'shared-blob', 'tree-sitter-rust', 'caller', 'caller', 'function',
+                0, 200, 1, 10, 'rust-syn'),
+               (2, 'shared-blob', 'tree-sitter-rust', 'target', 'crate::target', 'function',
+                201, 220, 11, 12, 'rust-syn')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES
+               ('shared-blob', 'tree-sitter-rust', 1, 'target', NULL, 'call',
+                42, 50, 5, 'rust-syn')",
+        [],
+    )
+    .unwrap();
+    let target_id: i64 = 2;
+    (db_tmp, conn, target_id)
+}
+
+#[test]
+fn find_references_with_shared_blob_does_not_see_other_manifest_resolution() {
+    let (_db, conn, target_id) = cross_manifest_ref_fixture();
+
+    // Write a manifest-2 resolution row at the exact same site as
+    // the manifest-1 ref. If the CTE filter were broken, this row
+    // would surface its `target_path` sentinel on the manifest-1
+    // query result.
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES
+               ('shared-blob', 'tree-sitter-rust', 42, 50, 'call', NULL, ?1,
+                'lib/other-manifest.rs', 'tier25-rust-resolver', 2)",
+        rusqlite::params![target_id],
+    )
+    .unwrap();
+
+    // include_noise=true keeps the bare-name tier2-fact row in the
+    // result so we can assert the row is visible *and* the
+    // manifest-2 metadata didn't attach to it.
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "target".into(),
+            direction: ReferenceDirection::Incoming,
+            include_noise: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "fact row must remain visible (only the other-manifest \
+         resolution should be filtered out): {hits:?}"
+    );
+    let hit = &hits[0];
+    assert_eq!(hit.target_name, "target");
+    // No resolution row covers the site from manifest 1's perspective,
+    // so kind_source falls back to fact and target_path stays None /
+    // target_qualified stays None.
+    assert_eq!(
+        hit.kind_source, KIND_SOURCE_FACT,
+        "manifest-2 resolution row leaked its `source` into manifest-1 hit"
+    );
+    assert!(
+        hit.target_path.is_none(),
+        "manifest-2 resolution row leaked its target_path into manifest-1 hit: {hit:?}"
+    );
+    assert!(
+        hit.target_qualified.is_none(),
+        "manifest-2 resolution row leaked its sibling-symbol qualified into manifest-1 hit: {hit:?}"
+    );
+}

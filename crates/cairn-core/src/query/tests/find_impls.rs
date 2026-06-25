@@ -412,21 +412,46 @@ fn impl_site(conn: &Connection, path_suffix: &str) -> Option<(String, String, i6
 /// to simulate higher-tier (tier25 / tier3) writers without standing
 /// up a real analyzer. The (blob_sha, parser_id, byte_range) tuple
 /// matches the existing impl row exactly so the query's LEFT JOIN
-/// fires.
+/// fires. Defaults `manifest_id = Some(1)` to match the HEAD anchor
+/// the suite's `init_repo` fixtures build.
 fn inject_synthetic_resolution(
     conn: &Connection,
     path_suffix: &str,
     semantic_kind: &str,
     source: &str,
 ) {
+    inject_synthetic_resolution_with_manifest(conn, path_suffix, semantic_kind, source, Some(1));
+}
+
+/// `inject_synthetic_resolution` variant that lets the caller pick
+/// the `manifest_id` column explicitly. Used by the cross-manifest
+/// isolation test below to write a row scoped to a manifest other
+/// than the one HEAD points at; the v11 CTE filter
+/// `(manifest_id = ?1 OR manifest_id IS NULL)` should keep that row
+/// out of HEAD-anchored query results.
+fn inject_synthetic_resolution_with_manifest(
+    conn: &Connection,
+    path_suffix: &str,
+    semantic_kind: &str,
+    source: &str,
+    manifest_id: Option<i64>,
+) {
     let (blob_sha, parser_id, start, end) = impl_site(conn, path_suffix)
         .unwrap_or_else(|| panic!("missing impl row for {path_suffix}"));
     conn.execute(
         "INSERT INTO resolutions
            (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
-            kind, semantic_kind, target_symbol_id, source)
-         VALUES (?1, ?2, ?3, ?4, 'type', ?5, NULL, ?6)",
-        rusqlite::params![blob_sha, parser_id, start, end, semantic_kind, source],
+            kind, semantic_kind, target_symbol_id, source, manifest_id)
+         VALUES (?1, ?2, ?3, ?4, 'type', ?5, NULL, ?6, ?7)",
+        rusqlite::params![
+            blob_sha,
+            parser_id,
+            start,
+            end,
+            semantic_kind,
+            source,
+            manifest_id
+        ],
     )
     .unwrap();
 }
@@ -532,4 +557,104 @@ fn find_subtypes_target_path_none_for_tier2_direct_fallback() {
         .expect("Dog subtype missing");
     assert_eq!(hit.kind_source, "tier2-direct-typescript");
     assert!(hit.target_path.is_none());
+}
+
+// ──── MF-1: cross-manifest isolation ────
+//
+// `find_supertypes` shares the same `find_impls::run()` CTE shape as
+// `find_subtypes` — only the WHERE column differs — so this single
+// test covers both query paths' v11 `(manifest_id = ?1 OR manifest_id
+// IS NULL)` predicate.
+
+/// MF-1: a `resolutions` row scoped to manifest 2 must be invisible
+/// to a HEAD-anchored (manifest 1) query, *even when the underlying
+/// blob is shared between both manifests*. The shared-blob shape is
+/// critical: without it, the `manifest_entries` JOIN would filter
+/// the row out for an unrelated reason, and the CTE's
+/// `manifest_id` predicate would never get pinned in isolation.
+#[test]
+fn find_subtypes_with_shared_blob_does_not_see_other_manifest_resolution() {
+    let (_repo, _sha) = init_repo(&[(
+        "src/pets.ts",
+        "class Animal {}\n\
+             class Dog extends Animal {}\n",
+    )]);
+    let db_tmp = tempfile::tempdir().unwrap();
+    let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    register_repo(&mut conn, _repo.path(), 0).unwrap();
+
+    // Materialize a second manifest that maps the *same* pets.ts
+    // blob under a different path. Sharing the blob is what pins the
+    // CTE's `manifest_id` filter in isolation — if we used a
+    // distinct blob, the main query's `manifest_entries` JOIN would
+    // drop the row regardless of the CTE.
+    let blob_sha: String = conn
+        .query_row(
+            "SELECT blob_sha FROM manifest_entries
+               JOIN manifests USING (manifest_id)
+              WHERE path LIKE '%pets.ts'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Pick a manifest_id that doesn't collide with any
+    // `register_repo` already allocated. We use MAX+1 rather than a
+    // hard-coded constant since registration may create more than
+    // one manifest row (workspace analyzers etc.).
+    let other_manifest_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(manifest_id), 0) + 1 FROM manifests",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (?1, 'tentative', 0)",
+        rusqlite::params![other_manifest_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (?1, 'lib/other-manifest.ts', ?2)",
+        rusqlite::params![other_manifest_id, blob_sha],
+    )
+    .unwrap();
+
+    // Other-manifest-scoped row at the exact same site as the
+    // existing tier2-direct fact row. `target_path` is a sentinel
+    // that must never reach a HEAD-anchored caller.
+    let (b, p, start, end) = impl_site(&conn, "pets.ts").expect("pets.ts impl row");
+    conn.execute(
+        "INSERT INTO resolutions
+           (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+            kind, semantic_kind, target_symbol_id, target_path, source,
+            manifest_id)
+         VALUES (?1, ?2, ?3, ?4, 'type', 'mixin', NULL,
+                 'lib/other-manifest.ts', 'tier25-ts-resolver', ?5)",
+        rusqlite::params![b, p, start, end, other_manifest_id],
+    )
+    .unwrap();
+
+    let hits = find_subtypes(
+        &conn,
+        &AnchorName::head(),
+        &FindSubtypesArgs {
+            name: "Animal".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hit = hits
+        .iter()
+        .find(|h| h.type_qualified == "Dog")
+        .unwrap_or_else(|| panic!("Dog→Animal fact must remain visible: {hits:?}"));
+    // Tier-2 direct fact row is manifest_id NULL and stays visible.
+    assert_eq!(hit.kind_source, "tier2-direct-typescript");
+    // The manifest-2 sentinel must NOT leak through.
+    assert!(
+        hit.target_path.is_none(),
+        "manifest-2 resolution leaked into a manifest-1 query: {hit:?}"
+    );
 }

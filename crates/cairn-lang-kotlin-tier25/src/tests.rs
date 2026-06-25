@@ -618,7 +618,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "kotlin-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 2);
+    assert_eq!(ANALYZER_REVISION, 3);
     assert_eq!(PARSER_ID, "tree-sitter-kotlin-ng");
     assert_eq!(RESOLUTION_SOURCE, "tier25-kotlin-resolver");
 }
