@@ -133,7 +133,9 @@ fn run_find_references(
                         ROW_NUMBER() OVER (
                             PARTITION BY site_blob_sha, site_parser_id,
                                          site_byte_start, site_byte_end, kind
-                            ORDER BY ",
+                            ORDER BY
+                                CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
+                                ",
         );
         sql.push_str(&resolution_source_rank);
         sql.push_str(
@@ -141,6 +143,7 @@ fn run_find_references(
                         ) AS rn
                    FROM resolutions
                   WHERE kind IN ('type', 'call', 'import')
+                    AND (manifest_id = ?1 OR manifest_id IS NULL)
              )
              SELECT target_name, target_qualified, kind, enclosing,
                     path, line, blob_sha, parser_id, kind_source,

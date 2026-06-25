@@ -9,6 +9,45 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Cross-manifest divergence of Tier-2.5 / Tier-3 resolutions
+  (schema v11).** `resolutions` rows now carry an explicit
+  `manifest_id` column. Workspace-aware rows (Tier-2.5 / Tier-3,
+  written by `persist_resolutions`) tag the writing manifest;
+  Tier-2 direct rows (syntactic-only, written by
+  `cas/blob.rs::insert_direct_resolution`) keep `manifest_id NULL`
+  to remain valid across every manifest that contains the blob. The
+  three query paths (`find_imports` / `find_impls` /
+  `find_references`) filter to `(manifest_id = ?1 OR manifest_id IS
+  NULL)`, with a `CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END`
+  tie-break in `ROW_NUMBER` so a manifest-specific row always
+  outranks a blob-scoped one when both cover the same site. Closes
+  the root cause behind the Phase 4 *cross-manifest leakage*
+  Known Limitation: queries against manifest B no longer pick up
+  `target_path` / `target_symbol_id` values that the resolver
+  wrote while indexing manifest A. Also removes the v10
+  *cascading-reindex* symptom where reindexing manifest A's shared
+  blob would nuke manifest B's resolution rows; v11's
+  `persist_resolutions` DELETE keys on `(source, manifest_id)`
+  with an extra clause for straggler legacy NULL rows of the same
+  source. Composite partial indexes
+  (`idx_resolutions_manifest_site`,
+  `idx_resolutions_blob_scoped_site`) cover both branches of the
+  `OR` so query plans avoid a full table scan; verified via
+  `EXPLAIN QUERY PLAN` in tests.
+
+  This release is **correctness-first, not permissive-compat**: the
+  v11 migration deletes every workspace-aware legacy NULL row
+  (`tier3-*` / `tier25-*` sources where `manifest_id IS NULL`) at
+  the moment it lands. Existing repositories will see fewer
+  cross-file resolved hits and `target_path` values until the user
+  runs `cairn ctl repo reindex <alias>`. The wrong-manifest
+  leakage stops at the migration point regardless. Newly registered
+  repositories are unaffected. All seven Tier-2.5 analyzers
+  (Ruby 3→4; PHP / Python / Kotlin / Swift / C# / JavaScript 2→3)
+  had their revisions bumped so, after
+  `cairn ctl repo reindex <alias>` is invoked, the standard
+  `workspace_analysis_runs` staleness mechanism queues the
+  analyzer reruns.
 - **Cross-parser-id qualified-name lookup for `find_references` /
   `find_callers` (Phase 4).** Strict qualified lookup now matches
   against `COALESCE(r.target_qualified, sym.qualified)` rather than

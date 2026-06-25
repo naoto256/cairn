@@ -81,7 +81,12 @@ pub const TIER_PREFIX: &str = "tier25";
 // skipped for import edges, matching the Phase 1 contract the other
 // six Tier-2.5 analyzers adopted at v10 landing. Analyzer logic itself
 // is otherwise unchanged.
-pub const ANALYZER_REVISION: u32 = 2;
+// Bumped for resolutions.manifest_id persistence (schema v11): the
+// persist layer now scopes resolution rows to the writing manifest,
+// so existing workspace_analysis_runs need to be invalidated and the
+// analyzer re-run to repopulate rows with manifest_id Some. Analyzer
+// logic itself is unchanged.
+pub const ANALYZER_REVISION: u32 = 3;
 pub const PARSER_ID: &str = "tree-sitter-javascript";
 pub const RESOLUTION_SOURCE: &str = "tier25-javascript-resolver";
 
