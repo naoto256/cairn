@@ -7,8 +7,49 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cross-parser-id qualified-name lookup for `find_references` /
+  `find_callers` (Phase 4).** Strict qualified lookup now matches
+  against `COALESCE(r.target_qualified, sym.qualified)` rather than
+  `r.target_qualified` alone. Phase 1 cross-parser resolutions
+  populate `target_symbol_id` and the surface `target_qualified`
+  flows from `sym.qualified` via the inner-SELECT COALESCE; before
+  Phase 4 the WHERE clause only checked the raw `refs.target_qualified`,
+  so a strict FQN query (`find_callers com.x.JsonAdapter.fromJson`)
+  returned zero hits for every cross-parser resolved call. The
+  qualified-name detector also gains `.` and `\` separators so
+  Python / Kotlin / Swift / C# / Java FQNs and PHP `App\Foo\Bar`
+  namespaces enter the strict path instead of falling through to a
+  bare-name fallback that picks up unrelated same-name symbols.
+- **Manifest-wide qualified-only symbol fallback gated on
+  `kind != Import` (Phase 4).** `resolve_resolution_target`'s
+  third-stage rescue (which adopts a manifest-wide unique symbol
+  when the analyzer emits `target_qualified = Some(...)` without a
+  path) now refuses to run for import edges. Some backends (Kotlin,
+  Swift, C#, sometimes PHP / Python) populate
+  `RequireEdge.target_qualified` with the import's bare FQN for
+  external / unresolved imports; without the gate the rescue could
+  adopt a coincidentally-matching workspace symbol and back-derive
+  a `target_path` via `path_for_symbol_id`, silently re-pointing an
+  import edge at a specific symbol's file. Type / call edges still
+  use the rescue and the cross-parser hierarchies they enable.
+- **`find_references` resolutions CTE filters by relevant kinds
+  (Phase 4).** Defensive `WHERE kind IN ('type', 'call', 'import')`
+  added to the `best_resolution` CTE, mirroring the explicit
+  `kind = 'import'` / `'type'` filters in `find_imports` /
+  `find_impls`. Today the JOIN-time `res.kind = r.kind` predicate
+  already discriminates, so this is a future-proof against new
+  `resolutions.kind` values rather than a behaviour change.
+
 ### Added
 
+- **CLI pretty output for `target_path` (Phase 4).** `cairn query
+  imports / subtypes / supertypes / refs / callers / callees` now
+  append `\ttarget=<path>` to each non-JSON row when the Tier-2.5
+  resolver pinned the edge to a workspace file. JSON / MCP output
+  already carried the field since Phase 1 / 2; this closes the
+  drift between wire and human-readable surfaces.
 - **JavaScript Tier-2.5 backend (Phase 3 integration of the
   Wave 2B canary).** In-process tree-sitter resolver for JavaScript:
   binding-form module imports (`const X = require(...)`,
@@ -118,8 +159,20 @@ versions follow [SemVer](https://semver.org/).
   `target_symbol_id` / `target_path`. v10 exposes the existing
   `target_symbol_id` issue for `target_path` as well (wrong-manifest
   reads can now surface user-visible incorrect file paths in
-  addition to incorrect symbol ids). A follow-up release will add
-  `resolutions.manifest_id` plus manifest-scoped query joins.
+  addition to incorrect symbol ids). Phase 4 added the
+  `best_resolution` CTE in every query path on top of this same
+  manifest-agnostic table, so `target_path` returned by
+  `find_imports` / `find_impls` / `find_references` for a query
+  scoped to manifest B may carry a path that the analyzer originally
+  pinned while indexing manifest A — write-time
+  `blob_for_path(manifest_id, ...)` validates the path against the
+  *writing* manifest, not the *reading* one. The root fix is the
+  same v11 follow-up: add `resolutions.manifest_id` plus
+  manifest-scoped query joins; reading-side CTEs gain `manifest_id`
+  filters once that column exists. Until then, single-manifest /
+  single-branch dogfood is unaffected; the issue surfaces only when
+  the same blob is shared across manifests with different on-disk
+  file layouts.
 
 ## [0.6.2] — 2026-06-24
 

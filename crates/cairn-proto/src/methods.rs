@@ -1657,4 +1657,111 @@ mod tests {
         ]);
         assert_query_envelope::<GetSymbolSourceResult>(source);
     }
+
+    // ──── Phase 4 MF-3: wire serde round-trip for `target_path` ────
+
+    #[test]
+    fn import_hit_target_path_serde_round_trip() {
+        let hit = ImportHit {
+            file: "lib/widget.rb".into(),
+            to_module: "sinatra".into(),
+            imported: None,
+            alias: None,
+            is_reexport: false,
+            kind_source: "tier25-ruby-resolver".into(),
+            target_path: Some("lib/sinatra.rb".into()),
+            branch: "tentative/1".into(),
+            location: "dogfood:tentative/1:lib/widget.rb:3".into(),
+            line: 3,
+        };
+        let s = serde_json::to_string(&hit).unwrap();
+        assert!(s.contains("\"target_path\":\"lib/sinatra.rb\""), "got {s}");
+        let back: ImportHit = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path.as_deref(), Some("lib/sinatra.rb"));
+    }
+
+    #[test]
+    fn impl_hit_target_path_serde_round_trip() {
+        let hit = ImplHit {
+            type_qualified: "Dog".into(),
+            interface_qualified: Some("Animal".into()),
+            kind: "inherit".into(),
+            kind_source: "tier25-csharp-resolver".into(),
+            target_path: Some("src/Newtonsoft.Json/JsonConverter.cs".into()),
+            branch: "tentative/1".into(),
+            location: "demo:tentative/1:src/Dog.cs:1".into(),
+        };
+        let s = serde_json::to_string(&hit).unwrap();
+        assert!(s.contains("\"target_path\":\"src/Newtonsoft.Json/JsonConverter.cs\""));
+        let back: ImplHit = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            back.target_path.as_deref(),
+            Some("src/Newtonsoft.Json/JsonConverter.cs")
+        );
+    }
+
+    #[test]
+    fn find_reference_hit_target_path_serde_round_trip() {
+        let hit = FindReferenceHit {
+            target_name: "fromJson".into(),
+            target_qualified: Some("com.x.JsonAdapter.fromJson".into()),
+            kind: crate::common::RefKind::Call,
+            kind_source: "tier25-kotlin-resolver".into(),
+            target_path: Some("src/JsonAdapter.java".into()),
+            enclosing_qualified: Some("caller".into()),
+            branch: "tentative/1".into(),
+            location: "demo:tentative/1:src/X.kt:5".into(),
+            snippet: None,
+        };
+        let s = serde_json::to_string(&hit).unwrap();
+        assert!(s.contains("\"target_path\":\"src/JsonAdapter.java\""));
+        let back: FindReferenceHit = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path.as_deref(), Some("src/JsonAdapter.java"));
+    }
+
+    #[test]
+    fn call_hit_target_path_serde_round_trip() {
+        let hit = CallHit {
+            target_name: "fromJson".into(),
+            target_qualified: Some("com.x.JsonAdapter.fromJson".into()),
+            kind_source: "tier25-kotlin-resolver".into(),
+            target_path: Some("src/JsonAdapter.java".into()),
+            enclosing_qualified: Some("caller".into()),
+            branch: "tentative/1".into(),
+            location: "demo:tentative/1:src/X.kt:5".into(),
+            snippet: None,
+        };
+        let s = serde_json::to_string(&hit).unwrap();
+        assert!(s.contains("\"target_path\":\"src/JsonAdapter.java\""));
+        let back: CallHit = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path.as_deref(), Some("src/JsonAdapter.java"));
+    }
+
+    /// `target_path = None` must be elided by `skip_serializing_if`,
+    /// not emitted as `"target_path": null`. Older daemons that
+    /// predate the field can then deserialize the payload without
+    /// touching `Option::default()`.
+    #[test]
+    fn target_path_none_is_elided_from_wire() {
+        let hit = ImportHit {
+            file: "x.rb".into(),
+            to_module: "rake".into(),
+            imported: None,
+            alias: None,
+            is_reexport: false,
+            kind_source: "tier2-fact".into(),
+            target_path: None,
+            branch: "tentative/1".into(),
+            location: "demo:tentative/1:x.rb:1".into(),
+            line: 1,
+        };
+        let s = serde_json::to_string(&hit).unwrap();
+        assert!(
+            !s.contains("target_path"),
+            "target_path None must be elided via skip_serializing_if, got {s}"
+        );
+        let stripped = r#"{"file":"x.rb","to_module":"rake","is_reexport":false,"kind_source":"tier2-fact","branch":"tentative/1","location":"demo:tentative/1:x.rb:1","line":1}"#;
+        let back: ImportHit = serde_json::from_str(stripped).unwrap();
+        assert!(back.target_path.is_none());
+    }
 }

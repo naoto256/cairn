@@ -1771,4 +1771,153 @@ mod tests {
             "qualified-only fallback must not run for PhantomDropped paths"
         );
     }
+
+    #[test]
+    fn persist_resolutions_import_kind_blocks_manifest_wide_qualified_fallback() {
+        // Phase 4 F2 regression pin: a `ResolutionKind::Import` whose
+        // analyzer returned `(target_path = None, target_qualified = Some(...))`
+        // must not adopt a manifest-wide unique workspace symbol just
+        // because the FQN happens to match. That would silently
+        // re-point an import edge ("we don't know the file") to a
+        // specific symbol's file. Kotlin / Swift / C# emit this shape
+        // for external imports today; the gate runs regardless of
+        // backend.
+        let site_blob = "site-blob";
+        let unrelated_blob = "unrelated-blob";
+        let kt_parser = "tree-sitter-kotlin-ng";
+        let java_parser = "tree-sitter-java";
+
+        let (mut conn, _tmp) = one_file_db("src/main/kotlin/X.kt", site_blob, kt_parser);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["src/main/java/JsonAdapter.java", unrelated_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![unrelated_blob, java_parser],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, ?2, 'JsonAdapter', 'com.x.JsonAdapter', 'class',
+                0, 100, 1, 10, 'syn')",
+            params![unrelated_blob, java_parser],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "src/main/kotlin/X.kt".into(),
+                site_byte_range: 0..5,
+                kind: ResolutionKind::Import,
+                semantic_kind: None,
+                target_path: None,
+                target_qualified: Some("com.x.JsonAdapter".into()),
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "kotlin-resolver",
+            "tier25",
+            kt_parser,
+            &facts,
+        )
+        .unwrap();
+        let (target_path, target_symbol_id): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT target_path, target_symbol_id FROM resolutions
+                 WHERE source = 'tier25-kotlin-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            target_path.is_none(),
+            "Import + manifest-wide fallback must stay NULL — not re-pointed to JsonAdapter.java"
+        );
+        assert!(
+            target_symbol_id.is_none(),
+            "manifest-wide qualified-only fallback must be gated on kind != Import"
+        );
+    }
+
+    #[test]
+    fn persist_resolutions_type_kind_still_uses_manifest_wide_qualified_fallback() {
+        // Companion to the F2 test: gating must be specific to Import.
+        // Type / Call edges still get the manifest-wide rescue when
+        // path-scoped lookup misses, so cross-parser hierarchies stay
+        // resolved.
+        let site_blob = "site-blob";
+        let target_blob = "target-blob";
+        let kt_parser = "tree-sitter-kotlin-ng";
+        let java_parser = "tree-sitter-java";
+
+        let (mut conn, _tmp) = one_file_db("src/main/kotlin/X.kt", site_blob, kt_parser);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["src/main/java/JsonAdapter.java", target_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![target_blob, java_parser],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, ?2, 'JsonAdapter', 'com.x.JsonAdapter', 'class',
+                0, 100, 1, 10, 'syn')",
+            params![target_blob, java_parser],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "src/main/kotlin/X.kt".into(),
+                site_byte_range: 30..40,
+                kind: ResolutionKind::Type,
+                semantic_kind: Some(SemanticKind::Inherit),
+                target_path: None,
+                target_qualified: Some("com.x.JsonAdapter".into()),
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "kotlin-resolver",
+            "tier25",
+            kt_parser,
+            &facts,
+        )
+        .unwrap();
+        let (target_path, target_symbol_id): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT target_path, target_symbol_id FROM resolutions
+                 WHERE source = 'tier25-kotlin-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            target_symbol_id.is_some(),
+            "Type-kind manifest-wide fallback should still adopt the unique sibling-parser symbol"
+        );
+        assert_eq!(
+            target_path.as_deref(),
+            Some("src/main/java/JsonAdapter.java"),
+            "and derive target_path from the adopted symbol's blob"
+        );
+    }
 }

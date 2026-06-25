@@ -612,6 +612,20 @@ fn insert_verbose_tier3(p: &mut serde_json::Map<String, Value>, verbose_tier3: b
 // separated by spaces (filenames are last so trailing whitespace is
 // irrelevant). The intent is grep / awk-ability, not a TUI.
 
+/// Format a `target_path` field for pretty stdout output. Returns
+/// `"\ttarget=<path>"` when the path is set, empty string otherwise —
+/// so call sites can append it unconditionally without breaking the
+/// existing column layout for rows that have no workspace-internal
+/// target. Mirrors the Tier-2.5 wire contract: only Tier-2.5+
+/// resolutions populate `target_path`, so the suffix is the visible
+/// signal that a row was pinned to a specific workspace file.
+fn format_target_path(target_path: &Option<String>) -> String {
+    target_path
+        .as_deref()
+        .map(|p| format!("\ttarget={p}"))
+        .unwrap_or_default()
+}
+
 /// Emit one stderr line when a result advertises `Partial` so a shell
 /// user spots the SLA caveat without it polluting the grep-friendly
 /// stdout stream. Cairn answers immediately and reports what it has;
@@ -686,9 +700,10 @@ fn render(method: &str, value: &Value) {
             if let Ok(r) = serde_json::from_value::<FindSubtypesResult>(value.clone()) {
                 for h in &r.items {
                     let iface = h.interface_qualified.as_deref().unwrap_or("-");
+                    let target = format_target_path(&h.target_path);
                     println!(
-                        "{}\t{}\t{}\t{}({})",
-                        h.location, h.kind, h.type_qualified, h.kind, iface
+                        "{}\t{}\t{}\t{}({}){}",
+                        h.location, h.kind, h.type_qualified, h.kind, iface, target
                     );
                 }
                 note_partial(&r.completeness);
@@ -699,9 +714,10 @@ fn render(method: &str, value: &Value) {
             if let Ok(r) = serde_json::from_value::<FindSupertypesResult>(value.clone()) {
                 for h in &r.items {
                     let iface = h.interface_qualified.as_deref().unwrap_or("-");
+                    let target = format_target_path(&h.target_path);
                     println!(
-                        "{}\t{}\t{} {} {}",
-                        h.location, h.kind, h.type_qualified, h.kind, iface
+                        "{}\t{}\t{} {} {}{}",
+                        h.location, h.kind, h.type_qualified, h.kind, iface, target
                     );
                 }
                 note_partial(&r.completeness);
@@ -713,7 +729,11 @@ fn render(method: &str, value: &Value) {
                 for h in &r.items {
                     let enc = h.enclosing_qualified.as_deref().unwrap_or("-");
                     let snippet = h.snippet.as_deref().unwrap_or("");
-                    println!("{}\t{} -> {}\t{}", h.location, enc, h.target_name, snippet);
+                    let target = format_target_path(&h.target_path);
+                    println!(
+                        "{}\t{} -> {}\t{}{}",
+                        h.location, enc, h.target_name, snippet, target
+                    );
                 }
                 note_partial(&r.completeness);
                 return;
@@ -722,12 +742,13 @@ fn render(method: &str, value: &Value) {
         "find_callees" => {
             if let Ok(r) = serde_json::from_value::<FindCalleesResult>(value.clone()) {
                 for h in &r.items {
-                    let target = h
+                    let target_name = h
                         .target_qualified
                         .as_deref()
                         .unwrap_or(h.target_name.as_str());
                     let snippet = h.snippet.as_deref().unwrap_or("");
-                    println!("{}\t-> {}\t{}", h.location, target, snippet);
+                    let target = format_target_path(&h.target_path);
+                    println!("{}\t-> {}\t{}{}", h.location, target_name, snippet, target);
                 }
                 note_partial(&r.completeness);
                 return;
@@ -743,7 +764,11 @@ fn render(method: &str, value: &Value) {
                         .map(|a| format!(" as {a}"))
                         .unwrap_or_default();
                     let reex = if h.is_reexport { " [pub]" } else { "" };
-                    println!("{}\t{}::{}{}{}", h.location, h.to_module, imp, alias, reex);
+                    let target = format_target_path(&h.target_path);
+                    println!(
+                        "{}\t{}::{}{}{}{}",
+                        h.location, h.to_module, imp, alias, reex, target
+                    );
                 }
                 note_partial(&r.completeness);
                 return;
@@ -753,9 +778,10 @@ fn render(method: &str, value: &Value) {
             if let Ok(r) = serde_json::from_value::<FindReferencesResult>(value.clone()) {
                 for h in &r.items {
                     let enc = h.enclosing_qualified.as_deref().unwrap_or("-");
+                    let target = format_target_path(&h.target_path);
                     println!(
-                        "{}\t{:?}\t{}\tin {}",
-                        h.location, h.kind, h.target_name, enc
+                        "{}\t{:?}\t{}\tin {}{}",
+                        h.location, h.kind, h.target_name, enc, target
                     );
                 }
                 note_partial(&r.completeness);

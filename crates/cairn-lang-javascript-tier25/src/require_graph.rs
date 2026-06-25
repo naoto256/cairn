@@ -9,9 +9,15 @@
 //!   * bare specifier (`express`, `lodash`): no target path. The
 //!     specifier string is *not* stuffed into
 //!     `RequireEdge.target_qualified` — import edges target a file,
-//!     not a symbol, and Phase 1 settled the contract as
-//!     `target_qualified = None` for all import edges across every
-//!     Tier-2.5 backend.
+//!     not a symbol, and JavaScript's contract since Phase 3 is to
+//!     leave `target_qualified = None` for both resolved and
+//!     unresolved imports, mirroring Ruby. Other Tier-2.5 backends
+//!     (PHP / Python / Kotlin / Swift / C#) populate
+//!     `RequireEdge.target_qualified` with a real symbol or module
+//!     FQN where they know one — that variance is intentional and
+//!     persist.rs treats `kind = Import` as a hard gate for the
+//!     manifest-wide qualified-only symbol fallback, so a leaked FQN
+//!     cannot silently re-point an import edge in either contract.
 //!   * `node:`-prefixed (`node:fs`): same `(None, None)` shape.
 //!   * path-alias (`@/foo`, leading non-relative non-bare): same.
 //!
