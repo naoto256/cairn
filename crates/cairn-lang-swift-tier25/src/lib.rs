@@ -74,7 +74,12 @@ pub const TIER_PREFIX: &str = "tier25";
 // layer now writes target_path directly into resolutions, so existing
 // workspace_analysis_runs need to be invalidated and re-run to populate
 // the new column. Analyzer logic itself is unchanged.
-pub const ANALYZER_REVISION: u32 = 2;
+// Bumped for resolutions.manifest_id persistence (schema v11): the
+// persist layer now scopes resolution rows to the writing manifest,
+// so existing workspace_analysis_runs need to be invalidated and the
+// analyzer re-run to repopulate rows with manifest_id Some. Analyzer
+// logic itself is unchanged.
+pub const ANALYZER_REVISION: u32 = 3;
 pub const PARSER_ID: &str = "tree-sitter-swift";
 pub const RESOLUTION_SOURCE: &str = "tier25-swift-resolver";
 

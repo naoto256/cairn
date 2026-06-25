@@ -145,10 +145,13 @@ fn run(
                     ROW_NUMBER() OVER (
                         PARTITION BY site_blob_sha, site_parser_id,
                                      site_byte_start, site_byte_end
-                        ORDER BY {source_rank}, id
+                        ORDER BY
+                            CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
+                            {source_rank}, id
                     ) AS rn
                FROM resolutions
               WHERE kind = 'type'
+                AND (manifest_id = ?1 OR manifest_id IS NULL)
          )
          SELECT i.type_qualified,
                 i.interface_qualified,

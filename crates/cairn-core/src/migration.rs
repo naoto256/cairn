@@ -16,6 +16,7 @@ use tracing::debug;
 use crate::Result;
 
 /// One forward migration step.
+#[derive(Clone)]
 pub struct Migration {
     /// User-version this migration takes the DB to.
     pub version: u32,

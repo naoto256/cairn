@@ -429,6 +429,97 @@ CREATE INDEX idx_resolutions_target_path
     WHERE target_path IS NOT NULL;
 "#,
     },
+    Migration {
+        version: 11,
+        sql: r#"
+-- Tier-2.5 resolution layer: manifest-scoped resolutions.
+--
+-- v10 added `target_path` but left rows keyed by
+-- `(site_blob_sha, site_parser_id, byte_range, source)` only — no
+-- `manifest_id`. The same source blob shared across branches / tags
+-- / manifests therefore reads the last-writer-wins target. Phase 4
+-- (post-landing audit) confirmed this is observable at the wire:
+-- `find_imports` / `find_impls` / `find_references` for a query
+-- scoped to manifest B can surface a `target_path` that the
+-- resolver wrote while indexing manifest A.
+--
+-- v11 introduces `resolutions.manifest_id` so workspace-aware rows
+-- can be scoped to one manifest. `manifest_id` has *three* semantic
+-- states; the wire layer treats them identically (Hit struct shape
+-- is unchanged) but persistence rules distinguish them carefully:
+--
+--   Some(id)           Workspace-aware row written by a Tier-2.5+
+--                      analyzer or by Tier-3 LSP pass. Visible only
+--                      to queries scoped to manifest `id`.
+--
+--   NULL (new write)   Blob-scoped row written by Tier-2 direct
+--                      (`cas/blob.rs::insert_direct_resolution`).
+--                      Syntactic-only — derived from blob content
+--                      alone, valid for every manifest containing
+--                      the blob. Intentional NULL.
+--
+--   NULL (legacy v10)  Row written under v10 schema before this
+--                      migration ran. Backward-compat fallback that
+--                      surfaces to every manifest. v11 migration
+--                      wholesale deletes these for workspace-aware
+--                      sources (see DELETE below) so the only NULLs
+--                      that survive are blob-scoped Tier-2 direct
+--                      rows.
+--
+-- The two NULL states are not distinguishable from `manifest_id`
+-- alone. They are distinguished by the `source` column: rows whose
+-- source starts with any prefix in
+-- `cairn_core::workspace_analyzer::WORKSPACE_TIER_PREFIXES`
+-- (`tier3-*`, `tier25-*`) are workspace-aware; everything else
+-- (specifically `tier2-direct-*`) is blob-scoped. The migration
+-- DELETE below relies on this naming convention; the corresponding
+-- invariant test in `cairn_core::cas::schema::tests`
+-- (`migration_v11_cleanup_drops_only_workspace_tier_legacy_rows`)
+-- pins the boundary so a new tier-prefix added to the constant
+-- without updating this DELETE is caught at CI.
+--
+-- This migration is correctness-first, not permissive backward-
+-- compat: cross-file resolved hits for Tier-2.5 / Tier-3 sources
+-- disappear from existing repos until the user runs
+-- `cairn ctl repo reindex <alias>`. CHANGELOG documents the upgrade
+-- step. Wrong-manifest `target_path` / `target_symbol_id` leakage
+-- stops at the migration point regardless of when the reindex runs.
+--
+-- Composite partial indexes mirror the query shape used by the
+-- three workspace-aware query paths (find_imports / find_impls /
+-- find_references). The CTE filters `(manifest_id = ?1 OR
+-- manifest_id IS NULL)` so each branch must hit a covering index;
+-- without them SQLite falls back to a `SCAN resolutions` over the
+-- full table at every query. EXPLAIN QUERY PLAN is asserted in
+-- tests (`explain_query_plan_production_shape_uses_both_partial_indexes`
+-- plus per-branch `..._manifest_specific_branch_uses_manifest_site_index`
+-- and `..._blob_scoped_branch_uses_blob_scoped_index`).
+-- If a future query shape causes the planner to drop one of these
+-- indexes, the fallback is to rewrite the affected query as
+-- `UNION ALL` over the two branches.
+ALTER TABLE resolutions
+    ADD COLUMN manifest_id INTEGER
+        REFERENCES manifests(manifest_id) ON DELETE CASCADE;
+
+CREATE INDEX idx_resolutions_manifest_site
+    ON resolutions(manifest_id, kind, site_blob_sha, site_parser_id,
+                   site_byte_start, site_byte_end)
+    WHERE manifest_id IS NOT NULL;
+
+CREATE INDEX idx_resolutions_blob_scoped_site
+    ON resolutions(kind, site_blob_sha, site_parser_id,
+                   site_byte_start, site_byte_end)
+    WHERE manifest_id IS NULL;
+
+-- Migration-time wholesale cleanup of workspace-aware legacy NULL
+-- rows. Tier-2 direct (`tier2-direct-*`) stays NULL on purpose.
+-- The prefix list mirrors `WORKSPACE_TIER_PREFIXES` and is pinned
+-- by the invariant test referenced above.
+DELETE FROM resolutions
+ WHERE manifest_id IS NULL
+   AND (source LIKE 'tier3-%' OR source LIKE 'tier25-%');
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -452,7 +543,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 10);
+        assert_eq!(v, 11);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).
@@ -521,5 +612,339 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM resolutions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(after, 0);
+    }
+
+    // ──── v11 migration invariants ────
+
+    /// v11 wholesale cleanup deletes only workspace-aware
+    /// (`WORKSPACE_TIER_PREFIXES`-matching) legacy NULL rows. The
+    /// invariant is: if a new tier prefix joins
+    /// `WORKSPACE_TIER_PREFIXES` and the migration's LIKE list isn't
+    /// updated, this test fails so a CI reviewer notices.
+    #[test]
+    fn migration_v11_cleanup_drops_only_workspace_tier_legacy_rows() {
+        use crate::workspace_analyzer::WORKSPACE_TIER_PREFIXES;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+
+        // Apply migrations only up to v10 so we can seed legacy rows.
+        let migrations_pre_v11: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 10)
+            .cloned()
+            .collect();
+        apply(&mut conn, &migrations_pre_v11).unwrap();
+
+        // Parent blob.
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('legacy-blob', 'test-parser', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        // Seed one workspace-aware legacy NULL row per prefix, plus
+        // a Tier-2 direct NULL row that must survive.
+        for (i, prefix) in WORKSPACE_TIER_PREFIXES.iter().enumerate() {
+            let source = format!("{prefix}-fake-analyzer");
+            let start = i as i64 * 10;
+            conn.execute(
+                "INSERT INTO resolutions
+                   (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                    kind, semantic_kind, target_symbol_id, source)
+                 VALUES ('legacy-blob', 'test-parser', ?1, ?2, 'type', 'inherit',
+                         NULL, ?3)",
+                rusqlite::params![start, start + 5, source],
+            )
+            .unwrap();
+        }
+        let blob_scoped_start = WORKSPACE_TIER_PREFIXES.len() as i64 * 10;
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, source)
+             VALUES ('legacy-blob', 'test-parser', ?1, ?2, 'type', 'inherit',
+                     NULL, 'tier2-direct-ruby')",
+            rusqlite::params![blob_scoped_start, blob_scoped_start + 5],
+        )
+        .unwrap();
+
+        // Now apply v11 migration on top.
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        // Workspace-aware legacy NULL rows must be gone.
+        for prefix in WORKSPACE_TIER_PREFIXES.iter() {
+            let pattern = format!("{prefix}-%");
+            let cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM resolutions
+                     WHERE source LIKE ?1 AND manifest_id IS NULL",
+                    rusqlite::params![pattern],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                cnt, 0,
+                "v11 cleanup must drop legacy NULL rows for prefix {prefix}-*"
+            );
+        }
+
+        // Tier-2 direct blob-scoped NULL row must survive (intentional NULL).
+        let blob_scoped_cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM resolutions
+                 WHERE source = 'tier2-direct-ruby' AND manifest_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            blob_scoped_cnt, 1,
+            "Tier-2 direct blob-scoped NULL row must survive v11 cleanup"
+        );
+    }
+
+    /// `ALTER TABLE` is not idempotent in SQLite (re-adding the same
+    /// column fails). Verify that the migration runner detects v11
+    /// is already applied and skips it on a second run.
+    #[test]
+    fn migration_v11_is_idempotent_on_second_apply() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+        // Second apply must be a no-op (migration runner reads
+        // user_version and skips).
+        apply(&mut conn, MIGRATIONS).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 11);
+    }
+
+    // ──── EXPLAIN QUERY PLAN: v11 composite partial indexes ────
+    //
+    // These three tests pin that:
+    //   1. The full production CTE shape used by `find_imports` /
+    //      `find_impls` / `find_references` avoids a full
+    //      `resolutions` table scan and hits *both* partial indexes
+    //      (one per branch of the `(manifest_id = ?1 OR manifest_id IS
+    //      NULL)` predicate).
+    //   2. The manifest-specific branch in isolation uses
+    //      `idx_resolutions_manifest_site` and *not* the blob-scoped
+    //      index.
+    //   3. The blob-scoped branch in isolation uses
+    //      `idx_resolutions_blob_scoped_site` and *not* the
+    //      manifest-site index.
+    //
+    // The production-shape SQL below MUST MIRROR `find_imports.rs:74-95`'s
+    // `best_resolution` CTE; the three query paths share the same
+    // (kind filter + manifest_id OR predicate) shape with only the
+    // selected columns and partition key differing. A shared SQL
+    // builder was considered and rejected: the three CTEs diverge on
+    // column list, kind filter, and PARTITION BY key enough that a
+    // common builder would either be over-parameterized or fail to
+    // capture the planner-relevant shape. When this raw copy ever
+    // diverges from `find_imports.rs`, update both and re-run these
+    // EXPLAIN tests.
+
+    /// Read the `detail` column (index 3) from every row of an EXPLAIN
+    /// QUERY PLAN result.
+    fn explain_details(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Vec<String> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// Fail when any line scans `resolutions` *without* an index.
+    /// Per-line judging is critical: `SCAN resolutions USING INDEX
+    /// idx_...` is index-driven and acceptable; a bare `SCAN
+    /// resolutions` / `SCAN TABLE resolutions` is the full-scan
+    /// regression we're guarding against.
+    fn assert_no_resolution_full_scan(plan: &[String]) {
+        for line in plan {
+            let mentions_resolutions =
+                line.contains("SCAN resolutions") || line.contains("SCAN TABLE resolutions");
+            let uses_index = line.contains("USING INDEX") || line.contains("USING COVERING INDEX");
+            assert!(
+                !mentions_resolutions || uses_index,
+                "EXPLAIN QUERY PLAN line is a full `resolutions` scan \
+                 (no USING INDEX clause): {line:?}; full plan: {plan:?}"
+            );
+        }
+    }
+
+    fn assert_uses_index(plan: &[String], index_name: &str) {
+        assert!(
+            plan.iter().any(|l| l.contains(index_name)),
+            "expected EXPLAIN QUERY PLAN to mention index `{index_name}`; \
+             full plan: {plan:?}"
+        );
+    }
+
+    fn assert_not_uses_index(plan: &[String], index_name: &str) {
+        assert!(
+            plan.iter().all(|l| !l.contains(index_name)),
+            "expected EXPLAIN QUERY PLAN to NOT mention index `{index_name}`; \
+             full plan: {plan:?}"
+        );
+    }
+
+    /// (1) Production CTE shape: both partial indexes must fire so the
+    /// `(manifest_id = ?1 OR manifest_id IS NULL)` OR doesn't degrade
+    /// to a full table scan.
+    ///
+    /// If this test fails because SQLite collapsed the plan to a single
+    /// strategy (e.g. picked a UNION ALL rewrite or fell back to a
+    /// b-tree scan that no longer mentions both partial indexes), treat
+    /// it as a deliberate design change: update the test plus
+    /// CHANGELOG, don't paper over it.
+    #[test]
+    fn explain_query_plan_production_shape_uses_both_partial_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        // MUST MIRROR find_imports.rs:74-95 `best_resolution` CTE.
+        // The `source_rank` CASE / `id` tie-break in the ORDER BY of
+        // the ROW_NUMBER are not relevant to the planner's index
+        // choice; the WHERE clause and partition shape are.
+        let sql = "EXPLAIN QUERY PLAN
+            WITH best_resolution AS (
+                SELECT site_blob_sha, site_parser_id,
+                       site_byte_start, site_byte_end,
+                       source, target_path,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY site_blob_sha, site_parser_id,
+                                        site_byte_start, site_byte_end
+                           ORDER BY
+                               CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
+                               id
+                       ) AS rn
+                  FROM resolutions
+                 WHERE kind = 'import'
+                   AND (manifest_id = ?1 OR manifest_id IS NULL)
+            )
+            SELECT site_blob_sha FROM best_resolution WHERE rn = 1";
+        let plan = explain_details(&conn, sql, rusqlite::params![1i64]);
+
+        assert_no_resolution_full_scan(&plan);
+        let index_hit_count = plan
+            .iter()
+            .filter(|l| l.contains("idx_resolutions_"))
+            .count();
+        assert!(
+            index_hit_count >= 2,
+            "production CTE shape must engage both v11 partial indexes \
+             (one per branch of the `manifest_id = ?1 OR manifest_id IS NULL` \
+             predicate); index_hit_count={index_hit_count}, plan: {plan:?}"
+        );
+    }
+
+    /// (2) Manifest-specific branch alone: must use
+    /// `idx_resolutions_manifest_site` and must NOT touch
+    /// `idx_resolutions_blob_scoped_site` (which is partial WHERE
+    /// `manifest_id IS NULL`).
+    #[test]
+    fn explain_query_plan_manifest_specific_branch_uses_manifest_site_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        let plan = explain_details(
+            &conn,
+            "EXPLAIN QUERY PLAN
+             SELECT site_blob_sha FROM resolutions
+              WHERE kind = 'import' AND manifest_id = ?1",
+            rusqlite::params![1i64],
+        );
+        assert_no_resolution_full_scan(&plan);
+        assert_uses_index(&plan, "idx_resolutions_manifest_site");
+        assert_not_uses_index(&plan, "idx_resolutions_blob_scoped_site");
+    }
+
+    /// (3) Blob-scoped branch alone: must use
+    /// `idx_resolutions_blob_scoped_site` and must NOT touch the
+    /// manifest-site index (which is partial WHERE `manifest_id IS
+    /// NOT NULL`).
+    #[test]
+    fn explain_query_plan_blob_scoped_branch_uses_blob_scoped_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        let plan = explain_details(
+            &conn,
+            "EXPLAIN QUERY PLAN
+             SELECT site_blob_sha FROM resolutions
+              WHERE kind = 'import' AND manifest_id IS NULL",
+            [],
+        );
+        assert_no_resolution_full_scan(&plan);
+        assert_uses_index(&plan, "idx_resolutions_blob_scoped_site");
+        assert_not_uses_index(&plan, "idx_resolutions_manifest_site");
+    }
+
+    /// FK cascade for v11: deleting a manifest must cascade-delete
+    /// `manifest_id = Some(that)` resolutions, but Tier-2 direct
+    /// blob-scoped rows (`manifest_id NULL`) must survive.
+    #[test]
+    fn delete_manifest_cascades_manifest_scoped_resolutions_but_preserves_blob_scoped() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('blob-x', 'tree-sitter-ruby', 1, 0)",
+            [],
+        )
+        .unwrap();
+        // Two rows for the same site: one manifest-scoped, one blob-scoped.
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES
+               ('blob-x', 'tree-sitter-ruby', 0, 5, 'type', 'inherit', NULL,
+                NULL, 'tier25-ruby-resolver', 1),
+               ('blob-x', 'tree-sitter-ruby', 0, 5, 'type', 'inherit', NULL,
+                NULL, 'tier2-direct-ruby', NULL)",
+            [],
+        )
+        .unwrap();
+
+        // Drop the manifest. FK ON DELETE CASCADE must remove only the
+        // manifest-scoped row.
+        conn.execute("DELETE FROM manifests WHERE manifest_id = 1", [])
+            .unwrap();
+        let (manifest_scoped_left, blob_scoped_left): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN manifest_id IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN manifest_id IS NULL THEN 1 ELSE 0 END)
+                 FROM resolutions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            manifest_scoped_left, 0,
+            "manifest-scoped row must cascade-delete with the manifest"
+        );
+        assert_eq!(
+            blob_scoped_left, 1,
+            "blob-scoped (NULL manifest_id) row must survive manifest deletion"
+        );
     }
 }

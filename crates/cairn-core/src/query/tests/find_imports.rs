@@ -203,3 +203,163 @@ fn find_imports_target_path_none_for_bare_specifier_fallback() {
     assert_eq!(hit.kind_source, "tier2-fact");
     assert!(hit.target_path.is_none());
 }
+
+// ──── v11 manifest scoping ────
+
+/// v11 row inserter that mirrors `persist_resolutions`'s shape with
+/// explicit `manifest_id`. The existing `insert_import_resolution`
+/// helper leaves `manifest_id NULL` (legacy/blob-scoped), which is
+/// fine for the pre-v11 tests above but not for testing the scoping.
+#[allow(clippy::too_many_arguments)]
+fn insert_v11_import_resolution(
+    conn: &Connection,
+    blob_sha: &str,
+    parser_id: &str,
+    byte_start: i64,
+    byte_end: i64,
+    source: &str,
+    target_path: Option<&str>,
+    manifest_id: Option<i64>,
+) {
+    conn.execute(
+        "INSERT INTO resolutions
+           (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+            kind, semantic_kind, target_symbol_id, target_path, source,
+            manifest_id)
+         VALUES (?1, ?2, ?3, ?4, 'import', NULL, NULL, ?5, ?6, ?7)",
+        rusqlite::params![
+            blob_sha,
+            parser_id,
+            byte_start,
+            byte_end,
+            target_path,
+            source,
+            manifest_id
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn find_imports_picks_manifest_specific_row_when_both_visible() {
+    // v11 Layer 3 regression pin: even if a legacy NULL row coexists
+    // with a manifest-specific row for the same site, the ROW_NUMBER
+    // `ORDER BY CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END` clause
+    // picks the manifest-specific row.
+    let (_tmp, conn, blob_sha, parser_id) = fixture_store();
+    insert_import(&conn, blob_sha, parser_id, "./db", 1, Some((9, 13)));
+
+    // Both rows present: legacy NULL and manifest 1.
+    insert_v11_import_resolution(
+        &conn,
+        blob_sha,
+        parser_id,
+        9,
+        13,
+        "tier25-ruby-resolver",
+        Some("lib/legacy-db.rb"),
+        None, // legacy NULL
+    );
+    insert_v11_import_resolution(
+        &conn,
+        blob_sha,
+        parser_id,
+        9,
+        13,
+        "tier25-ruby-resolver",
+        Some("lib/manifest1-db.rb"),
+        Some(1),
+    );
+
+    let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|h| h.to_module == "./db")
+        .expect("./db import missing");
+    assert_eq!(
+        hit.target_path.as_deref(),
+        Some("lib/manifest1-db.rb"),
+        "manifest-specific row must win over legacy NULL via Layer 3 ORDER precedence"
+    );
+}
+
+#[test]
+fn find_imports_does_not_see_other_manifest_resolution() {
+    // v11 isolation: a resolution row scoped to manifest 2 must not
+    // surface in queries scoped to manifest 1.
+    let (_tmp, conn, blob_sha, parser_id) = fixture_store();
+    // Create manifest 2 so the FK on resolutions.manifest_id is
+    // satisfied for the manifest-2 row below.
+    conn.execute(
+        "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (2, 'tentative', 0)",
+        [],
+    )
+    .unwrap();
+    insert_import(&conn, blob_sha, parser_id, "./db", 1, Some((9, 13)));
+    insert_v11_import_resolution(
+        &conn,
+        blob_sha,
+        parser_id,
+        9,
+        13,
+        "tier25-ruby-resolver",
+        Some("lib/manifest2-db.rb"),
+        Some(2),
+    );
+
+    let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|h| h.to_module == "./db")
+        .expect("./db import missing");
+    // The hit falls back to tier2-fact because no resolution row
+    // visible to manifest 1 covers the site (manifest 2's row is
+    // filtered out by the CTE's manifest_id predicate).
+    assert_eq!(hit.kind_source, "tier2-fact");
+    assert!(hit.target_path.is_none());
+}
+
+#[test]
+fn find_imports_picks_tier25_over_tier2_direct_when_both_present() {
+    // v11 regression pin: the source_rank precedence (tier25 over
+    // tier2-direct) must survive the new manifest_id filter and
+    // ORDER clause. Both rows share the same site and pass the CTE
+    // filter (manifest 1 row + blob-scoped NULL Tier-2 direct row).
+    let (_tmp, conn, blob_sha, parser_id) = fixture_store();
+    insert_import(&conn, blob_sha, parser_id, "./db", 1, Some((9, 13)));
+
+    // Tier-2 direct (blob-scoped NULL).
+    insert_v11_import_resolution(
+        &conn,
+        blob_sha,
+        parser_id,
+        9,
+        13,
+        "tier2-direct-ruby",
+        None,
+        None,
+    );
+    // Tier-2.5 manifest-specific.
+    insert_v11_import_resolution(
+        &conn,
+        blob_sha,
+        parser_id,
+        9,
+        13,
+        "tier25-ruby-resolver",
+        Some("lib/db.rb"),
+        Some(1),
+    );
+
+    let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|h| h.to_module == "./db")
+        .expect("./db import missing");
+    assert_eq!(
+        hit.kind_source, "tier25-ruby-resolver",
+        "tier25 must outrank tier2-direct via source_rank precedence"
+    );
+    assert_eq!(hit.target_path.as_deref(), Some("lib/db.rb"));
+}

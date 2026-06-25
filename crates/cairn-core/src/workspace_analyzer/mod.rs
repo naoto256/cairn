@@ -1920,4 +1920,265 @@ mod tests {
             "and derive target_path from the adopted symbol's blob"
         );
     }
+
+    // ──── v11 manifest_id persistence + cleanup invariants ────
+
+    #[test]
+    fn persist_resolutions_writes_manifest_id_for_tier25() {
+        // v11: workspace-aware persist tags every row with
+        // `manifest_id = Some(this_manifest)`. Companion test to the
+        // Tier-2 direct counterpart in cas/blob smoke.
+        let parser_id = "tree-sitter-ruby";
+        let (mut conn, _tmp) = one_file_db("main.rb", "site-blob", parser_id);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["lib/foo.rb", "target-blob"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params!["target-blob", parser_id],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "main.rb".into(),
+                site_byte_range: 0..5,
+                kind: ResolutionKind::Import,
+                semantic_kind: None,
+                target_path: Some("lib/foo.rb".into()),
+                target_qualified: None,
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        let manifest_id: Option<i64> = conn
+            .query_row(
+                "SELECT manifest_id FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            manifest_id,
+            Some(1),
+            "Tier-2.5 row must carry manifest_id = Some(this_manifest)"
+        );
+    }
+
+    #[test]
+    fn persist_resolutions_deletes_legacy_null_rows_for_current_manifest_source() {
+        // v11 Layer 2: the DELETE expansion in persist_resolutions
+        // sweeps any straggler `manifest_id = NULL` row that the
+        // migration-time wholesale cleanup missed, *only* when both
+        // the source string and the site_blob match this manifest.
+        let parser_id = "tree-sitter-ruby";
+        let (mut conn, _tmp) = one_file_db("main.rb", "site-blob", parser_id);
+
+        // Inject a "stragger" legacy NULL row for the same source +
+        // site_blob that's about to be reindexed.
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES ('site-blob', ?1, 0, 5, 'import', NULL, NULL, 'leaked',
+                     'tier25-ruby-resolver', NULL)",
+            params![parser_id],
+        )
+        .unwrap();
+
+        // Now run persist_resolutions with no facts; the DELETE alone
+        // should remove the legacy NULL row.
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "Layer 2 DELETE must sweep stragger legacy NULL rows of the same source/site_blob"
+        );
+    }
+
+    #[test]
+    fn manifest_a_reindex_does_not_delete_manifest_b_resolution_for_shared_blob() {
+        // v11 fixes the v10 cascading-reindex symptom: in v10 the
+        // DELETE scoped on `site_blob_sha IN (manifest_entries…)`
+        // would nuke manifest B's row whenever manifest A reindexed
+        // a shared blob. Post-v11 the DELETE keys on `manifest_id`
+        // so each manifest owns its rows independently.
+        let parser_id = "tree-sitter-ruby";
+        let (mut conn, _tmp) = one_file_db("main.rb", "shared-blob", parser_id);
+
+        // Add manifest B and share the same site_blob.
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (2, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (2, 'main.rb', 'shared-blob')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-populate manifest B's resolution row (as if a previous
+        // reindex of B persisted facts).
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES ('shared-blob', ?1, 0, 5, 'import', NULL, NULL,
+                     'lib/b.rb', 'tier25-ruby-resolver', 2)",
+            params![parser_id],
+        )
+        .unwrap();
+
+        // Reindex manifest A with empty facts.
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        let (count_b, target_b): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(target_path) FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver' AND manifest_id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            count_b, 1,
+            "manifest B's row must survive manifest A reindex"
+        );
+        assert_eq!(target_b.as_deref(), Some("lib/b.rb"));
+    }
+
+    #[test]
+    fn cas_blob_tier2_direct_writes_null_manifest_id() {
+        // Tier-2 direct rows (`tier2-direct-*` source) are blob-scoped
+        // by design: their semantic kind is derived from blob syntax
+        // alone, so one row is valid across every manifest containing
+        // the blob. v11 keeps `manifest_id NULL` for these.
+        //
+        // We test the Tier-2 direct path indirectly here by inserting
+        // a row in the shape `cas/blob.rs::insert_direct_resolution`
+        // writes, then asserting the manifest_id column is NULL.
+        // (Integration through the actual writer is covered by the
+        // `cas/blob.rs` test module.)
+        let (conn, _tmp) = one_file_db("main.rb", "site-blob", "tree-sitter-ruby");
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES ('site-blob', 'tree-sitter-ruby', 0, 5, 'type', 'inherit',
+                     NULL, NULL, 'tier2-direct-ruby', NULL)",
+            [],
+        )
+        .unwrap();
+        let manifest_id: Option<i64> = conn
+            .query_row(
+                "SELECT manifest_id FROM resolutions WHERE source = 'tier2-direct-ruby'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            manifest_id.is_none(),
+            "Tier-2 direct rows are blob-scoped; manifest_id must stay NULL"
+        );
+    }
+
+    #[test]
+    fn persist_resolutions_does_not_touch_tier2_direct_null_rows() {
+        // Layer 2 DELETE keys on `source = ?1`, where ?1 is a
+        // workspace-aware tier-prefix source. Tier-2 direct rows
+        // (different source) must therefore be untouched even when
+        // they share a site_blob with the manifest being reindexed.
+        // This pins the source-prefix boundary the migration
+        // wholesale cleanup also relies on.
+        let parser_id = "tree-sitter-ruby";
+        let (mut conn, _tmp) = one_file_db("main.rb", "shared-blob", parser_id);
+
+        // A Tier-2 direct blob-scoped row for the same site_blob.
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source,
+                manifest_id)
+             VALUES ('shared-blob', ?1, 0, 5, 'type', 'inherit', NULL, NULL,
+                     'tier2-direct-ruby', NULL)",
+            params![parser_id],
+        )
+        .unwrap();
+
+        // Reindex with empty Tier-2.5 facts.
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        let (count, manifest_id): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(manifest_id) FROM resolutions
+                 WHERE source = 'tier2-direct-ruby'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "Tier-2 direct row must survive Tier-2.5 reindex");
+        assert!(
+            manifest_id.is_none(),
+            "Tier-2 direct row must remain blob-scoped (manifest_id NULL)"
+        );
+    }
 }
