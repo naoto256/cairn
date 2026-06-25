@@ -8,7 +8,7 @@ use crate::cas::kind_conv::ref_kind_to_str;
 use crate::lsp::Location;
 use crate::manifest::ManifestId;
 
-use super::{WorkspaceFacts, WorkspaceResolution};
+use super::{ResolutionKind, WorkspaceFacts, WorkspaceResolution};
 
 /// 0.1.x persisted rust-analyzer refs under this alias instead of the
 /// uniform `<tier_prefix>-<analyzer_id>` scheme. Cleared alongside the
@@ -231,7 +231,7 @@ pub(super) fn persist_resolutions(
         //              identify the target file itself)
         //   Phantom  → no lookup; the row keeps target_symbol_id NULL
         //              so the analyzer-bug signal is preserved
-        let (mut sanitized_target_path, target_symbol_id) = match &path_origin {
+        let (mut sanitized_target_path, mut target_symbol_id) = match &path_origin {
             PathOrigin::PhantomDropped => (None, None),
             PathOrigin::Valid(path) => {
                 let id = resolve_resolution_target(&tx, manifest_id, parser_id, r, Some(path))?;
@@ -251,8 +251,39 @@ pub(super) fn persist_resolutions(
         // analyzer-emitted Valid path.
         if matches!(path_origin, PathOrigin::None) && sanitized_target_path.is_none() {
             if let Some(id) = target_symbol_id {
-                if let Some(derived) = path_for_symbol_id(&tx, manifest_id, id)? {
-                    sanitized_target_path = Some(derived);
+                match path_for_symbol_id(&tx, manifest_id, id)? {
+                    Some(derived) => sanitized_target_path = Some(derived),
+                    None => {
+                        // 3-state invariant: if we can't recover the
+                        // file the resolved symbol lives in, drop the
+                        // symbol id too so the row stays in one of the
+                        // documented `(target_path, target_symbol_id)`
+                        // shapes: `(Some, Some)`, `(Some, None)`, or
+                        // `(None, None)`. The fourth combination
+                        // `(None, Some)` would be a documented-but-
+                        // unsurfaced inconsistency — the wire layer
+                        // exposes `target_path` directly and there is
+                        // no consumer today that walks
+                        // `target_symbol_id` back to a path, so a row
+                        // with only the symbol id would carry
+                        // `kind_source = tier25-…` without any
+                        // user-visible workspace target, which reads
+                        // as "resolved but invisible". `warn!` so the
+                        // race (manifest GC vs persist tx) shows up
+                        // in operator logs even though it does not
+                        // break correctness.
+                        tracing::warn!(
+                            target: "cairn_core::persist",
+                            source = %source,
+                            source_path = %r.source_path,
+                            site_byte_start = r.site_byte_range.start,
+                            site_byte_end = r.site_byte_range.end,
+                            target_symbol_id = id,
+                            "persist_resolutions: path_for_symbol_id returned None; \
+                             dropping target_symbol_id to preserve 3-state invariant"
+                        );
+                        target_symbol_id = None;
+                    }
                 }
             }
         }
@@ -394,6 +425,22 @@ fn resolve_resolution_target(
     // should surface as `target_symbol_id = NULL` /
     // `target_path = NULL`, not get hidden behind an unrelated symbol.
     if target_path_hint.is_some() {
+        return Ok(None);
+    }
+    // Also gated on `kind != Import`: imports target a *file*, not a
+    // symbol. Some backends (Kotlin / Swift / C# today, PHP / Python
+    // in some shapes) emit `target_qualified = Some(b.fqn)` for
+    // external imports they cannot resolve to a workspace file. If
+    // that bare FQN happens to match a unique workspace symbol via
+    // manifest-wide lookup, adopting it would silently re-point the
+    // import edge to whatever file holds that symbol — turning a
+    // "no single target file" import semantic into "specific symbol's
+    // file". The caller (`persist_resolutions`) then back-derives
+    // `target_path` from the adopted symbol id, completing the
+    // semantic break. Gate at this branch so the manifest-wide rescue
+    // only applies to type / call edges where the symbol is the
+    // primary target identity.
+    if matches!(r.kind, ResolutionKind::Import) {
         return Ok(None);
     }
     let mut stmt = conn.prepare(

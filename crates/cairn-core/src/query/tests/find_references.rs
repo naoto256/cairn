@@ -704,3 +704,97 @@ fn find_references_phase2_preserves_resolved_noise_semantics() {
         "no resolution row → target_path must stay None (Phase 2 is surface-additive)"
     );
 }
+
+// ──── Phase 4 F1: qualified-name lookup with COALESCE + extended separators ────
+
+#[test]
+fn find_references_incoming_dotted_fqn_matches_via_coalesce() {
+    // Phase 4 F1 regression pin: a strict FQN query like
+    // `find_callers com.x.JsonAdapter.fromJson` (Kotlin / Java /
+    // C# / Python / Swift style) must hit a Tier-2.5
+    // cross-parser resolution row where the surface
+    // `target_qualified` comes from `sym.qualified` (because the
+    // refs row itself had `target_qualified = NULL`). Pre-Phase 4
+    // the WHERE clause only checked `r.target_qualified`, so this
+    // returned 0 hits. The fix introduces `is_qualified_symbol`
+    // (recognising `.` and `\` in addition to `::`) and switches
+    // the strict path to `COALESCE(r.target_qualified, sym.qualified)`.
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "com.x.JsonAdapter.fromJson".into(),
+            direction: ReferenceDirection::Incoming,
+            kind: Some(RefKind::Call),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "dotted FQN strict lookup must find the cross-parser hit"
+    );
+    assert_eq!(
+        hits[0].target_qualified.as_deref(),
+        Some("com.x.JsonAdapter.fromJson")
+    );
+    assert_eq!(hits[0].target_path.as_deref(), Some("src/JsonAdapter.java"));
+}
+
+#[test]
+fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
+    // Phase 4 F1: PHP FQN like `App\\Models\\Widget::render` (PHP
+    // is_qualified via `\` separator) must enter the qualified
+    // strict path, not the bare-name fallback.
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+
+    // A `App\\Foo\\Bar` lookup should not match the
+    // `com.x.JsonAdapter.fromJson` resolution row (different FQN).
+    // This pins that `\` is recognised as a qualified separator so
+    // the symbol enters the strict path. Note that the strict path
+    // still falls back to the bare-name index if the strict miss
+    // returns 0 rows; this fixture has no bare-name decoy named
+    // `Bar` for the fallback to pick up, so the outcome is
+    // `hits.is_empty()`. A future-tightening "strict miss means
+    // strict empty, no bare fallback" is a separate design knob.
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "App\\Foo\\Bar".into(),
+            direction: ReferenceDirection::Incoming,
+            kind: Some(RefKind::Call),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        hits.is_empty(),
+        "PHP-style FQN must not coincidentally match an unrelated cross-parser hit"
+    );
+}

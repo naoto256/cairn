@@ -140,6 +140,7 @@ fn run_find_references(
             ", id
                         ) AS rn
                    FROM resolutions
+                  WHERE kind IN ('type', 'call', 'import')
              )
              SELECT target_name, target_qualified, kind, enclosing,
                     path, line, blob_sha, parser_id, kind_source,
@@ -262,19 +263,98 @@ fn run_find_references(
     match args.direction {
         ReferenceDirection::Outgoing => run("enc.qualified", &args.symbol, true),
         ReferenceDirection::Incoming => {
-            // Prefer qualified-name matching when the symbol carries
-            // `::`; fall back to bare-name when qualified produces no
-            // hits. Bare symbols skip straight to the bare-name index.
-            if args.symbol.contains("::") {
-                let strict = run("r.target_qualified", &args.symbol, false)?;
+            // Prefer qualified-name matching when the symbol carries a
+            // language-specific separator (`::` for Rust, `.` for
+            // Python / Kotlin / Swift / C# / Java FQNs, `\` for PHP
+            // namespaces). Bare symbols skip straight to the bare-name
+            // index.
+            //
+            // The strict path matches against
+            // `COALESCE(r.target_qualified, sym.qualified)` rather than
+            // `r.target_qualified` alone so that cross-parser-id
+            // resolutions — where the Tier-2.5 persist layer adopted a
+            // sibling-parser symbol id and the surface `target_qualified`
+            // comes from `sym.qualified` — also match a strict FQN query.
+            // Pre-Phase 4 this only checked the raw `refs.target_qualified`
+            // and missed every cross-parser resolved hit.
+            if is_qualified_symbol(&args.symbol) {
+                let strict = run(
+                    "COALESCE(r.target_qualified, sym.qualified)",
+                    &args.symbol,
+                    false,
+                )?;
                 if !strict.is_empty() {
                     return Ok(strict);
                 }
-                let bare = args.symbol.rsplit("::").next().unwrap_or(&args.symbol);
+                let bare = bare_name_from_qualified(&args.symbol);
                 run("r.target_name", bare, false)
             } else {
                 run("r.target_name", &args.symbol, false)
             }
         }
+    }
+}
+
+/// `true` when `symbol` looks like a fully-qualified name in any
+/// language cairn currently indexes: Rust `::`, dotted FQNs (Python,
+/// Kotlin, Swift, C#, Java, JS), or PHP-style `\` namespaces.
+fn is_qualified_symbol(symbol: &str) -> bool {
+    symbol.contains("::") || symbol.contains('.') || symbol.contains('\\')
+}
+
+/// Strip everything before the last qualified-name segment, so the
+/// bare-name fallback can still try `r.target_name` when the strict
+/// `COALESCE(...)` lookup returns nothing. Recognises the same
+/// separators as [`is_qualified_symbol`].
+fn bare_name_from_qualified(symbol: &str) -> &str {
+    // Find the *rightmost* separator among the three we recognise.
+    let mut last = 0usize;
+    for (idx, _) in symbol.match_indices("::") {
+        last = last.max(idx + 2);
+    }
+    for (idx, c) in symbol.char_indices() {
+        if c == '.' || c == '\\' {
+            last = last.max(idx + c.len_utf8());
+        }
+    }
+    if last == 0 { symbol } else { &symbol[last..] }
+}
+
+#[cfg(test)]
+mod qualified_helpers_tests {
+    use super::{bare_name_from_qualified, is_qualified_symbol};
+
+    #[test]
+    fn is_qualified_recognises_rust_double_colon() {
+        assert!(is_qualified_symbol("crate::foo::Bar"));
+    }
+
+    #[test]
+    fn is_qualified_recognises_dotted_fqn() {
+        assert!(is_qualified_symbol("com.example.app.User"));
+        assert!(is_qualified_symbol("pkg.sub.Foo"));
+    }
+
+    #[test]
+    fn is_qualified_recognises_php_backslash_namespace() {
+        assert!(is_qualified_symbol("App\\Models\\Widget"));
+    }
+
+    #[test]
+    fn is_qualified_rejects_bare_name() {
+        assert!(!is_qualified_symbol("Widget"));
+        assert!(!is_qualified_symbol("render"));
+    }
+
+    #[test]
+    fn bare_name_strips_rightmost_separator() {
+        assert_eq!(bare_name_from_qualified("crate::foo::Bar"), "Bar");
+        assert_eq!(bare_name_from_qualified("com.example.app.User"), "User");
+        assert_eq!(bare_name_from_qualified("App\\Models\\Widget"), "Widget");
+    }
+
+    #[test]
+    fn bare_name_returns_input_when_no_separator() {
+        assert_eq!(bare_name_from_qualified("Widget"), "Widget");
     }
 }
