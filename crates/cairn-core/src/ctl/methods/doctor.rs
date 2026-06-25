@@ -848,6 +848,7 @@ mod tests {
             "clangd-cpp-lsp",
             "clangd-objc-lsp",
             "csharp-ls",
+            "csharp-resolver",
             "gopls-lsp",
             "jdtls-lsp",
             "kotlin-language-server",

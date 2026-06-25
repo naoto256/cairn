@@ -16,6 +16,7 @@ use cairn_lang_clangd_tier3 as _;
 use cairn_lang_cpp as _;
 use cairn_lang_csharp as _;
 use cairn_lang_csharp_tier3 as _;
+use cairn_lang_csharp_tier25 as _;
 use cairn_lang_go as _;
 use cairn_lang_go_tier3 as _;
 use cairn_lang_java as _;
@@ -147,6 +148,7 @@ mod tests {
                 "clangd-cpp-lsp",
                 "clangd-objc-lsp",
                 "csharp-ls",
+                "csharp-resolver",
                 "gopls-lsp",
                 "jdtls-lsp",
                 "kotlin-language-server",

@@ -26,6 +26,7 @@ members = [
     "crates/cairn-lang-c",
     "crates/cairn-lang-cpp",
     "crates/cairn-lang-csharp",
+    "crates/cairn-lang-csharp-tier25",
     "crates/cairn-lang-csharp-tier3",
     "crates/cairn-lang-java",
     "crates/cairn-lang-java-tier3",
@@ -165,6 +166,7 @@ cairn-lang-c = { version = "0.6.2", path = "crates/cairn-lang-c" }
 cairn-lang-cpp = { version = "0.6.2", path = "crates/cairn-lang-cpp" }
 cairn-lang-csharp = { version = "0.6.2", path = "crates/cairn-lang-csharp" }
 cairn-lang-csharp-tier3 = { version = "0.6.2", path = "crates/cairn-lang-csharp-tier3" }
+cairn-lang-csharp-tier25 = { version = "0.6.2", path = "crates/cairn-lang-csharp-tier25" }
 cairn-lang-java = { version = "0.6.2", path = "crates/cairn-lang-java" }
 cairn-lang-java-tier3 = { version = "0.6.2", path = "crates/cairn-lang-java-tier3" }
 cairn-lang-kotlin = { version = "0.6.2", path = "crates/cairn-lang-kotlin" }

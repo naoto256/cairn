@@ -139,6 +139,7 @@ dependencies = [
  "cairn-lang-clangd-tier3",
  "cairn-lang-cpp",
  "cairn-lang-csharp",
+ "cairn-lang-csharp-tier25",
  "cairn-lang-csharp-tier3",
  "cairn-lang-go",
  "cairn-lang-go-tier3",
@@ -260,6 +261,19 @@ dependencies = [
  "cairn-lang-api",
  "cairn-lang-treesitter-generic",
  "linkme",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+]
+
+[[package]]
+name = "cairn-lang-csharp-tier25"
+version = "0.6.2"
+dependencies = [
+ "cairn-core",
+ "cairn-proto",
+ "linkme",
+ "tempfile",
+ "tracing",
  "tree-sitter",
  "tree-sitter-c-sharp",
 ]
