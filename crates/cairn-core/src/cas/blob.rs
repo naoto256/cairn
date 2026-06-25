@@ -474,11 +474,15 @@ fn insert_direct_resolution(
     let Some((start, end)) = imp.interface_byte_range else {
         return Ok(());
     };
+    // Tier-2 direct does no cross-file resolution: both `target_symbol_id`
+    // and `target_path` are NULL by construction. The column list is spelled
+    // out so a future schema column with a different default does not
+    // silently slip through this writer.
     tx.execute(
         "INSERT INTO resolutions
            (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
-            kind, semantic_kind, target_symbol_id, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+            kind, semantic_kind, target_symbol_id, target_path, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
         params![
             blob_sha,
             parser_id,

@@ -297,11 +297,37 @@ pub struct WorkspaceFacts {
 
 /// One persistence-shaped resolution emitted by a workspace analyzer.
 ///
-/// Cairn has no global symbol-id at fact-emission time; analyzers carry the
-/// resolved target as `(target_path, target_qualified)` and the persist layer
-/// looks the row up in `symbols` keyed by `(blob_sha, parser_id, qualified)`.
-/// When both are `None` the row is recorded as "site observed, target
-/// unresolved" (matching `target_symbol_id = NULL` in the table).
+/// Two orthogonal axes carry the resolved target:
+///
+/// - [`Self::target_path`] — source of truth for "which workspace file the
+///   target lives in". Set whenever the analyzer resolved to a
+///   workspace-internal target, regardless of whether the target is a symbol
+///   (class, function, method) or a module / file (`require_relative './db'`,
+///   `import './foo'`). Flows into `resolutions.target_path` after the
+///   persist layer validates the path against the manifest (analyzer bugs
+///   that emit a phantom path are dropped to NULL with a `debug!` log).
+/// - [`Self::target_qualified`] — optional best-effort symbol qualified name.
+///   Persist layer feeds it into a `(blob_sha, parser_id, qualified)` symbols
+///   lookup (with a cross-parser-id uniqueness-checked fallback) to populate
+///   `resolutions.target_symbol_id`. May be `None` even when `target_path` is
+///   `Some` — import edges intentionally leave it `None` because the target
+///   is a file, not a symbol.
+///
+/// The two columns persist independently. Three wire-observable shapes
+/// result:
+///
+/// - `target_path = Some, target_symbol_id = Some` — workspace file *and*
+///   symbol pinned. Same-parser type/call edges, and cross-parser type/call
+///   edges where the `(blob_sha, qualified)` pair (or the manifest-wide
+///   `qualified`) had exactly one match.
+/// - `target_path = Some, target_symbol_id = None` — workspace file pinned,
+///   no symbol-level identity. Canonical for import edges (target is a file,
+///   not a symbol) and for type/call edges where the symbol lookup hit
+///   nothing or hit ambiguously.
+/// - `target_path = None, target_symbol_id = None` — site observed, target
+///   unresolved. Bare specifiers, external dependencies, stdlib, and the
+///   `PathOrigin::PhantomDropped` case where the analyzer emitted a path
+///   that does not exist in the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceResolution {
     /// Source path relative to the registered repository root.
@@ -314,10 +340,13 @@ pub struct WorkspaceResolution {
     /// [`Self::kind`] is [`ResolutionKind::Type`].
     pub semantic_kind: Option<SemanticKind>,
     /// Repo-root-relative path of the file containing the resolved target.
-    /// `None` when unresolved.
+    /// `None` when unresolved. See struct doc for the orthogonal relationship
+    /// with [`Self::target_qualified`].
     pub target_path: Option<String>,
-    /// Qualified name of the resolved target symbol (looked up against
-    /// `symbols.qualified`). `None` when unresolved.
+    /// Optional symbol qualified name (looked up against `symbols.qualified`
+    /// to populate `target_symbol_id`). Leave `None` for import edges and
+    /// any other target whose primary identity is a file path rather than a
+    /// symbol. See struct doc.
     pub target_qualified: Option<String>,
 }
 
@@ -1276,5 +1305,470 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    // ──── Schema v10 / Phase 1: target_path persistence ───────────────────
+
+    /// Set up a one-file manifest with one blob in an isolated tempdir.
+    /// Caller keeps the `TempDir` alive for the duration of the test.
+    fn one_file_db(
+        file_path: &str,
+        blob: &str,
+        parser_id: &str,
+    ) -> (rusqlite::Connection, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns) VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params![file_path, blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![blob, parser_id],
+        )
+        .unwrap();
+        (conn, tmp)
+    }
+
+    #[test]
+    fn persist_resolutions_roundtrips_target_path_for_import() {
+        // Import edge: `target_qualified = None` (post-Ruby-hack-fix), but
+        // `target_path` resolves to a workspace file. Expect:
+        //   - resolutions.target_path = Some("lib/db.rb")
+        //   - resolutions.target_symbol_id = NULL
+        let site_blob = "site-blob";
+        let target_blob = "target-blob";
+        let parser_id = "tree-sitter-ruby";
+
+        let (mut conn, _tmp) = one_file_db("Rakefile", site_blob, parser_id);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["lib/db.rb", target_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![target_blob, parser_id],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "Rakefile".into(),
+                site_byte_range: 10..20,
+                kind: ResolutionKind::Import,
+                semantic_kind: None,
+                target_path: Some("lib/db.rb".into()),
+                target_qualified: None,
+            }],
+        };
+        let inserted = persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(inserted, 1);
+        let (target_path, target_symbol_id): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT target_path, target_symbol_id FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(target_path.as_deref(), Some("lib/db.rb"));
+        assert!(target_symbol_id.is_none());
+    }
+
+    #[test]
+    fn persist_resolutions_cross_parser_unique_hit() {
+        // Kotlin call site resolves to Java symbol — single matching symbol
+        // exists across parser_ids. Expect cross-parser fallback to adopt
+        // its id.
+        let site_blob = "kt-blob";
+        let target_blob = "java-blob";
+        let kt_parser = "tree-sitter-kotlin-ng";
+        let java_parser = "tree-sitter-java";
+
+        let (mut conn, _tmp) = one_file_db("src/main/kotlin/X.kt", site_blob, kt_parser);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["src/main/java/JsonAdapter.java", target_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![target_blob, java_parser],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, ?2, 'JsonAdapter', 'com.x.JsonAdapter', 'class',
+                0, 100, 1, 10, 'syn')",
+            params![target_blob, java_parser],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "src/main/kotlin/X.kt".into(),
+                site_byte_range: 30..40,
+                kind: ResolutionKind::Type,
+                semantic_kind: Some(SemanticKind::Inherit),
+                target_path: Some("src/main/java/JsonAdapter.java".into()),
+                target_qualified: Some("com.x.JsonAdapter".into()),
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "kotlin-resolver",
+            "tier25",
+            kt_parser,
+            &facts,
+        )
+        .unwrap();
+        let target_symbol_id: Option<i64> = conn
+            .query_row(
+                "SELECT target_symbol_id FROM resolutions
+                 WHERE source = 'tier25-kotlin-resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            target_symbol_id.is_some(),
+            "cross-parser fallback should adopt the unique sibling-parser symbol id"
+        );
+    }
+
+    #[test]
+    fn persist_resolutions_cross_parser_uniqueness_check() {
+        // Two symbols share the same `(blob_sha, qualified)` across two
+        // parser_ids — the fallback must refuse to pick arbitrarily and
+        // leave target_symbol_id NULL. target_path is still persisted.
+        let site_blob = "kt-blob";
+        let target_blob = "shared-blob";
+        let kt_parser = "tree-sitter-kotlin-ng";
+
+        let (mut conn, _tmp) = one_file_db("src/main/kotlin/X.kt", site_blob, kt_parser);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["src/shared.both", target_blob],
+        )
+        .unwrap();
+        // Same blob_sha indexed by two parsers (synthetic but allowed by schema).
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'parser-a', 1, 0), (?1, 'parser-b', 1, 0)",
+            params![target_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, 'parser-a', 'F', 'pkg.F', 'class', 0, 50, 1, 5, 'syn'),
+               (?1, 'parser-b', 'F', 'pkg.F', 'class', 0, 50, 1, 5, 'syn')",
+            params![target_blob],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "src/main/kotlin/X.kt".into(),
+                site_byte_range: 0..5,
+                kind: ResolutionKind::Type,
+                semantic_kind: Some(SemanticKind::Inherit),
+                target_path: Some("src/shared.both".into()),
+                target_qualified: Some("pkg.F".into()),
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "kotlin-resolver",
+            "tier25",
+            kt_parser,
+            &facts,
+        )
+        .unwrap();
+        let (target_path, target_symbol_id): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT target_path, target_symbol_id FROM resolutions
+                 WHERE source = 'tier25-kotlin-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            target_path.as_deref(),
+            Some("src/shared.both"),
+            "target_path is preserved regardless of ambiguous symbol lookup"
+        );
+        assert!(
+            target_symbol_id.is_none(),
+            "ambiguous cross-parser fallback must return None"
+        );
+    }
+
+    #[test]
+    fn persist_resolutions_overwrites_legacy_rows_on_revision_bump() {
+        // R2 Phase 1 upgrade-path pin: simulate an existing-DB state
+        // where the manifest already has a `workspace_analysis_runs`
+        // row at the old revision and a resolutions row written by
+        // that old analyzer with `target_path = NULL` (pre-v10
+        // shape, post-migration NULL). When the analyzer re-runs at a
+        // bumped revision (the scheduler does not pick this up
+        // automatically; users invoke `cairn ctl repo reindex` per
+        // the upgrade notes in CHANGELOG.md) and emits a fresh
+        // WorkspaceResolution with `target_path = Some(...)`,
+        // `persist_resolutions` must:
+        //   1. DELETE the legacy resolutions row (same source key).
+        //   2. INSERT the new row carrying target_path.
+        // This test pins just the persist behaviour; the scheduler
+        // / re-enqueue path is documented as manual today and tracked
+        // for a follow-up release.
+        let site_blob = "site-blob";
+        let target_blob = "target-blob";
+        let parser_id = "tree-sitter-ruby";
+        let (conn, _tmp) = one_file_db("Rakefile", site_blob, parser_id);
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["lib/db.rb", target_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![target_blob, parser_id],
+        )
+        .unwrap();
+
+        // Legacy row: same source key, target_path NULL — what an
+        // older analyzer wrote before the v10 column existed.
+        // Hardcoded revision 99 (legacy) / 100 (bumped) decouples
+        // this test from the real analyzer revisions on disk.
+        let legacy_revision: u32 = 99;
+        let bumped_revision: u32 = 100;
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash, status,
+                started_at_ns, finished_at_ns, error)
+             VALUES (1, 'ruby-resolver', ?1, 'cfg', 'succeeded', 0, 1, NULL)",
+            params![legacy_revision],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES (?1, ?2, 10, 20, 'import', NULL, NULL, NULL, 'tier25-ruby-resolver')",
+            params![site_blob, parser_id],
+        )
+        .unwrap();
+
+        // Sanity: legacy row exists with target_path NULL.
+        let (count, before_target_path): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(target_path) FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(before_target_path.is_none());
+
+        // Bumped analyzer re-runs with the same source string but a
+        // new revision; emits a WorkspaceResolution with target_path
+        // pointing at a workspace file.
+        // (The persist layer does not consult analyzer_revision in
+        // its DELETE/INSERT; it scopes by `source` only. Bumping the
+        // run table row separately is what the scheduler does on
+        // re-run, mirrored here so the legacy state is realistic.)
+        let mut conn = conn;
+        conn.execute(
+            "UPDATE workspace_analysis_runs
+                SET analyzer_revision = ?1, status = 'queued'
+              WHERE manifest_id = 1 AND analyzer_id = 'ruby-resolver'",
+            params![bumped_revision],
+        )
+        .unwrap();
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "Rakefile".into(),
+                site_byte_range: 10..20,
+                kind: ResolutionKind::Import,
+                semantic_kind: None,
+                target_path: Some("lib/db.rb".into()),
+                target_qualified: None,
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+
+        // Legacy row must be deleted, single new row with target_path.
+        let (count, after_target_path): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(target_path) FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "legacy row should be replaced, not duplicated");
+        assert_eq!(after_target_path.as_deref(), Some("lib/db.rb"));
+    }
+
+    #[test]
+    fn persist_resolutions_skips_nonexistent_target_path() {
+        // Analyzer bug guard: target_path that does not exist in the
+        // manifest should be dropped to NULL (and debug-logged) rather
+        // than propagated to the wire.
+        let site_blob = "site-blob";
+        let parser_id = "tree-sitter-ruby";
+        let (mut conn, _tmp) = one_file_db("main.rb", site_blob, parser_id);
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "main.rb".into(),
+                site_byte_range: 0..5,
+                kind: ResolutionKind::Import,
+                semantic_kind: None,
+                target_path: Some("lib/phantom_not_in_manifest.rb".into()),
+                target_qualified: None,
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        let target_path: Option<String> = conn
+            .query_row(
+                "SELECT target_path FROM resolutions WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            target_path.is_none(),
+            "phantom target_path must be sanitized to NULL on the resolutions row"
+        );
+    }
+
+    #[test]
+    fn persist_resolutions_phantom_target_path_does_not_escape_via_qualified_fallback() {
+        // R2 B3 regression pin: a resolution whose `target_path` is
+        // *phantom* (analyzer emitted a non-existent path) plus a
+        // `target_qualified` that happens to match a unique
+        // workspace symbol must NOT silently adopt that symbol's
+        // file via the manifest-wide qualified-only fallback. The
+        // analyzer-bug signal (`target_path = NULL`,
+        // `target_symbol_id = NULL`) must be preserved.
+        let site_blob = "site-blob";
+        let unrelated_blob = "unrelated-blob";
+        let parser_id = "tree-sitter-ruby";
+
+        let (mut conn, _tmp) = one_file_db("Rakefile", site_blob, parser_id);
+        // A different workspace file holds a symbol whose qualified
+        // would match the analyzer's target_qualified. Without the
+        // phantom guard the qualified-only fallback would adopt
+        // this symbol and re-point target_path to its file.
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha) VALUES (1, ?1, ?2)",
+            params!["lib/unrelated.rb", unrelated_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, ?2, 1, 0)",
+            params![unrelated_blob, parser_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (?1, ?2, 'TempFile', 'rake/clean', 'class',
+                0, 100, 1, 10, 'syn')",
+            params![unrelated_blob, parser_id],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolved_refs: Vec::new(),
+            resolutions: vec![WorkspaceResolution {
+                source_path: "Rakefile".into(),
+                site_byte_range: 0..5,
+                kind: ResolutionKind::Type,
+                semantic_kind: Some(SemanticKind::Inherit),
+                // Phantom path (does not exist in this manifest).
+                target_path: Some("lib/phantom_not_in_manifest.rb".into()),
+                // Qualified that *would* match the unrelated symbol
+                // above via manifest-wide fallback if not gated.
+                target_qualified: Some("rake/clean".into()),
+            }],
+        };
+        persist_resolutions(
+            &mut conn,
+            ManifestId(1),
+            "ruby-resolver",
+            "tier25",
+            parser_id,
+            &facts,
+        )
+        .unwrap();
+        let (target_path, target_symbol_id): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT target_path, target_symbol_id FROM resolutions
+                 WHERE source = 'tier25-ruby-resolver'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            target_path.is_none(),
+            "phantom target_path must stay NULL — not re-pointed to lib/unrelated.rb"
+        );
+        assert!(
+            target_symbol_id.is_none(),
+            "qualified-only fallback must not run for PhantomDropped paths"
+        );
     }
 }

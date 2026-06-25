@@ -40,6 +40,13 @@ pub struct ImplHit {
     /// [`KIND_SOURCE_FACT`] (`"tier2-fact"`) when the Tier-2
     /// `implementations.kind` was used as fallback.
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the resolved
+    /// supertype lives in (v10+). `Some("src/Foo.java")` when the
+    /// resolver pinned the edge to a workspace-internal definition
+    /// (same row that promoted `kind_source` off `tier2-fact`);
+    /// `None` for unresolved sites and supertypes that live outside
+    /// the indexed workspace.
+    pub target_path: Option<String>,
     pub path: String,
     pub line: u32,
     pub parser_id: String,
@@ -134,7 +141,7 @@ fn run(
         "WITH best_resolution AS (
              SELECT site_blob_sha, site_parser_id,
                     site_byte_start, site_byte_end,
-                    semantic_kind, source,
+                    semantic_kind, source, target_path,
                     ROW_NUMBER() OVER (
                         PARTITION BY site_blob_sha, site_parser_id,
                                      site_byte_start, site_byte_end
@@ -148,6 +155,7 @@ fn run(
                 COALESCE(r.semantic_kind, i.kind) AS kind,
                 CASE WHEN r.source IS NOT NULL THEN r.source ELSE '{KIND_SOURCE_FACT}' END
                     AS kind_source,
+                r.target_path AS target_path,
                 me.path,
                 i.line,
                 i.parser_id
@@ -177,9 +185,10 @@ fn run(
                 interface_qualified: row.get(1)?,
                 kind: row.get(2)?,
                 kind_source: row.get(3)?,
-                path: row.get(4)?,
-                line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                parser_id: row.get(6)?,
+                target_path: row.get(4)?,
+                path: row.get(5)?,
+                line: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                parser_id: row.get(7)?,
             })
         })?
         .collect();

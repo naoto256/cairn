@@ -52,12 +52,15 @@ impl RequireGraph {
                 list.push(RequireEdge {
                     site_byte_start: req.byte_start,
                     site_byte_end: req.byte_end,
-                    // Use the path as the qualified key — symbols don't
-                    // have a 1-1 import-binding name in Ruby. Persist
-                    // tolerates this by looking the symbol up by the
-                    // first symbol in the target blob; if none, the row
-                    // still records site→file with target_symbol_id=NULL.
-                    target_qualified: resolved.clone(),
+                    // Import edges target a *file*, not a symbol — Ruby
+                    // `require_relative './foo'` and `require 'rake'`
+                    // resolve to a path, and there is no
+                    // `symbols.qualified` row matching that path. Keep
+                    // `target_qualified = None` so persist skips the
+                    // symbol-id lookup entirely; `target_path` is the
+                    // source of truth and surfaces via
+                    // `ImportHit.target_path` (schema v10+).
+                    target_qualified: None,
                     target_path: resolved,
                 });
             }

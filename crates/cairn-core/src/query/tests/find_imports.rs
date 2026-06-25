@@ -133,3 +133,73 @@ fn legacy_null_byte_range_keeps_tier2_fact_fallback() {
         .expect("legacy import missing");
     assert_eq!(hit.kind_source, "tier2-fact");
 }
+
+/// v10: helper that inserts a resolution row with `target_path Some`.
+/// `insert_import_resolution` writes NULL by default (legacy column-list
+/// pattern); this variant exercises the new column.
+fn insert_import_resolution_with_target_path(
+    conn: &Connection,
+    blob_sha: &str,
+    parser_id: &str,
+    byte_start: i64,
+    byte_end: i64,
+    source: &str,
+    target_path: &str,
+) {
+    conn.execute(
+        "INSERT INTO resolutions
+           (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+            kind, semantic_kind, target_symbol_id, target_path, source)
+         VALUES (?1, ?2, ?3, ?4, 'import', NULL, NULL, ?5, ?6)",
+        rusqlite::params![
+            blob_sha,
+            parser_id,
+            byte_start,
+            byte_end,
+            target_path,
+            source
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn find_imports_returns_target_path_for_workspace_internal() {
+    // v10 round-trip: when the resolver pinned an import to a workspace
+    // file by writing `resolutions.target_path = Some(...)`, the SELECT
+    // surfaces it on `ImportHit.target_path` directly (no symbol chain).
+    let (_tmp, conn, blob_sha, parser_id) = fixture_store();
+    insert_import(&conn, blob_sha, parser_id, "./db", 1, Some((9, 13)));
+    insert_import_resolution_with_target_path(
+        &conn,
+        blob_sha,
+        parser_id,
+        9,
+        13,
+        "tier25-ruby-resolver",
+        "lib/db.rb",
+    );
+
+    let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].to_module, "./db");
+    assert_eq!(hits[0].kind_source, "tier25-ruby-resolver");
+    assert_eq!(hits[0].target_path.as_deref(), Some("lib/db.rb"));
+}
+
+#[test]
+fn find_imports_target_path_none_for_bare_specifier_fallback() {
+    // Bare-specifier import that fell back to tier2-fact (no resolution
+    // row). target_path must surface as None — regression pin that the
+    // LEFT JOIN does not invent a path when no resolver claimed the site.
+    let (_tmp, conn, blob_sha, parser_id) = fixture_store();
+    insert_import(&conn, blob_sha, parser_id, "rake", 2, Some((20, 24)));
+
+    let hits = find_imports(&conn, &AnchorName::head(), &FindImportsArgs::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|h| h.to_module == "rake")
+        .expect("rake import missing");
+    assert_eq!(hit.kind_source, "tier2-fact");
+    assert!(hit.target_path.is_none());
+}
