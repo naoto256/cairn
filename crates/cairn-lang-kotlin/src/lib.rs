@@ -45,7 +45,17 @@ impl LanguageBackend for KotlinBackend {
         // The Kotlin Tier-2.5 resolver pins its `resolutions` row at the
         // same dotted-path span Tier-2 records here, so `find_imports`
         // can LEFT JOIN them.
-        2
+        //
+        // rev 3: prefix `SymbolFact.qualified` with the file's
+        // `package` declaration when present. Prior revisions stored
+        // bare names (`JsonAdapter`) which broke cross-parser
+        // `(blob_sha, qualified)` matching in the Tier-2.5 persist
+        // layer — sibling-language resolvers (Kotlin extending Java,
+        // etc.) emit fully-qualified target_qualified strings
+        // (`com.x.JsonAdapter`) and the bare-name symbols never
+        // matched. Index/blame consumers continue to read the
+        // unchanged `name` column for prefix and FTS lookups.
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -65,12 +75,30 @@ static REGISTER_KOTLIN: fn() -> Box<dyn LanguageBackend> = || Box::new(KotlinBac
 
 struct KotlinVisitor {
     nesting: NestingTracker,
+    /// File-scoped `package com.example.app` prefix, captured from the
+    /// `package_header` node. Persists for the lifetime of the visitor
+    /// (one per file). `None` when the file declares no package
+    /// (default/root package).
+    package_prefix: Option<String>,
 }
 
 impl KotlinVisitor {
     fn new() -> Self {
         Self {
             nesting: NestingTracker::new("."),
+            package_prefix: None,
+        }
+    }
+
+    /// `com.example.app.Outer.Inner.method` — package, class-nesting
+    /// path, and member name joined with `.`. Bare-named root types
+    /// fall back to just the package when nesting is empty, and to
+    /// the bare name when no package is declared.
+    fn qualified_for(&self, name: &str, facts: &SyntacticFacts) -> String {
+        let base = self.nesting.qualified_for(name, facts);
+        match &self.package_prefix {
+            Some(pkg) => format!("{pkg}.{base}"),
+            None => base,
         }
     }
 }
@@ -78,6 +106,13 @@ impl KotlinVisitor {
 impl Visitor for KotlinVisitor {
     fn visit_node(&mut self, node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
         self.nesting.pop_outside(node.start_byte());
+
+        if node.kind() == "package_header" {
+            if let Some(pkg) = match_package_header(node, source) {
+                self.package_prefix = Some(pkg);
+            }
+            return;
+        }
 
         if node.kind() == "import" {
             if let Some(import) = match_import(node, source) {
@@ -107,7 +142,7 @@ impl Visitor for KotlinVisitor {
             .next()
             .unwrap_or(&display_name)
             .to_string();
-        let qualified = self.nesting.qualified_for(&display_name, facts);
+        let qualified = self.qualified_for(&display_name, facts);
         let signature = signature_slice(node, source, body_start);
         let visibility = kotlin_visibility(node, source);
         let doc = extract_kdoc(node, source);
@@ -307,6 +342,24 @@ fn find_direct_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     node.children(&mut cursor).find(|c| c.kind() == kind)
 }
 
+// ─── package ───────────────────────────────────────────────────────────────
+
+/// Extract the dotted package name from a `package_header` node.
+/// Returns the path text (e.g. `"com.example.app"`) when present,
+/// `None` when the node has no recognizable identifier child (which
+/// the grammar should not produce, but we keep the visitor permissive
+/// so a parse-error file still emits its symbols under the default
+/// package rather than crashing).
+fn match_package_header(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let path = find_direct_child(node, "qualified_identifier")
+        .or_else(|| find_direct_child(node, "identifier"))?;
+    let text = node_text(path, source).trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 // ─── imports ───────────────────────────────────────────────────────────────
 
 fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
@@ -441,7 +494,7 @@ class Service(private val repo: String) : B(), Greeter {
     internal var counter = 0
 
     companion object {
-        const val TAG = "Service"
+        const val TAG = "com.example.app.Service"
         fun create(): Service = Service("default")
     }
 
@@ -494,27 +547,54 @@ suspend fun process(input: String): Result<User> {
     #[test]
     fn extracts_class_interface_object_enum_typealias() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "Greeter").kind, SymbolKind::Interface);
-        assert_eq!(symbol(&facts, "Result").kind, SymbolKind::Class);
-        assert_eq!(symbol(&facts, "User").kind, SymbolKind::Class);
-        assert_eq!(symbol(&facts, "Registry").kind, SymbolKind::Class);
-        assert_eq!(symbol(&facts, "Color").kind, SymbolKind::Enum);
-        assert_eq!(symbol(&facts, "Handler").kind, SymbolKind::TypeAlias);
-        assert_eq!(symbol(&facts, "Service").kind, SymbolKind::Class);
+        assert_eq!(
+            symbol(&facts, "com.example.app.Greeter").kind,
+            SymbolKind::Interface
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Result").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.User").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Registry").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Color").kind,
+            SymbolKind::Enum
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Handler").kind,
+            SymbolKind::TypeAlias
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service").kind,
+            SymbolKind::Class
+        );
     }
 
     #[test]
     fn nested_data_classes_are_qualified_under_sealed_parent() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "Result.Success").kind, SymbolKind::Class);
-        assert_eq!(symbol(&facts, "Result.Failure").kind, SymbolKind::Class);
         assert_eq!(
-            symbol(&facts, "Result.Success").parent_idx,
+            symbol(&facts, "com.example.app.Result.Success").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Result.Failure").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Result.Success").parent_idx,
             Some(
                 facts
                     .symbols
                     .iter()
-                    .position(|s| s.qualified == "Result")
+                    .position(|s| s.qualified == "com.example.app.Result")
                     .unwrap()
             )
         );
@@ -523,10 +603,16 @@ suspend fun process(input: String): Result<User> {
     #[test]
     fn data_class_constructor_val_var_params_become_properties() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "User.id").kind, SymbolKind::Property);
-        assert_eq!(symbol(&facts, "User.name").kind, SymbolKind::Property);
         assert_eq!(
-            symbol(&facts, "Service.repo").visibility,
+            symbol(&facts, "com.example.app.User.id").kind,
+            SymbolKind::Property
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.User.name").kind,
+            SymbolKind::Property
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.repo").visibility,
             Some(Visibility::Private)
         );
     }
@@ -534,13 +620,16 @@ suspend fun process(input: String): Result<User> {
     #[test]
     fn companion_object_members_qualify_through_companion() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "Service.Companion").kind, SymbolKind::Class);
         assert_eq!(
-            symbol(&facts, "Service.Companion.TAG").kind,
+            symbol(&facts, "com.example.app.Service.Companion").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.Companion.TAG").kind,
             SymbolKind::Constant
         );
         assert_eq!(
-            symbol(&facts, "Service.Companion.create").kind,
+            symbol(&facts, "com.example.app.Service.Companion.create").kind,
             SymbolKind::Method
         );
     }
@@ -548,12 +637,24 @@ suspend fun process(input: String): Result<User> {
     #[test]
     fn member_functions_are_methods_and_top_level_are_functions() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "Service.greet").kind, SymbolKind::Method);
-        assert_eq!(symbol(&facts, "Service.fetch").kind, SymbolKind::Method);
-        assert_eq!(symbol(&facts, "Greeter.greet").kind, SymbolKind::Method);
-        assert_eq!(symbol(&facts, "process").kind, SymbolKind::Function);
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.greet").kind,
+            SymbolKind::Method
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.fetch").kind,
+            SymbolKind::Method
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Greeter.greet").kind,
+            SymbolKind::Method
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.process").kind,
+            SymbolKind::Function
+        );
         assert!(
-            symbol(&facts, "Service.fetch")
+            symbol(&facts, "com.example.app.Service.fetch")
                 .signature
                 .as_deref()
                 .unwrap()
@@ -564,7 +665,7 @@ suspend fun process(input: String): Result<User> {
     #[test]
     fn extension_function_carries_receiver_in_qualified_name() {
         let facts = facts();
-        let shout = symbol(&facts, "String.shout");
+        let shout = symbol(&facts, "com.example.app.String.shout");
         assert_eq!(shout.kind, SymbolKind::Function);
         assert_eq!(shout.name, "shout");
     }
@@ -572,35 +673,50 @@ suspend fun process(input: String): Result<User> {
     #[test]
     fn nested_class_and_visibility() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "Service.Inner").kind, SymbolKind::Class);
         assert_eq!(
-            symbol(&facts, "Service.Inner.helper").visibility,
+            symbol(&facts, "com.example.app.Service.Inner").kind,
+            SymbolKind::Class
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.Inner.helper").visibility,
             Some(Visibility::Private)
         );
         assert_eq!(
-            symbol(&facts, "Service.counter").visibility,
+            symbol(&facts, "com.example.app.Service.counter").visibility,
             Some(Visibility::Crate)
         );
-        assert_eq!(symbol(&facts, "Service.cache").visibility, None);
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.cache").visibility,
+            None
+        );
     }
 
     #[test]
     fn const_and_properties() {
         let facts = facts();
-        assert_eq!(symbol(&facts, "MAX_RETRIES").kind, SymbolKind::Constant);
         assert_eq!(
-            symbol(&facts, "MAX_RETRIES").doc.as_deref(),
+            symbol(&facts, "com.example.app.MAX_RETRIES").kind,
+            SymbolKind::Constant
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.MAX_RETRIES").doc.as_deref(),
             Some("Max retry budget.")
         );
-        assert_eq!(symbol(&facts, "Registry.users").kind, SymbolKind::Property);
-        assert_eq!(symbol(&facts, "Service.cache").kind, SymbolKind::Property);
+        assert_eq!(
+            symbol(&facts, "com.example.app.Registry.users").kind,
+            SymbolKind::Property
+        );
+        assert_eq!(
+            symbol(&facts, "com.example.app.Service.cache").kind,
+            SymbolKind::Property
+        );
     }
 
     #[test]
     fn kdoc_attaches_to_class() {
         let facts = facts();
         assert_eq!(
-            symbol(&facts, "Service").doc.as_deref(),
+            symbol(&facts, "com.example.app.Service").doc.as_deref(),
             Some("Greets and fetches.")
         );
     }
