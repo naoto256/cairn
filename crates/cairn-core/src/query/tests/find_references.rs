@@ -1,6 +1,7 @@
 use super::{refs_dedup_fixture, registered};
 use crate::anchor::AnchorName;
 use crate::cas::store;
+use crate::query::find_references::KIND_SOURCE_FACT;
 use crate::query::{FindReferencesArgs, find_references};
 use crate::register::register_repo;
 use crate::testutil::init_repo;
@@ -603,5 +604,103 @@ fn find_references_outgoing_ambiguous_cross_parser_is_filtered_out() {
         hits.iter().all(|h| h.target_name != "fromJson"),
         "ambiguous cross-parser call must be filtered out by find_callees noise gate; \
          hits were: {hits:?}"
+    );
+}
+
+// ──── Phase 2: target_path surface on find_references / find_callers ────
+
+#[test]
+fn find_references_returns_target_path_for_workspace_internal() {
+    // Phase 2 round-trip: when persist wrote `resolutions.target_path`
+    // (cross-parser type/call or any workspace-internal resolved ref),
+    // `find_references` surfaces it on `ReferenceHit.target_path` via
+    // `res.target_path` projection. No SQL JOIN through symbols / paths.
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "caller".into(),
+            direction: ReferenceDirection::Outgoing,
+            kind: Some(RefKind::Call),
+            include_noise: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hit = hits
+        .iter()
+        .find(|h| h.target_name == "fromJson")
+        .expect("cross-parser fromJson call missing");
+    assert_eq!(hit.target_path.as_deref(), Some("src/JsonAdapter.java"));
+    assert_eq!(hit.kind_source, "tier25-kotlin-resolver");
+}
+
+#[test]
+fn find_references_target_path_none_when_no_resolution() {
+    // tier2-fact fallback (no resolution row): target_path stays None.
+    let (_db, conn) = refs_dedup_fixture(false, None);
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "render".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].target_path.is_none(),
+        "tier2-fact fallback must not invent a target_path: {:?}",
+        hits[0]
+    );
+    assert_eq!(hits[0].kind_source, KIND_SOURCE_FACT);
+}
+
+#[test]
+fn find_references_phase2_preserves_resolved_noise_semantics() {
+    // Phase 2 regression pin (R2 "surface-additive, semantics
+    // unchanged"): adding `target_path` to the projection must not
+    // shift which refs the noise filter suppresses or which dedup
+    // winner is picked. Same dedup fixture as the existing
+    // tier3-suppresses-tier2 test: assert that the same single hit
+    // wins, and the target_path field is None because no resolution
+    // row exists in this fixture (refs-only).
+    let (_db, conn) = refs_dedup_fixture(true, None);
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "render".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(hits.len(), 1, "dedup winner count must be 1: {hits:?}");
+    assert_eq!(
+        hits[0].target_qualified.as_deref(),
+        Some("crate::Widget::render"),
+        "tier3 row must still win dedup over tier2"
+    );
+    assert!(
+        hits[0].target_path.is_none(),
+        "no resolution row → target_path must stay None (Phase 2 is surface-additive)"
     );
 }

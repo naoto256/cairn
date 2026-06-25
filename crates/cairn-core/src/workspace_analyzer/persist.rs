@@ -304,7 +304,16 @@ pub(super) fn persist_resolutions(
 ///
 /// Today the cross-parser fallbacks primarily help cross-language
 /// hierarchies (Kotlin extending a Java class, Swift importing an
-/// Objective-C declaration). Future risk: a blob indexed by multiple
+/// Objective-C declaration). The manifest-wide step (#2) covers
+/// resolvers that emit `target_qualified` but cannot identify the
+/// file themselves — for example a future Python or Swift resolver
+/// that walks `import x.y.Z` to an FQN without scanning sibling
+/// backend files, or any qualified-name-first cross-language
+/// resolution (Kotlin → Java is handled by step #1 today because
+/// PR #213 made Kotlin symbols carry FQNs, but the same Kotlin
+/// resolver hitting a generated-source file with no `target_path`
+/// would land in step #2).
+/// Future risk: a blob indexed by multiple
 /// parsers (TS/JS overlap, generated files) — the uniqueness check
 /// catches it.
 fn resolve_resolution_target(

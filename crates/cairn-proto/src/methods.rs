@@ -1022,6 +1022,18 @@ pub struct FindReferenceHit {
     /// those payloads green.
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the target lives in
+    /// (v10+, Phase 2). `Some("src/foo.rs")` when a Tier-2.5+ resolver
+    /// pinned the reference to a workspace-internal target; `None` for
+    /// unresolved sites and for targets that resolved outside the
+    /// indexed workspace. Independent of `target_qualified`: cross-
+    /// parser-id resolution may carry `target_path = Some` even when
+    /// the qualified name could not be uniquely identified across
+    /// sibling parsers. Additive field — older daemons that predate
+    /// the Phase 2 target_path surface omit it and the default `None`
+    /// keeps deserialization of those payloads green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
     /// Qualified name of the function / impl block the reference sits
     /// inside. `None` for top-level expressions (rare in Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1161,6 +1173,19 @@ pub struct CallHit {
     /// `"tier25-ruby-resolver"`).
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
+    /// Repo-relative path of the workspace file the resolved callee
+    /// lives in (v10+, Phase 2). `Some("src/foo.rs")` when a
+    /// Tier-2.5+ resolver pinned the call to a workspace-internal
+    /// definition; `None` for unresolved calls and callees that live
+    /// outside the indexed workspace. Independent of
+    /// `target_qualified`: cross-parser-id resolution may carry
+    /// `target_path = Some` even when the qualified name was not
+    /// uniquely matched across sibling parsers. Additive field —
+    /// older daemons that predate the Phase 2 target_path surface
+    /// omit it and the default `None` keeps deserialization of those
+    /// payloads green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
     /// Qualified name of the enclosing function — the caller side of
     /// the edge. `None` for top-level expressions (rare in Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]
