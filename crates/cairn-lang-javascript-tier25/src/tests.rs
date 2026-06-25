@@ -62,7 +62,12 @@ fn cjs_default_require_resolves_module_path() {
         .iter()
         .find(|r| r.target_path.as_deref() == Some("foo.js"))
         .expect("CJS require of ./foo should resolve");
-    assert_eq!(hit.target_qualified.as_deref(), Some("./foo"));
+    // Import edges target a *file*, not a symbol; the require-graph
+    // sets `target_qualified = None` (Phase 3, matching the Ruby
+    // and other tier25 backends' Phase 1 contract) so persist.rs
+    // skips the symbol lookup and `target_path` remains the source
+    // of truth.
+    assert!(hit.target_qualified.is_none());
 }
 
 #[test]
@@ -445,53 +450,49 @@ fn unknown_receiver_method_call_is_not_resolved() {
 
 #[test]
 fn bare_specifier_import_records_no_path() {
+    // Phase 3 contract: bare specifiers (npm packages) produce an
+    // Import resolution whose `target_path` and `target_qualified`
+    // are both `None`. Import edges target a file, not a symbol, so
+    // the specifier string (`express`) intentionally does not become
+    // a path-shaped `target_qualified`.
     let tmp = tempfile::tempdir().unwrap();
     let src = "const express = require('express');\n";
     let res = run(tmp.path(), &[("m.js", src)]);
     let imps = imports_of(&res, "m.js");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("express"))
-        .expect("bare require should record specifier");
-    assert!(
-        hit.target_path.is_none(),
-        "bare specifier must have no target_path; got {:?}",
-        hit.target_path
-    );
+    assert_eq!(imps.len(), 1, "exactly one import row expected: {imps:#?}");
+    let hit = &imps[0];
+    assert!(hit.target_path.is_none());
+    assert!(hit.target_qualified.is_none());
 }
 
 #[test]
 fn node_builtin_import_records_no_path() {
+    // Same as bare_specifier: `node:fs` is a builtin module, not a
+    // workspace file or workspace symbol.
     let tmp = tempfile::tempdir().unwrap();
     let src = "import fs from 'node:fs';\n";
     let res = run(tmp.path(), &[("m.js", src)]);
     let imps = imports_of(&res, "m.js");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("node:fs"))
-        .expect("node: builtin should record specifier");
-    assert!(
-        hit.target_path.is_none(),
-        "node: builtin must have no target_path; got {:?}",
-        hit.target_path
-    );
+    assert_eq!(imps.len(), 1, "exactly one import row expected: {imps:#?}");
+    let hit = &imps[0];
+    assert!(hit.target_path.is_none());
+    assert!(hit.target_qualified.is_none());
 }
 
 #[test]
 fn path_alias_import_records_no_path() {
+    // `@/foo` is a webpack/tsconfig-style path alias the resolver
+    // does not understand. Should fall back to the same "no path,
+    // no qualified" shape as bare specifiers — the resolver
+    // refuses to invent a workspace path.
     let tmp = tempfile::tempdir().unwrap();
     let src = "import x from '@/foo';\n";
     let res = run(tmp.path(), &[("m.js", src)]);
     let imps = imports_of(&res, "m.js");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("@/foo"))
-        .expect("path alias should record specifier");
-    assert!(
-        hit.target_path.is_none(),
-        "path alias must not be invented as workspace path; got {:?}",
-        hit.target_path
-    );
+    assert_eq!(imps.len(), 1, "exactly one import row expected: {imps:#?}");
+    let hit = &imps[0];
+    assert!(hit.target_path.is_none());
+    assert!(hit.target_qualified.is_none());
 }
 
 #[test]
@@ -519,7 +520,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "javascript-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 1);
+    assert_eq!(ANALYZER_REVISION, 2);
     assert_eq!(PARSER_ID, "tree-sitter-javascript");
     assert_eq!(RESOLUTION_SOURCE, "tier25-javascript-resolver");
 }
