@@ -48,6 +48,13 @@ impl LanguageBackend for CsharpBackend {
         "tree-sitter-c-sharp"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // rev 2: emit byte_range on ImportFact (using directives) so
+        // Tier-2.5's csharp-resolver can pin its resolution rows at the
+        // same dotted-path span; find_imports LEFT JOINs them.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_c_sharp::LANGUAGE.into();
         extract(source, &language, CsharpVisitor::new(source.len()))
@@ -312,6 +319,10 @@ fn match_using(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     // `using static` brings members into scope, like Go's dot import.
     let imported = has_keyword_child(node, "static").then(|| "*".to_string());
 
+    // rev 2: pin byte_range at the dotted-path span so Tier-2.5's
+    // csharp-resolver resolutions JOIN against the same offsets.
+    let path_range = target.byte_range();
+
     Some(ImportFact {
         to_module,
         imported,
@@ -319,7 +330,7 @@ fn match_using(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
         is_reexport: false,
         line: line_of(node),
 
-        byte_range: None,
+        byte_range: Some((path_range.start as u32, path_range.end as u32)),
     })
 }
 

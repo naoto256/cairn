@@ -102,6 +102,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
         || crate_name == "cairn-lang-php-tier25"
         || crate_name == "cairn-lang-python-tier25"
         || crate_name == "cairn-lang-kotlin-tier25"
+        || crate_name == "cairn-lang-csharp-tier25"
         || crate_name == "cairn-lang-swift-tier3"
         || crate_name == "cairn-lang-swift-tier25"
     {
@@ -121,6 +122,7 @@ fn expected_entries(crate_name: &str) -> Vec<Entry> {
                 "cairn-lang-php-tier25" => "php-resolver",
                 "cairn-lang-python-tier25" => "python-resolver",
                 "cairn-lang-kotlin-tier25" => "kotlin-resolver",
+                "cairn-lang-csharp-tier25" => "csharp-resolver",
                 "cairn-lang-swift-tier3" => "sourcekit-lsp",
                 "cairn-lang-swift-tier25" => "swift-resolver",
                 _ => unreachable!(),
