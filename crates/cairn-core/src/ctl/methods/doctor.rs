@@ -850,6 +850,7 @@ mod tests {
             "csharp-ls",
             "csharp-resolver",
             "gopls-lsp",
+            "javascript-resolver",
             "jdtls-lsp",
             "kotlin-language-server",
             "kotlin-resolver",
