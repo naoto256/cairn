@@ -860,6 +860,7 @@ mod tests {
             "ruby-resolver",
             "rust-analyzer-lsp",
             "sourcekit-lsp",
+            "swift-resolver",
             "typescript-language-server-js-lsp",
             "typescript-language-server-ts-lsp",
             "typescript-language-server-tsx-lsp",

@@ -46,6 +46,14 @@ impl LanguageBackend for SwiftBackend {
         "tree-sitter-swift"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // rev 2: emit byte_range on ImportFact for Tier-2.5
+        // consumption. The Swift Tier-2.5 resolver pins its
+        // `resolutions` row at the same dotted-path span Tier-2
+        // records here, so `find_imports` can LEFT JOIN them.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_swift::LANGUAGE.into();
         extract(source, &language, SwiftVisitor::new())
@@ -363,6 +371,9 @@ fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
         .rsplit('.')
         .find(|part| !part.is_empty())
         .map(str::to_string);
+    // rev 2: pin byte_range at the dotted-path span so Tier-2.5's
+    // `find_imports` JOIN aligns with the resolutions row.
+    let path_range = path.byte_range();
     Some(ImportFact {
         to_module,
         imported,
@@ -370,7 +381,7 @@ fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
         is_reexport: false,
         line: line_of(node),
 
-        byte_range: None,
+        byte_range: Some((path_range.start as u32, path_range.end as u32)),
     })
 }
 
