@@ -62,7 +62,7 @@ mod tests;
 use const_resolver::{FileConstFacts, ImportKind, PackageIndex};
 use dispatch::MethodIndex;
 use mro::Mro;
-use require_graph::RequireGraph;
+use require_graph::{RequireGraph, ResolvedBinding};
 
 pub const ANALYZER_ID: &str = "kotlin-resolver";
 pub const TIER_PREFIX: &str = "tier25";
@@ -75,7 +75,14 @@ pub const TIER_PREFIX: &str = "tier25";
 // so existing workspace_analysis_runs need to be invalidated and the
 // analyzer re-run to repopulate rows with manifest_id Some. Analyzer
 // logic itself is unchanged.
-pub const ANALYZER_REVISION: u32 = 3;
+// Bumped for path-aware dispatch: `PackageIndex` and `RequireGraph`
+// bindings now key by `(path, qualified)` so cross-file same-name
+// class collisions no longer collapse to a first-hit, and the
+// dispatch resolution chain validates every candidate before
+// adoption. Stale `workspace_analysis_runs` rows must be invalidated
+// so cached call edges that fell through to tier2-fact get re-run
+// against the path-aware resolver.
+pub const ANALYZER_REVISION: u32 = 4;
 pub const PARSER_ID: &str = "tree-sitter-kotlin-ng";
 pub const RESOLUTION_SOURCE: &str = "tier25-kotlin-resolver";
 
@@ -177,18 +184,21 @@ pub fn analyze_files(
     let mro = Mro::build(&per_file, &package_index);
     let methods = MethodIndex::build(&per_file);
 
-    // Per-file alias map: short-name → FQN. Wildcard imports don't
-    // produce a single binding; they're consulted at call resolution
-    // sites directly through `file_facts.import_bindings`.
-    let mut alias_maps: HashMap<&str, HashMap<String, String>> = HashMap::new();
+    // Per-file alias map: short-name → ResolvedBinding (path + FQN).
+    // Wildcard imports don't produce a single binding; they're
+    // consulted at call resolution sites directly through
+    // `file_facts.import_bindings`. The binding carries `target_path`
+    // so dispatch can use `PackageIndex::lookup_in_file` rather than a
+    // path-agnostic fallback that loses cross-file collision info.
+    let mut alias_maps: HashMap<&str, HashMap<String, ResolvedBinding>> = HashMap::new();
     for (path, _, facts) in &per_file {
-        let mut m: HashMap<String, String> = HashMap::new();
+        let mut m: HashMap<String, ResolvedBinding> = HashMap::new();
         for binding in &facts.import_bindings {
             if binding.kind == ImportKind::Wildcard {
                 continue;
             }
-            if let Some(q) = require_graph.resolve_binding(path, binding) {
-                m.insert(binding.local.clone(), q);
+            if let Some(rb) = require_graph.resolve_binding(path, binding) {
+                m.insert(binding.local.clone(), rb.clone());
             }
         }
         alias_maps.insert(path.as_str(), m);
@@ -217,7 +227,7 @@ pub fn analyze_files(
         // is pinnable from the grammar.
         for call in &facts.method_calls {
             let Some(resolved) =
-                dispatch::resolve_call(call, &package_index, &mro, &methods, &aliases, facts)
+                dispatch::resolve_call(path, call, &package_index, &mro, &methods, &aliases, facts)
             else {
                 // Unresolvable (`obj.method()`, reflection, etc.) —
                 // Tier-2.5 does NOT emit a "site observed" row for
@@ -251,7 +261,7 @@ fn read_blob(file: &WorkspaceFile) -> Option<Vec<u8>> {
 /// target external" with no target.
 fn resolve_dotted(
     parts: &[String],
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, ResolvedBinding>,
     facts: &FileConstFacts,
     package_index: &PackageIndex,
 ) -> Option<(String, String)> {
@@ -265,25 +275,37 @@ fn resolve_dotted(
         None
     };
 
-    // 1. Alias substitution.
-    if let Some(target) = aliases.get(head) {
+    // 1. Alias substitution. If the import binding pinned a workspace
+    // file, look the candidate up there directly — collisions on the
+    // short qualified across other files must not steal this hit.
+    if let Some(binding) = aliases.get(head) {
         let candidate = match &tail {
-            Some(t) => format!("{target}.{t}"),
-            None => target.clone(),
+            Some(t) => format!("{}.{}", binding.target_qualified, t),
+            None => binding.target_qualified.clone(),
         };
-        if let Some(hit) = package_index.lookup(&candidate) {
+        if let Some(target_path) = &binding.target_path {
+            if let Some(hit) = package_index.lookup_in_file(target_path, &candidate) {
+                return Some((hit.path.clone(), hit.qualified.clone()));
+            }
+        }
+        // External binding (kotlin-stdlib / jar) or workspace-resolved
+        // import whose candidate doesn't exist in the bound file —
+        // fall back to path-agnostic unique lookup. Collisions stay
+        // None on purpose: better to under-resolve than to silently
+        // pick the wrong file.
+        if let Some(hit) = package_index.lookup_unique(&candidate) {
             return Some((hit.path.clone(), hit.qualified.clone()));
         }
-        // Alias resolved a name we can't pin to a workspace file —
-        // leave it unresolved at the path level (consumers see the
-        // qualified via the Tier-2 ImportFact).
         return None;
     }
 
-    // 2. In-package lookup.
+    // 2. In-package lookup. The current file's package + parts is
+    // expected to be unique workspace-wide, but we still go through
+    // `lookup_unique` so a future duplicate-FQN bug doesn't masquerade
+    // as a successful resolution.
     if let Some(pkg) = facts.package.as_deref().filter(|s| !s.is_empty()) {
         let candidate = format!("{pkg}.{}", parts.join("."));
-        if let Some(hit) = package_index.lookup(&candidate) {
+        if let Some(hit) = package_index.lookup_unique(&candidate) {
             return Some((hit.path.clone(), hit.qualified.clone()));
         }
     }
@@ -292,7 +314,7 @@ fn resolve_dotted(
     for b in &facts.import_bindings {
         if b.kind == ImportKind::Wildcard {
             let candidate = format!("{}.{}", b.fqn, parts.join("."));
-            if let Some(hit) = package_index.lookup(&candidate) {
+            if let Some(hit) = package_index.lookup_unique(&candidate) {
                 return Some((hit.path.clone(), hit.qualified.clone()));
             }
         }
@@ -300,7 +322,7 @@ fn resolve_dotted(
 
     // 4. Bare FQN as written.
     let bare = parts.join(".");
-    if let Some(hit) = package_index.lookup(&bare) {
+    if let Some(hit) = package_index.lookup_unique(&bare) {
         return Some((hit.path.clone(), hit.qualified.clone()));
     }
 

@@ -87,6 +87,15 @@ impl Mro {
 
     /// Ancestors innermost-first, used for both instance and static
     /// dispatch.
+    ///
+    /// MRO is keyed by ancestor FQN, not `(path, FQN)`. This is sound
+    /// for Kotlin specifically: the language forbids two declarations
+    /// with the same FQN in the same workspace (same package + same
+    /// short name → duplicate definition error at compile time), so an
+    /// FQN identifies an ancestor class uniquely. Path-aware lookup at
+    /// the call site (`method_index.get_method(ancestor_fqn, name)`)
+    /// closes the loop: the method index is itself owner-FQN-keyed and
+    /// therefore inherits the same uniqueness guarantee.
     pub fn ancestors(&self, class: &str) -> Vec<String> {
         self.chain
             .get(class)
@@ -142,7 +151,7 @@ fn resolve_base(
             Some(t) => format!("{target}.{t}"),
             None => target.clone(),
         };
-        if package_index.lookup(&candidate).is_some() {
+        if package_index.lookup_unique(&candidate).is_some() {
             return Some(candidate);
         }
         // Even when we can't pin it to a workspace symbol, keep the
@@ -153,7 +162,7 @@ fn resolve_base(
     // 2. Same-package lookup: prepend the file's package.
     if let Some(pkg) = facts.package.as_deref().filter(|s| !s.is_empty()) {
         let candidate = format!("{pkg}.{}", edge.parts.join("."));
-        if package_index.lookup(&candidate).is_some() {
+        if package_index.lookup_unique(&candidate).is_some() {
             return Some(candidate);
         }
     }
@@ -162,7 +171,7 @@ fn resolve_base(
     for b in &facts.import_bindings {
         if b.kind == ImportKind::Wildcard {
             let candidate = format!("{}.{}", b.fqn, edge.parts.join("."));
-            if package_index.lookup(&candidate).is_some() {
+            if package_index.lookup_unique(&candidate).is_some() {
                 return Some(candidate);
             }
         }
@@ -170,7 +179,7 @@ fn resolve_base(
     // 4. Bare FQN as written (covers fully-qualified usage at the
     // declaration site, like `class Sub : com.foo.Base()`).
     let bare = edge.parts.join(".");
-    if package_index.lookup(&bare).is_some() {
+    if package_index.lookup_unique(&bare).is_some() {
         return Some(bare);
     }
     None

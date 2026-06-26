@@ -722,7 +722,16 @@ fn has_direct_token(node: Node<'_>, token: &str) -> bool {
 /// `x.y.Y` when the user wrote the bare class name.
 #[derive(Debug, Default)]
 pub struct PackageIndex {
-    by_qualified: HashMap<String, PackageTarget>,
+    /// `(path, qualified) → target`. Path-aware so cross-file collisions
+    /// (the same short class name declared in different files) stay
+    /// distinguishable — no first-hit anti-pattern, no HashMap iteration
+    /// order leaking into resolution results.
+    by_file_qualified: HashMap<(String, String), PackageTarget>,
+    /// Qualified → list of declaring (path, qualified) keys, sorted by
+    /// path. Lets `lookup_all` / `lookup_unique` answer "where does
+    /// `com.foo.Helper` live?" deterministically when the path isn't
+    /// known up front.
+    by_qualified_index: HashMap<String, Vec<(String, String)>>,
     /// Files indexed by their declared package. Lets the require-graph
     /// answer "does this `import com.foo.*` point at a workspace
     /// package?" without re-walking facts.
@@ -731,7 +740,8 @@ pub struct PackageIndex {
 
 impl PackageIndex {
     pub fn build(per_file: &[(String, Vec<u8>, FileConstFacts)]) -> Self {
-        let mut by_qualified: HashMap<String, PackageTarget> = HashMap::new();
+        let mut by_file_qualified: HashMap<(String, String), PackageTarget> = HashMap::new();
+        let mut by_qualified_index: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut files_by_package: HashMap<String, Vec<String>> = HashMap::new();
 
         for (path, _, facts) in per_file {
@@ -741,40 +751,77 @@ impl PackageIndex {
                     .or_default()
                     .push(path.clone());
             }
-            for class in &facts.class_defs {
-                by_qualified
-                    .entry(class.qualified.clone())
+            let mut insert = |qualified: &str| {
+                let key = (path.clone(), qualified.to_string());
+                by_file_qualified
+                    .entry(key.clone())
                     .or_insert(PackageTarget {
                         path: path.clone(),
-                        qualified: class.qualified.clone(),
+                        qualified: qualified.to_string(),
                     });
+                by_qualified_index
+                    .entry(qualified.to_string())
+                    .or_default()
+                    .push(key);
+            };
+            for class in &facts.class_defs {
+                insert(&class.qualified);
             }
             for m in &facts.method_defs {
-                by_qualified
-                    .entry(m.qualified.clone())
-                    .or_insert(PackageTarget {
-                        path: path.clone(),
-                        qualified: m.qualified.clone(),
-                    });
+                insert(&m.qualified);
             }
             for c in &facts.const_defs {
-                by_qualified
-                    .entry(c.qualified.clone())
-                    .or_insert(PackageTarget {
-                        path: path.clone(),
-                        qualified: c.qualified.clone(),
-                    });
+                insert(&c.qualified);
             }
         }
 
+        // Stabilize multi-hit ordering so `lookup_all` is deterministic
+        // independent of file-walk order. Per-key dedup keeps the same
+        // (path, qualified) pair from appearing twice when a definition
+        // got inserted via multiple def buckets.
+        for keys in by_qualified_index.values_mut() {
+            keys.sort();
+            keys.dedup();
+        }
+
         Self {
-            by_qualified,
+            by_file_qualified,
+            by_qualified_index,
             files_by_package,
         }
     }
 
-    pub fn lookup(&self, qualified: &str) -> Option<&PackageTarget> {
-        self.by_qualified.get(qualified)
+    /// Path-aware exact lookup. Returns the symbol declared in `path`
+    /// under the given qualified name, or `None` if that specific file
+    /// does not declare it.
+    pub fn lookup_in_file(&self, path: &str, qualified: &str) -> Option<&PackageTarget> {
+        self.by_file_qualified
+            .get(&(path.to_string(), qualified.to_string()))
+    }
+
+    /// All workspace targets matching `qualified`, sorted by path for
+    /// deterministic iteration. Used by callers that want to scan
+    /// collisions explicitly.
+    pub fn lookup_all(&self, qualified: &str) -> Vec<&PackageTarget> {
+        let Some(keys) = self.by_qualified_index.get(qualified) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|k| self.by_file_qualified.get(k))
+            .collect()
+    }
+
+    /// Path-agnostic lookup that adopts a target only when exactly one
+    /// workspace file declares it. Replaces the old first-hit `lookup`
+    /// pattern: collisions return `None` so dispatch falls through to
+    /// the path-aware lookup rather than silently picking a winner.
+    pub fn lookup_unique(&self, qualified: &str) -> Option<&PackageTarget> {
+        let keys = self.by_qualified_index.get(qualified)?;
+        if keys.len() == 1 {
+            self.by_file_qualified.get(&keys[0])
+        } else {
+            None
+        }
     }
 
     /// Files declaring this exact package (for wildcard-import

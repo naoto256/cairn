@@ -618,7 +618,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "kotlin-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 3);
+    assert_eq!(ANALYZER_REVISION, 4);
     assert_eq!(PARSER_ID, "tree-sitter-kotlin-ng");
     assert_eq!(RESOLUTION_SOURCE, "tier25-kotlin-resolver");
 }
@@ -636,4 +636,255 @@ fn root_package_file_resolves_class() {
         .find(|t| t.target_qualified.as_deref() == Some("Widget"))
         .expect("root-package Widget should resolve");
     assert_eq!(hit.target_path.as_deref(), Some("Widget.kt"));
+}
+
+// ─── path-aware dispatch (Sub-fix A / A0 / B / C) ────────────────────────
+
+#[test]
+fn dotted_call_with_same_name_class_in_multiple_files_picks_correct_target_via_path() {
+    // Two distinct packages each declare an `object Registry` with a
+    // `build()` member; their qualifieds (`pkg.a.Registry`,
+    // `pkg.b.Registry`) differ — this isn't the strict
+    // same-FQN-HashMap-collision case but the everyday
+    // `same short name in different packages` case. The caller imports
+    // the one in `pkg.b`; the alias binding's `target_path` must steer
+    // the resolution to the bound file rather than the first
+    // `Registry` the resolver happens to visit.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = "package pkg.a\n\nobject Registry {\n    fun build() {}\n}\n";
+    let b = "package pkg.b\n\nobject Registry {\n    fun build() {}\n}\n";
+    let caller = "\
+package app
+
+import pkg.b.Registry
+
+fun main() {
+    Registry.build()
+}
+";
+    let res = run(tmp.path(), &[("A.kt", a), ("B.kt", b), ("Main.kt", caller)]);
+    let calls = calls_of(&res, "Main.kt");
+    let build_hits: Vec<_> = calls
+        .iter()
+        .filter(|c| {
+            c.target_qualified
+                .as_deref()
+                .map(|q| q.ends_with(".build"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !build_hits.is_empty(),
+        "Registry.build() should resolve to one of the workspace Registry objects; got {:#?}",
+        calls,
+    );
+    assert!(
+        build_hits.iter().all(
+            |c| c.target_qualified.as_deref() == Some("pkg.b.Registry.build")
+                && c.target_path.as_deref() == Some("B.kt")
+        ),
+        "Registry.build() must resolve to pkg.b.Registry.build (binding's pinned file), \
+         not pkg.a's; got {:#?}",
+        build_hits,
+    );
+}
+
+#[test]
+fn dotted_call_resolves_via_validated_candidate_chain_when_pkg_prefix_does_not_exist() {
+    // `Foo` is not in `app`'s package and there is no `import` for it,
+    // but `app` imports the package via wildcard and `pkg.foo` declares
+    // `Foo`. The buggy resolver would short-circuit on the
+    // package+parts string ("app.Foo") and return it unchecked, killing
+    // the wildcard fallback. This test pins the validated chain.
+    let tmp = tempfile::tempdir().unwrap();
+    let lib = "\
+package pkg.foo
+
+object Foo {
+    fun bar() {}
+}
+";
+    // A second `bar` exists on an unrelated class so the
+    // get_unique_by_name fallback can't paper over a missing
+    // wildcard-import resolution path. The dispatcher must reach
+    // pkg.foo.Foo.bar through the validated candidate chain (alias →
+    // same-package → wildcard → bare FQN), not through name-only.
+    let noise = "\
+package pkg.other
+
+object Sink {
+    fun bar() {}
+}
+";
+    let caller = "\
+package app
+
+import pkg.foo.*
+
+fun go() {
+    Foo.bar()
+}
+";
+    let res = run(
+        tmp.path(),
+        &[("Lib.kt", lib), ("Noise.kt", noise), ("Main.kt", caller)],
+    );
+    let calls = calls_of(&res, "Main.kt");
+    let bar_hits: Vec<_> = calls
+        .iter()
+        .filter(|c| c.target_qualified.as_deref() == Some("pkg.foo.Foo.bar"))
+        .collect();
+    assert!(
+        !bar_hits.is_empty(),
+        "Foo.bar() must resolve via wildcard import when no same-package candidate \
+         exists; the dispatcher must not short-circuit on an unchecked `app.Foo`; \
+         got {:#?}",
+        calls,
+    );
+    assert_eq!(bar_hits[0].target_path.as_deref(), Some("Lib.kt"));
+}
+
+#[test]
+fn bare_call_resolves_via_lexical_class_mro() {
+    // Inside `Sub.run`, the bare `foo()` must walk Sub's MRO and find
+    // `Base.foo`. Pre-Sub-fix-C, the Bare branch ignored
+    // `lexical_class` entirely and only checked alias / same-package /
+    // wildcard. A second unrelated class also declares `foo`, so the
+    // best-effort unique-name fallback can't paper over a missing MRO
+    // walk — without lexical-class MRO this call stays unresolved.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = "\
+package m
+
+open class Base {
+    fun foo() {}
+}
+
+class Other {
+    fun foo() {}
+}
+";
+    let sub = "\
+package m
+
+class Sub : Base() {
+    fun run() {
+        foo()
+    }
+}
+";
+    let res = run(tmp.path(), &[("Base.kt", base), ("Sub.kt", sub)]);
+    let calls = calls_of(&res, "Sub.kt");
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.target_qualified.as_deref() == Some("m.Base.foo")
+                && c.target_path.as_deref() == Some("Base.kt")),
+        "bare foo() must resolve to m.Base.foo via lexical-class MRO; got {:#?}",
+        calls,
+    );
+}
+
+#[test]
+fn import_alias_call_uses_binding_target_path_not_first_qualified_hit() {
+    // Sub-fix A0 pin. Two files declare a top-level function `helper`
+    // in distinct packages. The caller `import pkg.first.helper`s,
+    // then calls `helper()`. The binding's `target_path` must be
+    // preserved through the alias map so dispatch picks the file the
+    // import points at, not whichever package the HashMap visited
+    // first.
+    let tmp = tempfile::tempdir().unwrap();
+    let first = "package pkg.first\n\nfun helper() {}\n";
+    let second = "package pkg.second\n\nfun helper() {}\n";
+    let caller = "\
+package app
+
+import pkg.first.helper
+
+fun main() {
+    helper()
+}
+";
+    let res = run(
+        tmp.path(),
+        &[
+            ("First.kt", first),
+            ("Second.kt", second),
+            ("Main.kt", caller),
+        ],
+    );
+    let calls = calls_of(&res, "Main.kt");
+    let helper_hits: Vec<_> = calls
+        .iter()
+        .filter(|c| {
+            c.target_qualified
+                .as_deref()
+                .map(|q| q.ends_with(".helper"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        helper_hits.len(),
+        1,
+        "helper() should produce exactly one resolution; got {:#?}",
+        helper_hits,
+    );
+    assert_eq!(
+        helper_hits[0].target_qualified.as_deref(),
+        Some("pkg.first.helper"),
+        "import binding must steer dispatch to pkg.first.helper, not the other file",
+    );
+    assert_eq!(helper_hits[0].target_path.as_deref(), Some("First.kt"));
+}
+
+#[test]
+fn alias_bound_dotted_prefix_does_not_fall_back_to_same_package_when_bound_file_misses() {
+    // `import pkg.b.Registry` path-binds `Registry` to `B.kt`. The
+    // caller writes `Registry.Inner.build()`, but the bound file has
+    // no `Inner`. There IS an `app.Registry.Inner.build` in the
+    // caller's own package — without a terminal alias contract the
+    // resolver would silently fall through alias → same-package and
+    // adopt `app.Registry.Inner.build`, silently re-interpreting the
+    // user's `import`. The terminal contract is: once the alias head
+    // matches, the dotted prefix is finalized; a miss means
+    // unresolved, not "try the next stage".
+    let tmp = tempfile::tempdir().unwrap();
+    let app = "\
+package app
+
+object Registry {
+    object Inner {
+        fun build() {}
+    }
+}
+";
+    let b = "\
+package pkg.b
+
+object Registry {}
+";
+    let caller = "\
+package app
+
+import pkg.b.Registry
+
+fun main() {
+    Registry.Inner.build()
+}
+";
+    let res = run(
+        tmp.path(),
+        &[("App.kt", app), ("B.kt", b), ("Main.kt", caller)],
+    );
+    let calls = calls_of(&res, "Main.kt");
+    let leaked: Vec<_> = calls
+        .iter()
+        .filter(|c| c.target_qualified.as_deref() == Some("app.Registry.Inner.build"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "alias-bound prefix must NOT fall through to same-package; \
+         leaked into app.Registry.Inner.build: {:#?}",
+        leaked,
+    );
 }
