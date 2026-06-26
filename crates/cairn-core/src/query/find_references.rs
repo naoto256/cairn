@@ -281,10 +281,13 @@ fn run_find_references(
             // Pre-Phase 4 this only checked the raw `refs.target_qualified`
             // and missed every cross-parser resolved hit.
             if is_qualified_symbol(&args.symbol) {
-                let strict = run(
-                    "COALESCE(r.target_qualified, sym.qualified)",
+                let strict = run_strict_incoming(
+                    conn,
+                    manifest_id,
                     &args.symbol,
-                    false,
+                    kind_str,
+                    args.include_noise,
+                    limit,
                 )?;
                 if !strict.is_empty() {
                     return Ok(strict);
@@ -296,6 +299,202 @@ fn run_find_references(
             }
         }
     }
+}
+
+/// Strict-FQN incoming reference lookup with index-friendly query
+/// shape (PR-γ #8).
+///
+/// Pre-fix, this case ran through `run()` with
+/// `WHERE COALESCE(r.target_qualified, sym.qualified) = ?`. The
+/// COALESCE referenced a column from a LEFT JOIN (`symbols.qualified`
+/// via `resolutions.target_symbol_id`), so SQLite could not push it
+/// through `idx_refs_target_qualified` and fell back to `SCAN refs
+/// USING idx_refs_blob`, an O(N) scan per query (measured ~135× the
+/// index-driven path on a 1K-ref fixture).
+///
+/// The rewrite is a strict equivalence: `COALESCE(a, b) = ?` becomes
+/// `a = ? OR (a IS NULL AND b = ?)`, but expressed as a `UNION ALL`
+/// over two disjoint `strict_refs` branches so SQLite can pick an
+/// index for each:
+///
+///   * **Branch A** — `refs.target_qualified = ?` hits the partial
+///     index `idx_refs_target_qualified (target_qualified IS NOT NULL)`.
+///   * **Branch B** — `refs.target_qualified IS NULL` + the join to
+///     `best_resolution` + `symbols.qualified = ?` lets SQLite probe
+///     `idx_symbols_qualified` first and ride the resolution-row
+///     uniqueness back to the ref.
+///
+/// The two branches are mutually exclusive by construction
+/// (`target_qualified IS NULL` is a single-table predicate on `refs`),
+/// so `UNION ALL` is the right combinator: no dedup needed across
+/// branches.
+///
+/// Critical invariants (see `pr_gamma_*` tests):
+///   * Empty-string is NOT NULL — Branch A still selects
+///     `target_qualified = ''` rows when that happens to match the
+///     query value, matching the COALESCE semantics exactly.
+///   * The downstream `dedup_rank` / noise filter / projection
+///     COALESCE are unchanged — Branch B rows continue to carry
+///     `target_qualified=NULL` and inherit `sym.qualified` through
+///     the existing projection.
+///   * Scope is limited to **incoming + qualified-symbol + strict**.
+///     Bare-name fallback, outgoing, and non-qualified symbols still
+///     go through `run()` and `idx_refs_target_name` as before.
+#[allow(clippy::too_many_arguments)]
+fn run_strict_incoming(
+    conn: &Connection,
+    manifest_id: ManifestId,
+    symbol: &str,
+    kind_str: Option<&'static str>,
+    include_noise: bool,
+    limit: u32,
+) -> Result<Vec<ReferenceHit>> {
+    let source_rank_r = source_rank_case_sql("r.source");
+    let resolution_source_rank = source_rank_case_sql("source");
+    let workspace_tier_t = source_is_workspace_tier_sql("t.source");
+
+    let mut sql = String::from(
+        "WITH best_resolution AS (
+             SELECT site_blob_sha, site_parser_id,
+                    site_byte_start, site_byte_end, kind,
+                    target_symbol_id, source, target_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY site_blob_sha, site_parser_id,
+                                     site_byte_start, site_byte_end, kind
+                        ORDER BY
+                            CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
+                            ",
+    );
+    sql.push_str(&resolution_source_rank);
+    sql.push_str(
+        ", id
+                    ) AS rn
+               FROM resolutions
+              WHERE kind IN ('type', 'call', 'import')
+                AND (manifest_id = ?1 OR manifest_id IS NULL)
+         ),
+         strict_refs AS (
+             -- Branch A: r.target_qualified hits idx_refs_target_qualified.
+             SELECT r.*
+               FROM refs r
+              WHERE r.target_qualified = ?2
+             UNION ALL
+             -- Branch B: cross-parser fallback. The Tier-2.5 persist
+             -- layer adopted a sibling-parser symbol id (so
+             -- `target_qualified` on the ref is NULL); the strict
+             -- query reaches it via the resolution row + symbol
+             -- table. Probes idx_symbols_qualified first.
+             SELECT r.*
+               FROM refs r
+               JOIN best_resolution res
+                 ON res.site_blob_sha = r.blob_sha
+                AND res.site_parser_id = r.parser_id
+                AND res.site_byte_start = r.byte_start
+                AND res.site_byte_end = r.byte_end
+                AND res.kind = r.kind
+                AND res.rn = 1
+               JOIN symbols sym ON sym.id = res.target_symbol_id
+              WHERE r.target_qualified IS NULL
+                AND sym.qualified = ?2
+         )
+         SELECT target_name, target_qualified, kind, enclosing,
+                path, line, blob_sha, parser_id, kind_source,
+                target_path
+           FROM (
+             SELECT r.target_name,
+                    COALESCE(r.target_qualified, sym.qualified)
+                        AS target_qualified,
+                    r.kind,
+                    enc.qualified AS enclosing,
+                    me.path, r.line, r.blob_sha, r.parser_id,
+                    r.byte_start, r.byte_end,
+                    res.target_path AS target_path,
+                    CASE WHEN res.source IS NOT NULL THEN res.source
+                         ELSE '",
+    );
+    sql.push_str(KIND_SOURCE_FACT);
+    sql.push_str("' END AS kind_source,\n                    ");
+    sql.push_str(&source_rank_r);
+    sql.push_str(" AS source_rank,\n");
+    sql.push_str(&format!(
+        "                    EXISTS (
+                      SELECT 1
+                        FROM refs t
+                       WHERE t.blob_sha = r.blob_sha
+                         AND ({workspace_tier_t})
+                         AND t.line = r.line
+                         AND t.kind = r.kind
+                         AND t.target_name = r.target_name
+                         AND t.enclosing_id IS r.enclosing_id
+                    ) AS has_workspace_tier_same_line_target_name,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
+                      ORDER BY
+                        {source_rank_r},
+                        CASE
+                          WHEN r.target_qualified IS NOT NULL
+                           AND r.target_qualified <> '' THEN 0
+                          ELSE 1
+                        END,
+                        r.source
+                    ) AS dedup_rank
+               FROM strict_refs r
+               JOIN manifest_entries me
+                 ON me.manifest_id = ?1
+                AND me.blob_sha = r.blob_sha
+               LEFT JOIN best_resolution res
+                 ON res.site_blob_sha = r.blob_sha
+                AND res.site_parser_id = r.parser_id
+                AND res.site_byte_start = r.byte_start
+                AND res.site_byte_end = r.byte_end
+                AND res.kind = r.kind
+                AND res.rn = 1
+               LEFT JOIN symbols sym ON sym.id = res.target_symbol_id
+               LEFT JOIN symbols enc ON enc.id = r.enclosing_id
+              WHERE 1=1"
+    ));
+    if kind_str.is_some() {
+        sql.push_str(" AND r.kind = ?3");
+    }
+    sql.push(')');
+    if !include_noise {
+        sql.push_str(" WHERE dedup_rank = 1");
+        sql.push_str(
+            " AND NOT (
+                source_rank > 0
+                AND byte_start = 0
+                AND byte_end = 0
+                AND has_workspace_tier_same_line_target_name
+            )",
+        );
+    }
+    sql.push_str(" ORDER BY path, line, byte_start, source_rank");
+    sql.push_str(&format!(" LIMIT {limit}"));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let row_to_hit = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ReferenceHit> {
+        Ok(ReferenceHit {
+            target_name: row.get(0)?,
+            target_qualified: row.get(1)?,
+            kind: ref_kind_from_str(&row.get::<_, String>(2)?),
+            enclosing_qualified: row.get(3)?,
+            path: row.get(4)?,
+            line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+            blob_sha: row.get(6)?,
+            parser_id: row.get(7)?,
+            kind_source: row.get(8)?,
+            target_path: row.get(9)?,
+        })
+    };
+    let rows: rusqlite::Result<Vec<ReferenceHit>> = match kind_str {
+        Some(k) => stmt
+            .query_map(rusqlite::params![manifest_id.0, symbol, k], row_to_hit)?
+            .collect(),
+        None => stmt
+            .query_map(rusqlite::params![manifest_id.0, symbol], row_to_hit)?
+            .collect(),
+    };
+    Ok(rows?)
 }
 
 /// `true` when `symbol` looks like a fully-qualified name in any

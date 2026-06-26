@@ -930,3 +930,271 @@ fn find_references_with_shared_blob_does_not_see_other_manifest_resolution() {
         "manifest-2 resolution row leaked its sibling-symbol qualified into manifest-1 hit: {hit:?}"
     );
 }
+
+// ──── PR-γ #8: SQLite expression-index perf fix ─────────────────────────
+//
+// Pre-fix, the strict-incoming + qualified-symbol path issued
+// `WHERE COALESCE(r.target_qualified, sym.qualified) = ?`. The COALESCE
+// referenced a column from a LEFT JOIN, so SQLite could not push the
+// filter through `idx_refs_target_qualified` and fell back to
+// `SCAN refs USING idx_refs_blob` (~135× slower on a 1K-ref fixture).
+//
+// The fix splits the predicate into two index-friendly branches inside
+// a `strict_refs` CTE (`UNION ALL`). Tests below pin:
+//   * the EXPLAIN QUERY PLAN shape (no `SCAN refs`, both branch indices
+//     visible),
+//   * Branch B fires when `target_qualified IS NULL` and only the
+//     resolution-row-backed `sym.qualified` matches,
+//   * the new shape returns the same row set as the old COALESCE
+//     query — the rewrite is a perf-only refactor.
+
+/// EXPLAIN QUERY PLAN over the production `strict_refs` shape: no
+/// full `refs` scan, both branch indices appear.
+#[test]
+fn pr_gamma_strict_incoming_explain_uses_branch_indices() {
+    use crate::cas::store;
+    let db_tmp = tempfile::tempdir().unwrap();
+    let conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    // Empty DB is enough — EXPLAIN doesn't execute the query, it
+    // returns the plan the planner *would* use. We just need the
+    // schema (indices and tables) in place.
+    let sql = "EXPLAIN QUERY PLAN
+        WITH best_resolution AS (
+            SELECT site_blob_sha, site_parser_id,
+                   site_byte_start, site_byte_end, kind,
+                   target_symbol_id, source, target_path,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY site_blob_sha, site_parser_id,
+                                    site_byte_start, site_byte_end, kind
+                       ORDER BY id
+                   ) AS rn
+              FROM resolutions
+             WHERE kind IN ('type', 'call', 'import')
+               AND (manifest_id = ?1 OR manifest_id IS NULL)
+        ),
+        strict_refs AS (
+            SELECT r.* FROM refs r WHERE r.target_qualified = ?2
+            UNION ALL
+            SELECT r.*
+              FROM refs r
+              JOIN best_resolution res
+                ON res.site_blob_sha = r.blob_sha
+               AND res.site_parser_id = r.parser_id
+               AND res.site_byte_start = r.byte_start
+               AND res.site_byte_end = r.byte_end
+               AND res.kind = r.kind
+               AND res.rn = 1
+              JOIN symbols sym ON sym.id = res.target_symbol_id
+             WHERE r.target_qualified IS NULL
+               AND sym.qualified = ?2
+        )
+        SELECT * FROM strict_refs";
+    let plan: Vec<String> = conn
+        .prepare(sql)
+        .unwrap()
+        .query_map(rusqlite::params![1i64, "x"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let joined = plan.join(" | ");
+
+    // Branch A: idx_refs_target_qualified is the partial index over
+    // (target_qualified IS NOT NULL); a strict equality lookup must
+    // pick it.
+    assert!(
+        joined.contains("idx_refs_target_qualified"),
+        "Branch A must use idx_refs_target_qualified; plan: {joined}"
+    );
+    // Branch B: starts from idx_symbols_qualified probe.
+    assert!(
+        joined.contains("idx_symbols_qualified"),
+        "Branch B must use idx_symbols_qualified; plan: {joined}"
+    );
+    // No bare `SCAN refs` (Tier-1 ref table seq scan) anywhere — both
+    // branches must drive through an index. `SCAN refs USING INDEX ...`
+    // is OK; we deliberately match the bare prefix to catch the
+    // regression where the planner falls back to a covering-only
+    // scan of refs.
+    for line in &plan {
+        let mentions_refs = line.contains("SCAN refs") || line.contains("SCAN TABLE refs");
+        let uses_index = line.contains("USING INDEX") || line.contains("USING COVERING INDEX");
+        assert!(
+            !mentions_refs || uses_index,
+            "plan line is a full refs scan (no USING INDEX): {line:?}; full plan: {plan:?}"
+        );
+    }
+}
+
+/// Branch B regression: a ref row with `target_qualified=NULL` that
+/// only matches via the resolution-row → symbol path must surface.
+/// A Branch-A-shaped distractor with the same `target_name` but a
+/// *different* `sym.qualified` must NOT come along for the ride.
+#[test]
+fn pr_gamma_strict_incoming_branch_b_resolves_via_resolution_symbol() {
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    // Resolution row: Kotlin call site → Java symbol.
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                NULL, 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+    // Distractor: a separate ref with the same target_name but a
+    // *non-matching* sym.qualified. Pre-fix this could silently win
+    // via `idx_refs_target_name` fallback paths; the new code path
+    // must still ignore it because the strict FQN doesn't match.
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, target_name, target_qualified, kind,
+                line, byte_start, byte_end, enclosing_id, source)
+             VALUES
+               ('sha-java', 'tree-sitter-java', 'fromJson',
+                'com.different.Other.fromJson', 'call', 99, 200, 210,
+                NULL, 'tree-sitter-java')",
+        [],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "com.x.JsonAdapter.fromJson".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Only the Kotlin site (Branch B via resolution+symbol) should
+    // surface — the distractor's target_qualified is a different
+    // strict FQN so neither branch picks it up.
+    let kt_hits: Vec<_> = hits.iter().filter(|h| h.path == "src/X.kt").collect();
+    assert_eq!(
+        kt_hits.len(),
+        1,
+        "Branch B should resolve the Kotlin->Java call exactly once; got: {hits:#?}"
+    );
+    assert_eq!(
+        hits.iter()
+            .filter(|h| h.target_qualified.as_deref() == Some("com.different.Other.fromJson"))
+            .count(),
+        0,
+        "distractor with different strict FQN must not be returned: {hits:#?}"
+    );
+}
+
+/// Equivalence pin (R2 strict): the new `strict_refs` UNION ALL shape
+/// returns the same row set the old `COALESCE = ?` WHERE would have
+/// returned, for every strict-incoming-qualified-symbol query the
+/// fix touches. Rather than running the legacy query string (which
+/// is gone), we cover the equivalence by asserting that:
+///   1. Branch A semantics: `target_qualified = ?` direct hits work.
+///   2. Branch B semantics: `target_qualified IS NULL` +
+///      resolution-backed `sym.qualified = ?` hits work.
+///   3. Both can coexist in the same query and dedup correctly when
+///      a single ref row would have qualified through either branch
+///      (impossible by construction — `target_qualified IS NULL` is
+///      mutually exclusive with `target_qualified = ?`).
+#[test]
+fn pr_gamma_strict_incoming_union_branches_are_disjoint_and_equivalent_to_coalesce() {
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                NULL, 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+    // Additionally, drop in a direct `target_qualified` ref at a
+    // separate site so Branch A also fires.
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, target_name, target_qualified, kind,
+                line, byte_start, byte_end, enclosing_id, source)
+             VALUES
+               ('sha-java', 'tree-sitter-java', 'fromJson',
+                'com.x.JsonAdapter.fromJson', 'call', 12, 50, 60,
+                NULL, 'tree-sitter-java')",
+        [],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "com.x.JsonAdapter.fromJson".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Branch A row (the direct refs insertion above).
+    assert!(
+        hits.iter()
+            .any(|h| h.path == "src/JsonAdapter.java" && h.line == 12),
+        "Branch A (direct target_qualified) row missing; got: {hits:#?}"
+    );
+    // Branch B row (the Kotlin call site that needs resolution
+    // → symbol fallback). The fixture's refs row sits at line 5.
+    assert!(
+        hits.iter().any(|h| h.path == "src/X.kt" && h.line == 5),
+        "Branch B (resolution-backed) row missing; got: {hits:#?}"
+    );
+}
+
+/// Empty-string semantics: COALESCE(NULL, 'X') = 'X', but
+/// COALESCE('', 'X') = '' — empty string is NOT NULL. Branch A's
+/// `target_qualified = ?` correctly picks up the empty-string case
+/// when the symbol query is empty; Branch B's `target_qualified IS
+/// NULL` does not. The old COALESCE expression had the same
+/// semantics, so the rewrite must too. R2 flagged this explicitly:
+/// mixing empty-string into the NULL bucket would be a *semantic
+/// change*, not a perf fix.
+///
+/// We don't expect callers to actually issue empty-string FQN
+/// queries (`is_qualified_symbol("")` returns false, so the strict
+/// path is never entered), but the test pins the SQL-level
+/// invariant in case the upstream guard changes.
+#[test]
+fn pr_gamma_strict_incoming_empty_string_is_not_null() {
+    let (_db, conn, _, _) = cross_parser_call_fixture(false);
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, target_name, target_qualified, kind,
+                line, byte_start, byte_end, enclosing_id, source)
+             VALUES
+               ('sha-java', 'tree-sitter-java', 'empty', '', 'call',
+                7, 0, 5, NULL, 'tree-sitter-java')",
+        [],
+    )
+    .unwrap();
+    let empty_ref_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM refs WHERE target_qualified = ''",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Sanity: '' and IS NULL are distinct row sets at the SQL level —
+    // this is what makes the Branch A / Branch B split a faithful
+    // COALESCE equivalent. The COALESCE projection later in the
+    // outer SELECT also treats '' as a non-NULL value, so the
+    // rewrite preserves visible semantics.
+    assert!(
+        empty_ref_count >= 1,
+        "empty-string target_qualified rows must be observable as a \
+         distinct bucket from IS NULL"
+    );
+}

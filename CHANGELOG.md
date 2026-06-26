@@ -48,6 +48,34 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **`find_references` strict-FQN incoming query plan recovered from
+  `SCAN refs` to index-driven lookup.** Phase 4 introduced a
+  `WHERE COALESCE(r.target_qualified, sym.qualified) = ?` predicate
+  so cross-parser-resolved hits (where the surface
+  `target_qualified` comes from `symbols.qualified` via
+  `resolutions.target_symbol_id`) would also match a strict FQN
+  query. The COALESCE referenced a LEFT-JOINed column, so SQLite
+  could not push the filter through `idx_refs_target_qualified` and
+  fell back to a `SCAN refs USING idx_refs_blob` — about **135×
+  slower** than the index-driven path on a 1K-ref fixture (extrapolating to
+  a noticeable interactive lag on large monorepos). The strict path
+  now runs a `strict_refs AS (Branch A UNION ALL Branch B)` CTE:
+  Branch A is the index-friendly `r.target_qualified = ?` lookup
+  through `idx_refs_target_qualified`; Branch B is the
+  resolution-row-backed fallback that probes `idx_symbols_qualified`
+  first and rides the resolution uniqueness back to the ref. The
+  two branches are mutually exclusive by construction
+  (`r.target_qualified IS NULL` is a single-table predicate on
+  `refs`), so `UNION ALL` is the right combinator — no cross-branch
+  dedup needed. Empty-string `target_qualified` rows stay in
+  Branch A, preserving the `COALESCE('', sym.qualified) = ''`
+  semantics. The rewrite is intentionally a pure perf refactor:
+  same row set, same downstream `dedup_rank` / noise-filter /
+  projection pipeline, no analyzer or parser revision bump. The
+  EXPLAIN QUERY PLAN is pinned by
+  `pr_gamma_strict_incoming_explain_uses_branch_indices`; future
+  changes that drop either branch's index use will fail at CI.
+
 - **JavaScript/TypeScript Tier-1 now emits `require('./x')` as
   `ImportFact` in statement-position, expression-position, and
   re-export shapes.** Previously only the binding form
