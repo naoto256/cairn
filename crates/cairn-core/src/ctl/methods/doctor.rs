@@ -1,7 +1,8 @@
 //! `doctor` — environment / dependency / registry sanity checks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cairn_proto::control::{DoctorCheck, DoctorReport, DoctorStatus};
 use linkme::distributed_slice;
@@ -16,7 +17,16 @@ use crate::lsp_discovery::{
 };
 use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
-use crate::workspace_analyzer::{all_workspace_analyzers, expected_analyzers_for_manifest};
+use crate::workspace_analyzer::{
+    StaleRevision, all_workspace_analyzers, expected_analyzers_for_manifest,
+};
+
+/// Wall-clock budget after which a `queued` / `running`
+/// `workspace_analysis_runs` row is treated as wedged and surfaces a
+/// `Warn` in doctor. 6 hours is long enough that an honest cold-start
+/// LSP pass on a large repo finishes well under it, and short enough
+/// that a stuck pool waiter from yesterday is obvious in the morning.
+const STUCK_RUN_THRESHOLD: Duration = Duration::from_secs(6 * 3600);
 
 include!(concat!(env!("OUT_DIR"), "/expected_backend_crates.rs"));
 
@@ -111,6 +121,7 @@ impl ControlMethod for Doctor {
                 .await
                 .map_err(|e| crate::Error::internal_task_panic("doctor", e))?;
                 checks.extend(tentative_snapshot_checks(&store_probes));
+                checks.extend(revision_stale_checks(&store_probes));
                 checks.extend(tier3_run_checks(&store_probes));
             }
             Err(e) => checks.push(doctor_check(
@@ -216,6 +227,12 @@ struct AliasStoreState {
     tentative_manifest_id: Option<i64>,
     tier3_runs: Vec<Tier3Run>,
     expected_tier3_analyzer_ids: Vec<String>,
+    /// Per-analyzer revision-mismatch evidence the doctor surfaces as a
+    /// `Warn`. Populated from
+    /// [`crate::workspace_analyzer::expected_analyzers_for_manifest`]'s
+    /// `revision()` vs the persisted `analyzer_revision` column. Empty
+    /// when nothing is stale (the common case).
+    stale_revisions: Vec<StaleRevision>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +241,11 @@ struct Tier3Run {
     manifest_id: i64,
     status: String,
     error: Option<String>,
+    /// `started_at_ns` from `workspace_analysis_runs`. Doctor uses it to
+    /// detect rows that have been `queued`/`running` past
+    /// [`STUCK_RUN_THRESHOLD`] — that level of pool-wait usually means
+    /// the worker is wedged, not that indexing is genuinely slow.
+    started_at_ns: i64,
 }
 
 fn probe_alias_stores(
@@ -274,38 +296,75 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             .optional()?,
         None => None,
     };
-    let (tier3_runs, expected_tier3_analyzer_ids) = match tentative_manifest_id {
+    let (tier3_runs, expected_tier3_analyzer_ids, stale_revisions) = match tentative_manifest_id {
         Some(manifest_id) => {
-            let mut expected_tier3_analyzer_ids =
-                expected_analyzers_for_manifest(&conn, ManifestId(manifest_id))?
-                    .into_iter()
-                    .map(|analyzer| analyzer.id().to_string())
-                    .collect::<Vec<_>>();
+            let expected_analyzers =
+                expected_analyzers_for_manifest(&conn, ManifestId(manifest_id))?;
+            let mut expected_tier3_analyzer_ids = expected_analyzers
+                .iter()
+                .map(|analyzer| analyzer.id().to_string())
+                .collect::<Vec<_>>();
             expected_tier3_analyzer_ids.sort();
 
             let mut stmt = conn.prepare(
-                "SELECT analyzer_id, manifest_id, status, error FROM workspace_analysis_runs
+                "SELECT analyzer_id, manifest_id, status, error, analyzer_revision, started_at_ns
+                 FROM workspace_analysis_runs
                  WHERE manifest_id = ?1
                  ORDER BY analyzer_id",
             )?;
-            let tier3_runs = stmt
+            let rows = stmt
                 .query_map(params![manifest_id], |r| {
-                    Ok(Tier3Run {
-                        analyzer_id: r.get(0)?,
-                        manifest_id: r.get(1)?,
-                        status: r.get(2)?,
-                        error: r.get(3)?,
-                    })
+                    Ok((
+                        Tier3Run {
+                            analyzer_id: r.get(0)?,
+                            manifest_id: r.get(1)?,
+                            status: r.get(2)?,
+                            error: r.get(3)?,
+                            started_at_ns: r.get(5)?,
+                        },
+                        r.get::<_, i64>(4)? as u32,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            (tier3_runs, expected_tier3_analyzer_ids)
+
+            // Build a `(analyzer_id -> persisted_revision)` map so we can
+            // compare against each expected analyzer's `revision()`.
+            let mut persisted_revs: HashMap<String, u32> = HashMap::new();
+            let tier3_runs = rows
+                .into_iter()
+                .map(|(run, rev)| {
+                    persisted_revs.insert(run.analyzer_id.clone(), rev);
+                    run
+                })
+                .collect::<Vec<_>>();
+
+            let mut stale_revisions = Vec::new();
+            for analyzer in &expected_analyzers {
+                let expected_rev = analyzer.revision();
+                let current_rev = persisted_revs.get(analyzer.id()).copied();
+                let is_mismatch = match current_rev {
+                    Some(cur) => cur < expected_rev,
+                    None => true,
+                };
+                if is_mismatch {
+                    stale_revisions.push(StaleRevision {
+                        analyzer_id: analyzer.id().to_string(),
+                        current_rev,
+                        expected_rev,
+                    });
+                }
+            }
+            stale_revisions.sort_by(|a, b| a.analyzer_id.cmp(&b.analyzer_id));
+
+            (tier3_runs, expected_tier3_analyzer_ids, stale_revisions)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     Ok(AliasStoreState {
         tentative_manifest_id,
         tier3_runs,
         expected_tier3_analyzer_ids,
+        stale_revisions,
     })
 }
 
@@ -571,6 +630,47 @@ fn resolve_sourcekit_lsp() -> Option<PathBuf> {
     discover_sourcekit_lsp()
 }
 
+/// Surface analyzer-revision drift as a doctor warning, even after the
+/// startup hook has already enqueued reruns. This is the shadow-case
+/// fallback: if `staleness::check_revision_staleness_and_enqueue`
+/// failed at boot (DB error, JobManager full, etc.), the
+/// `workspace_analysis_runs.analyzer_revision` column still records
+/// the old value and the operator sees it here. Empty
+/// `stale_revisions` means everything matches `expected_analyzer.revision()`
+/// at probe time.
+fn revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
+    probes
+        .iter()
+        .filter_map(|probe| {
+            let state = probe.result.as_ref().ok()?;
+            if state.stale_revisions.is_empty() {
+                return None;
+            }
+            let detail = state
+                .stale_revisions
+                .iter()
+                .map(|sr| {
+                    let cur = sr
+                        .current_rev
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    format!("{}: current={}, expected={}", sr.analyzer_id, cur, sr.expected_rev)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            Some(doctor_check(
+                format!("repo `{}` analyzer revision drift", probe.alias),
+                DoctorStatus::Warn,
+                Some(detail),
+                Some(format!(
+                    "Run `cairn ctl repo reindex {}` to rerun the stale analyzers under the current build's revisions.",
+                    probe.alias
+                )),
+            ))
+        })
+        .collect()
+}
+
 fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
     probes
         .iter()
@@ -615,6 +715,40 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
     }
 
     let detail = tier3_runs_detail(state);
+
+    // Stuck-run check: a `queued` or `running` row whose
+    // `started_at_ns` is older than `STUCK_RUN_THRESHOLD` (6h) is
+    // almost certainly wedged (worker hang, pool deadlock, daemon
+    // crash that left the row mid-flight). Surface it loudly so the
+    // operator can `reindex_repo` instead of staring at "indexing in
+    // progress" forever.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let stuck_threshold_ns = STUCK_RUN_THRESHOLD.as_nanos() as i64;
+    if let Some(run) = state.tier3_runs.iter().find(|run| {
+        matches!(run.status.as_str(), "queued" | "running")
+            && run.started_at_ns > 0
+            && now_ns.saturating_sub(run.started_at_ns) > stuck_threshold_ns
+    }) {
+        let age_hours = (now_ns.saturating_sub(run.started_at_ns) / 1_000_000_000) / 3600;
+        return doctor_check(
+            format!("repo `{alias}` Tier-3 analyzer status"),
+            DoctorStatus::Warn,
+            Some(format!(
+                "{detail}; {} stuck in `{}` for ~{}h (threshold {}h)",
+                run.analyzer_id,
+                run.status,
+                age_hours,
+                STUCK_RUN_THRESHOLD.as_secs() / 3600,
+            )),
+            Some(format!(
+                "Likely a wedged worker. Run `cairn ctl repo reindex {alias}` to clear and re-queue."
+            )),
+        );
+    }
+
     if state
         .tier3_runs
         .iter()
@@ -1000,6 +1134,7 @@ mod tests {
                     tentative_manifest_id: Some(7),
                     tier3_runs: Vec::new(),
                     expected_tier3_analyzer_ids: Vec::new(),
+                    stale_revisions: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1009,6 +1144,7 @@ mod tests {
                     tentative_manifest_id: None,
                     tier3_runs: Vec::new(),
                     expected_tier3_analyzer_ids: Vec::new(),
+                    stale_revisions: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1062,8 +1198,10 @@ mod tests {
                     manifest_id: 1,
                     status: "succeeded".into(),
                     error: None,
+                    started_at_ns: 0,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
         let skipped = tier3_run_check(
@@ -1075,8 +1213,10 @@ mod tests {
                     manifest_id: 2,
                     status: "skipped".into(),
                     error: Some("ContentModified".into()),
+                    started_at_ns: 0,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
         let pending = tier3_run_check(
@@ -1088,8 +1228,10 @@ mod tests {
                     manifest_id: 5,
                     status: "queued".into(),
                     error: None,
+                    started_at_ns: 0,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
         let running = tier3_run_check(
@@ -1101,8 +1243,10 @@ mod tests {
                     manifest_id: 6,
                     status: "running".into(),
                     error: None,
+                    started_at_ns: 0,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
         let failed = tier3_run_check(
@@ -1114,8 +1258,10 @@ mod tests {
                     manifest_id: 3,
                     status: "failed".into(),
                     error: Some("boom".into()),
+                    started_at_ns: 0,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
         let missing = tier3_run_check(
@@ -1124,6 +1270,7 @@ mod tests {
                 tentative_manifest_id: Some(4),
                 tier3_runs: Vec::new(),
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
 
@@ -1184,15 +1331,18 @@ mod tests {
                         manifest_id: 9,
                         status: "succeeded".into(),
                         error: None,
+                        started_at_ns: 0,
                     },
                     Tier3Run {
                         analyzer_id: RUST_ANALYZER_ID.into(),
                         manifest_id: 9,
                         status: "skipped".into(),
                         error: Some("no matching files".into()),
+                        started_at_ns: 0,
                     },
                 ],
                 expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
             },
         );
 
@@ -1213,8 +1363,10 @@ mod tests {
                     manifest_id: 10,
                     status: "succeeded".into(),
                     error: None,
+                    started_at_ns: 0,
                 }],
                 expected_tier3_analyzer_ids: vec!["new-analyzer".into(), "old-analyzer".into()],
+                stale_revisions: Vec::new(),
             },
         );
 
@@ -1466,5 +1618,147 @@ mod tests {
             .iter()
             .find(|check| check.name == name)
             .unwrap_or_else(|| panic!("missing check `{name}` in {:#?}", report.checks))
+    }
+
+    /// `revision_stale_checks` MUST emit one `Warn` per probe whose
+    /// `stale_revisions` is non-empty, with the analyzer id, current
+    /// revision, and expected revision surfaced in detail.
+    #[test]
+    fn revision_stale_checks_emits_warn_with_remediation() {
+        let probes = vec![AliasStoreProbe {
+            alias: "myrepo".into(),
+            store_path: PathBuf::from("/tmp/myrepo/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: Vec::new(),
+                expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: vec![StaleRevision {
+                    analyzer_id: "demo-analyzer".into(),
+                    current_rev: Some(3),
+                    expected_rev: 4,
+                }],
+            }),
+        }];
+        let checks = revision_stale_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("demo-analyzer")
+                && detail.contains("current=3")
+                && detail.contains("expected=4"),
+            "expected detail to surface analyzer + revisions, got: {detail}"
+        );
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("cairn ctl repo reindex myrepo"),
+            "expected remediation to suggest reindex, got: {remediation}"
+        );
+    }
+
+    /// When every analyzer's recorded revision matches the linked-in
+    /// build's `revision()`, `revision_stale_checks` returns no checks
+    /// at all (silent pass — drift surfaces only when there is drift).
+    #[test]
+    fn revision_stale_checks_silent_when_no_drift() {
+        let probes = vec![AliasStoreProbe {
+            alias: "clean".into(),
+            store_path: PathBuf::from("/tmp/clean/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
+                    manifest_id: 1,
+                    status: "succeeded".into(),
+                    error: None,
+                    started_at_ns: 0,
+                }],
+                expected_tier3_analyzer_ids: vec!["demo-analyzer".into()],
+                stale_revisions: Vec::new(),
+            }),
+        }];
+        let checks = revision_stale_checks(&probes);
+        assert!(
+            checks.is_empty(),
+            "no drift should produce no checks; got {checks:#?}"
+        );
+    }
+
+    /// MA-1: a `running` row whose `started_at_ns` is older than
+    /// `STUCK_RUN_THRESHOLD` (6h) MUST surface as `Warn` with an
+    /// explicit "stuck" framing, not as the routine "indexing in
+    /// progress" message. The remediation MUST nudge the operator
+    /// toward `reindex_repo` (a wedged worker recovers via re-queue).
+    #[test]
+    fn tier3_run_check_warns_stuck_run_after_6h_running() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        // 7 hours ago — well past the 6h threshold.
+        let stuck_started_at = now_ns - (7 * 3600 * 1_000_000_000);
+        let stuck = tier3_run_check(
+            "wedged",
+            &AliasStoreState {
+                tentative_manifest_id: Some(9),
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
+                    manifest_id: 9,
+                    status: "running".into(),
+                    error: None,
+                    started_at_ns: stuck_started_at,
+                }],
+                expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
+            },
+        );
+        assert_eq!(stuck.status, DoctorStatus::Warn);
+        let detail = stuck.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("stuck") && detail.contains("running"),
+            "expected stuck framing in detail, got: {detail}"
+        );
+        let remediation = stuck.remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("reindex wedged"),
+            "expected remediation to nudge reindex, got: {remediation}"
+        );
+    }
+
+    /// MA-1 sibling: a `queued` row whose `started_at_ns` is older than
+    /// `STUCK_RUN_THRESHOLD` MUST also surface as `Warn` with the
+    /// "stuck" framing — the worker that picks up the row may be
+    /// blocked behind a pool-group quota, deadlocked, or never wake
+    /// up. queued and running share the same branch in
+    /// `tier3_run_check`; this test pins that the queued status is
+    /// not silently dropped by the threshold check.
+    #[test]
+    fn tier3_run_check_warns_stuck_run_after_6h_queued() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let stuck_started_at = now_ns - (7 * 3600 * 1_000_000_000);
+        let stuck = tier3_run_check(
+            "wedged-queue",
+            &AliasStoreState {
+                tentative_manifest_id: Some(11),
+                tier3_runs: vec![Tier3Run {
+                    analyzer_id: "demo-analyzer".into(),
+                    manifest_id: 11,
+                    status: "queued".into(),
+                    error: None,
+                    started_at_ns: stuck_started_at,
+                }],
+                expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
+            },
+        );
+        assert_eq!(stuck.status, DoctorStatus::Warn);
+        let detail = stuck.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("stuck") && detail.contains("queued"),
+            "expected stuck framing for queued row, got: {detail}"
+        );
     }
 }

@@ -6,6 +6,8 @@
 //! manifest, then resolves the manifest's `(path, blob_sha)` pairs
 //! to blob-keyed parsed data.
 
+use std::path::Path;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::Result;
@@ -247,6 +249,51 @@ pub fn delete(tx: &Transaction<'_>, name: &AnchorName) -> Result<bool> {
         params![name.as_str()],
     )?;
     Ok(n > 0)
+}
+
+/// Resolve a registered repo's `tentative/<worktree_id>` anchor to its
+/// current `manifest_id`, given the worktree's filesystem root.
+///
+/// Used by the daemon's revision-staleness scanner and any other caller
+/// that has a repo root path but not the worktree id. Two SQL hops, both
+/// optional:
+///
+///   1. `worktrees` → `worktree_id` (returns `Ok(None)` if the worktree
+///      row is missing — possible during a teardown race).
+///   2. `anchors WHERE anchor_name = 'tentative/<id>'` (returns
+///      `Ok(None)` if the tentative anchor has not been written yet,
+///      e.g. between `register` opening the DB and the first
+///      `manifest::build_from_worktree` completing).
+///
+/// Both `None` cases are non-error so that callers can `continue` past
+/// a partially-initialized alias without bubbling a per-store hiccup
+/// into a fatal failure. SQL errors still surface as `Err`.
+///
+/// # Errors
+/// SQLite failure on either lookup.
+pub fn resolve_tentative_manifest_id(
+    conn: &Connection,
+    repo_root: &Path,
+) -> Result<Option<ManifestId>> {
+    let path_str = repo_root.to_string_lossy().to_string();
+    let worktree_id: Option<i64> = conn
+        .query_row(
+            "SELECT worktree_id FROM worktrees WHERE path = ?1",
+            params![path_str],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(worktree_id) = worktree_id else {
+        return Ok(None);
+    };
+    let manifest_id: Option<i64> = conn
+        .query_row(
+            "SELECT manifest_id FROM anchors WHERE anchor_name = ?1",
+            params![format!("tentative/{worktree_id}")],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(manifest_id.map(ManifestId))
 }
 
 fn row_to_anchor(r: &rusqlite::Row<'_>) -> rusqlite::Result<Anchor> {

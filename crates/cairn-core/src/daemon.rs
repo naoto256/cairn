@@ -68,6 +68,56 @@ impl Daemon {
         let ctrl = bind_socket_with_mode(&self.paths.control)?;
         info!(cairn = %self.paths.cairn.display(), control = %self.paths.control.display(), "daemon listening");
 
+        // Revision-staleness scan: enqueue analyzer reruns for any
+        // registered alias whose tentative manifest carries a
+        // `workspace_analysis_runs` row at an old `analyzer_revision`
+        // (or no row at all). Runs once per daemon boot, fire-and-
+        // forget on a blocking thread because every step is sync
+        // rusqlite I/O.
+        //
+        // Crash-isolation invariant: failures inside the scan must
+        // never escape this spawn. The scan itself downgrades
+        // per-alias errors to a `warn!` and continues; an outer-level
+        // failure (e.g. alias-index unreadable) is logged here.
+        if let Some(job_manager) = self.job_manager.clone() {
+            let cas_data_dir_for_staleness = job_manager.cas_data_dir().clone();
+            // The scan is sync SQLite I/O, so we hand it to the blocking
+            // pool. We then `spawn` an awaiter so a panic inside the
+            // blocking thread surfaces as a `JoinError` and gets
+            // logged instead of vanishing silently. The awaiter does
+            // not block daemon startup; the outer `if let` returns
+            // immediately.
+            let scan_handle = tokio::task::spawn_blocking(move || {
+                crate::workspace_analyzer::check_revision_staleness_and_enqueue(
+                    &cas_data_dir_for_staleness,
+                    &job_manager,
+                )
+            });
+            tokio::spawn(async move {
+                match scan_handle.await {
+                    Ok(Ok(_summary)) => {
+                        // staleness module already emits a structured
+                        // `info!` summary; nothing more to do here.
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            error = %err,
+                            "revision staleness scan failed; daemon continues"
+                        );
+                    }
+                    Err(join_err) => {
+                        // Panic inside the blocking thread. Loud so a
+                        // never-fires invariant violation doesn't sit
+                        // hidden in production.
+                        tracing::error!(
+                            error = %join_err,
+                            "revision staleness scan panicked; daemon continues (no auto-rerun this boot)"
+                        );
+                    }
+                }
+            });
+        }
+
         let cairn_task = spawn_accept_loop(
             "cairn",
             cairn,
