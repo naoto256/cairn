@@ -12,6 +12,7 @@
 
 mod analyzer;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cairn_lang_api::{
@@ -61,12 +62,15 @@ impl LanguageBackend for TypescriptBackend {
         "tree-sitter-typescript"
     }
 
-    /// Revision 2: CommonJS `require(...)` is now emitted as
-    /// `ImportFact` for all three dialects (Wave 2C follow-up to the
-    /// JavaScript Tier-2.5 backend). Same input yields more facts, so
-    /// the CAS-cached syntactic snapshot must be invalidated.
+    /// Revision 3: `require('./x')` is now emitted as `ImportFact` for
+    /// statement-position (`require('./setup')` as a top-level
+    /// expression statement), expression-position (`app.use(require(...))`,
+    /// argument-nested), and `module.exports = require('./x')` re-export
+    /// shapes, in addition to the binding-form (`const X = require(...)`)
+    /// that revision 2 introduced. Same input yields more `ImportFact`
+    /// rows, so the CAS-cached syntactic snapshot must be invalidated.
     fn parser_revision(&self) -> u32 {
-        2
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -105,7 +109,7 @@ impl LanguageBackend for TsxBackend {
 
     /// See [`TypescriptBackend::parser_revision`].
     fn parser_revision(&self) -> u32 {
-        2
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -146,7 +150,7 @@ impl LanguageBackend for JavascriptBackend {
 
     /// See [`TypescriptBackend::parser_revision`].
     fn parser_revision(&self) -> u32 {
-        2
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -167,12 +171,22 @@ static REGISTER_JAVASCRIPT: fn() -> Box<dyn LanguageBackend> = || Box::new(Javas
 
 struct TypescriptVisitor {
     nesting: NestingTracker,
+    /// Byte ranges of `require(...)` call sites we have already emitted
+    /// an `ImportFact` for. Key is the `call_expression` node's byte
+    /// range — that uniquely identifies the call site even when two
+    /// different visit paths (binding-form `extract_cjs_requires` and
+    /// the generic statement / expression / re-export visitors below)
+    /// reach the same node. Keying on the module-literal range alone
+    /// would conflate distinct sites that happen to share the same
+    /// specifier.
+    seen_require_sites: HashSet<(usize, usize)>,
 }
 
 impl TypescriptVisitor {
     fn new() -> Self {
         Self {
             nesting: NestingTracker::new("."),
+            seen_require_sites: HashSet::new(),
         }
     }
 }
@@ -194,7 +208,32 @@ impl Visitor for TypescriptVisitor {
         // declarator whose RHS is *not* a require call must fall through
         // unchanged).
         if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
-            extract_cjs_requires(node, source, facts);
+            extract_cjs_requires(node, source, facts, &mut self.seen_require_sites);
+        }
+
+        // Expression-position `require('./x')`: every `call_expression`
+        // whose callee is the bare identifier `require` and whose first
+        // argument is a string literal becomes an `ImportFact`. This
+        // catches statement-position calls (`require('./setup');`),
+        // argument-nested calls (`app.use(require('./routes'))`), and
+        // every other syntactic position. Binding-form
+        // (`const X = require(...)`) is emitted with richer
+        // `imported`/`alias` info by `extract_cjs_requires` above; the
+        // shared `seen_require_sites` set guarantees this generic visitor
+        // doesn't re-emit it.
+        if node.kind() == "call_expression" {
+            extract_expression_position_require(node, source, facts, &mut self.seen_require_sites);
+        }
+
+        // `module.exports = require('./x')` re-export shape. Visited at
+        // the `assignment_expression` level so we can structurally match
+        // the LHS as `member_expression(module.exports)` before
+        // committing to a re-export emission. The call site is still
+        // tracked in `seen_require_sites` so the generic
+        // `call_expression` visitor above doesn't also emit a plain
+        // side-effect ImportFact for the same RHS.
+        if node.kind() == "assignment_expression" {
+            extract_reexport_require(node, source, facts, &mut self.seen_require_sites);
         }
 
         let Some((mut kind, name, body_start)) = match_typescript_item(node, source) else {
@@ -449,6 +488,187 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
     }
 }
 
+/// Structural test for a `call_expression` of the bare identifier
+/// `require` with a single static string literal argument. Returns the
+/// module specifier text (quotes stripped), the byte range of the
+/// string-literal source node (for `ImportFact.byte_range`), and the
+/// byte range of the call site itself (for `seen_require_sites`).
+///
+/// The shape this accepts must match the Tier-2.5 JavaScript backend's
+/// recognizer in `crates/cairn-lang-javascript-tier25/src/const_resolver.rs`
+/// **bit for bit**:
+///   * callee is `node.kind() == "identifier"` with text `"require"`.
+///     Member-expression callees (`require.resolve('./x')`) are rejected
+///     structurally — the call's `function` field is not an identifier.
+///   * the first positional argument is `node.kind() == "string"`.
+///     `template_string`, `identifier` (`require(name)`), and
+///     `binary_expression` (`` require(`./` + name) ``) are all rejected.
+///
+/// Both backends must reject the same shapes; the regression tests
+/// `require_dot_resolve_does_not_emit_*`, `dynamic_require_with_*`, and
+/// `template_string_require_*` pin this contract.
+/// `(module_specifier_text, module_string_byte_range, call_site_byte_range)`.
+/// Three coordinates the require-emit callers need together.
+type RequireCallShape = (String, (u32, u32), (usize, usize));
+
+fn is_require_string_call(call: Node<'_>, source: &[u8]) -> Option<RequireCallShape> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let func = child_by_field(call, "function")?;
+    if func.kind() != "identifier" || node_text(func, source) != "require" {
+        return None;
+    }
+    let args = child_by_field(call, "arguments")?;
+    let mut arg_cursor = args.walk();
+    let module_node = args.named_children(&mut arg_cursor).next()?;
+    if module_node.kind() != "string" {
+        return None;
+    }
+    let module_text = strip_string_literal(node_text(module_node, source));
+    let mr = module_node.byte_range();
+    let module_range = (mr.start as u32, mr.end as u32);
+    let cr = call.byte_range();
+    let call_range = (cr.start, cr.end);
+    Some((module_text, module_range, call_range))
+}
+
+/// Statement-position / expression-position generic visitor. Fires for
+/// every `call_expression` node and emits a side-effect-shaped
+/// `ImportFact` (`imported = None, alias = None, is_reexport = false`)
+/// if the call matches `require('<literal>')`. The shared
+/// `seen_require_sites` set suppresses duplicates with the binding-form
+/// path (`extract_cjs_requires`) and the re-export path
+/// (`extract_reexport_require`); both populate the same set before this
+/// visitor runs against the same `call_expression`.
+fn extract_expression_position_require(
+    call: Node<'_>,
+    source: &[u8],
+    facts: &mut SyntacticFacts,
+    seen: &mut HashSet<(usize, usize)>,
+) {
+    let Some((to_module, module_range, call_range)) = is_require_string_call(call, source) else {
+        return;
+    };
+    if !seen.insert(call_range) {
+        return;
+    }
+    facts.imports.push(ImportFact {
+        to_module,
+        imported: None,
+        alias: None,
+        is_reexport: false,
+        line: line_of(call),
+        byte_range: Some(module_range),
+    });
+}
+
+/// `module.exports = require('./x')` re-export shape. We accept only
+/// the strict `member_expression(object=identifier("module"),
+/// property=identifier("exports"))` LHS form — the `exports.X =
+/// require('./x')` and `module.exports.X = require('./x')` named
+/// re-exports are intentionally out of scope for this PR (Tier-2.5
+/// cannot yet model named re-export graph semantics, so emitting a
+/// `ImportFact { is_reexport: true }` for them would mislead
+/// downstream consumers).
+///
+/// Named re-export shapes still need active handling: their RHS is a
+/// real `require(...)` call, and the generic `call_expression`
+/// visitor would otherwise emit a plain side-effect `ImportFact` for
+/// them. We **claim** the RHS call site in `seen_require_sites`
+/// without emitting anything, suppressing that downstream emission
+/// and keeping the scope-out contract intact end-to-end. The
+/// negative tests `exports_named_reexport_does_not_emit_import_fact`
+/// and `module_exports_named_reexport_does_not_emit_import_fact`
+/// pin this.
+///
+/// The Tier-2.5 backend treats the strict `module.exports = require(...)`
+/// shape as edge-only as well (`ImportKind::SideEffect`, no
+/// `ResolvedBinding`).
+fn extract_reexport_require(
+    node: Node<'_>,
+    source: &[u8],
+    facts: &mut SyntacticFacts,
+    seen: &mut HashSet<(usize, usize)>,
+) {
+    if node.kind() != "assignment_expression" {
+        return;
+    }
+    let Some(left) = child_by_field(node, "left") else {
+        return;
+    };
+    let Some(right) = child_by_field(node, "right") else {
+        return;
+    };
+    // Only act on assignment whose RHS is a real `require('...')` call;
+    // anything else is none of our business.
+    let Some((to_module, module_range, call_range)) = is_require_string_call(right, source) else {
+        return;
+    };
+
+    // Strict `module.exports = require(...)` — emit the re-export
+    // ImportFact and claim the call site.
+    if is_module_exports_member(left, source) {
+        if !seen.insert(call_range) {
+            return;
+        }
+        facts.imports.push(ImportFact {
+            to_module,
+            imported: None,
+            alias: None,
+            is_reexport: true,
+            line: line_of(node),
+            byte_range: Some(module_range),
+        });
+        return;
+    }
+
+    // Named re-export shapes (`exports.X = require(...)` /
+    // `module.exports.X = require(...)`): scope-out per spec. Claim
+    // the RHS call site so the generic `call_expression` visitor
+    // doesn't fall through and emit a side-effect ImportFact for it.
+    if is_named_reexport_lhs(left, source) {
+        seen.insert(call_range);
+    }
+}
+
+/// `module.exports` exact member-expression LHS.
+fn is_module_exports_member(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "member_expression" {
+        return false;
+    }
+    let Some(obj) = child_by_field(node, "object") else {
+        return false;
+    };
+    let Some(prop) = child_by_field(node, "property") else {
+        return false;
+    };
+    obj.kind() == "identifier"
+        && node_text(obj, source) == "module"
+        && prop.kind() == "property_identifier"
+        && node_text(prop, source) == "exports"
+}
+
+/// Named-re-export LHS shapes: `exports.X` (single-level) or
+/// `module.exports.X` (nested). Both are scope-out for this PR; we
+/// detect them only to suppress the generic visitor's side-effect
+/// emission for their RHS require call.
+fn is_named_reexport_lhs(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "member_expression" {
+        return false;
+    }
+    let Some(obj) = child_by_field(node, "object") else {
+        return false;
+    };
+    // `exports.X` — obj is the bare identifier `exports`.
+    if obj.kind() == "identifier" && node_text(obj, source) == "exports" {
+        return true;
+    }
+    // `module.exports.X` — obj is itself a `module.exports`
+    // member_expression.
+    is_module_exports_member(obj, source)
+}
+
 /// Detect CommonJS `require(...)` bindings inside a `lexical_declaration`
 /// or `variable_declaration` and emit `ImportFact`s for each.
 ///
@@ -464,7 +684,12 @@ fn extract_imports(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
 ///
 /// Emitted on all three dialects (TS / TSX / JS). CommonJS in `.ts`
 /// is rare but valid and shows up in mixed CJS/ESM codebases.
-fn extract_cjs_requires(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
+fn extract_cjs_requires(
+    node: Node<'_>,
+    source: &[u8],
+    facts: &mut SyntacticFacts,
+    seen: &mut HashSet<(usize, usize)>,
+) {
     let mut cursor = node.walk();
     for declarator in node.named_children(&mut cursor) {
         if declarator.kind() != "variable_declarator" {
@@ -476,7 +701,7 @@ fn extract_cjs_requires(node: Node<'_>, source: &[u8], facts: &mut SyntacticFact
         let Some(value_node) = child_by_field(declarator, "value") else {
             continue;
         };
-        try_emit_cjs_require(name_node, value_node, source, facts);
+        try_emit_cjs_require(name_node, value_node, source, facts, seen);
     }
 }
 
@@ -485,6 +710,7 @@ fn try_emit_cjs_require(
     value_node: Node<'_>,
     source: &[u8],
     facts: &mut SyntacticFacts,
+    seen: &mut HashSet<(usize, usize)>,
 ) {
     // RHS shape: `require('./foo')` or `require('./foo').Member`.
     let (require_call, member): (Node<'_>, Option<String>) = match value_node.kind() {
@@ -526,6 +752,14 @@ fn try_emit_cjs_require(
     let module_range = module_node.byte_range();
     let source_byte_range: (u32, u32) = (module_range.start as u32, module_range.end as u32);
     let line = line_of(require_call);
+
+    // Mark the require call site as seen so the generic
+    // `extract_expression_position_require` visitor doesn't also emit a
+    // bare side-effect ImportFact for the same call. We register
+    // unconditionally — even if the destructure pattern below yields no
+    // bindings, the binding-form path "claims" this call.
+    let call_range = require_call.byte_range();
+    seen.insert((call_range.start, call_range.end));
 
     match name_node.kind() {
         "identifier" => {
@@ -997,13 +1231,170 @@ const { join } = require('path');
     }
 
     #[test]
-    fn parser_revision_bumped_for_cjs_emit() {
-        // Bump signals to the CAS-cached syntactic snapshot that the
-        // emission policy changed; without this, stale snapshots would
-        // miss CJS imports until the user manually reindexed.
-        assert_eq!(TypescriptBackend.parser_revision(), 2);
-        assert_eq!(TsxBackend.parser_revision(), 2);
-        assert_eq!(JavascriptBackend.parser_revision(), 2);
+    fn parser_revision_bumped_for_expanded_require_emit() {
+        // Revision 3 (PR-β): statement-position, expression-position,
+        // and `module.exports = require(...)` re-export require calls
+        // now also emit `ImportFact` rows. Bump signals the CAS-cached
+        // syntactic snapshot to invalidate so the same input yields the
+        // wider fact set without a manual reindex.
+        assert_eq!(TypescriptBackend.parser_revision(), 3);
+        assert_eq!(TsxBackend.parser_revision(), 3);
+        assert_eq!(JavascriptBackend.parser_revision(), 3);
+    }
+
+    // ─── PR-β: expanded require() ImportFact emit ────────────────
+
+    #[test]
+    fn statement_position_require_emits_side_effect_import_fact() {
+        // Top-level `require('./setup');` as a bare expression statement
+        // must emit a side-effect ImportFact pinned at the module
+        // literal span.
+        let src = b"require('./setup');\n";
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        assert_eq!(facts.imports.len(), 1);
+        let i = &facts.imports[0];
+        assert_eq!(i.to_module, "./setup");
+        assert!(i.imported.is_none());
+        assert!(i.alias.is_none());
+        assert!(!i.is_reexport);
+        let (s, e) = i.byte_range.expect("byte_range emitted");
+        assert_eq!(&src[s as usize..e as usize], b"'./setup'");
+    }
+
+    #[test]
+    fn expression_position_require_emits_side_effect_import_fact() {
+        // Argument-nested `require('./routes')` inside `app.use(...)`
+        // must also emit. The binding-form path isn't triggered here.
+        let src = b"app.use(require('./routes'));\n";
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        let hit = facts
+            .imports
+            .iter()
+            .find(|i| i.to_module == "./routes")
+            .expect("expression-position require should emit");
+        assert!(hit.imported.is_none());
+        assert!(hit.alias.is_none());
+        assert!(!hit.is_reexport);
+        // Exactly one ImportFact total for this site — no duplicate
+        // from the generic visitor.
+        assert_eq!(
+            facts
+                .imports
+                .iter()
+                .filter(|i| i.to_module == "./routes")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn module_exports_assign_require_emits_reexport_import_fact() {
+        // `module.exports = require('./inner')` is a re-export; the
+        // ImportFact carries `is_reexport: true` and no
+        // `imported`/`alias` (Tier-2.5 cannot model the export-name
+        // mapping yet, so this is the only safe shape).
+        let src = b"module.exports = require('./inner');\n";
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        let hit = facts
+            .imports
+            .iter()
+            .find(|i| i.to_module == "./inner")
+            .expect("module.exports = require(...) should emit");
+        assert!(hit.is_reexport);
+        assert!(hit.imported.is_none());
+        assert!(hit.alias.is_none());
+        // No duplicate from the generic expression visitor on the same
+        // call site.
+        assert_eq!(
+            facts
+                .imports
+                .iter()
+                .filter(|i| i.to_module == "./inner")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exports_named_reexport_does_not_emit_import_fact() {
+        // `exports.X = require('./x')` is a named re-export. Tier-2.5
+        // does not yet model named re-export graph semantics, so this
+        // PR keeps it out of scope: the assignment visitor recognises
+        // the LHS and *claims* the RHS call site in `seen_require_sites`
+        // without emitting anything, suppressing the generic
+        // `call_expression` visitor's side-effect ImportFact emission
+        // for the same site.
+        let src = b"exports.foo = require('./inner');\n";
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        assert!(
+            facts.imports.iter().all(|i| i.to_module != "./inner"),
+            "exports.X = require('./inner') must not emit any ImportFact \
+             (scope-out); got: {:#?}",
+            facts.imports
+        );
+    }
+
+    #[test]
+    fn module_exports_named_reexport_does_not_emit_import_fact() {
+        // `module.exports.X = require('./x')` is the nested form of
+        // the named re-export above. Same scope-out contract applies.
+        let src = b"module.exports.foo = require('./inner');\n";
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        assert!(
+            facts.imports.iter().all(|i| i.to_module != "./inner"),
+            "module.exports.X = require('./inner') must not emit any \
+             ImportFact (scope-out); got: {:#?}",
+            facts.imports
+        );
+    }
+
+    #[test]
+    fn esm_and_cjs_imports_coexist_in_same_file() {
+        // Mixed-paradigm files (common during ESM migration) must
+        // surface both kinds of ImportFact independently.
+        let src = br#"
+import { foo } from './a';
+const bar = require('./b');
+"#;
+        let facts = JavascriptBackend.extract_syntactic(src).unwrap();
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "./a" && i.imported.as_deref() == Some("foo") && i.alias.is_none()
+        }));
+        assert!(facts.imports.iter().any(|i| {
+            i.to_module == "./b"
+                && i.imported.as_deref() == Some("default")
+                && i.alias.as_deref() == Some("bar")
+        }));
+    }
+
+    #[test]
+    fn require_dot_resolve_does_not_emit_import_fact() {
+        // `require.resolve('./x')` is a member-expression callee, not
+        // a bare `require` identifier — must be rejected structurally.
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const p = require.resolve('./x');\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 0);
+    }
+
+    #[test]
+    fn dynamic_require_with_identifier_arg_does_not_emit() {
+        // Dynamic specifier — argument is an identifier, not a string
+        // literal. Tier-1 can't resolve the target without runtime info.
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const name = './a';\nrequire(name);\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 0);
+    }
+
+    #[test]
+    fn template_string_require_does_not_emit() {
+        // Template literal argument — recognizer requires
+        // `node.kind() == "string"` exactly.
+        let facts = JavascriptBackend
+            .extract_syntactic(b"const x = './a';\nrequire(`./${x}`);\n")
+            .unwrap();
+        assert_eq!(facts.imports.len(), 0);
     }
 
     #[test]

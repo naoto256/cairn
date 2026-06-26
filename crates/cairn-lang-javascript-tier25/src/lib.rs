@@ -35,11 +35,12 @@
 //! * `node:fs` and other `node:`-prefixed builtins: same shape as
 //!   bare specifiers.
 //! * Bundler / `tsconfig` path aliases (`@/foo`, webpack `resolve.alias`).
-//! * Expression-position / side-effect `require(...)` calls
-//!   (`require('./setup')` as a statement, `app.use(require(...))`,
-//!   `module.exports = require(...)`): the Tier-1 emitter only sees
-//!   binding-form `const X = require(...)` today. Tracked as a
-//!   follow-up to extend `extract_cjs_requires`.
+//! * `exports.X = require('./x')` named re-export: only the strict
+//!   `module.exports = require('./x')` shape is recognized here, and as
+//!   an edge-only `ImportKind::SideEffect` (no `ResolvedBinding`, no
+//!   `target_qualified`). Named re-export graph semantics (resolving
+//!   `import { X } from './outer'` through a re-export chain) are out
+//!   of scope for this revision.
 //! * `obj.method()` where `obj` is a local of unresolved class.
 //! * Mixin factories (`class Foo extends Mixin(Base)`) — base is a call
 //!   expression and we deliberately skip it from MRO.
@@ -86,7 +87,17 @@ pub const TIER_PREFIX: &str = "tier25";
 // so existing workspace_analysis_runs need to be invalidated and the
 // analyzer re-run to repopulate rows with manifest_id Some. Analyzer
 // logic itself is unchanged.
-pub const ANALYZER_REVISION: u32 = 3;
+// Bumped to 4: const_resolver now emits an ImportBinding (and the
+// require_graph a RequireEdge with `target_path` populated for
+// in-workspace targets) for statement-position
+// (`require('./setup');`), expression-position
+// (`app.use(require('./routes'))`, argument-nested), and
+// `module.exports = require('./x')` re-export shapes — previously only
+// binding-form (`const X = require('./foo')`) reached this path. The
+// rerun of `const_resolver` / `require_graph` is driven by PR #220's
+// analyzer-revision staleness scanner; this is the 2nd real use case
+// of that scanner after Wave 2C's PR-α (CJS binding-form expansion).
+pub const ANALYZER_REVISION: u32 = 4;
 pub const PARSER_ID: &str = "tree-sitter-javascript";
 pub const RESOLUTION_SOURCE: &str = "tier25-javascript-resolver";
 
