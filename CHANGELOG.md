@@ -48,6 +48,41 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **JavaScript/TypeScript Tier-1 now emits `require('./x')` as
+  `ImportFact` in statement-position, expression-position, and
+  re-export shapes.** Previously only the binding form
+  `const X = require('./foo')` reached `extract_cjs_requires`; bare
+  statement calls (`require('./setup');`), argument-nested calls
+  (`app.use(require('./routes'))`), and `module.exports =
+  require('./x')` re-exports were silently dropped on the floor, so
+  `find_references` / `find_callers` / `find_callees` against the
+  imported module fell through to tier2-fact fallback with no
+  `target_path`. The Tier-1 emitter now visits every `call_expression`
+  whose callee is the bare identifier `require` with a single static
+  string-literal argument, with a shared `seen_require_sites` HashSet
+  keyed on the call-site byte range so the binding-form path and the
+  generic visitor cannot double-emit the same call. The Tier-2.5
+  JavaScript backend (`cairn-lang-javascript-tier25`) consumes the
+  same shapes as `ImportBinding`/`RequireEdge`, with statement /
+  expression / re-export all mapped to `ImportKind::SideEffect`
+  (edge-only — no `ResolvedBinding`, no `target_qualified`), so
+  `require_graph` produces a real module edge with `target_path`
+  populated for in-workspace targets and `resolutions.target_path` is
+  finally written for these sites. The recognizer shape is kept
+  bit-for-bit identical between Tier-1 and Tier-2.5 (`require.resolve`,
+  dynamic specifiers, and template literals are rejected structurally
+  on both sides). TypeScript `parser_revision` bumps 2 → 3 to
+  invalidate the CAS-cached syntactic snapshot; JS Tier-2.5
+  `ANALYZER_REVISION` bumps 3 → 4 to drive a `const_resolver` /
+  `require_graph` rerun — the 2nd real use case of PR #220's
+  analyzer-revision staleness scanner after Wave 2C's PR-α CJS
+  binding-form expansion. **Known limitations**: `exports.X =
+  require('./x')` named re-export pattern is out of scope (only the
+  strict `module.exports = require(...)` shape is recognized);
+  re-export graph semantics (resolving a downstream
+  `import { X } from './outer'` through a re-export chain) are not
+  modeled — the Tier-2.5 contract for `module.exports =
+  require('./x')` is edge-only.
 - **Kotlin Tier-1 emits enum entries and constructors.** `enum class
   Color { RED, GREEN }` now surfaces `Color.RED` / `Color.GREEN` as
   `SymbolKind::Constant` (mirroring the Java backend's

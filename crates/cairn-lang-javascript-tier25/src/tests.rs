@@ -513,6 +513,151 @@ fn object_set_prototype_of_does_not_invent_hierarchy() {
     );
 }
 
+// ─── PR-β: expanded require() ImportBinding emit ──────────────────────
+
+#[test]
+fn statement_require_flows_to_require_edge_target_path() {
+    // Top-level `require('./setup');` is a side-effect import — the
+    // require_graph still produces a RequireEdge with a real
+    // `target_path` so the resolutions row can fall through to the
+    // workspace file.
+    let tmp = tempfile::tempdir().unwrap();
+    let setup = "console.log('init');\n";
+    let main = "require('./setup');\n";
+    let res = run(tmp.path(), &[("setup.js", setup), ("main.js", main)]);
+    let imps = imports_of(&res, "main.js");
+    assert!(
+        imps.iter()
+            .any(|r| r.target_path.as_deref() == Some("setup.js")),
+        "statement-position require should resolve to setup.js; got {:#?}",
+        imps
+    );
+}
+
+#[test]
+fn expression_require_flows_to_require_edge_target_path() {
+    // `app.use(require('./routes'))` — argument-nested require call.
+    let tmp = tempfile::tempdir().unwrap();
+    let routes = "module.exports = {};\n";
+    let main = "const app = {};\napp.use(require('./routes'));\n";
+    let res = run(tmp.path(), &[("routes.js", routes), ("main.js", main)]);
+    let imps = imports_of(&res, "main.js");
+    assert!(
+        imps.iter()
+            .any(|r| r.target_path.as_deref() == Some("routes.js")),
+        "expression-position require should resolve to routes.js; got {:#?}",
+        imps
+    );
+}
+
+#[test]
+fn module_exports_require_emits_module_edge() {
+    // `module.exports = require('./inner')` — re-export shape. Tier-2.5
+    // emits the require edge with a `target_path`, but does NOT create
+    // a ResolvedBinding (edge-only contract; named re-export graph
+    // semantics are out of scope for this PR).
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = "module.exports = class X {};\n";
+    let outer = "module.exports = require('./inner');\n";
+    let res = run(tmp.path(), &[("inner.js", inner), ("outer.js", outer)]);
+    let imps = imports_of(&res, "outer.js");
+    assert!(
+        imps.iter()
+            .any(|r| r.target_path.as_deref() == Some("inner.js")),
+        "module.exports = require('./inner') should pin inner.js; got {:#?}",
+        imps
+    );
+    // target_qualified must remain None — import edges target a file,
+    // not a symbol (Phase 1 contract).
+    let hit = imps
+        .iter()
+        .find(|r| r.target_path.as_deref() == Some("inner.js"))
+        .unwrap();
+    assert!(hit.target_qualified.is_none());
+}
+
+#[test]
+fn exports_named_reexport_does_not_emit_tier25_import_binding() {
+    // `exports.X = require('./inner')` — named re-export, scope-out
+    // per spec. The assignment visitor recognises the LHS and claims
+    // the RHS call site in `seen_require_sites` without emitting,
+    // suppressing the generic call_expression visitor's side-effect
+    // ImportBinding. We check at the `FileConstFacts` layer because
+    // require_graph dedups downstream — the upstream gate is where
+    // the scope-out contract must hold.
+    let src = b"exports.foo = require('./inner');\n";
+    let facts = crate::const_resolver::parse_file(src).expect("parses");
+    let leaked: Vec<_> = facts
+        .import_bindings
+        .iter()
+        .filter(|b| b.module == "./inner")
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "exports.X = require('./inner') must NOT produce an ImportBinding \
+         (named re-export is scope-out); got: {leaked:#?}",
+    );
+}
+
+#[test]
+fn module_exports_named_reexport_does_not_emit_tier25_import_binding() {
+    // Same scope-out as above, nested form: `module.exports.X = require(...)`.
+    let src = b"module.exports.foo = require('./inner');\n";
+    let facts = crate::const_resolver::parse_file(src).expect("parses");
+    let leaked: Vec<_> = facts
+        .import_bindings
+        .iter()
+        .filter(|b| b.module == "./inner")
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "module.exports.X = require('./inner') must NOT produce an \
+         ImportBinding (named re-export is scope-out); got: {leaked:#?}",
+    );
+}
+
+#[test]
+fn binding_form_require_not_double_emitted() {
+    // `const X = require('./foo')` reaches both the binding-form path
+    // (emit_var_declaration → try_emit_cjs_require) and the generic
+    // expression-position visitor (try_emit_expression_position_require)
+    // because the visitor walks into the variable_declarator's RHS
+    // call_expression. The shared `seen_require_sites` guarantees a
+    // single ImportBinding (Cjs flavor, with `local = "X"`) — the
+    // generic visitor must skip the same call site.
+    //
+    // We check at the `FileConstFacts` layer rather than the resolutions
+    // layer, because `require_graph.rs` already dedups by
+    // (path, site_byte_start, site_byte_end) at edge-emission time, so
+    // an `import_bindings`-level dup would still collapse to a single
+    // Import row downstream. This test pins the upstream dedup
+    // separately so a future refactor can't silently lean on the
+    // edge-level dedup and break the alias map.
+    let src = b"const X = require('./foo');\n";
+    let facts = crate::const_resolver::parse_file(src).expect("parses");
+    assert_eq!(
+        facts.import_bindings.len(),
+        1,
+        "exactly one ImportBinding for the require site; got {:#?}",
+        facts.import_bindings
+    );
+    assert_eq!(facts.import_bindings[0].local, "X");
+    assert!(matches!(
+        facts.import_bindings[0].kind,
+        crate::const_resolver::ImportKind::Cjs
+    ));
+}
+
+#[test]
+fn analyzer_revision_bumped_for_expanded_require_emit() {
+    // Revision 4 (PR-β): const_resolver now emits ImportBinding for
+    // statement / expression / re-export `require(...)` shapes.
+    // The 2nd real use case of PR #220's analyzer-revision staleness
+    // scanner (after Wave 2C's PR-α CJS binding-form expansion).
+    use crate::ANALYZER_REVISION;
+    assert_eq!(ANALYZER_REVISION, 4);
+}
+
 // ─── glue ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -520,7 +665,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "javascript-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 3);
+    assert_eq!(ANALYZER_REVISION, 4);
     assert_eq!(PARSER_ID, "tree-sitter-javascript");
     assert_eq!(RESOLUTION_SOURCE, "tier25-javascript-resolver");
 }
