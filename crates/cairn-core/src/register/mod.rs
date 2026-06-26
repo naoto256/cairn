@@ -31,7 +31,9 @@ use crate::anchor::{self, AnchorName};
 use crate::cas;
 use crate::jobs::{EnqueueReindex, JobManager, QueuedAnalyzerJob};
 use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
-use crate::workspace_analyzer::run_registered_workspace_analyzers;
+use crate::workspace_analyzer::{
+    check_workspace_analyzer_current_succeeded, run_registered_workspace_analyzers,
+};
 
 mod header_detect;
 
@@ -45,7 +47,15 @@ pub struct RegisterOutcome {
     pub branch: Option<String>,
     pub committed_manifest: ManifestId,
     pub tentative_manifest: ManifestId,
-    pub analyzers_skipped_due_to_dedup: bool,
+    /// `true` iff the workspace analyzer pass was skipped because the
+    /// tentative manifest entries were byte-identical to the prior
+    /// tentative, no blobs were re-parsed by `parse_pending_blobs`,
+    /// and every expected analyzer already has a `succeeded` run row
+    /// at the current `analyzer_revision`. All three gates must hold
+    /// — entries-unchanged alone is not enough to skip (it would let
+    /// a parser_revision bump leave the resolutions table stale under
+    /// a reused `manifest_id`).
+    pub skip_analyzers_for_unchanged_manifest: bool,
     pub analyzer_jobs: Vec<QueuedAnalyzerJob>,
     /// Number of `(blob, parser)` pairs that were parsed fresh
     /// (= not reused from a prior call).
@@ -200,21 +210,35 @@ where
 
     let built_tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, include)?;
     let built_tentative_entries = manifest::get_entries(&tx, built_tentative)?;
-    let (tentative, tentative_entries, analyzers_skipped_due_to_dedup) =
-        if dedupe_unchanged_tentative
-            && let Some(prior) = prior_tentative
-            && manifest::get_entries(&tx, prior)? == built_tentative_entries
-        {
-            manifest::delete_manifest(&tx, built_tentative)?;
-            debug!(
-                repo = %worktree_path.display(),
-                manifest_id = prior.0,
-                "tentative manifest unchanged; skipping analyzer pass"
-            );
-            (prior, built_tentative_entries, true)
-        } else {
-            (built_tentative, built_tentative_entries, false)
+
+    // Gate #1 (manifest reuse): tentative entries byte-identical to
+    // the prior tentative manifest. When this holds we drop the
+    // freshly-built tentative and keep the prior `manifest_id`. This
+    // is *only* about not allocating a new manifest row — it does
+    // NOT, on its own, mean facts under that manifest_id are
+    // current. v11's `resolutions.manifest_id ON DELETE CASCADE`
+    // turned a stale fact-set under a reused manifest_id into an
+    // invisible-version-skew bug (Tier-2.5 facts lost on file touch
+    // after parser_revision bump), so the analyzer-skip decision is
+    // now gated separately below.
+    let entries_unchanged = dedupe_unchanged_tentative
+        && match prior_tentative {
+            Some(prior) => manifest::get_entries(&tx, prior)? == built_tentative_entries,
+            None => false,
         };
+    let (tentative, tentative_entries) = if entries_unchanged {
+        // Safe: entries_unchanged is only true if prior_tentative was Some.
+        let prior = prior_tentative.expect("entries_unchanged implies prior_tentative is Some");
+        manifest::delete_manifest(&tx, built_tentative)?;
+        debug!(
+            repo = %worktree_path.display(),
+            manifest_id = prior.0,
+            "tentative manifest unchanged; reusing prior manifest"
+        );
+        (prior, built_tentative_entries)
+    } else {
+        (built_tentative, built_tentative_entries)
+    };
 
     // Anchors.
     anchor::set(&tx, &AnchorName::head(), committed, now_ns)?;
@@ -236,6 +260,16 @@ where
     let committed_entries = manifest::get_entries(&tx, committed)?;
     tx.commit()?;
 
+    // Gate #2 (blobs re-parsed): the truth-source for "Tier-1 facts
+    // moved under this manifest" is `parse_pending_blobs`. Any of
+    // (a) a new blob, (b) a parser_revision bump on an existing
+    // blob, or (c) a missing parsed_data row triggers `blobs_parsed
+    // > 0`. We use that signal directly instead of re-deriving a
+    // parser-drift check, so the two paths cannot drift apart.
+    //
+    // Order matters: `parse_pending_blobs` must run BEFORE the
+    // skip decision. Running it after would observe a post-skip
+    // state and let drift slip through (the F-A regression).
     let blobs_parsed = parse_pending_blobs(
         conn,
         worktree_path,
@@ -244,9 +278,40 @@ where
         &tentative_entries,
         now_ns,
     )?;
-    let analyzer_jobs = if analyzers_skipped_due_to_dedup {
+
+    // Gate #3 (analyzer revision current): every expected analyzer
+    // has a `succeeded` workspace_analysis_runs row at the current
+    // linked-in `revision()`. queued / running / failed / skipped /
+    // cancelled / timed_out all count as "not current" so a
+    // half-finished pass cannot masquerade as up-to-date — the
+    // misleading-state symptom that motivated this fix.
+    let analyzer_current = if entries_unchanged && blobs_parsed == 0 {
+        check_workspace_analyzer_current_succeeded(conn, tentative)?
+    } else {
+        // Skip the DB probe when the cheap gates already disqualify
+        // skipping. Saves the SELECT in the common churn path.
+        false
+    };
+
+    let skip_analyzers_for_unchanged_manifest =
+        entries_unchanged && blobs_parsed == 0 && analyzer_current;
+
+    let analyzer_jobs = if skip_analyzers_for_unchanged_manifest {
+        debug!(
+            repo = %worktree_path.display(),
+            manifest_id = tentative.0,
+            "workspace analyzer pass skipped; facts current"
+        );
         Vec::new()
     } else {
+        debug!(
+            repo = %worktree_path.display(),
+            manifest_id = tentative.0,
+            entries_unchanged,
+            blobs_parsed,
+            analyzer_current,
+            "workspace analyzer pass forced"
+        );
         run_analyzers(conn, worktree_path, tentative, &tentative_entries, now_ns)?
     };
 
@@ -256,7 +321,7 @@ where
         branch,
         committed_manifest: committed,
         tentative_manifest: tentative,
-        analyzers_skipped_due_to_dedup,
+        skip_analyzers_for_unchanged_manifest,
         analyzer_jobs,
         blobs_parsed,
     })
@@ -658,10 +723,129 @@ mod tests {
         })
         .unwrap();
 
-        assert!(!first.analyzers_skipped_due_to_dedup);
-        assert!(second.analyzers_skipped_due_to_dedup);
+        assert!(!first.skip_analyzers_for_unchanged_manifest);
+        assert!(second.skip_analyzers_for_unchanged_manifest);
         assert_eq!(second.tentative_manifest, first.tentative_manifest);
         assert_eq!(analyzer_runs.get(), 1);
+    }
+
+    /// F-A regression: when blobs were re-parsed (e.g. parser_revision
+    /// bumped on a freshly upgraded binary), the second register call
+    /// must NOT skip the workspace analyzer pass even though the
+    /// tentative manifest entries are byte-identical to the prior
+    /// tentative.
+    ///
+    /// We simulate "blob re-parse fired" by deleting the parsed-blob
+    /// rows between the two registers. `parse_pending_blobs` will then
+    /// re-compute them and return `blobs_parsed > 0`, which is the
+    /// truth-source the skip gate watches. Manifest entries stay
+    /// identical because they reference the same `blob_sha` values.
+    #[test]
+    fn register_repo_forces_analyzer_when_blobs_parsed_gt_zero() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let analyzer_runs = Cell::new(0);
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert!(!first.skip_analyzers_for_unchanged_manifest);
+        assert!(first.blobs_parsed >= 1);
+
+        // Wipe the parsed-blob rows so the next register re-parses
+        // everything. This is the test-double for "Tier-1 parser_revision
+        // bumped on a binary upgrade" — same manifest entries, different
+        // parser output → CAS invalidation → blobs_parsed > 0.
+        conn.execute("DELETE FROM blobs", []).unwrap();
+
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap();
+
+        assert!(
+            !second.skip_analyzers_for_unchanged_manifest,
+            "blobs_parsed > 0 must force the analyzer pass even when \
+             entries are unchanged"
+        );
+        assert!(
+            second.blobs_parsed >= 1,
+            "expected re-parse on second register, got {} fresh",
+            second.blobs_parsed
+        );
+        assert_eq!(
+            analyzer_runs.get(),
+            2,
+            "analyzer must run twice when blobs were re-parsed"
+        );
+    }
+
+    /// F-A direct regression pin: after a parser_revision bump
+    /// (modeled by wiping `blobs` between calls), the second register
+    /// must force the workspace analyzer pass so any resolutions /
+    /// Tier-2.5 facts tied to the reused `manifest_id` get an
+    /// opportunity to repopulate at the new revision.
+    ///
+    /// Before this fix, the dedup shortcut skipped the analyzer pass
+    /// on the second register because tentative entries matched,
+    /// leaving the resolutions table tied to the old fact-set version
+    /// under the reused `manifest_id`. v11's `resolutions ON DELETE
+    /// CASCADE` made the skew silent (no orphan detection in queries).
+    ///
+    /// We assert two things at the register-layer boundary: (1) the
+    /// `tentative_manifest` is reused (same id as first call), so the
+    /// dedup gate is still working; and (2) the analyzer is still
+    /// forced to run. Together they pin the post-fix contract: dedup
+    /// the manifest, don't dedup the analyzer pass.
+    #[test]
+    fn register_repo_forces_analyzer_after_revision_bump_f_a_regression() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let analyzer_runs = Cell::new(0);
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert!(!first.skip_analyzers_for_unchanged_manifest);
+        assert_eq!(analyzer_runs.get(), 1);
+
+        // Simulate Tier-1 parser_revision bump: wipe parsed-blob rows.
+        // `parse_pending_blobs` on the next register will re-parse and
+        // return `blobs_parsed > 0` — the truth-source the skip gate
+        // watches. Manifest entries stay identical because the worktree
+        // is unchanged.
+        conn.execute("DELETE FROM blobs", []).unwrap();
+
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap();
+
+        // Manifest dedup still works: same id reused.
+        assert_eq!(
+            second.tentative_manifest, first.tentative_manifest,
+            "tentative manifest_id must be reused when entries match"
+        );
+        // Analyzer pass NOT skipped: the gate now picks up blobs_parsed.
+        assert!(
+            !second.skip_analyzers_for_unchanged_manifest,
+            "blobs_parsed > 0 after revision bump must force the analyzer pass"
+        );
+        assert!(second.blobs_parsed >= 1);
+        assert_eq!(
+            analyzer_runs.get(),
+            2,
+            "F-A regression: analyzer must re-run when blobs were re-parsed \
+             even though manifest_id is reused"
+        );
     }
 
     #[test]
@@ -682,8 +866,8 @@ mod tests {
         })
         .unwrap();
 
-        assert!(!first.analyzers_skipped_due_to_dedup);
-        assert!(!second.analyzers_skipped_due_to_dedup);
+        assert!(!first.skip_analyzers_for_unchanged_manifest);
+        assert!(!second.skip_analyzers_for_unchanged_manifest);
         assert_ne!(second.tentative_manifest, first.tentative_manifest);
         assert_eq!(analyzer_runs.get(), 2);
     }
