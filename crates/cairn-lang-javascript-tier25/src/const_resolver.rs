@@ -11,7 +11,7 @@
 //! File-uniqueness of these short qualified names is held by the
 //! `PackageIndex`, which keys by `(path, qualified)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Parser};
 
@@ -188,6 +188,14 @@ struct Visitor<'a> {
     source: &'a [u8],
     facts: FileConstFacts,
     container_stack: Vec<ContainerFrame>,
+    /// Byte ranges of `require(...)` call sites already turned into an
+    /// `ImportBinding`. Mirrors the Tier-1 backend's
+    /// `seen_require_sites` so the binding-form path
+    /// (`emit_var_declaration`) and the new statement / expression /
+    /// re-export paths can't double-emit the same call. Keyed on the
+    /// call site itself (not the module-literal range) so two distinct
+    /// calls to the same specifier don't collide.
+    seen_require_sites: HashSet<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +212,7 @@ impl<'a> Visitor<'a> {
             source,
             facts: FileConstFacts::default(),
             container_stack: Vec::new(),
+            seen_require_sites: HashSet::new(),
         }
     }
 
@@ -265,10 +274,12 @@ impl<'a> Visitor<'a> {
             }
             "assignment_expression" => {
                 self.emit_assignment(node);
+                self.try_emit_reexport_require(node);
                 // Fall through to capture nested calls.
             }
             "call_expression" => {
                 self.emit_call(node);
+                self.try_emit_expression_position_require(node);
                 // Fall through to recurse arguments.
             }
             _ => {}
@@ -444,6 +455,12 @@ impl<'a> Visitor<'a> {
             return;
         };
         let module_range = module_node.byte_range();
+        // Claim this require call site so the generic
+        // `try_emit_expression_position_require` doesn't double-emit a
+        // SideEffect ImportBinding for the same call.
+        let call_range = require_call.byte_range();
+        self.seen_require_sites
+            .insert((call_range.start as u32, call_range.end as u32));
 
         match name_node.kind() {
             "identifier" => {
@@ -789,6 +806,159 @@ impl<'a> Visitor<'a> {
         }
     }
 
+    // ─── statement / expression / re-export `require(...)` ──────────
+    //
+    // Type alias kept inside the impl block via the helper below.
+
+    /// Structural recognizer for `require('<literal>')`. Returns the
+    /// module specifier text, the byte range of the string-literal
+    /// source node (for `ImportBinding.site_byte_*`), and the call site
+    /// byte range (for `seen_require_sites`).
+    ///
+    /// Must match the Tier-1 backend's `is_require_string_call` shape
+    /// bit-for-bit:
+    ///   * callee is `node.kind() == "identifier"` with text "require"
+    ///     (rejects `require.resolve(...)` member callees)
+    ///   * first positional arg is `node.kind() == "string"`
+    ///     (rejects `require(name)`, ``require(`./` + x)``, etc.)
+    fn is_require_string_call(&self, call: Node<'_>) -> Option<RequireCallShape> {
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let func = call.child_by_field_name("function")?;
+        if func.kind() != "identifier" || self.text(func) != "require" {
+            return None;
+        }
+        let args = call.child_by_field_name("arguments")?;
+        let mut cursor = args.walk();
+        let module_node = args.named_children(&mut cursor).next()?;
+        if module_node.kind() != "string" {
+            return None;
+        }
+        let module = string_literal_text(module_node, self.source)?;
+        let mr = module_node.byte_range();
+        let cr = call.byte_range();
+        Some((
+            module,
+            (mr.start as u32, mr.end as u32),
+            (cr.start as u32, cr.end as u32),
+        ))
+    }
+
+    /// Statement-position (`require('./setup');`) and any
+    /// expression-position (`app.use(require('./routes'))`,
+    /// argument-nested, etc.) `require('<literal>')` call. Emits a
+    /// `SideEffect` `ImportBinding` so the require-graph still produces
+    /// a module edge / `target_path` — but no `ResolvedBinding` is
+    /// created (the existing `kind != SideEffect && !local.is_empty()`
+    /// guard in `require_graph.rs` already skips this kind), so the
+    /// call doesn't leak a fake alias into `dispatch`'s alias map.
+    fn try_emit_expression_position_require(&mut self, call: Node<'_>) {
+        let Some((module, module_range, call_range)) = self.is_require_string_call(call) else {
+            return;
+        };
+        if !self.seen_require_sites.insert(call_range) {
+            return;
+        }
+        self.facts.import_bindings.push(ImportBinding {
+            kind: ImportKind::SideEffect,
+            local: String::new(),
+            imported_name: None,
+            module,
+            site_byte_start: module_range.0,
+            site_byte_end: module_range.1,
+        });
+    }
+
+    /// `module.exports = require('./x')` re-export shape. Edge-only:
+    /// `ImportKind::SideEffect` with empty `local`, no
+    /// `ResolvedBinding`, and `target_qualified` stays `None` in the
+    /// require_graph.
+    ///
+    /// Named re-export `exports.X = require('./x')` and
+    /// `module.exports.X = require('./x')` are deliberately out of
+    /// scope for this PR — Tier-2.5 does not yet model re-export
+    /// graph semantics, so emitting an `ImportBinding` for the named
+    /// shape would mislead `dispatch`'s alias map without any
+    /// downstream consumer to resolve it.
+    ///
+    /// Named re-exports still need active handling: their RHS is a
+    /// real `require(...)` call, and the generic `call_expression`
+    /// visitor would otherwise emit a plain side-effect
+    /// `ImportBinding` for them. We **claim** the RHS call site in
+    /// `seen_require_sites` without emitting anything, keeping the
+    /// scope-out contract intact end-to-end.
+    fn try_emit_reexport_require(&mut self, node: Node<'_>) {
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        let Some(right) = node.child_by_field_name("right") else {
+            return;
+        };
+        let Some((module, module_range, call_range)) = self.is_require_string_call(right) else {
+            return;
+        };
+
+        // Strict `module.exports = require(...)` — emit the re-export
+        // edge.
+        if self.is_module_exports_member(left) {
+            if !self.seen_require_sites.insert(call_range) {
+                return;
+            }
+            self.facts.import_bindings.push(ImportBinding {
+                kind: ImportKind::SideEffect,
+                local: String::new(),
+                imported_name: None,
+                module,
+                site_byte_start: module_range.0,
+                site_byte_end: module_range.1,
+            });
+            return;
+        }
+
+        // Named re-export (`exports.X = require(...)` /
+        // `module.exports.X = require(...)`): scope-out per spec.
+        // Claim the RHS call site so the generic visitor doesn't
+        // fall through and emit a side-effect ImportBinding for it.
+        if self.is_named_reexport_lhs(left) {
+            self.seen_require_sites.insert(call_range);
+        }
+    }
+
+    /// `module.exports` exact member-expression LHS.
+    fn is_module_exports_member(&self, node: Node<'_>) -> bool {
+        if node.kind() != "member_expression" {
+            return false;
+        }
+        let Some(obj) = node.child_by_field_name("object") else {
+            return false;
+        };
+        let Some(prop) = node.child_by_field_name("property") else {
+            return false;
+        };
+        obj.kind() == "identifier"
+            && self.text(obj) == "module"
+            && prop.kind() == "property_identifier"
+            && self.text(prop) == "exports"
+    }
+
+    /// Named-re-export LHS shapes: `exports.X` (single-level) or
+    /// `module.exports.X` (nested). Both are scope-out for this PR;
+    /// we detect them only to suppress the generic visitor's
+    /// side-effect emission for their RHS require call.
+    fn is_named_reexport_lhs(&self, node: Node<'_>) -> bool {
+        if node.kind() != "member_expression" {
+            return false;
+        }
+        let Some(obj) = node.child_by_field_name("object") else {
+            return false;
+        };
+        if obj.kind() == "identifier" && self.text(obj) == "exports" {
+            return true;
+        }
+        self.is_module_exports_member(obj)
+    }
+
     // ─── calls ───────────────────────────────────────────────────────
 
     fn emit_call(&mut self, node: Node<'_>) {
@@ -810,6 +980,11 @@ impl<'a> Visitor<'a> {
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────
+
+/// `(module_specifier_text, module_string_byte_range, call_site_byte_range)`.
+/// Returned by `Visitor::is_require_string_call`; bundled so the three
+/// distinct emit paths don't each take three positional return values.
+type RequireCallShape = (String, (u32, u32), (u32, u32));
 
 fn find_direct_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
