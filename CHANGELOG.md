@@ -48,6 +48,47 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Kotlin Tier-1 emits enum entries and constructors.** `enum class
+  Color { RED, GREEN }` now surfaces `Color.RED` / `Color.GREEN` as
+  `SymbolKind::Constant` (mirroring the Java backend's
+  `enum_constant` shape), and `class Foo(val x: Int)` /
+  `class Foo { constructor(x: Int) { ... } }` surface as
+  `SymbolKind::Constructor` at qualified `pkg.Foo.Foo` (parent class
+  FQN + class short name, same shape Java already emits for
+  `Foo::new`). Pre-fix Java↔Kotlin cross-parser lookups for
+  `MyEnum.VALUE` and `new Foo(...)` missed and fell through to
+  tier2-fact because the row simply didn't exist on the Kotlin side.
+  Constructors are not pushed as nesting parents — `val`/`var`
+  primary-constructor parameters continue to attach as properties of
+  the enclosing class, not of the synthetic ctor symbol. Kotlin
+  `parser_revision` 3 → 4 — the daemon's PR-#220 startup
+  staleness scanner auto-enqueues a reindex when an upgraded build
+  first opens an existing workspace. No manual
+  `cairn ctl repo reindex <alias>` is required; this is the first
+  real-world exercise of that auto-rerun pathway.
+- **Kotlin Tier-2.5 absorbs the JVM `<File>Kt` synthetic class.**
+  Java callers cross-calling Kotlin top-level functions write
+  `FooKt.bar()` (or `com.x.FooKt.bar()`); the JVM compiler
+  synthesizes `<File>Kt` to host top-level callables. A new
+  Stage 7.5 in `resolve_dotted_call` strips a trailing `*Kt`
+  segment and routes the call to
+  `methods.get_package_callable(pkg, method)` so the edge resolves
+  to e.g. `com.x.bar`. Discipline:
+  literal workspace `class FooKt` / `object FooKt` always wins
+  (verified via `lookup_unique`); the normalization never routes
+  into `get_unique_by_name` (R2 contract from PR #219 — would
+  re-introduce the same-short-name collision class that PR closed);
+  the alias-bound terminal contract is preserved end-to-end
+  (`import pkg.b.FooKt; FooKt.bar()` does not fall through to a
+  same-package `bar` when `pkg.b` has no `bar`). Kotlin Tier-2.5
+  `analyzer_revision` 4 → 5; the same PR-#220 startup scanner
+  auto-enqueues the rerun.
+- Known limitation: `@file:JvmName("Custom")` is not handled. The
+  annotation rewrites the synthetic class name from `<File>Kt` to
+  `Custom`, but tree-sitter-kotlin-ng does not surface that
+  annotation reliably from Tier-1 syntax alone. Affected Java
+  callers' `Custom.bar()` calls stay unresolved at Tier-2.5; a
+  Tier-3 LSP cross-check is the intended fix.
 - **Kotlin Tier-2.5 dispatch chain is path-aware.** `PackageIndex` and
   `RequireGraph` bindings now key by `(path, qualified)` instead of
   qualified-only. Cross-file same-name class collisions no longer
