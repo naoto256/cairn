@@ -406,6 +406,31 @@ pub struct EnqueueReindex<'a> {
     pub now_ns: i64,
 }
 
+/// Public enqueue request for one specific (manifest, analyzer) pair.
+///
+/// Caller supplies the routing identity (`alias`, `repo_hash`,
+/// `repo_root`, `manifest_id`, `analyzer_id`) and a clock
+/// (`now_ns`). The run-row stamp — `analyzer_revision`, `config_hash`,
+/// `pool_group`, `job_id` — is derived **inside**
+/// [`JobManager::enqueue_analyzer_run`] from the linked-in analyzer
+/// registry, so a buggy caller cannot stamp a stale revision or a
+/// wrong pool group. If the linked-in registry has no analyzer with
+/// the requested `analyzer_id` for this manifest, the enqueue
+/// returns `Ok(None)` (typed skip) instead of synthesizing a row.
+///
+/// De-dup against running/queued jobs and the in-memory tracked-keys
+/// set still applies; concurrent identical requests collapse to one
+/// row, with the loser observing `Ok(None)`.
+pub struct EnqueueAnalyzerRun<'a> {
+    pub conn: &'a mut Connection,
+    pub alias: &'a str,
+    pub repo_hash: &'a str,
+    pub repo_root: &'a Path,
+    pub manifest_id: ManifestId,
+    pub analyzer_id: &'a str,
+    pub now_ns: i64,
+}
+
 impl JobManager {
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Arc<Self> {
@@ -549,6 +574,67 @@ impl JobManager {
             }
         }
         Ok(())
+    }
+
+    /// Enqueue one `(manifest_id, analyzer_id)` rerun. The job stamp
+    /// (`analyzer_revision`, `config_hash`, `pool_group`, `job_id`) is
+    /// computed **inside** this method from the linked-in analyzer
+    /// registry — callers do not (and must not) supply those values.
+    /// This is the single source of truth for what "an analyzer rerun
+    /// at this manifest" hashes to: a buggy caller cannot stamp a
+    /// stale revision or a wrong pool group.
+    ///
+    /// Returns:
+    /// * `Ok(Some(job))` when a fresh row is queued.
+    /// * `Ok(None)` when the analyzer is not in
+    ///   [`expected_analyzers_for_manifest`] for this manifest (the
+    ///   linked-in registry has no producer for that id — typed skip,
+    ///   not a failure), OR when the de-dup / tracked-keys gate
+    ///   coalesces the request away.
+    ///
+    /// # Errors
+    /// SQLite errors from the underlying write or
+    /// `expected_analyzers_for_manifest` query.
+    pub fn enqueue_analyzer_run(
+        &self,
+        request: EnqueueAnalyzerRun<'_>,
+    ) -> Result<Option<QueuedAnalyzerJob>> {
+        let EnqueueAnalyzerRun {
+            conn,
+            alias,
+            repo_hash,
+            repo_root,
+            manifest_id,
+            analyzer_id,
+            now_ns,
+        } = request;
+
+        // Single source of truth: find the linked-in analyzer for this
+        // manifest by id. If absent (e.g. an obsolete analyzer_id from
+        // a build the persisted row remembers but this build has
+        // dropped), skip cleanly rather than stamping a synthesized
+        // row.
+        let analyzers = expected_analyzers_for_manifest(conn, manifest_id)?;
+        let Some(analyzer) = analyzers.iter().find(|a| a.id() == analyzer_id) else {
+            return Ok(None);
+        };
+        let (analyzer_revision, cfg, pool_group) =
+            crate::workspace_analyzer::compute_analyzer_run_inputs(analyzer.as_ref(), repo_root);
+        let job_id = next_job_id(conn)?.max(now_ns);
+
+        self.queue_analyzer_run(QueueAnalyzerRun {
+            conn,
+            alias,
+            repo_hash,
+            repo_root,
+            manifest_id,
+            now_ns,
+            job_id,
+            analyzer_id,
+            analyzer_revision,
+            config_hash: &cfg,
+            pool_group,
+        })
     }
 
     pub fn enqueue_reindex(&self, request: EnqueueReindex<'_>) -> Result<Vec<QueuedAnalyzerJob>> {
@@ -1377,6 +1463,16 @@ fn next_job_id(conn: &Connection) -> Result<JobId> {
     Ok(max.unwrap_or_else(now_ns) + 1)
 }
 
+impl JobManager {
+    /// Borrow the [`CasDataDir`] this manager was constructed with.
+    /// The revision-staleness scanner needs it to enumerate stores
+    /// without re-threading the path through Daemon::run.
+    #[must_use]
+    pub fn cas_data_dir(&self) -> &Arc<CasDataDir> {
+        &self.cas_data_dir
+    }
+}
+
 fn now_ns() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -2023,6 +2119,111 @@ mod tests {
             manifest_id: ManifestId(manifest_id),
             analyzer_id: analyzer_id.into(),
         }
+    }
+
+    /// `enqueue_analyzer_run` is the only public surface for a
+    /// **targeted** single-`(manifest, analyzer)` rerun. The stamp
+    /// (`analyzer_revision`, `config_hash`, `pool_group`, `job_id`) must
+    /// be derived inside JobManager — callers do not supply it — and
+    /// an unknown `analyzer_id` must return `Ok(None)` instead of
+    /// stamping a synthesized row. The de-dup gate must also hold:
+    /// a second call for the same `(manifest, analyzer)` while the
+    /// first is still `queued` coalesces.
+    #[test]
+    fn enqueue_analyzer_run_stamps_from_registry_and_dedupes() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        let manager = JobManager::new(Arc::clone(&cas_data_dir));
+        let repo_hash = "repo-hash";
+        let manifest_id = ManifestId(1);
+        let mut conn = cas_store::open(&cas_data_dir.store_db_path(repo_hash)).unwrap();
+        insert_manifest(&conn, manifest_id.0);
+        insert_manifest_parser(&conn, manifest_id, "src/fake.rs", "fake-sha", "fake-parser");
+
+        // Unknown analyzer id → typed skip, no row written.
+        let skip = manager
+            .enqueue_analyzer_run(super::EnqueueAnalyzerRun {
+                conn: &mut conn,
+                alias: "repo",
+                repo_hash,
+                repo_root: repo.path(),
+                manifest_id,
+                analyzer_id: "not-in-registry",
+                now_ns: 1,
+            })
+            .unwrap();
+        assert!(
+            skip.is_none(),
+            "unknown analyzer id must skip cleanly without stamping a row"
+        );
+        let unknown_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs
+                 WHERE analyzer_id = 'not-in-registry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown_rows, 0);
+
+        // Known analyzer id (fake-workspace, registered via the
+        // distributed_slice in workspace_analyzer/mod.rs test helpers)
+        // → enqueue with the stamp derived from the analyzer instance,
+        // not caller-supplied.
+        let queued = manager
+            .enqueue_analyzer_run(super::EnqueueAnalyzerRun {
+                conn: &mut conn,
+                alias: "repo",
+                repo_hash,
+                repo_root: repo.path(),
+                manifest_id,
+                analyzer_id: "fake-workspace",
+                now_ns: 1,
+            })
+            .unwrap()
+            .expect("first enqueue should queue");
+        assert_eq!(queued.analyzer_id, "fake-workspace");
+
+        // The stamped revision matches the linked-in registry value (7),
+        // proving the API computed it internally rather than echoing a
+        // caller value.
+        let stamped_rev: i64 = conn
+            .query_row(
+                "SELECT analyzer_revision FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'fake-workspace'",
+                [manifest_id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped_rev, 7);
+
+        // Second call for the same (manifest, analyzer) coalesces while
+        // the first is still queued — only one row total.
+        let dup = manager
+            .enqueue_analyzer_run(super::EnqueueAnalyzerRun {
+                conn: &mut conn,
+                alias: "repo",
+                repo_hash,
+                repo_root: repo.path(),
+                manifest_id,
+                analyzer_id: "fake-workspace",
+                now_ns: 2,
+            })
+            .unwrap();
+        assert!(
+            dup.is_none(),
+            "duplicate enqueue while queued should coalesce"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'fake-workspace'",
+                [manifest_id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     fn test_queue_request<'a>(
