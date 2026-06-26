@@ -351,6 +351,78 @@ fn resolve_dotted_call(
         }
     }
 
+    // Stage 7.5 — JVM `<File>Kt` synthetic-class normalization.
+    //
+    // Kotlin top-level functions JVM-compile into a synthetic class
+    // whose name is the source file's stem + `Kt` (`Foo.kt` →
+    // `FooKt`). Java callers cross-calling `FooKt.bar()` come into
+    // this resolver as `parts=["FooKt"]`, `method="bar"` — Stage 6
+    // misses because no workspace `FooKt` class exists, and Stage 8
+    // misses because `FooKt` is not a package.
+    //
+    // Narrow normalization rules (R2 strict):
+    //   * Only fires when `!alias_head_bound` — `import x.FooKt; FooKt.bar()`
+    //     is terminal at the binding (PR #219 contract). Stage 7
+    //     already handles the bound case via `get_package_callable`
+    //     on `binding.target_qualified`.
+    //   * Only fires when the dotted prefix ends with a `*Kt`-suffixed
+    //     segment (`FooKt`, `com.x.FooKt`).
+    //   * Only fires when no literal `class/object FooKt` exists at
+    //     that FQN (a real `object FooKt` wins — verified through
+    //     `lookup_unique`, package-agnostic uniqueness).
+    //   * Only routes into `methods.get_package_callable(stripped,
+    //     method)` — never `get_unique_by_name` (R2 strict: would
+    //     re-introduce the collision class of bug PR #219 closed).
+    //   * Strips ONE trailing `Kt` segment: `com.x.FooKt` → package
+    //     `com.x`. `@file:JvmName("Custom")` (which would produce a
+    //     `Custom` synthetic instead of `<File>Kt`) is documented as
+    //     a known limitation in CHANGELOG; tree-sitter-kotlin-ng does
+    //     not surface that annotation reliably, so it's a Tier-3 LSP
+    //     concern.
+    if !alias_head_bound {
+        if let Some(head) = parts.last() {
+            if head.ends_with("Kt") && head.len() > 2 {
+                // For bare `FooKt.bar()` the `parts` slice has no
+                // explicit package prefix — Java callers cross-calling
+                // a Kotlin top-level function in the *same package*
+                // come in this way. Fall back to the calling file's
+                // own package so `package util; UtilKt.bar()` routes
+                // to `util.bar`, not the root-package `bar` (which
+                // does not exist as a top-level callable in the
+                // workspace).
+                let same_package_prefix: &str = file_facts.package.as_deref().unwrap_or("");
+                let literal_qualified = if parts.len() == 1 && !same_package_prefix.is_empty() {
+                    format!("{same_package_prefix}.{head}")
+                } else {
+                    parts.join(".")
+                };
+                // Real `class FooKt` / `object FooKt` always wins —
+                // the synthetic strip only applies when no such
+                // workspace symbol exists. We also check the
+                // same-package literal to keep a real `object UtilKt`
+                // in the calling file's package from being shadowed.
+                if package_index.lookup_unique(&literal_qualified).is_none() {
+                    // Drop the `*Kt` segment entirely — Kotlin
+                    // top-level callables are keyed by their
+                    // *package* FQN, not by `package.FileStem`.
+                    // `com.x.FooKt.bar()` → package `com.x`;
+                    // bare `FooKt.bar()` in `package util` → `util`.
+                    let pkg = if parts.len() == 1 {
+                        same_package_prefix.to_string()
+                    } else {
+                        parts[..parts.len() - 1].join(".")
+                    };
+                    if let Some(hit) = methods.get_package_callable(&pkg, method) {
+                        return Some(DispatchResolution {
+                            path: hit.path.clone(),
+                            qualified: hit.qualified.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Terminal-alias short-circuit (see top-of-function comment).
     // If `parts[0]` was an `import`-bound head, the prefix's meaning
     // is fixed by Stage 6 / 7. A miss there is unresolved — never

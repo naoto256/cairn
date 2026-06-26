@@ -55,7 +55,18 @@ impl LanguageBackend for KotlinBackend {
         // (`com.x.JsonAdapter`) and the bare-name symbols never
         // matched. Index/blame consumers continue to read the
         // unchanged `name` column for prefix and FTS lookups.
-        3
+        //
+        // rev 4: emit `enum_entry` (`SymbolKind::Constant`, qualified
+        // `pkg.Enum.VALUE`) and both `primary_constructor` /
+        // `secondary_constructor` (`SymbolKind::Constructor`, qualified
+        // `pkg.Class.Class`). Mirrors the Java backend's
+        // `enum_constant` / `constructor_declaration` shape so
+        // cross-parser `MyEnum.VALUE` and `new Foo(...)` joins hit
+        // the same `(kind, qualified)` row instead of falling through
+        // to tier2-fact. Existing blob caches are invalidated; the
+        // PR #220 staleness scanner auto-enqueues reindex at daemon
+        // startup, no manual `cairn ctl repo reindex` required.
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -250,6 +261,56 @@ fn match_kotlin_item(node: Node<'_>, source: &[u8]) -> Option<(SymbolKind, Strin
                 SymbolKind::TypeAlias,
                 node_text(name, source).to_string(),
                 None,
+            ))
+        }
+        // Enum entries (`enum class Color { RED, GREEN }` → `RED`,
+        // `GREEN`). Modeled as `Constant` for cross-parser symmetry
+        // with the Java backend's `enum_constant` (Java↔Kotlin
+        // interop lookups join on `(kind, qualified)`). Kotlin's
+        // internal semantics treat each entry as a singleton object
+        // of the enum class — closer to a Property — but interop
+        // symmetry is the primary motivator: a Java caller writing
+        // `MyEnum.VALUE` must hit the same `Constant` shape whether
+        // the enum is declared in Java or Kotlin.
+        "enum_entry" => {
+            let name = find_direct_child(node, "identifier")?;
+            Some((
+                SymbolKind::Constant,
+                node_text(name, source).to_string(),
+                None,
+            ))
+        }
+        // Primary constructor: `class Foo(val x: Int)`. Name = parent
+        // class short name (Kotlin/Java convention `Foo.Foo` qualified),
+        // body_start = None (primaries are not containers — the
+        // `val`/`var` class_parameter children are emitted as
+        // properties from their own visitor pass at the class_body
+        // scope, not nested under the constructor).
+        "primary_constructor" => {
+            let parent = node.parent()?;
+            let class_name = child_by_field(parent, "name")?;
+            Some((
+                SymbolKind::Constructor,
+                node_text(class_name, source).to_string(),
+                None,
+            ))
+        }
+        // Secondary constructor: `class Foo { constructor(x: Int) { ... } }`.
+        // Name = parent class short name (same qualified shape as
+        // primary). body_start = the `block` child when present so
+        // the signature slice stops at the brace.
+        "secondary_constructor" => {
+            let parent = node.parent()?;
+            // Walk up past `class_body` to the enclosing class.
+            let class_decl = parent
+                .parent()
+                .filter(|p| matches!(p.kind(), "class_declaration" | "object_declaration"))?;
+            let class_name = child_by_field(class_decl, "name")?;
+            let body_start = find_direct_child(node, "block").map(|n| n.start_byte());
+            Some((
+                SymbolKind::Constructor,
+                node_text(class_name, source).to_string(),
+                body_start,
             ))
         }
         _ => None,
@@ -480,7 +541,11 @@ sealed class Result<out T> {
     data class Failure(val error: Throwable) : Result<Nothing>()
 }
 
-data class User(val id: Long, var name: String)
+data class User(val id: Long, var name: String) {
+    constructor(id: Long) : this(id, "anon") {
+        require(id >= 0)
+    }
+}
 
 object Registry {
     val users = mutableListOf<User>()
@@ -726,6 +791,92 @@ suspend fun process(input: String): Result<User> {
         let facts = facts();
         assert!(facts.symbols.iter().all(|s| s.name != "local"));
         assert!(facts.symbols.iter().all(|s| s.name != "kind"));
+    }
+
+    #[test]
+    fn enum_entries_emit_as_constants_qualified_under_enum() {
+        let facts = facts();
+        // `enum class Color { RED, GREEN }` — each entry must surface
+        // as a `Constant` at `pkg.Color.<NAME>`, matching the Java
+        // backend's `enum_constant` shape for cross-parser interop.
+        let red = symbol(&facts, "com.example.app.Color.RED");
+        assert_eq!(red.kind, SymbolKind::Constant);
+        assert_eq!(red.name, "RED");
+        let green = symbol(&facts, "com.example.app.Color.GREEN");
+        assert_eq!(green.kind, SymbolKind::Constant);
+        // parent_idx threads back through the Enum container.
+        let color_idx = facts
+            .symbols
+            .iter()
+            .position(|s| s.qualified == "com.example.app.Color")
+            .unwrap();
+        assert_eq!(red.parent_idx, Some(color_idx));
+    }
+
+    #[test]
+    fn primary_constructor_emits_under_class_qualified() {
+        let facts = facts();
+        // `data class User(val id: Long, var name: String)` — the
+        // primary constructor surfaces as `Constructor` at
+        // `pkg.User.User` (name = class short name, parent qualified
+        // shape mirrors Java).
+        let ctors: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.qualified == "com.example.app.User.User")
+            .collect();
+        assert!(
+            !ctors.is_empty(),
+            "expected at least one User.User constructor; got {:?}",
+            facts
+                .symbols
+                .iter()
+                .map(|s| (&s.name, &s.qualified, &s.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(ctors.iter().all(|c| c.kind == SymbolKind::Constructor));
+        assert!(ctors.iter().all(|c| c.name == "User"));
+        // At least one of them (the primary) is body-less.
+        assert!(ctors.iter().any(|c| c.body_start.is_none()));
+    }
+
+    #[test]
+    fn secondary_constructor_emits_with_body_start() {
+        let facts = facts();
+        // The fixture `User` declares a secondary `constructor(id: Long)`
+        // alongside its primary — there must be two ctor rows, and
+        // exactly one of them carries a `body_start`.
+        let ctors: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.qualified == "com.example.app.User.User" && s.kind == SymbolKind::Constructor
+            })
+            .collect();
+        assert_eq!(
+            ctors.len(),
+            2,
+            "expected primary + secondary; got {:?}",
+            ctors
+        );
+        let bodied = ctors.iter().filter(|c| c.body_start.is_some()).count();
+        assert_eq!(bodied, 1, "exactly the secondary should carry body_start");
+    }
+
+    #[test]
+    fn constructors_are_not_pushed_as_containers() {
+        // Regression guard: ctors must not become nesting parents
+        // (would re-qualify any sibling symbol under the ctor).
+        let facts = facts();
+        let user_idx = facts
+            .symbols
+            .iter()
+            .position(|s| s.qualified == "com.example.app.User")
+            .unwrap();
+        let id_prop = symbol(&facts, "com.example.app.User.id");
+        // `id` is the constructor `val` param — its parent must be
+        // the class, not the synthetic constructor symbol.
+        assert_eq!(id_prop.parent_idx, Some(user_idx));
     }
 
     #[test]

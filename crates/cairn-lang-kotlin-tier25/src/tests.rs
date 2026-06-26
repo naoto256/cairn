@@ -618,7 +618,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "kotlin-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 4);
+    assert_eq!(ANALYZER_REVISION, 5);
     assert_eq!(PARSER_ID, "tree-sitter-kotlin-ng");
     assert_eq!(RESOLUTION_SOURCE, "tier25-kotlin-resolver");
 }
@@ -886,5 +886,187 @@ fun main() {
         "alias-bound prefix must NOT fall through to same-package; \
          leaked into app.Registry.Inner.build: {:#?}",
         leaked,
+    );
+}
+
+// ─── FileKt synthetic-class normalization (Stage 7.5) ────────────────────
+
+#[test]
+fn filekt_synthetic_class_routes_to_package_top_level() {
+    // Java→Kotlin top-level call shape: top-level `fun bar()` in
+    // `package util` JVM-compiles to `util.UtilKt.bar`. Java callers
+    // come into the resolver as `parts=["UtilKt"]` (or
+    // `["util", "UtilKt"]`); Stage 7.5 strips `*Kt` and routes to
+    // `methods.get_package_callable(pkg, method)`.
+    //
+    // A second package also defines `bar()` so the last-resort
+    // unique-name fallback (Stage 10) CANNOT accidentally rescue
+    // the call — only Stage 7.5's package-targeted lookup picks
+    // the correct one.
+    let tmp = tempfile::tempdir().unwrap();
+    let util = "package util\n\nfun bar() {}\n";
+    let distractor = "package other\n\nfun bar() {}\n";
+    let caller = "package app\n\nfun main() {\n    util.UtilKt.bar()\n}\n";
+    let res = run(
+        tmp.path(),
+        &[
+            ("Util.kt", util),
+            ("Distractor.kt", distractor),
+            ("Main.kt", caller),
+        ],
+    );
+    let calls = calls_of(&res, "Main.kt");
+    let hit = calls
+        .iter()
+        .find(|c| c.target_qualified.as_deref() == Some("util.bar"))
+        .unwrap_or_else(|| {
+            panic!(
+                "util.UtilKt.bar() should normalize to util.bar (not other.bar); got {calls:#?}",
+            )
+        });
+    assert_eq!(hit.target_path.as_deref(), Some("Util.kt"));
+    // And the distractor must NOT have won.
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.target_qualified.as_deref() == Some("other.bar")),
+        "synthetic strip must target the right package, not unique-name fallback; got {:#?}",
+        calls
+    );
+}
+
+#[test]
+fn filekt_synthetic_normalization_does_not_override_real_object() {
+    // Regression: a real workspace `object UtilKt` MUST win over the
+    // synthetic strip. If somebody defines `object UtilKt { fun bar() }`
+    // in package `util`, then `util.UtilKt.bar()` from anywhere else
+    // is a literal call to that object's member, not a synthetic
+    // strip to `util.bar`.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = "package util\n\nobject UtilKt {\n    fun bar() {}\n}\n";
+    let caller = "package app\n\nfun main() {\n    util.UtilKt.bar()\n}\n";
+    let res = run(tmp.path(), &[("RealKt.kt", real), ("Main.kt", caller)]);
+    let calls = calls_of(&res, "Main.kt");
+    // The resolver should pick the literal object member.
+    let hit = calls
+        .iter()
+        .find(|c| c.target_qualified.as_deref() == Some("util.UtilKt.bar"))
+        .expect("real object UtilKt.bar should win; got {calls:#?}");
+    assert_eq!(hit.target_path.as_deref(), Some("RealKt.kt"));
+    // And must NOT have produced a phantom util.bar (no such symbol
+    // exists in the workspace anyway, but guard it).
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.target_qualified.as_deref() == Some("util.bar")),
+        "synthetic strip must not fire when literal object exists; got {:#?}",
+        calls
+    );
+}
+
+#[test]
+fn filekt_normalization_respects_alias_terminal_contract() {
+    // PR #219 terminal-alias contract: when an `import` binds the
+    // head, Stage 7.5 must NOT fire — `import pkg.b.UtilKt; UtilKt.bar()`
+    // is terminal at `pkg.b.UtilKt`. If `pkg.b` has no `bar`,
+    // resolution is None. The synthetic strip must NOT fall through
+    // to a same-package `bar()` that happens to share the short name.
+    let tmp = tempfile::tempdir().unwrap();
+    // `pkg.b` exists (so the import binding is workspace-resolved)
+    // but has no top-level `bar`. Stage 7 binding-aware lookup
+    // misses; Stage 7.5 must not silently re-route the call.
+    let b_marker = "package pkg.b\n\nclass Marker\n";
+    // Same-package `bar()` that would be the wrong target.
+    let app_bar = "package app\n\nfun bar() {}\n";
+    let caller = "\
+package app
+
+import pkg.b.UtilKt
+
+fun main() {
+    UtilKt.bar()
+}
+";
+    let res = run(
+        tmp.path(),
+        &[
+            ("Marker.kt", b_marker),
+            ("AppBar.kt", app_bar),
+            ("Main.kt", caller),
+        ],
+    );
+    let calls = calls_of(&res, "Main.kt");
+    let leaked: Vec<_> = calls
+        .iter()
+        .filter(|c| c.target_qualified.as_deref() == Some("app.bar"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "alias-bound UtilKt must NOT fall through to same-package bar; \
+         leaked into app.bar: {:#?}",
+        leaked,
+    );
+}
+
+#[test]
+fn filekt_synthetic_class_routes_same_package_bare_to_package_top_level() {
+    // R2 must-fix: bare `UtilKt.bar()` from inside `package util` must
+    // route to `util.bar` (the calling file's own package), NOT root
+    // package `bar`. Java callers cross-calling a Kotlin top-level
+    // function in the same package come in this way after a Tier-2
+    // emission that elides the package prefix.
+    //
+    // A distractor `package other` also defines `bar()` so the Stage 10
+    // unique-name fallback (deliberately not used by Stage 7.5) cannot
+    // accidentally rescue the call.
+    let tmp = tempfile::tempdir().unwrap();
+    let util = "package util\n\nfun bar() {}\n";
+    let distractor = "package other\n\nfun bar() {}\n";
+    let caller = "package util\n\nfun main() {\n    UtilKt.bar()\n}\n";
+    let res = run(
+        tmp.path(),
+        &[
+            ("Util.kt", util),
+            ("Distractor.kt", distractor),
+            ("Main.kt", caller),
+        ],
+    );
+    let calls = calls_of(&res, "Main.kt");
+    let hit = calls
+        .iter()
+        .find(|c| c.target_qualified.as_deref() == Some("util.bar"))
+        .unwrap_or_else(|| {
+            panic!(
+                "bare `UtilKt.bar()` in `package util` must normalize to util.bar \
+                 (not root.bar, not other.bar); got {calls:#?}"
+            )
+        });
+    assert_eq!(hit.target_path.as_deref(), Some("Util.kt"));
+}
+
+#[test]
+fn filekt_same_package_real_object_wins() {
+    // R2 must-fix: when a real `object UtilKt` exists in the calling
+    // file's own package, bare `UtilKt.bar()` must dispatch to that
+    // object's member — Stage 7.5 must check the same-package literal
+    // FQN (`util.UtilKt`) before stripping the `Kt` suffix.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = "package util\n\nobject UtilKt {\n    fun bar() {}\n}\n";
+    let caller = "package util\n\nfun main() {\n    UtilKt.bar()\n}\n";
+    let res = run(tmp.path(), &[("RealKt.kt", real), ("Main.kt", caller)]);
+    let calls = calls_of(&res, "Main.kt");
+    let hit = calls
+        .iter()
+        .find(|c| c.target_qualified.as_deref() == Some("util.UtilKt.bar"))
+        .unwrap_or_else(|| {
+            panic!("real same-package `object UtilKt.bar` should win; got {calls:#?}")
+        });
+    assert_eq!(hit.target_path.as_deref(), Some("RealKt.kt"));
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.target_qualified.as_deref() == Some("util.bar")),
+        "synthetic strip must not fire when same-package literal object exists; got {:#?}",
+        calls
     );
 }

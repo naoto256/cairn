@@ -82,7 +82,19 @@ pub const TIER_PREFIX: &str = "tier25";
 // adoption. Stale `workspace_analysis_runs` rows must be invalidated
 // so cached call edges that fell through to tier2-fact get re-run
 // against the path-aware resolver.
-pub const ANALYZER_REVISION: u32 = 4;
+//
+// rev 5: dispatch chain gained a narrow Stage 7.5 that strips the
+// JVM `<File>Kt` synthetic-class suffix for Java→Kotlin top-level
+// function calls. `FooKt.bar()` from a Java caller now resolves to
+// `com.foo.bar` when no literal workspace `class/object FooKt`
+// exists. The normalization stays in front of the
+// `alias_head_bound` short-circuit (PR #219 contract preserved) and
+// never routes into `get_unique_by_name`. Pre-rev-5 runs would have
+// fallen through to tier2-fact for these callsites; daemons must
+// invalidate cached runs so the path-aware resolver re-records the
+// edge. The PR #220 startup staleness scanner auto-enqueues the
+// rerun.
+pub const ANALYZER_REVISION: u32 = 5;
 pub const PARSER_ID: &str = "tree-sitter-kotlin-ng";
 pub const RESOLUTION_SOURCE: &str = "tier25-kotlin-resolver";
 
