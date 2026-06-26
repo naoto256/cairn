@@ -31,13 +31,26 @@ pub struct RequireEdge {
     pub target_qualified: Option<String>,
 }
 
+/// Resolved binding info preserved per (file, local-name). When the
+/// import target lives in the workspace, `target_path` is Some so
+/// downstream dispatch can do path-aware lookups instead of falling
+/// back to a HashMap-order first hit. `target_path` is None for
+/// external (stdlib / jar) imports — only `target_qualified` is known.
+#[derive(Debug, Clone)]
+pub struct ResolvedBinding {
+    pub target_path: Option<String>,
+    pub target_qualified: String,
+}
+
 #[derive(Debug, Default)]
 pub struct RequireGraph {
     edges: HashMap<String, Vec<RequireEdge>>,
-    /// `(file, local-name) → resolved FQN` so the resolver pass can
+    /// `(file, local-name) → resolved binding` so the resolver pass can
     /// re-look-up what each binding produced without re-walking
-    /// per-file facts.
-    bindings: HashMap<(String, String), String>,
+    /// per-file facts. Stores the full `(target_path, target_qualified)`
+    /// pair so dispatch can use `PackageIndex::lookup_in_file` instead
+    /// of the path-agnostic fallback.
+    bindings: HashMap<(String, String), ResolvedBinding>,
 }
 
 impl RequireGraph {
@@ -46,7 +59,7 @@ impl RequireGraph {
         package_index: &PackageIndex,
     ) -> Self {
         let mut edges: HashMap<String, Vec<RequireEdge>> = HashMap::new();
-        let mut bindings: HashMap<(String, String), String> = HashMap::new();
+        let mut bindings: HashMap<(String, String), ResolvedBinding> = HashMap::new();
 
         for (path, _, facts) in per_file {
             let mut list = Vec::new();
@@ -57,7 +70,13 @@ impl RequireGraph {
                     // them as alias bindings (they expand at use
                     // sites instead).
                     if b.kind != ImportKind::Wildcard {
-                        bindings.insert((path.clone(), b.local.clone()), q.clone());
+                        bindings.insert(
+                            (path.clone(), b.local.clone()),
+                            ResolvedBinding {
+                                target_path: target_path.clone(),
+                                target_qualified: q.clone(),
+                            },
+                        );
                     }
                 }
                 list.push(RequireEdge {
@@ -77,11 +96,12 @@ impl RequireGraph {
         self.edges.get(path).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Look up the resolved FQN this binding produced.
-    pub fn resolve_binding(&self, path: &str, binding: &ImportBinding) -> Option<String> {
+    /// Look up the resolved binding (path + qualified) this import
+    /// produced. Returns `None` only when no import binding for that
+    /// local name exists in the file.
+    pub fn resolve_binding(&self, path: &str, binding: &ImportBinding) -> Option<&ResolvedBinding> {
         self.bindings
             .get(&(path.to_string(), binding.local.clone()))
-            .cloned()
     }
 }
 
@@ -91,8 +111,12 @@ fn resolve_import(
 ) -> (Option<String>, Option<String>) {
     match b.kind {
         ImportKind::Plain | ImportKind::Aliased => {
-            // Try as a symbol (class / function / const) first.
-            if let Some(hit) = package_index.lookup(&b.fqn) {
+            // Try as a symbol (class / function / const) first. We use
+            // `lookup_unique` so a same-FQN collision (which would be a
+            // duplicate definition under Kotlin's package rules — and
+            // therefore a workspace bug) doesn't silently pick a
+            // first-hit winner.
+            if let Some(hit) = package_index.lookup_unique(&b.fqn) {
                 return (Some(hit.path.clone()), Some(hit.qualified.clone()));
             }
             // External jar / stdlib — leave unresolved (target_path

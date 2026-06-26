@@ -8,20 +8,30 @@
 //!   * `pkg.Cls.method(...)` — fully-qualified static call.
 //!   * `this.method(...)` — current lexical class's MRO walk.
 //!   * `super.method(...)` — MRO walk starting after the lexical class.
-//!   * `foo(...)` — bare callee resolved through the alias map
-//!     (covers `import x.y.foo`) → top-level function in current
-//!     package → wildcard-import top-level lookup.
+//!   * `foo(...)` — bare callee resolved through lexical class MRO,
+//!     the alias map (covers `import x.y.foo`), top-level function in
+//!     current package, or wildcard-import top-level lookup.
 //!
 //! `obj.method(...)` where `obj` is a local variable / parameter, and
 //! reflection (`KFunction::invoke`, `Class.forName(...)`, etc.), and
 //! extension functions on dynamic receivers are deliberately *not*
 //! recorded. Extension functions on a statically-known receiver are
 //! best-effort matched by name only.
+//!
+//! **Path discipline.** Every candidate qualified produced by the
+//! resolver cascade is validated against `PackageIndex` before being
+//! adopted — either via `lookup_in_file(path, qualified)` (when the
+//! resolver knows where the candidate should live) or via
+//! `lookup_unique(qualified)` (when the candidate isn't path-bound,
+//! e.g. an external-binding alias fallback). Returning an unchecked
+//! qualified from any stage would cut off later fallbacks; doing so is
+//! the bug Sub-fix B exists to prevent.
 
 use std::collections::HashMap;
 
 use crate::const_resolver::{CallReceiver, FileConstFacts, ImportKind, MethodCall, PackageIndex};
 use crate::mro::Mro;
+use crate::require_graph::ResolvedBinding;
 
 #[derive(Debug, Clone)]
 pub struct DispatchResolution {
@@ -32,6 +42,13 @@ pub struct DispatchResolution {
 /// Workspace-wide method index keyed by `(owner_qualified,
 /// method_name)`. The owner is either a class FQN, a companion FQN,
 /// or a package FQN (for top-level functions).
+///
+/// Owner-FQN is unique workspace-wide under Kotlin's package rules,
+/// so we don't need to key by `(path, owner)` the way the JS backend
+/// does (JS qualifieds are file-local short names; Kotlin qualifieds
+/// already include the package prefix). MRO walks remain FQN-keyed
+/// for the same reason — see `Mro::ancestors` for the explicit
+/// argument.
 #[derive(Debug, Default)]
 pub struct MethodIndex {
     by_owner: HashMap<(String, String), MethodEntry>,
@@ -104,16 +121,28 @@ impl MethodIndex {
     }
 }
 
+/// Candidate class target with both path and qualified — every stage
+/// of the resolver chain returns this rather than a bare string, so
+/// every adoption goes through a `PackageIndex` validation step.
+#[derive(Debug, Clone)]
+struct ResolvedClass {
+    path: String,
+    qualified: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_call(
+    source_path: &str,
     call: &MethodCall,
     package_index: &PackageIndex,
     mro: &Mro,
     methods: &MethodIndex,
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, ResolvedBinding>,
     file_facts: &FileConstFacts,
 ) -> Option<DispatchResolution> {
     match &call.receiver {
         CallReceiver::Dotted { parts } => resolve_dotted_call(
+            source_path,
             parts,
             &call.method,
             package_index,
@@ -123,43 +152,41 @@ pub fn resolve_call(
             file_facts,
         ),
         CallReceiver::ThisRef => {
-            let owner = call.lexical_class.clone()?;
-            for ancestor in mro.ancestors(&owner) {
-                if let Some(hit) = methods.get_method(&ancestor, &call.method) {
-                    return Some(DispatchResolution {
-                        path: hit.path.clone(),
-                        qualified: hit.qualified.clone(),
-                    });
-                }
-            }
-            None
+            // `this.method()` — walk lexical class's MRO including the
+            // class itself.
+            let owner = call.lexical_class.as_deref()?;
+            walk_mro(owner, &call.method, mro, methods, 0)
         }
         CallReceiver::SuperRef => {
+            // `super.method()` — skip the lexical class itself; we want
+            // the inherited definition.
             let owner = call.lexical_class.as_deref()?;
-            let chain = mro.ancestors(owner);
-            // Skip the lexical class itself.
-            for ancestor in chain.into_iter().skip(1) {
-                if let Some(hit) = methods.get_method(&ancestor, &call.method) {
-                    return Some(DispatchResolution {
-                        path: hit.path.clone(),
-                        qualified: hit.qualified.clone(),
-                    });
-                }
-            }
-            None
+            walk_mro(owner, &call.method, mro, methods, 1)
         }
         CallReceiver::Bare { name } => {
-            // 1. Alias-bound bare name (`import com.foo.helper` ⇒
-            // `helper()` resolves to `com.foo.helper`).
-            if let Some(target_fqn) = aliases.get(name) {
-                if let Some(hit) = package_index.lookup(target_fqn) {
+            // 1. Lexical-class MRO: bare `foo()` inside a class body
+            //    must check inherited methods before falling out to
+            //    top-level / alias resolution. Mirrors JS Bare stage.
+            if let Some(owner) = call.lexical_class.as_deref() {
+                if let Some(hit) = walk_mro(owner, name, mro, methods, 0) {
+                    return Some(hit);
+                }
+            }
+            // 2. Alias-bound bare name (`import com.foo.helper` ⇒
+            //    `helper()` resolves to `com.foo.helper`). Use the
+            //    binding's `target_path` to avoid first-hit on
+            //    qualified collision.
+            if let Some(binding) = aliases.get(name) {
+                if let Some(hit) =
+                    lookup_via_binding(binding, &binding.target_qualified, package_index)
+                {
                     return Some(DispatchResolution {
-                        path: hit.path.clone(),
-                        qualified: hit.qualified.clone(),
+                        path: hit.path,
+                        qualified: hit.qualified,
                     });
                 }
             }
-            // 2. Current-package top-level function.
+            // 3. Current-package top-level function.
             if let Some(pkg) = file_facts.package.as_deref() {
                 if let Some(hit) = methods.get_package_callable(pkg, name) {
                     return Some(DispatchResolution {
@@ -168,7 +195,7 @@ pub fn resolve_call(
                     });
                 }
             }
-            // 3. Wildcard-imported package top-level function.
+            // 4. Wildcard-imported package top-level function.
             for b in &file_facts.import_bindings {
                 if b.kind == ImportKind::Wildcard {
                     if let Some(hit) = methods.get_package_callable(&b.fqn, name) {
@@ -179,58 +206,186 @@ pub fn resolve_call(
                     }
                 }
             }
+            // 5. Last-resort unique-name match (best-effort extension
+            //    fallback).
+            if let Some(hit) = methods.get_unique_by_name(name) {
+                return Some(DispatchResolution {
+                    path: hit.path.clone(),
+                    qualified: hit.qualified.clone(),
+                });
+            }
             None
         }
         CallReceiver::Unknown => None,
     }
 }
 
-fn resolve_dotted_call(
-    parts: &[String],
-    method: &str,
-    package_index: &PackageIndex,
+/// Walk `class`'s MRO from `skip` ancestors deep (0 = include class
+/// itself, 1 = skip-self for `super`). Returns the first method
+/// matching `name`.
+fn walk_mro(
+    class: &str,
+    name: &str,
     mro: &Mro,
     methods: &MethodIndex,
-    aliases: &HashMap<String, String>,
-    file_facts: &FileConstFacts,
+    skip: usize,
 ) -> Option<DispatchResolution> {
-    let class_qualified =
-        resolve_dotted_to_qualified(parts, aliases, file_facts.package.as_deref(), file_facts)?;
-    // 1. Class-method dispatch: the dotted prefix resolves to a
-    // workspace class — walk its MRO.
-    if package_index.lookup(&class_qualified).is_some() {
-        for ancestor in mro.ancestors(&class_qualified) {
-            if let Some(hit) = methods.get_method(&ancestor, method) {
-                return Some(DispatchResolution {
-                    path: hit.path.clone(),
-                    qualified: hit.qualified.clone(),
-                });
-            }
-        }
-    }
-    // 2. Package-level call: `pkg.foo()` where `pkg` is a workspace
-    // package. The dotted prefix is the package, the method is its
-    // top-level function.
-    if package_index.has_package(&class_qualified) {
-        if let Some(hit) = methods.get_package_callable(&class_qualified, method) {
+    for ancestor in mro.ancestors(class).into_iter().skip(skip) {
+        if let Some(hit) = methods.get_method(&ancestor, name) {
             return Some(DispatchResolution {
                 path: hit.path.clone(),
                 qualified: hit.qualified.clone(),
             });
         }
     }
-    // 3. Composite FQN: `parts.method` resolves directly to a workspace
-    // symbol (covers `Cls.STATIC_FIELD` chains via the package index).
-    let composite = format!("{class_qualified}.{method}");
-    if let Some(hit) = package_index.lookup(&composite) {
+    None
+}
+
+/// Validate an `(binding, qualified)` pair into a workspace target.
+/// When the binding pins a file (workspace-resolved import), require
+/// the candidate to live in that file. Otherwise fall back to a
+/// path-agnostic unique lookup. Never falls through to a first-hit.
+fn lookup_via_binding(
+    binding: &ResolvedBinding,
+    qualified: &str,
+    package_index: &PackageIndex,
+) -> Option<ResolvedClass> {
+    if let Some(target_path) = &binding.target_path {
+        if let Some(hit) = package_index.lookup_in_file(target_path, qualified) {
+            return Some(ResolvedClass {
+                path: hit.path.clone(),
+                qualified: hit.qualified.clone(),
+            });
+        }
+        // Binding had a path but the candidate doesn't live there. Do
+        // NOT silently fall through — that would re-introduce the
+        // collision bug.
+        return None;
+    }
+    package_index
+        .lookup_unique(qualified)
+        .map(|hit| ResolvedClass {
+            path: hit.path.clone(),
+            qualified: hit.qualified.clone(),
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_dotted_call(
+    source_path: &str,
+    parts: &[String],
+    method: &str,
+    package_index: &PackageIndex,
+    mro: &Mro,
+    methods: &MethodIndex,
+    aliases: &HashMap<String, ResolvedBinding>,
+    file_facts: &FileConstFacts,
+) -> Option<DispatchResolution> {
+    if parts.is_empty() {
+        return None;
+    }
+
+    // Terminal-alias contract: once an `import` binds `parts[0]`, the
+    // dotted prefix is finalized to that binding. Stage 6 / 7 may
+    // succeed inside the binding's scope, but if neither does, the
+    // resolver must return None — downstream Stage 8-10 fallbacks
+    // would silently re-interpret the user's `import` and adopt an
+    // unrelated workspace symbol that happens to share a short name.
+    // This pins R2's path-bound-alias contract end-to-end.
+    let alias_head_bound = aliases.contains_key(&parts[0]);
+
+    // Stage 6 (the heaviest): resolve the dotted prefix to a class
+    // target, then dispatch the method through its MRO.
+    if let Some(class_target) =
+        resolve_class_target(source_path, parts, aliases, file_facts, package_index)
+    {
+        // (a) static-style: `Cls.method` registered as composite FQN
+        // (companion members, nested-object members) — try the
+        // composite first via path-aware lookup.
+        let composite = format!("{}.{}", class_target.qualified, method);
+        if let Some(hit) = package_index.lookup_in_file(&class_target.path, &composite) {
+            return Some(DispatchResolution {
+                path: hit.path.clone(),
+                qualified: hit.qualified.clone(),
+            });
+        }
+        // (b) instance-method MRO walk anchored at the class FQN.
+        if let Some(hit) = walk_mro(&class_target.qualified, method, mro, methods, 0) {
+            return Some(hit);
+        }
+    }
+
+    // Stage 7: best-effort package-like alias shapes. When a dotted
+    // call's head is an import binding, retry the tail against
+    // package-level callables in the bound qualified namespace.
+    // Kotlin does not have JS's `import * as F` namespace concept,
+    // but the resolver still encounters `Container.foo()` shapes
+    // where `Container` resolves via the alias map and `foo` ends up
+    // as a top-level callable in the bound package.
+    if parts.len() >= 2 {
+        let head = &parts[0];
+        let tail = &parts[1..];
+        if let Some(binding) = aliases.get(head) {
+            let package_candidate = binding.target_qualified.clone();
+            // `F.bar()` — single-segment tail = top-level function in
+            // the bound package.
+            if tail.len() == 1 {
+                if let Some(hit) = methods.get_package_callable(&package_candidate, &tail[0]) {
+                    // Top-level callable; treat `method` as the
+                    // attribute on it (this stays None unless there's
+                    // a workspace symbol — extremely rare for Kotlin,
+                    // but harmless).
+                    if hit.qualified == format!("{}.{}", package_candidate, tail[0]) {
+                        let composite = format!("{}.{}", hit.qualified, method);
+                        if let Some(static_hit) =
+                            package_index.lookup_in_file(&hit.path, &composite)
+                        {
+                            return Some(DispatchResolution {
+                                path: static_hit.path.clone(),
+                                qualified: static_hit.qualified.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Terminal-alias short-circuit (see top-of-function comment).
+    // If `parts[0]` was an `import`-bound head, the prefix's meaning
+    // is fixed by Stage 6 / 7. A miss there is unresolved — never
+    // re-interpreted by package / composite / unique-name fallbacks.
+    if alias_head_bound {
+        return None;
+    }
+
+    // Stage 8: `pkg.foo()` where the dotted prefix itself is a
+    // workspace package. Validated through `has_package` + path-aware
+    // lookup of the package callable.
+    let prefix = parts.join(".");
+    if package_index.has_package(&prefix) {
+        if let Some(hit) = methods.get_package_callable(&prefix, method) {
+            return Some(DispatchResolution {
+                path: hit.path.clone(),
+                qualified: hit.qualified.clone(),
+            });
+        }
+    }
+
+    // Stage 9: composite FQN `parts.method` resolves directly to a
+    // workspace symbol (covers `Cls.STATIC_FIELD` chains via the
+    // package index). Path-agnostic but uniqueness-gated.
+    let composite = format!("{prefix}.{method}");
+    if let Some(hit) = package_index.lookup_unique(&composite) {
         return Some(DispatchResolution {
             path: hit.path.clone(),
             qualified: hit.qualified.clone(),
         });
     }
-    // 4. Last resort: name-only unique match. This is the best-effort
-    // extension-function path — only fires when one workspace method
-    // has that name, so collisions stay None.
+
+    // Stage 10 — best-effort unique-name match (extension functions on
+    // receivers whose type isn't pinnable). Only fires when one
+    // workspace method has this name; collisions stay unresolved.
     if let Some(hit) = methods.get_unique_by_name(method) {
         return Some(DispatchResolution {
             path: hit.path.clone(),
@@ -240,43 +395,111 @@ fn resolve_dotted_call(
     None
 }
 
-/// Best-effort resolution of a dotted prefix to its workspace
-/// qualified, applying alias → in-package → wildcard → bare lookup
-/// rules. Returns the qualified name even when the workspace can't
-/// pin it to a file, because the caller decides whether to treat
-/// unresolved heads as package references or to drop them.
-fn resolve_dotted_to_qualified(
+/// Resolve a dotted prefix (everything before `.method`) into a
+/// validated `(path, qualified)` class target. Each candidate stage
+/// is checked against `PackageIndex` — we never return an unchecked
+/// String the way the pre-fix resolver did.
+///
+/// Order mirrors Kotlin's lookup rules: alias map (path-constrained)
+/// → same-package → wildcard import → bare FQN → same-file class
+/// fallback (handles `Inner.method()` where `Inner` is declared in
+/// the calling file under no package prefix).
+fn resolve_class_target(
+    source_path: &str,
     parts: &[String],
-    aliases: &HashMap<String, String>,
-    package: Option<&str>,
+    aliases: &HashMap<String, ResolvedBinding>,
     file_facts: &FileConstFacts,
-) -> Option<String> {
-    if parts.is_empty() {
-        return None;
-    }
+    package_index: &PackageIndex,
+) -> Option<ResolvedClass> {
     let head = &parts[0];
     let tail = if parts.len() > 1 {
         Some(parts[1..].join("."))
     } else {
         None
     };
-    if let Some(target) = aliases.get(head) {
-        return Some(match &tail {
-            Some(t) => format!("{target}.{t}"),
-            None => target.clone(),
-        });
+
+    // 1. Alias substitution. When the binding pinned a workspace file
+    //    use `lookup_in_file`; otherwise fall back to `lookup_unique`.
+    //
+    //    Terminal: if an `import` binds `head`, the head's meaning is
+    //    fixed by that binding. A path-bound miss must NOT silently
+    //    fall through to same-package / wildcard / bare-FQN stages —
+    //    doing so would let `import pkg.b.Registry; Registry.Inner.x()`
+    //    re-resolve to a `Registry.Inner` declared in some *other*
+    //    package whose head also happens to be `Registry`. The
+    //    `lookup_via_binding` result is final for the alias-head case.
+    if let Some(binding) = aliases.get(head) {
+        let candidate = match &tail {
+            Some(t) => format!("{}.{}", binding.target_qualified, t),
+            None => binding.target_qualified.clone(),
+        };
+        return lookup_via_binding(binding, &candidate, package_index);
     }
-    // In-package: prepend file's package.
-    if let Some(p) = package.filter(|s| !s.is_empty()) {
-        return Some(format!("{p}.{}", parts.join(".")));
-    }
-    // Wildcard imports contribute candidate prefixes too — try them
-    // before the bare form (so `import com.foo.*` + `Bar.baz()`
-    // resolves to `com.foo.Bar.baz`).
-    for b in &file_facts.import_bindings {
-        if b.kind == ImportKind::Wildcard {
-            return Some(format!("{}.{}", b.fqn, parts.join(".")));
+
+    // 2. Same-package lookup.
+    if let Some(pkg) = file_facts.package.as_deref().filter(|s| !s.is_empty()) {
+        let candidate = format!("{pkg}.{}", parts.join("."));
+        if let Some(hit) = package_index.lookup_unique(&candidate) {
+            return Some(ResolvedClass {
+                path: hit.path.clone(),
+                qualified: hit.qualified.clone(),
+            });
         }
     }
-    Some(parts.join("."))
+
+    // 3. Wildcard-import expansion.
+    for b in &file_facts.import_bindings {
+        if b.kind == ImportKind::Wildcard {
+            let candidate = format!("{}.{}", b.fqn, parts.join("."));
+            if let Some(hit) = package_index.lookup_unique(&candidate) {
+                return Some(ResolvedClass {
+                    path: hit.path.clone(),
+                    qualified: hit.qualified.clone(),
+                });
+            }
+        }
+    }
+
+    // 4. Bare FQN as written (covers `com.foo.Registry.build()` where
+    //    the head is `com`).
+    let bare = parts.join(".");
+    if let Some(hit) = package_index.lookup_unique(&bare) {
+        return Some(ResolvedClass {
+            path: hit.path.clone(),
+            qualified: hit.qualified.clone(),
+        });
+    }
+
+    // 5. Same-file class fallback. Build `pkg.parts[0]` (or just
+    //    `parts[0]` for root package) and look it up in the calling
+    //    file — useful when the class is declared inline and the
+    //    prefix is just the class name.
+    let same_file_qualified = match file_facts.package.as_deref().filter(|s| !s.is_empty()) {
+        Some(pkg) => format!("{pkg}.{}", parts[0]),
+        None => parts[0].clone(),
+    };
+    if let Some(hit) = package_index.lookup_in_file(source_path, &same_file_qualified) {
+        // Append the dotted tail if any (preserves
+        // `Inner.NestedObject.member` chains).
+        let qualified = match &tail {
+            Some(t) => format!("{}.{}", hit.qualified, t),
+            None => hit.qualified.clone(),
+        };
+        // Verify the extended qualified actually exists in that file
+        // before adopting it.
+        if let Some(extended) = package_index.lookup_in_file(source_path, &qualified) {
+            return Some(ResolvedClass {
+                path: extended.path.clone(),
+                qualified: extended.qualified.clone(),
+            });
+        }
+        // Otherwise return the bare same-file class; MRO walking
+        // takes care of the method dispatch from there.
+        return Some(ResolvedClass {
+            path: hit.path.clone(),
+            qualified: hit.qualified.clone(),
+        });
+    }
+
+    None
 }
