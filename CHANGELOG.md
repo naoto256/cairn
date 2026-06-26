@@ -7,6 +7,45 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Automatic revision-staleness rerun at daemon startup.** When an
+  analyzer's compiled-in `revision()` is higher than the value
+  persisted in `workspace_analysis_runs.analyzer_revision`, the daemon
+  enqueues a targeted rerun for that specific `(manifest_id,
+  analyzer_id)` pair after the file watcher is up. No more manual
+  `cairn ctl repo reindex <alias>` after every PR that bumps an
+  analyzer revision. The scan runs in `tokio::task::spawn_blocking`
+  so the daemon's start path is not blocked. On the first upgrade,
+  expect an `auto-reindexing N stale aliases (revision bump detected)`
+  info log — this is a documented behavior change, not silent UX
+  drift. Failure modes (per-alias error, DB unavailable, JobManager
+  full) log a `warn`/`error` and the daemon keeps running; doctor
+  picks up the shadow case (see below).
+- **`cairn ctl doctor` surfaces analyzer-revision drift.** A new
+  per-alias `analyzer revision drift` check Warns whenever the
+  persisted `analyzer_revision` is lower than the linked-in build's
+  `revision()`, listing the analyzer ids and the version delta. Acts
+  as a shadow-case fallback if the startup auto-rerun failed to
+  enqueue (DB error, pool full); the operator sees the drift either
+  way and can run `cairn ctl repo reindex <alias>` to resolve.
+- **`cairn ctl doctor` detects wedged analyzer runs.** A `queued` or
+  `running` `workspace_analysis_runs` row whose `started_at_ns` is
+  older than `STUCK_RUN_THRESHOLD` (6h) now surfaces as a distinct
+  "stuck in `running` for ~Xh" Warn with a `reindex_repo`
+  remediation, instead of being misclassified as routine "indexing in
+  progress". Catches worker-pool deadlocks and crash-mid-run rows
+  that `restore_from_db` flipped back to `queued`/`running` and that
+  would otherwise sit silently.
+- **Coupling-invariant documentation for `parser_revision` and
+  `analyzer_revision`.** New module-level doc on
+  `crates/cairn-core/src/workspace_analyzer/mod.rs` records that the
+  two revision signals are independent (Tier-1 lives on `blobs`,
+  Tier-2.5/Tier-3 lives on `workspace_analysis_runs`), how staleness
+  is detected for each, why `config_hash` is *not* a stale criterion
+  in the auto-rerun path, and why the rollback case (`<` comparison)
+  intentionally produces no spurious rerun.
+
 ### Fixed
 
 - **Kotlin Tier-2.5 dispatch chain is path-aware.** `PackageIndex` and

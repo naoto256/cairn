@@ -10,6 +10,71 @@
 //! cross-file pass that runs entirely in-process to an LSP-class
 //! analyzer such as rust-analyzer that talks to a long-lived language
 //! server; both implement the same [`WorkspaceAnalyzer`] trait.
+//!
+//! ## Revision invariants (parser_revision vs analyzer_revision)
+//!
+//! Two revision signals live on disk; they are deliberately
+//! **independent** and the staleness machinery for each is different.
+//!
+//! 1. **Tier-1 `parser_revision`** (per [`cairn_lang_api`]
+//!    `LanguageBackend`). Stored on `blobs(parser_id, parser_revision)`.
+//!    Bumped whenever a Tier-1 backend changes the syntactic facts it
+//!    emits. Staleness is **implicit**: the next parse of any blob with
+//!    a stale `parser_revision` recomputes Tier-1 facts, so no
+//!    out-of-band scan is needed.
+//!
+//! 2. **Tier-2.5 / Tier-3 [`WorkspaceAnalyzer::revision`]**. Stored on
+//!    `workspace_analysis_runs(analyzer_id, analyzer_revision)`. Bumped
+//!    when an analyzer changes the *resolved* facts it produces from
+//!    the same Tier-1 input. Staleness is **explicit**: no source
+//!    change touches `workspace_analysis_runs` rows, so a stale row
+//!    would sit indefinitely unless the resolver knows to rerun. Three
+//!    mechanisms cooperate:
+//!    - [`staleness::check_revision_staleness_and_enqueue`] runs at
+//!      daemon startup (under `tokio::task::spawn_blocking`) and
+//!      enqueues a targeted [`crate::jobs::EnqueueAnalyzerRun`] for
+//!      each `(manifest_id, analyzer_id)` whose persisted revision is
+//!      lower than the linked-in build's `revision()`.
+//!    - `cairn ctl doctor` raises a `Warn` on the same drift,
+//!      independently of the startup hook. If the startup enqueue
+//!      failed (DB unavailable, JobManager full), doctor remains the
+//!      shadow-case fallback the operator sees.
+//!    - The manual `cairn ctl repo reindex <alias>` path is unchanged
+//!      and remains the operator's escape hatch.
+//!
+//! ### Independence
+//! Bumping `parser_revision` does **not** invalidate
+//! `workspace_analysis_runs`, and bumping `analyzer_revision` does
+//! **not** force a re-parse. A workspace analyzer that depends on a
+//! new Tier-1 fact must also bump its own `revision()` so the
+//! staleness scan re-runs it once new Tier-1 facts land.
+//!
+//! ### `config_hash` is not part of the auto-rerun stale criterion
+//! `workspace_analysis_runs.config_hash` distinguishes runs for the
+//! same `(manifest_id, analyzer_id, analyzer_revision)` across config
+//! edits, but the auto-rerun scan keys on `analyzer_revision` only —
+//! a config change without a revision bump is **not** treated as
+//! stale (config edits already drive their own re-queue elsewhere).
+//!
+//! ### Rollback case (`<` is the only comparison)
+//! Staleness uses `persisted_rev < expected_rev`. A build whose
+//! `revision()` is *lower* than what's persisted (downgrade) does
+//! not trigger spurious reruns — facts produced by the newer
+//! revision are assumed forward-compatible. Cross-version fact
+//! compatibility is therefore an explicit invariant of bumping
+//! `revision()`.
+//!
+//! ### Sequential by default
+//! The startup scan walks aliases sequentially. Parallel scanning is
+//! plausible future work; per-alias I/O dominates today and the
+//! daemon's job scheduler is the real concurrency boundary.
+//!
+//! ### Tier-2 direct (`tier2-direct-*`) is out of scope
+//! `tier2-direct-*` resolution rows ride the Tier-1 parser CAS path
+//! and have no `manifest_id`. They invalidate when their producing
+//! Tier-1 backend's `parser_revision` bumps. The
+//! `workspace_analysis_runs` staleness machinery does not look at
+//! `tier2-direct-*` rows.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,6 +107,7 @@ mod lsp_pass;
 mod path;
 mod persist;
 mod run;
+mod staleness;
 
 pub use expected::expected_analyzers_for_manifest;
 pub(crate) use expected::manifest_parser_ids;
@@ -54,6 +120,7 @@ pub(crate) use run::{
     ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, config_hash, mark_run,
     run_one_workspace_analyzer_with_timeout,
 };
+pub use staleness::{StaleRevision, StalenessSummary, check_revision_staleness_and_enqueue};
 
 /// Linker-time registry of workspace analyzers.
 ///
@@ -267,6 +334,28 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         files: &[WorkspaceFile],
         progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts>;
+}
+
+/// Compute the per-run staleness inputs for one analyzer instance: the
+/// `(revision, config_hash, pool_group)` tuple the scheduler stamps onto
+/// `workspace_analysis_runs`. Centralizing this lets the revision-
+/// staleness scanner and the future `JobManager::enqueue_analyzer_run`
+/// helper share one source of truth for what "this analyzer at this
+/// repo" hashes to, instead of duplicating the call sequence.
+///
+/// `pool_group` is `Option<&'static str>` on purpose. The scheduler's
+/// pool-group lane uses `&'static str` keys so the lookup is a pointer
+/// compare; runtime-allocated strings would break that contract.
+#[must_use]
+pub fn compute_analyzer_run_inputs(
+    analyzer: &dyn WorkspaceAnalyzer,
+    repo_root: &Path,
+) -> (u32, String, Option<&'static str>) {
+    (
+        analyzer.revision(),
+        run::config_hash(repo_root, analyzer.config_paths()),
+        analyzer.pool_group(),
+    )
 }
 
 /// One file visible to a [`WorkspaceAnalyzer`] within a manifest.
