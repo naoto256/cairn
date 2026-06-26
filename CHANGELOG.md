@@ -9,6 +9,25 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Kotlin Tier-2.5 dispatch chain is path-aware.** `PackageIndex` and
+  `RequireGraph` bindings now key by `(path, qualified)` instead of
+  qualified-only. Cross-file same-name class collisions no longer
+  collapse to a HashMap first-hit, and `dispatch::resolve_call` runs
+  every candidate qualified through `lookup_in_file` (when path-
+  bound) or `lookup_unique` (when path-agnostic) before adoption —
+  the pre-fix `resolve_dotted_to_qualified` would return
+  `package + parts` unchecked, killing later fallbacks and dropping
+  call edges to tier2-fact. Continues v11
+  (`resolutions.manifest_id`) toward cross-manifest dispatch
+  consistency. `CallReceiver::This` / `Super` / `Bare` now all walk
+  lexical-class MRO as first-class cases (bare calls inside a class
+  body resolve through inherited methods before falling out to the
+  alias / same-package / wildcard cascade). Kotlin analyzer
+  revision 3→4; running `cairn ctl repo reindex <alias>` invokes
+  the `workspace_analysis_runs` staleness mechanism to queue
+  analyzer reruns (no automatic global reindex). JS Tier-2.5
+  verified unchanged (analyzer revision and tests untouched).
+
 - **Cross-manifest divergence of Tier-2.5 / Tier-3 resolutions
   (schema v11).** `resolutions` rows now carry an explicit
   `manifest_id` column. Workspace-aware rows (Tier-2.5 / Tier-3,
