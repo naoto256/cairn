@@ -48,6 +48,42 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Manifest dedup shortcut no longer skips the workspace analyzer
+  pass when blobs were re-parsed or analyzer revision drifted (F-A
+  regression).** v11 introduced `resolutions.manifest_id ON DELETE
+  CASCADE` to fix cross-manifest leakage. Combined with the existing
+  `register_repo_inner` shortcut that reused the prior `manifest_id`
+  when tentative entries matched, this created a fact-set version
+  skew: blob re-parse fired (because the Tier-1 `parser_revision`
+  bumped on a freshly upgraded binary, or because a new analyzer
+  revision invalidated CAS rows), but the workspace analyzer pass was
+  skipped, leaving Tier-2.5 resolutions rows stale (orphaned facts
+  under the reused `manifest_id`).
+
+  Dogfood symptom: after `touch Moshi.kt` (or a `cairn` binary
+  upgrade with a `parser_revision` bump), Tier-2.5 subtypes /
+  callers fell back to `tier2-fact`, status displayed `Ready,
+  stale=0` misleadingly.
+
+  Fix: separate the contract. `register_repo_inner` now treats
+  *manifest reuse* (cheap: entries unchanged) and *analyzer skip*
+  (entries unchanged AND `blobs_parsed == 0` AND every expected
+  analyzer has a `succeeded` `workspace_analysis_runs` row at the
+  current `analyzer_revision`) as two independent gates. The
+  analyzer-skip decision is moved to AFTER `parse_pending_blobs`
+  runs, so the blob-CAS invalidation result is the truth-source the
+  gate watches — no duplicate `parser_revision` drift helper. `queued`
+  / `running` / `failed` / `skipped` / `cancelled` / `timed_out` rows
+  all force a re-run; only an outright `succeeded` row at the current
+  revision counts as "facts current". The `RegisterOutcome` field
+  formerly named `analyzers_skipped_due_to_dedup` is renamed to
+  `skip_analyzers_for_unchanged_manifest` to reflect that the skip is
+  not unconditional on entries-unchanged. A register-level
+  integration test pins the F-A state transition (`blobs_parsed > 0`
+  forces a re-run while the `manifest_id` stays reused), and unit
+  tests on the new `check_workspace_analyzer_current_succeeded`
+  helper pin the per-status gate behavior.
+
 - **`find_references` strict-FQN incoming query plan recovered from
   `SCAN refs` to index-driven lookup.** Phase 4 introduced a
   `WHERE COALESCE(r.target_qualified, sym.qualified) = ?` predicate
@@ -374,6 +410,43 @@ versions follow [SemVer](https://semver.org/).
   single-branch dogfood is unaffected; the issue surfaces only when
   the same blob is shared across manifests with different on-disk
   file layouts.
+
+- **Kotlin Tier-2.5 dispatch is static-receiver scope only.**
+  `adapter.fromJson(json)` where `adapter` is a local variable bound
+  to e.g. `JsonAdapter<T>` — or any polymorphic adapter chain (Moshi,
+  Retrofit-shaped builders, runtime-selected backends) — is out of
+  scope for the current `dispatch::resolve_call` path. Resolving
+  these receivers requires type-flow propagation from the construction
+  site through every reassignment, which is Tier-3 LSP territory and
+  is queued as a future epic. PR #219 closed the `dispatch::resolve_call`
+  `None`-return path that surfaced as a regression on static-receiver
+  sites; the polymorphic-receiver case is a separate analysis layer
+  queued for a future Tier-3 epic.
+
+### Follow-up
+
+- **`parser_revision` drift staleness scanner.** The PR #220 startup
+  staleness scanner currently checks only
+  `workspace_analysis_runs.analyzer_revision` against the linked-in
+  `revision()`. A `blobs.parser_revision` drift between persisted and
+  linked-in values — the F-A trigger in this release — should also
+  surface and auto-reindex. The fix landing here closes the dedup-gate
+  side of that bug; the scanner side is a separate PR. When that
+  scanner ships, the **parser-drift path must schedule a full repo
+  reindex, not `enqueue_analyzer_run`**: a parser_revision bump
+  invalidates Tier-1 facts, and the corresponding Tier-2.5 / Tier-3
+  passes can only run after Tier-1 has been re-emitted. The PR #220
+  lesson — don't hand a low-level stamp to a caller that needs a
+  higher-level rebuild — applies here.
+
+- **Post-enqueue job tracking.** The startup staleness scanner enqueues
+  jobs but does not surface their downstream outcome (failed /
+  timed_out / cancelled). Add a per-job follow-up surface to doctor
+  and a structured log line at scanner exit. **Job tracking truth
+  must be DB state, not memory**: a daemon restart must still be able
+  to recover the post-scan job outcome from `workspace_analysis_runs`
+  and the job table, not from an in-process tracker that vanishes
+  with the process.
 
 ## [0.6.2] — 2026-06-24
 

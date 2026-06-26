@@ -110,7 +110,7 @@ mod run;
 mod staleness;
 
 pub use expected::expected_analyzers_for_manifest;
-pub(crate) use expected::manifest_parser_ids;
+pub(crate) use expected::{check_workspace_analyzer_current_succeeded, manifest_parser_ids};
 pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
     LspMultiKindDefinitionPass, run_lsp_definition_pass, run_lsp_multi_kind_definition_pass,
