@@ -19,9 +19,17 @@
 //! 1. **Tier-1 `parser_revision`** (per [`cairn_lang_api`]
 //!    `LanguageBackend`). Stored on `blobs(parser_id, parser_revision)`.
 //!    Bumped whenever a Tier-1 backend changes the syntactic facts it
-//!    emits. Staleness is **implicit**: the next parse of any blob with
-//!    a stale `parser_revision` recomputes Tier-1 facts, so no
-//!    out-of-band scan is needed.
+//!    emits. Recovery has two paths: (a) on the next `register_repo`
+//!    pass over a blob with a stale revision, `parse_pending_blobs`
+//!    transparently re-parses via `cas::blob::reuse_or_compute`;
+//!    (b) the daemon-startup [`staleness::check_revision_staleness_and_enqueue`]
+//!    runs a [`staleness::detect_parser_revision_drift`] pre-check
+//!    against every alias and enqueues a full repo reindex via
+//!    [`crate::jobs::JobManager::enqueue_full_repo_reindex`] when an
+//!    expected parse unit is missing or off-revision. The startup
+//!    path catches the case where an existing user upgrades the
+//!    binary without otherwise touching the workspace — without it
+//!    the implicit (a) path never fires.
 //!
 //! 2. **Tier-2.5 / Tier-3 [`WorkspaceAnalyzer::revision`]**. Stored on
 //!    `workspace_analysis_runs(analyzer_id, analyzer_revision)`. Bumped
@@ -112,8 +120,8 @@ mod staleness;
 
 pub use expected::expected_analyzers_for_manifest;
 pub(crate) use expected::{
-    ExpectedParseUnit, check_workspace_analyzer_current_succeeded, expected_parse_units,
-    is_c_family_header_path, manifest_parser_ids, pick_backend_with_fallbacks,
+    check_workspace_analyzer_current_succeeded, expected_parse_units, is_c_family_header_path,
+    manifest_parser_ids, pick_backend_with_fallbacks,
 };
 pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
@@ -124,7 +132,10 @@ pub(crate) use run::{
     ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, config_hash, mark_run,
     run_one_workspace_analyzer_with_timeout,
 };
-pub use staleness::{StaleRevision, StalenessSummary, check_revision_staleness_and_enqueue};
+pub use staleness::{
+    ParserStaleRevision, StaleRevision, StalenessSummary, check_revision_staleness_and_enqueue,
+    compute_parser_stale_revisions,
+};
 
 /// Linker-time registry of workspace analyzers.
 ///

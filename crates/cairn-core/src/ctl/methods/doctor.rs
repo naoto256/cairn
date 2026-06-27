@@ -18,7 +18,8 @@ use crate::lsp_discovery::{
 use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::{
-    StaleRevision, all_workspace_analyzers, expected_analyzers_for_manifest,
+    ParserStaleRevision, StaleRevision, all_workspace_analyzers, compute_parser_stale_revisions,
+    expected_analyzers_for_manifest,
 };
 
 /// Wall-clock budget after which a `queued` / `running`
@@ -122,6 +123,7 @@ impl ControlMethod for Doctor {
                 .map_err(|e| crate::Error::internal_task_panic("doctor", e))?;
                 checks.extend(tentative_snapshot_checks(&store_probes));
                 checks.extend(revision_stale_checks(&store_probes));
+                checks.extend(parser_revision_stale_checks(&store_probes));
                 checks.extend(tier3_run_checks(&store_probes));
             }
             Err(e) => checks.push(doctor_check(
@@ -233,6 +235,13 @@ struct AliasStoreState {
     /// `revision()` vs the persisted `analyzer_revision` column. Empty
     /// when nothing is stale (the common case).
     stale_revisions: Vec<StaleRevision>,
+    /// Per-`(parser_id, current_rev)` `parser_revision` drift. Built
+    /// from `compute_parser_stale_revisions`, which starts from the
+    /// expected parse units rather than `SELECT DISTINCT parser_id
+    /// FROM blobs`. A `current_rev = None` entry means a parse row
+    /// is missing entirely (same recovery path as a mismatch).
+    /// Empty in the common case.
+    stale_parser_revisions: Vec<ParserStaleRevision>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,76 +305,95 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             .optional()?,
         None => None,
     };
-    let (tier3_runs, expected_tier3_analyzer_ids, stale_revisions) = match tentative_manifest_id {
-        Some(manifest_id) => {
-            let expected_analyzers =
-                expected_analyzers_for_manifest(&conn, ManifestId(manifest_id))?;
-            let mut expected_tier3_analyzer_ids = expected_analyzers
-                .iter()
-                .map(|analyzer| analyzer.id().to_string())
-                .collect::<Vec<_>>();
-            expected_tier3_analyzer_ids.sort();
-
-            let mut stmt = conn.prepare(
-                "SELECT analyzer_id, manifest_id, status, error, analyzer_revision, started_at_ns
-                 FROM workspace_analysis_runs
-                 WHERE manifest_id = ?1
-                 ORDER BY analyzer_id",
-            )?;
-            let rows = stmt
-                .query_map(params![manifest_id], |r| {
-                    Ok((
-                        Tier3Run {
-                            analyzer_id: r.get(0)?,
-                            manifest_id: r.get(1)?,
-                            status: r.get(2)?,
-                            error: r.get(3)?,
-                            started_at_ns: r.get(5)?,
-                        },
-                        r.get::<_, i64>(4)? as u32,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            // Build a `(analyzer_id -> persisted_revision)` map so we can
-            // compare against each expected analyzer's `revision()`.
-            let mut persisted_revs: HashMap<String, u32> = HashMap::new();
-            let tier3_runs = rows
-                .into_iter()
-                .map(|(run, rev)| {
-                    persisted_revs.insert(run.analyzer_id.clone(), rev);
-                    run
-                })
-                .collect::<Vec<_>>();
-
-            let mut stale_revisions = Vec::new();
-            for analyzer in &expected_analyzers {
-                let expected_rev = analyzer.revision();
-                let current_rev = persisted_revs.get(analyzer.id()).copied();
-                let is_mismatch = match current_rev {
-                    Some(cur) => cur < expected_rev,
-                    None => true,
-                };
-                if is_mismatch {
-                    stale_revisions.push(StaleRevision {
-                        analyzer_id: analyzer.id().to_string(),
-                        current_rev,
-                        expected_rev,
-                    });
-                }
-            }
-            stale_revisions.sort_by(|a, b| a.analyzer_id.cmp(&b.analyzer_id));
-
-            (tier3_runs, expected_tier3_analyzer_ids, stale_revisions)
-        }
-        None => (Vec::new(), Vec::new(), Vec::new()),
-    };
+    let (tier3_runs, expected_tier3_analyzer_ids, stale_revisions, stale_parser_revisions) =
+        match tentative_manifest_id {
+            Some(manifest_id) => probe_manifest(&conn, manifest_id, Path::new(root_path))?,
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
     Ok(AliasStoreState {
         tentative_manifest_id,
         tier3_runs,
         expected_tier3_analyzer_ids,
         stale_revisions,
+        stale_parser_revisions,
     })
+}
+
+#[allow(clippy::type_complexity)]
+fn probe_manifest(
+    conn: &rusqlite::Connection,
+    manifest_id: i64,
+    root_path: &Path,
+) -> Result<(
+    Vec<Tier3Run>,
+    Vec<String>,
+    Vec<StaleRevision>,
+    Vec<ParserStaleRevision>,
+)> {
+    let expected_analyzers = expected_analyzers_for_manifest(conn, ManifestId(manifest_id))?;
+    let mut expected_tier3_analyzer_ids = expected_analyzers
+        .iter()
+        .map(|analyzer| analyzer.id().to_string())
+        .collect::<Vec<_>>();
+    expected_tier3_analyzer_ids.sort();
+
+    let mut stmt = conn.prepare(
+        "SELECT analyzer_id, manifest_id, status, error, analyzer_revision, started_at_ns
+         FROM workspace_analysis_runs
+         WHERE manifest_id = ?1
+         ORDER BY analyzer_id",
+    )?;
+    let rows = stmt
+        .query_map(params![manifest_id], |r| {
+            Ok((
+                Tier3Run {
+                    analyzer_id: r.get(0)?,
+                    manifest_id: r.get(1)?,
+                    status: r.get(2)?,
+                    error: r.get(3)?,
+                    started_at_ns: r.get(5)?,
+                },
+                r.get::<_, i64>(4)? as u32,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut persisted_revs: HashMap<String, u32> = HashMap::new();
+    let tier3_runs = rows
+        .into_iter()
+        .map(|(run, rev)| {
+            persisted_revs.insert(run.analyzer_id.clone(), rev);
+            run
+        })
+        .collect::<Vec<_>>();
+
+    let mut stale_revisions = Vec::new();
+    for analyzer in &expected_analyzers {
+        let expected_rev = analyzer.revision();
+        let current_rev = persisted_revs.get(analyzer.id()).copied();
+        let is_mismatch = match current_rev {
+            Some(cur) => cur < expected_rev,
+            None => true,
+        };
+        if is_mismatch {
+            stale_revisions.push(StaleRevision {
+                analyzer_id: analyzer.id().to_string(),
+                current_rev,
+                expected_rev,
+            });
+        }
+    }
+    stale_revisions.sort_by(|a, b| a.analyzer_id.cmp(&b.analyzer_id));
+
+    let stale_parser_revisions =
+        compute_parser_stale_revisions(conn, ManifestId(manifest_id), root_path)?;
+
+    Ok((
+        tier3_runs,
+        expected_tier3_analyzer_ids,
+        stale_revisions,
+        stale_parser_revisions,
+    ))
 }
 
 fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
@@ -664,6 +692,51 @@ fn revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                 Some(detail),
                 Some(format!(
                     "Run `cairn ctl repo reindex {}` to rerun the stale analyzers under the current build's revisions.",
+                    probe.alias
+                )),
+            ))
+        })
+        .collect()
+}
+
+/// Surface `parser_revision` drift as a doctor warning. Same shadow-
+/// case role as `revision_stale_checks` (analyzer revision), but for
+/// the Tier-1 backend's `parser_revision()` vs. `blobs.parser_revision`.
+/// Empty `stale_parser_revisions` means every expected parse unit has
+/// a row whose persisted revision equals the linked-in backend's.
+fn parser_revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
+    probes
+        .iter()
+        .filter_map(|probe| {
+            let state = probe.result.as_ref().ok()?;
+            if state.stale_parser_revisions.is_empty() {
+                return None;
+            }
+            let detail = state
+                .stale_parser_revisions
+                .iter()
+                .map(|psr| {
+                    let cur = psr
+                        .current_rev
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "missing".to_string());
+                    format!(
+                        "{}: current={} ({} blob{}), expected={}",
+                        psr.parser_id,
+                        cur,
+                        psr.affected_blob_count,
+                        if psr.affected_blob_count == 1 { "" } else { "s" },
+                        psr.expected_rev,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            Some(doctor_check(
+                format!("repo `{}` parser revision drift", probe.alias),
+                DoctorStatus::Warn,
+                Some(detail),
+                Some(format!(
+                    "Run `cairn ctl repo reindex {}` to reparse blobs at the current build's `parser_revision`.",
                     probe.alias
                 )),
             ))
@@ -1135,6 +1208,7 @@ mod tests {
                     tier3_runs: Vec::new(),
                     expected_tier3_analyzer_ids: Vec::new(),
                     stale_revisions: Vec::new(),
+                    stale_parser_revisions: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1145,6 +1219,7 @@ mod tests {
                     tier3_runs: Vec::new(),
                     expected_tier3_analyzer_ids: Vec::new(),
                     stale_revisions: Vec::new(),
+                    stale_parser_revisions: Vec::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1202,6 +1277,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         let skipped = tier3_run_check(
@@ -1217,6 +1293,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         let pending = tier3_run_check(
@@ -1232,6 +1309,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         let running = tier3_run_check(
@@ -1247,6 +1325,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         let failed = tier3_run_check(
@@ -1262,6 +1341,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         let missing = tier3_run_check(
@@ -1271,6 +1351,7 @@ mod tests {
                 tier3_runs: Vec::new(),
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
 
@@ -1343,6 +1424,7 @@ mod tests {
                 ],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
 
@@ -1367,6 +1449,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: vec!["new-analyzer".into(), "old-analyzer".into()],
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
 
@@ -1637,6 +1720,7 @@ mod tests {
                     current_rev: Some(3),
                     expected_rev: 4,
                 }],
+                stale_parser_revisions: Vec::new(),
             }),
         }];
         let checks = revision_stale_checks(&probes);
@@ -1675,12 +1759,119 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: vec!["demo-analyzer".into()],
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             }),
         }];
         let checks = revision_stale_checks(&probes);
         assert!(
             checks.is_empty(),
             "no drift should produce no checks; got {checks:#?}"
+        );
+    }
+
+    /// Doctor parser-revision drift: groups by `(parser_id,
+    /// current_rev)`. The detail string carries the per-group blob
+    /// count so the operator can tell "12 blobs at rev 3" apart from
+    /// "1 blob at rev 2" within the same parser.
+    #[test]
+    fn parser_revision_stale_checks_groups_by_parser_and_revision() {
+        let probes = vec![AliasStoreProbe {
+            alias: "myrepo".into(),
+            store_path: PathBuf::from("/tmp/myrepo/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: Vec::new(),
+                expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
+                stale_parser_revisions: vec![
+                    ParserStaleRevision {
+                        parser_id: "tree-sitter-kotlin".into(),
+                        current_rev: Some(2),
+                        expected_rev: 4,
+                        affected_blob_count: 4,
+                    },
+                    ParserStaleRevision {
+                        parser_id: "tree-sitter-kotlin".into(),
+                        current_rev: Some(3),
+                        expected_rev: 4,
+                        affected_blob_count: 12,
+                    },
+                ],
+            }),
+        }];
+        let checks = parser_revision_stale_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        let check = &checks[0];
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert_eq!(check.name, "repo `myrepo` parser revision drift");
+        let detail = check.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("current=2 (4 blobs)") && detail.contains("current=3 (12 blobs)"),
+            "expected per-group blob counts in detail, got: {detail}"
+        );
+        let remediation = check.remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("cairn ctl repo reindex myrepo"),
+            "expected reindex remediation, got: {remediation}"
+        );
+    }
+
+    /// Doctor parser-revision drift: a missing parsed row surfaces
+    /// as `current=missing` (not omitted). The recovery action — full
+    /// reindex — is the same as for a revision mismatch, and hiding
+    /// the missing case would leave the operator blind to a state
+    /// the scanner already enqueued recovery for.
+    #[test]
+    fn parser_revision_stale_checks_surfaces_missing_row_as_current_missing() {
+        let probes = vec![AliasStoreProbe {
+            alias: "gappy".into(),
+            store_path: PathBuf::from("/tmp/gappy/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: Vec::new(),
+                expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
+                stale_parser_revisions: vec![ParserStaleRevision {
+                    parser_id: "tree-sitter-rust".into(),
+                    current_rev: None,
+                    expected_rev: 3,
+                    affected_blob_count: 1,
+                }],
+            }),
+        }];
+        let checks = parser_revision_stale_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("current=missing"),
+            "missing row must surface as 'current=missing', got: {detail}"
+        );
+        assert!(
+            detail.contains("(1 blob)"),
+            "expected singular '1 blob' form, got: {detail}"
+        );
+    }
+
+    /// Doctor parser-revision drift: empty `stale_parser_revisions`
+    /// produces no checks (the common case — every expected parse
+    /// unit is up to date).
+    #[test]
+    fn parser_revision_stale_checks_silent_when_no_drift() {
+        let probes = vec![AliasStoreProbe {
+            alias: "clean".into(),
+            store_path: PathBuf::from("/tmp/clean/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: Vec::new(),
+                expected_tier3_analyzer_ids: Vec::new(),
+                stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
+            }),
+        }];
+        let checks = parser_revision_stale_checks(&probes);
+        assert!(
+            checks.is_empty(),
+            "no parser drift should produce no checks; got {checks:#?}"
         );
     }
 
@@ -1710,6 +1901,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         assert_eq!(stuck.status, DoctorStatus::Warn);
@@ -1752,6 +1944,7 @@ mod tests {
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
             },
         );
         assert_eq!(stuck.status, DoctorStatus::Warn);
