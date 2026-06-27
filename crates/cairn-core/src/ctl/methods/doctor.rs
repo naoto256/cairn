@@ -243,6 +243,16 @@ struct AliasStoreState {
     /// is missing entirely (same recovery path as a mismatch).
     /// Empty in the common case.
     stale_parser_revisions: Vec<ParserStaleRevision>,
+    /// `analyzer_id -> expected revision` for every analyzer the
+    /// current build expects to run on this manifest. Lets
+    /// `parser_drift_rerun_check` actually verify that a row whose
+    /// `status = succeeded` is at the current revision (R2 catch:
+    /// inferring "current" from the absence of a `StaleRevision`
+    /// entry is fragile — the parser-drift check would otherwise
+    /// declare a `succeeded` row at any revision as "current" and
+    /// misclassify analyzer-stale rows as the D PR safety-net Case A
+    /// Fail).
+    expected_analyzer_revisions: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,17 +325,29 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             .optional()?,
         None => None,
     };
-    let (tier3_runs, expected_tier3_analyzer_ids, stale_revisions, stale_parser_revisions) =
-        match tentative_manifest_id {
-            Some(manifest_id) => probe_manifest(&conn, manifest_id, Path::new(root_path))?,
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-        };
+    let (
+        tier3_runs,
+        expected_tier3_analyzer_ids,
+        stale_revisions,
+        stale_parser_revisions,
+        expected_analyzer_revisions,
+    ) = match tentative_manifest_id {
+        Some(manifest_id) => probe_manifest(&conn, manifest_id, Path::new(root_path))?,
+        None => (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+        ),
+    };
     Ok(AliasStoreState {
         tentative_manifest_id,
         tier3_runs,
         expected_tier3_analyzer_ids,
         stale_revisions,
         stale_parser_revisions,
+        expected_analyzer_revisions,
     })
 }
 
@@ -339,6 +361,7 @@ fn probe_manifest(
     Vec<String>,
     Vec<StaleRevision>,
     Vec<ParserStaleRevision>,
+    HashMap<String, u32>,
 )> {
     let expected_analyzers = expected_analyzers_for_manifest(conn, ManifestId(manifest_id))?;
     let mut expected_tier3_analyzer_ids = expected_analyzers
@@ -394,11 +417,22 @@ fn probe_manifest(
     let stale_parser_revisions =
         compute_parser_stale_revisions(conn, ManifestId(manifest_id), root_path)?;
 
+    // Capture the expected revision for every analyzer so the
+    // parser-drift cross-reference can verify a `succeeded` row's
+    // revision directly (R2 catch on PR #228 v1: relying on the
+    // absence of `stale_revisions` to imply "current" would let
+    // analyzer-stale rows masquerade as the D PR safety-net Case A).
+    let mut expected_analyzer_revisions: HashMap<String, u32> = HashMap::new();
+    for analyzer in &expected_analyzers {
+        expected_analyzer_revisions.insert(analyzer.id().to_string(), analyzer.revision());
+    }
+
     Ok((
         tier3_runs,
         expected_tier3_analyzer_ids,
         stale_revisions,
         stale_parser_revisions,
+        expected_analyzer_revisions,
     ))
 }
 
@@ -818,6 +852,7 @@ fn analyzer_rerun_health_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> 
                 &probe.alias,
                 &state.stale_parser_revisions,
                 &state.expected_tier3_analyzer_ids,
+                &state.expected_analyzer_revisions,
                 &state.tier3_runs,
             ));
         }
@@ -922,24 +957,19 @@ fn parser_drift_rerun_check(
     alias: &str,
     stale_parser: &[crate::workspace_analyzer::ParserStaleRevision],
     expected_analyzer_ids: &[String],
+    expected_analyzer_revisions: &HashMap<String, u32>,
     runs: &[Tier3Run],
 ) -> DoctorCheck {
     let name = format!("repo `{alias}` parser drift rerun health");
     let mut any_failed = None;
     let mut any_pending = false;
     let mut any_row_missing = false;
-    let mut every_succeeded_at_current = true;
-
-    if expected_analyzer_ids.is_empty() {
-        // No analyzers to evaluate (e.g. a Tier-1-only language) —
-        // the parser drift alone has no rerun chain to verify, so
-        // skip emission. The plain `parser_revision_stale_checks`
-        // Warn already surfaces the drift.
-        every_succeeded_at_current = false;
-    }
+    let mut any_stale_succeeded: Option<(String, u32, u32)> = None;
+    let mut every_succeeded_at_current = !expected_analyzer_ids.is_empty();
 
     for analyzer_id in expected_analyzer_ids {
         let row = runs.iter().find(|r| r.analyzer_id == *analyzer_id);
+        let expected_rev = expected_analyzer_revisions.get(analyzer_id).copied();
         match row {
             None => {
                 any_row_missing = true;
@@ -948,22 +978,33 @@ fn parser_drift_rerun_check(
             Some(run) => {
                 match run.status.as_str() {
                     "succeeded" => {
-                        // Counts toward "every succeeded at current"
-                        // only when the row's revision is what the
-                        // current build expects. A stale-revision row
-                        // here keeps the alias in the "rerun never
-                        // landed" bucket.
-                        //
-                        // We don't have the analyzer's expected
-                        // revision here in the AliasStoreState, but
-                        // `stale_revisions` already captures that
-                        // mismatch — analyzer_rerun_health_checks
-                        // emits its own Case D Warn for it, so we
-                        // only need to make sure "all succeeded
-                        // current" stays exclusive of any stale row.
-                        // Defer to stale_revisions presence: caller
-                        // already verifies stale_revisions for the
-                        // analyzer-side warning.
+                        // R2 catch (PR #228 v1): `succeeded` alone is
+                        // not "current succeeded" — the revision must
+                        // match the current build's expectation. A
+                        // `succeeded` row at an older revision is the
+                        // "rerun never landed" case (Case D-like) and
+                        // must NOT count toward the Case A safety net.
+                        match expected_rev {
+                            Some(exp) if run.analyzer_revision == exp => {
+                                // current succeeded — counts toward
+                                // the every-succeeded-at-current pile.
+                            }
+                            Some(exp) => {
+                                any_stale_succeeded.get_or_insert((
+                                    analyzer_id.clone(),
+                                    run.analyzer_revision,
+                                    exp,
+                                ));
+                                every_succeeded_at_current = false;
+                            }
+                            None => {
+                                // Analyzer is no longer in the
+                                // linked-in registry for this manifest;
+                                // observability is best-effort here.
+                                // Don't count it toward Case A.
+                                every_succeeded_at_current = false;
+                            }
+                        }
                     }
                     "failed" | "timed_out" | "cancelled" => {
                         any_failed.get_or_insert((
@@ -1050,6 +1091,24 @@ fn parser_drift_rerun_check(
             DoctorStatus::Warn,
             Some(format!(
                 "parser drift remains and at least one expected analyzer has no rerun row — the rerun was not enqueued, was dropped, or was lost before run. Parser drift summary: {parser_summary}",
+            )),
+            Some(format!(
+                "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
+            )),
+        );
+    }
+    // Case D-like — every row is `succeeded` but at least one is at
+    // a revision older than what the current build expects. The
+    // scanner did not enqueue the analyzer-revision rerun, or it
+    // was dropped before the worker landed it (R2 catch: this state
+    // would otherwise be misclassified as the safety-net Case A
+    // because all rows are `succeeded`).
+    if let Some((stale_analyzer, persisted, expected_rev)) = any_stale_succeeded {
+        return doctor_check(
+            name,
+            DoctorStatus::Warn,
+            Some(format!(
+                "parser drift remains and at least one analyzer rerun never landed at the current revision: `{stale_analyzer}` is `succeeded` at revision {persisted}, expected revision {expected_rev}. Parser drift summary: {parser_summary}",
             )),
             Some(format!(
                 "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
@@ -1535,6 +1594,7 @@ mod tests {
                     expected_tier3_analyzer_ids: Vec::new(),
                     stale_revisions: Vec::new(),
                     stale_parser_revisions: Vec::new(),
+                    expected_analyzer_revisions: HashMap::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1546,6 +1606,7 @@ mod tests {
                     expected_tier3_analyzer_ids: Vec::new(),
                     stale_revisions: Vec::new(),
                     stale_parser_revisions: Vec::new(),
+                    expected_analyzer_revisions: HashMap::new(),
                 }),
             },
             AliasStoreProbe {
@@ -1605,6 +1666,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         let skipped = tier3_run_check(
@@ -1622,6 +1684,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         let pending = tier3_run_check(
@@ -1639,6 +1702,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         let running = tier3_run_check(
@@ -1656,6 +1720,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         let failed = tier3_run_check(
@@ -1673,6 +1738,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         let missing = tier3_run_check(
@@ -1683,6 +1749,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
 
@@ -1758,6 +1825,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
 
@@ -1784,6 +1852,7 @@ mod tests {
                 expected_tier3_analyzer_ids: vec!["new-analyzer".into(), "old-analyzer".into()],
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
 
@@ -2055,6 +2124,7 @@ mod tests {
                     expected_rev: 4,
                 }],
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }];
         let checks = revision_stale_checks(&probes);
@@ -2095,6 +2165,7 @@ mod tests {
                 expected_tier3_analyzer_ids: vec!["demo-analyzer".into()],
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }];
         let checks = revision_stale_checks(&probes);
@@ -2132,6 +2203,7 @@ mod tests {
                         affected_blob_count: 12,
                     },
                 ],
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }];
         let checks = parser_revision_stale_checks(&probes);
@@ -2172,6 +2244,7 @@ mod tests {
                     expected_rev: 3,
                     affected_blob_count: 1,
                 }],
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }];
         let checks = parser_revision_stale_checks(&probes);
@@ -2201,6 +2274,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }];
         let checks = parser_revision_stale_checks(&probes);
@@ -2239,6 +2313,7 @@ mod tests {
                     expected_rev,
                 }],
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }
     }
@@ -2256,7 +2331,7 @@ mod tests {
 
     fn parser_drift_probe(
         alias: &str,
-        expected_analyzer_ids: &[&str],
+        analyzers: &[(&str, u32)], // (analyzer_id, expected_revision)
         runs: Vec<Tier3Run>,
     ) -> AliasStoreProbe {
         AliasStoreProbe {
@@ -2265,9 +2340,9 @@ mod tests {
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: runs,
-                expected_tier3_analyzer_ids: expected_analyzer_ids
+                expected_tier3_analyzer_ids: analyzers
                     .iter()
-                    .map(|s| (*s).to_string())
+                    .map(|(id, _)| (*id).to_string())
                     .collect(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: vec![ParserStaleRevision {
@@ -2276,6 +2351,10 @@ mod tests {
                     expected_rev: 4,
                     affected_blob_count: 99,
                 }],
+                expected_analyzer_revisions: analyzers
+                    .iter()
+                    .map(|(id, rev)| ((*id).to_string(), *rev))
+                    .collect(),
             }),
         }
     }
@@ -2396,7 +2475,7 @@ mod tests {
     fn parser_drift_all_analyzers_succeeded_is_fail_chain_bug() {
         let probes = vec![parser_drift_probe(
             "moshi",
-            &["kotlin-resolver", "jdtls-lsp"],
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
             vec![
                 run_row("kotlin-resolver", 5, "succeeded", None),
                 run_row("jdtls-lsp", 1, "succeeded", None),
@@ -2425,7 +2504,7 @@ mod tests {
     fn parser_drift_mixed_succeeded_and_failed_is_warn_on_failed() {
         let probes = vec![parser_drift_probe(
             "moshi",
-            &["kotlin-resolver", "jdtls-lsp"],
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
             vec![
                 run_row("kotlin-resolver", 5, "succeeded", None),
                 run_row("jdtls-lsp", 1, "failed", Some("jdtls oom")),
@@ -2451,7 +2530,7 @@ mod tests {
     fn parser_drift_mixed_succeeded_and_queued_is_pass_pending() {
         let probes = vec![parser_drift_probe(
             "moshi",
-            &["kotlin-resolver", "jdtls-lsp"],
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
             vec![
                 run_row("kotlin-resolver", 5, "succeeded", None),
                 run_row("jdtls-lsp", 1, "running", None),
@@ -2471,7 +2550,7 @@ mod tests {
     fn parser_drift_no_run_rows_is_warn_lost_or_dropped() {
         let probes = vec![parser_drift_probe(
             "moshi",
-            &["kotlin-resolver", "jdtls-lsp"],
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
             Vec::new(),
         )];
         let checks = analyzer_rerun_health_checks(&probes);
@@ -2502,6 +2581,7 @@ mod tests {
                 expected_tier3_analyzer_ids: vec!["kotlin-resolver".into()],
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             }),
         }];
         let checks = analyzer_rerun_health_checks(&probes);
@@ -2534,6 +2614,141 @@ mod tests {
         );
     }
 
+    /// **R2 must-fix on PR #228 v1**: parser drift + every analyzer
+    /// row `succeeded` but at an **older** revision than the current
+    /// build expects → MUST surface as `Warn` (rerun never landed),
+    /// NOT as the safety-net Case A `Fail`. The Case A framing
+    /// implies "the parser-drift / full-reindex chain is broken,"
+    /// which would be a doctor observability lie when the simpler
+    /// explanation is that the analyzer-revision rerun was not
+    /// enqueued or was lost before the worker landed it.
+    ///
+    /// Fixture: parser drift on `tree-sitter-kotlin`, both
+    /// `kotlin-resolver` and `jdtls-lsp` are `succeeded` at the
+    /// **older** revision (4 vs current 5 for kotlin-resolver, and
+    /// 0 vs current 1 for jdtls-lsp). The check must classify this
+    /// as the Case D-like "rerun never landed" Warn, mention the
+    /// stale analyzer's persisted-vs-expected revision in the
+    /// detail, and steer the operator at the daemon log + manual
+    /// reindex.
+    #[test]
+    fn parser_drift_all_succeeded_at_old_revision_is_warn_not_case_a_fail() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
+            vec![
+                run_row("kotlin-resolver", 4, "succeeded", None),
+                run_row("jdtls-lsp", 0, "succeeded", None),
+            ],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "succeeded-at-old-revision must NOT be misclassified as Case A Fail"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("never landed"),
+            "detail must use the 'rerun never landed' framing rather than the Case A chain-bug framing: {detail}"
+        );
+        assert!(
+            detail.contains("revision 4") && detail.contains("expected revision 5"),
+            "detail must surface the persisted-vs-expected revision so the operator can confirm the analyzer is stale: {detail}"
+        );
+        assert!(
+            !detail.contains("chain is broken"),
+            "Case A chain-bug language must NOT appear when the explanation is simply that the analyzer rerun has not landed yet: {detail}"
+        );
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(remediation.contains("daemon log") && remediation.contains("staleness"));
+        assert!(remediation.contains("cairn ctl repo reindex moshi"));
+    }
+
+    /// **R2 must-fix on PR #228 v1, cross-emission pin**: the same
+    /// probe carries `stale_revisions` (analyzer drift on
+    /// `kotlin-resolver`) AND `stale_parser_revisions` (parser
+    /// drift). The two checks the helper emits must classify
+    /// correctly side-by-side:
+    ///
+    ///   - the analyzer-side check must surface Case D-like Warn
+    ///     ("rerun never landed at current revision"),
+    ///   - the parser-side check must surface Warn (NOT Case A
+    ///     Fail), because the stale analyzer prevents the safety-net
+    ///     framing from kicking in.
+    #[test]
+    fn cross_emission_analyzer_drift_and_parser_drift_both_warn() {
+        let probes = vec![AliasStoreProbe {
+            alias: "moshi".into(),
+            store_path: PathBuf::from("/tmp/moshi/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: vec![
+                    run_row("kotlin-resolver", 4, "succeeded", None),
+                    run_row("jdtls-lsp", 1, "succeeded", None),
+                ],
+                expected_tier3_analyzer_ids: vec!["kotlin-resolver".into(), "jdtls-lsp".into()],
+                stale_revisions: vec![StaleRevision {
+                    analyzer_id: "kotlin-resolver".into(),
+                    current_rev: Some(4),
+                    expected_rev: 5,
+                }],
+                stale_parser_revisions: vec![ParserStaleRevision {
+                    parser_id: "tree-sitter-kotlin".into(),
+                    current_rev: Some(1),
+                    expected_rev: 4,
+                    affected_blob_count: 99,
+                }],
+                expected_analyzer_revisions: [
+                    ("kotlin-resolver".to_string(), 5),
+                    ("jdtls-lsp".to_string(), 1),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+        }];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(
+            checks.len(),
+            2,
+            "one analyzer-side check + one parser-side check"
+        );
+
+        // Find the parser-drift check by name.
+        let parser_check = checks
+            .iter()
+            .find(|c| c.name.contains("parser drift rerun health"))
+            .expect("parser drift rerun health check must be emitted");
+        assert_eq!(
+            parser_check.status,
+            DoctorStatus::Warn,
+            "parser-drift side must NOT misclassify as Case A Fail when an analyzer is stale"
+        );
+        let parser_detail = parser_check.detail.as_deref().unwrap_or("");
+        assert!(
+            parser_detail.contains("never landed"),
+            "parser-drift detail must use the 'never landed' framing, not the chain-bug framing: {parser_detail}"
+        );
+        assert!(
+            !parser_detail.contains("chain is broken"),
+            "Case A chain-bug language must NOT appear: {parser_detail}"
+        );
+
+        // Find the analyzer-side check by name.
+        let analyzer_check = checks
+            .iter()
+            .find(|c| c.name.contains("analyzer `kotlin-resolver` rerun health"))
+            .expect("analyzer-side rerun health check must be emitted");
+        assert_eq!(analyzer_check.status, DoctorStatus::Warn);
+        let analyzer_detail = analyzer_check.detail.as_deref().unwrap_or("");
+        assert!(
+            analyzer_detail.contains("revision 4")
+                && analyzer_detail.contains("expected revision 5"),
+            "analyzer-side detail must include the persisted-vs-expected revision: {analyzer_detail}"
+        );
+    }
+
     /// MA-1: a `running` row whose `started_at_ns` is older than
     /// `STUCK_RUN_THRESHOLD` (6h) MUST surface as `Warn` with an
     /// explicit "stuck" framing, not as the routine "indexing in
@@ -2562,6 +2777,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         assert_eq!(stuck.status, DoctorStatus::Warn);
@@ -2606,6 +2822,7 @@ mod tests {
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
                 stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
             },
         );
         assert_eq!(stuck.status, DoctorStatus::Warn);
