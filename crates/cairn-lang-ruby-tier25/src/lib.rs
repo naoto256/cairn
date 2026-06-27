@@ -93,6 +93,10 @@ impl WorkspaceAnalyzer for RubyTier25Analyzer {
         PARSER_ID
     }
 
+    fn requires_materialized_files(&self) -> bool {
+        true
+    }
+
     fn analyze_workspace(
         &self,
         _repo_root: &Path,
@@ -213,6 +217,10 @@ pub fn analyze_files(
 }
 
 fn read_blob(file: &WorkspaceFile) -> Option<Vec<u8>> {
-    let path = file.worktree_path.as_ref()?;
-    std::fs::read(path).ok()
+    // v0.7.0 D PR: the runner pre-reads workspace files for
+    // Tier-2.5 analyzers (`requires_materialized_files() == true`)
+    // and attaches the bytes here. Reading `worktree_path` directly
+    // would re-open a race window between the runner's readability
+    // check and the analyzer's actual read.
+    file.source_bytes.as_deref().map(<[u8]>::to_vec)
 }

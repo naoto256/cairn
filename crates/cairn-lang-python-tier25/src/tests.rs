@@ -20,6 +20,7 @@ fn write_files(root: &std::path::Path, files: &[(&str, &str)]) -> Vec<WorkspaceF
             path: (*rel).to_string(),
             blob_sha: format!("blob-{rel}"),
             worktree_path: Some(abs),
+            source_bytes: Some(std::sync::Arc::from(content.as_bytes())),
         });
     }
     out

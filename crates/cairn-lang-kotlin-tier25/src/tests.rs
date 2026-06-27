@@ -20,6 +20,7 @@ fn write_files(root: &std::path::Path, files: &[(&str, &str)]) -> Vec<WorkspaceF
             path: (*rel).to_string(),
             blob_sha: format!("blob-{rel}"),
             worktree_path: Some(abs),
+            source_bytes: Some(std::sync::Arc::from(content.as_bytes())),
         });
     }
     out
@@ -1068,5 +1069,75 @@ fn filekt_same_package_real_object_wins() {
             .any(|c| c.target_qualified.as_deref() == Some("util.bar")),
         "synthetic strip must not fire when same-package literal object exists; got {:#?}",
         calls
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// D PR (v0.7.0) consumer-migration smoke test
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Pin that `analyze_files` reads its input from
+/// `WorkspaceFile.source_bytes` — the bytes the runner materialized
+/// on the analyzer's behalf — and NOT from `worktree_path` on disk.
+///
+/// Fixture: an on-disk file with content that would NOT produce any
+/// `Type` resolutions, but with `source_bytes` carrying real Kotlin
+/// source that declares two subclasses of a base interface. If the
+/// resolver ever regresses to reading `worktree_path` directly (the
+/// silent-data-loss path the D PR closed), this test fails because
+/// the disk content emits no resolutions while the in-memory bytes do.
+#[test]
+fn read_blob_uses_source_bytes_not_worktree_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base_path = tmp.path().join("Base.kt");
+    let impl_path = tmp.path().join("Impl.kt");
+
+    // Disk content: empty package decls, no inheritance edges to emit.
+    std::fs::write(
+        &base_path,
+        b"package util
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &impl_path,
+        b"package util
+",
+    )
+    .unwrap();
+
+    let real_base = b"package util
+
+interface Base
+";
+    let real_impl = b"package util
+
+class Impl : Base
+";
+
+    let files = vec![
+        WorkspaceFile {
+            path: "Base.kt".into(),
+            blob_sha: "blob-Base.kt".into(),
+            worktree_path: Some(base_path),
+            source_bytes: Some(std::sync::Arc::from(&real_base[..])),
+        },
+        WorkspaceFile {
+            path: "Impl.kt".into(),
+            blob_sha: "blob-Impl.kt".into(),
+            worktree_path: Some(impl_path),
+            source_bytes: Some(std::sync::Arc::from(&real_impl[..])),
+        },
+    ];
+
+    let res = analyze_files(&files, &AnalyzerProgress::default());
+    let types: Vec<_> = res
+        .iter()
+        .filter(|r| r.kind == ResolutionKind::Type && r.source_path == "Impl.kt")
+        .collect();
+    assert!(
+        !types.is_empty(),
+        "analyzer must read from source_bytes (in-memory), \
+         not worktree_path (empty on disk); got {res:#?}"
     );
 }

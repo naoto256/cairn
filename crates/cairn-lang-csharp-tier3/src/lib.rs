@@ -607,6 +607,7 @@ class Declared : BaseWidget, IWidget {
                 path: source.file_name().unwrap().to_string_lossy().to_string(),
                 blob_sha: "blob".into(),
                 worktree_path: Some(source.to_path_buf()),
+                source_bytes: None,
             }],
             &AnalyzerProgress::default(),
         )
