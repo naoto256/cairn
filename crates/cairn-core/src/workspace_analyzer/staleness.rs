@@ -233,7 +233,8 @@ fn scan_one_alias(
     // an infinite reindex loop (the row stays in place across reindex,
     // and `expected_parse_units` ignores it).
     if detect_parser_revision_drift(&conn, manifest_id, repo_root)? {
-        match job_manager.enqueue_full_repo_reindex(&entry.alias, ReindexReason::ParserRevisionDrift)
+        match job_manager
+            .enqueue_full_repo_reindex(&entry.alias, ReindexReason::ParserRevisionDrift)
         {
             Ok(outcome) => {
                 info!(
@@ -525,22 +526,26 @@ pub fn compute_parser_stale_revisions(
 
     let mut out: Vec<ParserStaleRevision> = groups
         .into_iter()
-        .map(|((parser_id, current_rev), (expected_rev, count))| ParserStaleRevision {
-            parser_id,
-            current_rev,
-            expected_rev,
-            affected_blob_count: count,
-        })
+        .map(
+            |((parser_id, current_rev), (expected_rev, count))| ParserStaleRevision {
+                parser_id,
+                current_rev,
+                expected_rev,
+                affected_blob_count: count,
+            },
+        )
         .collect();
     // Stable sort for deterministic doctor output: parser_id asc,
     // then current_rev (None last) asc.
     out.sort_by(|a, b| {
-        a.parser_id.cmp(&b.parser_id).then_with(|| match (a.current_rev, b.current_rev) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        })
+        a.parser_id
+            .cmp(&b.parser_id)
+            .then_with(|| match (a.current_rev, b.current_rev) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
     });
     Ok(out)
 }
@@ -1044,7 +1049,10 @@ mod e2e {
         let drifted =
             detect_parser_revision_drift(&conn, f.manifest_id, &std::path::PathBuf::from("/"))
                 .unwrap();
-        assert!(!drifted, "matching parser_revision must not register as drift");
+        assert!(
+            !drifted,
+            "matching parser_revision must not register as drift"
+        );
     }
 
     /// Test #2 — R2 must-fix: equality (`!=`) is the rule, not order
@@ -1276,8 +1284,7 @@ mod e2e {
             tx.commit().unwrap();
         }
         let clean_manifest_id = ManifestId(1);
-        let conn =
-            cas_store::open(&drifted.cas_data_dir.store_db_path(clean_hash)).unwrap();
+        let conn = cas_store::open(&drifted.cas_data_dir.store_db_path(clean_hash)).unwrap();
         conn.execute(
             "INSERT INTO manifests (manifest_id, kind, built_at_ns)
              VALUES (?1, 'tentative', 0)",
