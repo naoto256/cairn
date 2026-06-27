@@ -20,9 +20,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cairn_lang_api::{
-    LanguageBackend, all_backends, pick_backend_for_path, pick_backend_for_shebang,
-};
+use cairn_lang_api::{LanguageBackend, all_backends, pick_backend_for_path};
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::debug;
 
@@ -32,12 +30,9 @@ use crate::cas;
 use crate::jobs::{EnqueueReindex, JobManager, QueuedAnalyzerJob};
 use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
 use crate::workspace_analyzer::{
-    check_workspace_analyzer_current_succeeded, run_registered_workspace_analyzers,
+    check_workspace_analyzer_current_succeeded, is_c_family_header_path,
+    pick_backend_with_fallbacks, run_registered_workspace_analyzers,
 };
-
-mod header_detect;
-
-use header_detect::{is_c_family_header_path, pick_c_family_header_backend};
 
 /// Outcome of a successful `register_repo` call.
 #[derive(Debug, Clone)]
@@ -375,8 +370,7 @@ fn parse_pending_blobs(
             ContentSource::Worktree(p) => std::fs::read(p)?,
             ContentSource::Git(sha) => git_cat_file(worktree_path, sha)?,
         };
-        let Some(backend) = pick_backend_with_shebang_fallback(backends, &entry.path, &content)
-        else {
+        let Some(backend) = pick_backend_with_fallbacks(backends, &entry.path, &content) else {
             continue;
         };
         let parser_id = backend.parser_id().to_string();
@@ -436,33 +430,6 @@ fn source_for(
         Some(rel) => ContentSource::Worktree(worktree_path.join(rel)),
         None => ContentSource::Git(entry.blob_sha.clone()),
     }
-}
-
-fn pick_backend_with_shebang_fallback<'a>(
-    backends: &'a [Box<dyn LanguageBackend>],
-    path: &str,
-    content: &[u8],
-) -> Option<&'a dyn LanguageBackend> {
-    if let Some(backend) = pick_backend_for_path(backends, path) {
-        return Some(backend);
-    }
-    if let Some(backend) = pick_c_family_header_backend(backends, path, content) {
-        return Some(backend);
-    }
-    let first_line = read_first_line(content)?;
-    if !first_line.starts_with("#!") {
-        return None;
-    }
-    pick_backend_for_shebang(backends, first_line)
-}
-
-fn read_first_line(content: &[u8]) -> Option<&str> {
-    let window = &content[..content.len().min(256)];
-    let end = window
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(window.len());
-    std::str::from_utf8(&window[..end]).ok()
 }
 
 enum ContentSource {
@@ -1137,7 +1104,7 @@ mod tests {
     #[test]
     fn shebang_fallback_picks_python_env_script() {
         let backends = python_backends();
-        let backend = pick_backend_with_shebang_fallback(
+        let backend = pick_backend_with_fallbacks(
             &backends,
             "bin/foo",
             b"#!/usr/bin/env python3\nprint('hi')\n",
@@ -1149,7 +1116,7 @@ mod tests {
     #[test]
     fn shebang_fallback_picks_uv_inline_script() {
         let backends = python_backends();
-        let backend = pick_backend_with_shebang_fallback(
+        let backend = pick_backend_with_fallbacks(
             &backends,
             "bin/foo",
             b"#!/usr/bin/env -S uv run --script\nprint('hi')\n",
@@ -1162,7 +1129,7 @@ mod tests {
     fn shebang_fallback_rejects_shell_script() {
         let backends = python_backends();
         assert!(
-            pick_backend_with_shebang_fallback(&backends, "bin/foo", b"#!/bin/bash\necho hi\n")
+            pick_backend_with_fallbacks(&backends, "bin/foo", b"#!/bin/bash\necho hi\n")
                 .is_none()
         );
     }
@@ -1170,21 +1137,15 @@ mod tests {
     #[test]
     fn shebang_fallback_rejects_extensionless_without_shebang() {
         let backends = python_backends();
-        assert!(pick_backend_with_shebang_fallback(&backends, "bin/foo", b"\x7fELF").is_none());
+        assert!(pick_backend_with_fallbacks(&backends, "bin/foo", b"\x7fELF").is_none());
     }
 
     #[test]
     fn shebang_fallback_keeps_path_based_match() {
         let backends = python_backends();
         let backend =
-            pick_backend_with_shebang_fallback(&backends, "foo.py", b"print('hi')\n").unwrap();
+            pick_backend_with_fallbacks(&backends, "foo.py", b"print('hi')\n").unwrap();
         assert_eq!(backend.parser_id(), "tree-sitter-python");
-    }
-
-    #[test]
-    fn read_first_line_handles_empty_and_short_files() {
-        assert_eq!(read_first_line(b""), Some(""));
-        assert_eq!(read_first_line(b"abc"), Some("abc"));
     }
 
     #[test]

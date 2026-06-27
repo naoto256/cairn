@@ -103,6 +103,7 @@ use crate::workspace_analyzer::run::{
 };
 
 mod expected;
+mod header_detect;
 mod lsp_pass;
 mod path;
 mod persist;
@@ -110,7 +111,10 @@ mod run;
 mod staleness;
 
 pub use expected::expected_analyzers_for_manifest;
-pub(crate) use expected::{check_workspace_analyzer_current_succeeded, manifest_parser_ids};
+pub(crate) use expected::{
+    ExpectedParseUnit, check_workspace_analyzer_current_succeeded, expected_parse_units,
+    is_c_family_header_path, manifest_parser_ids, pick_backend_with_fallbacks,
+};
 pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
     LspMultiKindDefinitionPass, run_lsp_definition_pass, run_lsp_multi_kind_definition_pass,

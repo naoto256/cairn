@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 
+use cairn_lang_api::{LanguageBackend, pick_backend_for_path, pick_backend_for_shebang};
 use rusqlite::params;
 
 use crate::Result;
-use crate::manifest::ManifestId;
+use crate::manifest::{self, ManifestId};
 
+use super::header_detect::pick_c_family_header_backend;
 use super::{WorkspaceAnalyzer, all_workspace_analyzers};
+
+pub(crate) use super::header_detect::is_c_family_header_path;
 
 /// Returns the Tier-3 analyzers that are expected to run for one manifest.
 ///
@@ -97,6 +102,119 @@ pub(crate) fn manifest_parser_ids(
         .query_map(params![manifest_id.0], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
     Ok(parser_ids)
+}
+
+/// Shared backend-selection chain used by both the register hot path
+/// (`parse_pending_blobs`) and the daemon-startup parser-revision
+/// staleness scanner.
+///
+/// Selection priority is: extension match → C-family header
+/// disambiguation → shebang. The same chain produces the same
+/// `(parser_id, parser_revision)` answer in both callers, so a future
+/// drift between "what register reparses" and "what the scanner
+/// considers stale" cannot grow from divergent selection logic.
+pub(crate) fn pick_backend_with_fallbacks<'a>(
+    backends: &'a [Box<dyn LanguageBackend>],
+    path: &str,
+    content: &[u8],
+) -> Option<&'a dyn LanguageBackend> {
+    if let Some(backend) = pick_backend_for_path(backends, path) {
+        return Some(backend);
+    }
+    if let Some(backend) = pick_c_family_header_backend(backends, path, content) {
+        return Some(backend);
+    }
+    let first_line = read_first_line(content)?;
+    if !first_line.starts_with("#!") {
+        return None;
+    }
+    pick_backend_for_shebang(backends, first_line)
+}
+
+fn read_first_line(content: &[u8]) -> Option<&str> {
+    let window = &content[..content.len().min(256)];
+    let end = window
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(window.len());
+    std::str::from_utf8(&window[..end]).ok()
+}
+
+/// A single `(blob_sha, parser_id, parser_revision)` triple that the
+/// current backend set expects to be present in `blobs` for a given
+/// manifest.
+///
+/// Computed by [`expected_parse_units`] starting from the manifest
+/// entries and applying the same backend-selection chain
+/// (`pick_backend_with_fallbacks`) that the register hot path uses.
+/// "Expected" is the right framing for staleness detection: a row
+/// missing from `blobs` is just as much a drift signal as a row whose
+/// `parser_revision` mismatches the linked-in backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedParseUnit {
+    pub blob_sha: String,
+    pub parser_id: String,
+    pub parser_revision: u32,
+}
+
+/// Expected parse units for `manifest_id`, computed against the
+/// current backend set.
+///
+/// Reads manifest entries from the store, runs each path through
+/// [`pick_backend_with_fallbacks`] (lazily loading content from the
+/// worktree only when the extension match misses), and returns the
+/// distinct `(blob_sha, parser_id, parser_revision)` triples the
+/// current backend set considers parseable.
+///
+/// Missing worktree files (entry referenced a file that has since
+/// been deleted) and read errors during fallback are silently
+/// skipped — they would also be skipped by `parse_pending_blobs`, and
+/// the scanner has no recovery for them either.
+///
+/// Caller is responsible for stopping at the first manifest that
+/// matters; this function does not scan every manifest in the store.
+pub(crate) fn expected_parse_units(
+    conn: &rusqlite::Connection,
+    manifest_id: ManifestId,
+    repo_root: &Path,
+    backends: &[Box<dyn LanguageBackend>],
+) -> Result<Vec<ExpectedParseUnit>> {
+    let entries = manifest::get_entries(conn, manifest_id)?;
+    let mut units = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for entry in &entries {
+        if let Some(backend) = pick_backend_for_path(backends, &entry.path) {
+            push_unit(&mut units, &mut seen, entry.blob_sha.clone(), backend);
+            continue;
+        }
+        // Fallback paths need content. The worktree copy is the
+        // ground truth at scan time; if the file has been deleted
+        // we can only consult the extension match (which already
+        // missed), so skip cleanly.
+        let Ok(content) = std::fs::read(repo_root.join(entry.path.as_str())) else {
+            continue;
+        };
+        if let Some(backend) = pick_backend_with_fallbacks(backends, &entry.path, &content) {
+            push_unit(&mut units, &mut seen, entry.blob_sha.clone(), backend);
+        }
+    }
+    Ok(units)
+}
+
+fn push_unit(
+    units: &mut Vec<ExpectedParseUnit>,
+    seen: &mut HashSet<(String, String)>,
+    blob_sha: String,
+    backend: &dyn LanguageBackend,
+) {
+    let parser_id = backend.parser_id().to_string();
+    if seen.insert((blob_sha.clone(), parser_id.clone())) {
+        units.push(ExpectedParseUnit {
+            blob_sha,
+            parser_id,
+            parser_revision: backend.parser_revision(),
+        });
+    }
 }
 
 #[cfg(test)]
