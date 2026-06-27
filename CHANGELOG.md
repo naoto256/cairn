@@ -176,6 +176,23 @@ versions follow [SemVer](https://semver.org/).
   assertion. The previous test would have passed even if `\\` were
   no longer treated as a qualifier separator.
 
+### Known limitations (deferred to 0.7.1)
+
+- **Tier-1 `find_symbols` scope filter is JS/TS only.** The
+  `scope = 'top_level'` filter introduced in schema v12 (see the
+  nested-function-suppression entry above) currently only
+  distinguishes top-level from nested for the
+  `cairn-lang-typescript` JS/TS Tier-1 visitor. C++ / Java
+  function-local types (`class` / `struct` / `enum` / `record`
+  declared inside a function body) still emit
+  `scope = 'top_level'` and may leak into `find_symbols` results
+  even though they are not workspace-addressable. 0.7.1 will
+  extend frame tracking to the cpp / java visitors. Workaround
+  until then: narrow `find_symbols` queries with `path=` or
+  `container=` when working in C++ / Java codebases. Other Tier-1
+  backends (Rust, Python, Go, etc.) have less idiomatic function-
+  local type declarations and are not blocking 0.7.1.
+
 ### Analyzer revisions
 
 - All seven Tier-2.5 analyzers are now at their v0.7.0 ship
