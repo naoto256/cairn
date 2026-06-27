@@ -94,7 +94,13 @@ pub const TIER_PREFIX: &str = "tier25";
 // invalidate cached runs so the path-aware resolver re-records the
 // edge. The PR #220 startup staleness scanner auto-enqueues the
 // rerun.
-pub const ANALYZER_REVISION: u32 = 5;
+// Bumped to 6 for CodeRabbit follow-ups #2/#10: import-edge
+// resolutions now set `target_qualified = None` (contract clean-up
+// matching the other Tier-2.5 backends), and root-package top-level
+// functions are indexed in the package callable map (owner="" /
+// package=None mapping) so bare `helper()` and synthetic
+// `FileKt.helper()` calls resolve. Cached runs need invalidation.
+pub const ANALYZER_REVISION: u32 = 6;
 pub const PARSER_ID: &str = "tree-sitter-kotlin-ng";
 pub const RESOLUTION_SOURCE: &str = "tier25-kotlin-resolver";
 
@@ -182,6 +188,18 @@ pub fn analyze_files(
 
     // 3. Emit Import resolutions for `import …` statements whose
     // target lives in the workspace.
+    //
+    // Phase 1 contract (matches Ruby / JavaScript): Import-edge rows
+    // record `target_path` only; `target_qualified` is forced to
+    // `None`. The require_graph still computes the qualified name
+    // internally (for the binding map / wildcard expansion), but
+    // leaking it into the persisted row lets `persist.rs` path-scoped
+    // lookup (`(blob_sha, parser_id, qualified)`) spuriously pin a
+    // symbol_id for an import edge, turning a "no single target
+    // file" import semantic into "specific symbol's file". The
+    // manifest-wide fallback in persist.rs is gated on
+    // `kind != Import`, but the path-scoped fast path runs first and
+    // is not gated, so we scrub `target_qualified` at the source.
     for (path, _, _) in &per_file {
         for edge in require_graph.edges_for(path) {
             resolutions.push(WorkspaceResolution {
@@ -190,7 +208,7 @@ pub fn analyze_files(
                 kind: ResolutionKind::Import,
                 semantic_kind: None,
                 target_path: edge.target_path.clone(),
-                target_qualified: edge.target_qualified.clone(),
+                target_qualified: None,
             });
         }
     }

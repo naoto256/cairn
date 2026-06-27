@@ -346,6 +346,18 @@ fn module_attribute_call_via_import_module() {
 }
 
 // ─── require_graph (imports → workspace files) ───────────────────────────
+//
+// Phase 1 contract: persisted Import resolutions carry `target_path`
+// only — `target_qualified` is always `None` (matches Ruby /
+// JavaScript). The qualified name still lives on the require_graph
+// internally for binding lookup; we just don't leak it into the row,
+// because persist.rs path-scoped lookup would otherwise spuriously
+// pin a workspace symbol_id to the import edge.
+
+fn import_targets_path(imps: &[WorkspaceResolution], path: &str) -> bool {
+    imps.iter()
+        .any(|r| r.target_path.as_deref() == Some(path) && r.target_qualified.is_none())
+}
 
 #[test]
 fn from_import_emits_resolution_for_workspace_class() {
@@ -355,9 +367,8 @@ fn from_import_emits_resolution_for_workspace_class() {
     let res = run(tmp.path(), &[("widget.py", widget), ("main.py", main)]);
     let imps = imports_of(&res, "main.py");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("widget.Widget")),
-        "from import should emit a resolution; got {:#?}",
+        import_targets_path(&imps, "widget.py"),
+        "from import should emit a resolution pinned to widget.py with target_qualified=None; got {:#?}",
         imps,
     );
 }
@@ -370,9 +381,8 @@ fn import_module_emits_resolution() {
     let res = run(tmp.path(), &[("widget.py", widget), ("main.py", main)]);
     let imps = imports_of(&res, "main.py");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("widget")),
-        "import widget should resolve to module; got {:#?}",
+        import_targets_path(&imps, "widget.py"),
+        "import widget should resolve to module file with target_qualified=None; got {:#?}",
         imps,
     );
 }
@@ -393,9 +403,8 @@ fn relative_import_resolves_through_package() {
     );
     let imps = imports_of(&res, "pkg/caller.py");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("pkg.widget.Widget")),
-        "relative `from .widget import Widget` should resolve; got {:#?}",
+        import_targets_path(&imps, "pkg/widget.py"),
+        "relative `from .widget import Widget` should resolve to pkg/widget.py with target_qualified=None; got {:#?}",
         imps,
     );
 }
@@ -419,11 +428,12 @@ fn relative_dot_import_resolves_sibling_module() {
     let imps = imports_of(&res, "pkg/sub/caller.py");
     assert!(
         imps.iter().any(|r| r
-            .target_qualified
+            .target_path
             .as_deref()
-            .map(|q| q.contains("widget"))
-            .unwrap_or(false)),
-        "`from . import widget` should resolve; got {:#?}",
+            .map(|p| p.contains("widget"))
+            .unwrap_or(false)
+            && r.target_qualified.is_none()),
+        "`from . import widget` should resolve to a widget path with target_qualified=None; got {:#?}",
         imps,
     );
 }
@@ -439,9 +449,8 @@ fn package_init_resolves_for_import() {
     );
     let imps = imports_of(&res, "caller.py");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("pkg.Root")),
-        "package __init__.py Root should resolve; got {:#?}",
+        import_targets_path(&imps, "pkg/__init__.py"),
+        "package __init__.py Root should resolve to pkg/__init__.py with target_qualified=None; got {:#?}",
         imps,
     );
 }
@@ -462,11 +471,34 @@ fn absolute_dotted_import_resolves() {
     );
     let imps = imports_of(&res, "main.py");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("pkg.sub.widget.Widget")),
-        "absolute dotted import should resolve; got {:#?}",
+        import_targets_path(&imps, "pkg/sub/widget.py"),
+        "absolute dotted import should resolve to pkg/sub/widget.py with target_qualified=None; got {:#?}",
         imps,
     );
+}
+
+#[test]
+fn import_target_qualified_is_none_even_when_require_graph_resolved() {
+    // Regression for CodeRabbit PR #231 finding C-2 (python): even
+    // when the require_graph internally resolves a qualified target
+    // (here "widget.Widget"), the persisted Import
+    // WorkspaceResolution must carry `target_qualified = None`.
+    // Otherwise persist.rs path-scoped `(blob_sha, parser_id,
+    // qualified)` lookup would spuriously pin a workspace symbol_id
+    // to the import edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let widget = "class Widget:\n    pass\n";
+    let main = "from widget import Widget\n";
+    let res = run(tmp.path(), &[("widget.py", widget), ("main.py", main)]);
+    let imps = imports_of(&res, "main.py");
+    assert!(!imps.is_empty(), "expected at least one import row");
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must have target_qualified=None even when binding resolved internally; got {:?}",
+            r
+        );
+    }
 }
 
 // ─── 諦め: things Tier-2.5 must NOT resolve ─────────────────────────────

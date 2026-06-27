@@ -188,8 +188,13 @@ fn resolve_dotted_call(
     aliases: &HashMap<String, String>,
     file_facts: &FileConstFacts,
 ) -> Option<DispatchResolution> {
-    let class_qualified =
-        resolve_dotted_to_qualified(parts, aliases, file_facts.package.as_deref(), file_facts)?;
+    let class_qualified = resolve_dotted_to_qualified(
+        parts,
+        aliases,
+        file_facts.package.as_deref(),
+        file_facts,
+        package_index,
+    )?;
     // 1. Class-method dispatch (walk MRO).
     if package_index.lookup(&class_qualified).is_some() {
         for ancestor in mro.ancestors(&class_qualified) {
@@ -230,11 +235,28 @@ fn resolve_dotted_call(
     None
 }
 
+/// Resolve a dotted receiver (`Co.App.Registry` in
+/// `Co.App.Registry.Build()`) to a fully-qualified class / namespace
+/// name. Mirrors the Kotlin `lookup_via_binding` discipline (PR
+/// #219): when the receiver has multiple parts (i.e. is shaped like
+/// a namespace path or qualified type), every candidate is validated
+/// against `PackageIndex` before being adopted; if none verifies
+/// we return None, blocking the spurious-prefix bug (CodeRabbit PR
+/// #231 finding C-6) where `Co.App.Registry.Build()` inside
+/// namespace `Other` was rewritten to `Other.Co.App.Registry`
+/// without checking whether that prefix existed.
+///
+/// For single-part receivers (`y.Method()`) we keep the legacy
+/// permissive behavior — `y` is typically a local variable that
+/// cannot live in the workspace symbol index, and rejecting it
+/// would break extension-method dispatch via the caller's branch 4
+/// (`get_unique_by_name`).
 fn resolve_dotted_to_qualified(
     parts: &[String],
     aliases: &HashMap<String, String>,
     package: Option<&str>,
     file_facts: &FileConstFacts,
+    package_index: &PackageIndex,
 ) -> Option<String> {
     if parts.is_empty() {
         return None;
@@ -245,23 +267,48 @@ fn resolve_dotted_to_qualified(
     } else {
         None
     };
+    // `using X = A.B;` — alias bindings are authoritative.
     if let Some(target) = aliases.get(head) {
         return Some(match &tail {
             Some(t) => format!("{target}.{t}"),
             None => target.clone(),
         });
     }
-    // Same-namespace and containing-namespace lookup. We return the
-    // first candidate even if it doesn't pin a workspace symbol; the
-    // caller distinguishes the path.
-    if let Some(p) = package.filter(|s| !s.is_empty()) {
-        return Some(format!("{p}.{}", parts.join(".")));
+
+    let joined = parts.join(".");
+
+    // Single-part receiver: extension-method / local-variable shape.
+    // Cannot be a namespace by C# grammar (a stand-alone identifier
+    // call would be parsed as `CallReceiver::Bare`, not Dotted; a
+    // single-part Dotted means `x.Method()` where `x` is a local /
+    // field / parameter). Keep the legacy permissive behavior.
+    if parts.len() == 1 {
+        if let Some(p) = package.filter(|s| !s.is_empty()) {
+            return Some(format!("{p}.{joined}"));
+        }
+        return Some(joined);
     }
-    // Wildcard imports.
-    for b in &file_facts.import_bindings {
-        if b.kind == ImportKind::Plain {
-            return Some(format!("{}.{}", b.fqn, parts.join(".")));
+
+    // Multi-part receiver: build candidate FQNs in declaration-scope
+    // precedence and adopt the first that pins to a workspace symbol
+    // or known namespace.
+    //   1. current namespace and each containing namespace prefix.
+    //   2. `using namespace ...;` (wildcard plain imports) prefixes.
+    //   3. the bare dotted form itself (absolute reference).
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(p) = package.filter(|s| !s.is_empty()) {
+        for prefix in containing_namespaces(p) {
+            candidates.push(format!("{prefix}.{joined}"));
         }
     }
-    Some(parts.join("."))
+    for b in &file_facts.import_bindings {
+        if b.kind == ImportKind::Plain {
+            candidates.push(format!("{}.{}", b.fqn, joined));
+        }
+    }
+    candidates.push(joined);
+
+    candidates
+        .into_iter()
+        .find(|cand| package_index.lookup(cand).is_some() || package_index.has_package(cand))
 }

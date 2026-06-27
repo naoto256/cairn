@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::AliasTarget;
-use crate::const_resolver::{CallReceiver, FileConstFacts, MethodCall, PackageIndex};
+use crate::const_resolver::{CallReceiver, FileConstFacts, ImportKind, MethodCall, PackageIndex};
 use crate::mro::Mro;
 
 #[derive(Debug, Clone)]
@@ -159,7 +159,15 @@ pub fn resolve_call(
             aliases,
         ),
         CallReceiver::NewExpr { class } => {
-            let class_target = resolve_class_target(class, aliases, package_index)?;
+            // Mirror the `Cls.method()` path (see `resolve_dotted_call`
+            // single-part case): if no alias / unique-workspace class
+            // is found, fall back to a same-file class. Without this
+            // fallback, `new Foo().bar()` in the file that declares
+            // `Foo` fails to resolve whenever another workspace file
+            // also defines a `Foo`, because `lookup_unique_class` is
+            // ambiguous.
+            let class_target = resolve_class_target(class, aliases, package_index)
+                .or_else(|| same_file_class(source_path, class, package_index))?;
             let ancestors = mro.ancestors_of(&class_target.path, &class_target.qualified);
             for (apath, aname) in ancestors {
                 if let Some(hit) = methods.get_method(&apath, &aname, &call.method) {
@@ -215,24 +223,35 @@ fn resolve_dotted_call(
     }
 
     // 2. `Ns.X()` — head is a namespace alias, tail = export name.
+    //
+    // Only an `import * as Ns from './foo'` shape lets us treat
+    // `Ns.X` as the *named export* `X` of the target module. For a
+    // default / named / CJS import (`import Foo from './foo'` etc.),
+    // `Foo.X` is a runtime property access on the imported value
+    // and we cannot statically pin it to a same-named export of the
+    // module — doing so would silently mis-route (e.g. a default
+    // import of class `Foo` calling `Foo.bar()` would jump to a
+    // sibling export `bar` that happens to live in the same file).
     if let Some(alias) = aliases.get(head) {
-        if let Some(target_path) = &alias.target_path {
-            let exported = &parts[1];
-            if let Some(hit) = package_index.lookup_export(target_path, exported) {
-                let composite = format!("{}.{}", hit.qualified, method);
-                if let Some(static_hit) = package_index.lookup_in_file(&hit.path, &composite) {
-                    return Some(DispatchResolution {
-                        path: static_hit.path.clone(),
-                        qualified: static_hit.qualified.clone(),
-                    });
-                }
-                let ancestors = mro.ancestors_of(&hit.path, &hit.qualified);
-                for (apath, aname) in ancestors {
-                    if let Some(method_hit) = methods.get_method(&apath, &aname, method) {
+        if alias.import_kind == ImportKind::EsmNamespace {
+            if let Some(target_path) = &alias.target_path {
+                let exported = &parts[1];
+                if let Some(hit) = package_index.lookup_export(target_path, exported) {
+                    let composite = format!("{}.{}", hit.qualified, method);
+                    if let Some(static_hit) = package_index.lookup_in_file(&hit.path, &composite) {
                         return Some(DispatchResolution {
-                            path: method_hit.path.clone(),
-                            qualified: method_hit.qualified.clone(),
+                            path: static_hit.path.clone(),
+                            qualified: static_hit.qualified.clone(),
                         });
+                    }
+                    let ancestors = mro.ancestors_of(&hit.path, &hit.qualified);
+                    for (apath, aname) in ancestors {
+                        if let Some(method_hit) = methods.get_method(&apath, &aname, method) {
+                            return Some(DispatchResolution {
+                                path: method_hit.path.clone(),
+                                qualified: method_hit.qualified.clone(),
+                            });
+                        }
                     }
                 }
             }

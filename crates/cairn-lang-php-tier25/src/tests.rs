@@ -335,6 +335,12 @@ fn dispatch_fqn_static_call() {
 
 // ─── require_graph ────────────────────────────────────────────────────────
 
+// Phase 1 contract: persisted Import resolutions carry `target_path`
+// only — `target_qualified` is always `None` (matches Ruby /
+// JavaScript). The qualified name still lives on the require_graph
+// internally for binding lookup; we just don't leak it into the row,
+// because persist.rs path-scoped lookup would otherwise spuriously
+// pin a workspace symbol_id to the import edge.
 #[test]
 fn use_import_emits_resolution_for_workspace_class() {
     let tmp = tempfile::tempdir().unwrap();
@@ -351,7 +357,11 @@ fn use_import_emits_resolution_for_workspace_class() {
     );
     let r = r.unwrap();
     assert_eq!(r.target_path.as_deref(), Some("Widget.php"));
-    assert_eq!(r.target_qualified.as_deref(), Some("App\\Models\\Widget"));
+    assert!(
+        r.target_qualified.is_none(),
+        "Import row must not carry target_qualified; got {:?}",
+        r.target_qualified
+    );
 }
 
 #[test]
@@ -365,12 +375,41 @@ fn group_use_import_emits_resolution_per_clause() {
         .filter(|r| r.source_path == "main.php" && r.kind == ResolutionKind::Import)
         .collect();
     assert_eq!(imports.len(), 2, "got {:#?}", imports);
-    let names: Vec<_> = imports
+    for r in &imports {
+        assert_eq!(r.target_path.as_deref(), Some("Traits.php"));
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must not carry target_qualified; got {:?}",
+            r.target_qualified
+        );
+    }
+}
+
+#[test]
+fn import_target_qualified_is_none_even_when_require_graph_resolved() {
+    // Regression for CodeRabbit PR #231 finding C-2 (php): even when
+    // the require_graph internally resolves a qualified target (here
+    // "App\\Models\\Widget"), the persisted Import
+    // WorkspaceResolution must carry `target_qualified = None`.
+    // Otherwise persist.rs path-scoped `(blob_sha, parser_id,
+    // qualified)` lookup would spuriously pin a workspace symbol_id
+    // to the import edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let widget = "<?php\nnamespace App\\Models;\nclass Widget {}\n";
+    let main = "<?php\nuse App\\Models\\Widget;\n";
+    let res = run(tmp.path(), &[("Widget.php", widget), ("main.php", main)]);
+    let imps: Vec<_> = res
         .iter()
-        .filter_map(|r| r.target_qualified.as_deref())
+        .filter(|r| r.source_path == "main.php" && r.kind == ResolutionKind::Import)
         .collect();
-    assert!(names.contains(&"App\\Traits\\Timestamps"));
-    assert!(names.contains(&"App\\Traits\\SoftDeletes"));
+    assert!(!imps.is_empty(), "expected at least one import row");
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must have target_qualified=None even when binding resolved internally; got {:?}",
+            r
+        );
+    }
 }
 
 #[test]

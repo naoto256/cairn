@@ -649,16 +649,6 @@ fn binding_form_require_not_double_emitted() {
     ));
 }
 
-#[test]
-fn analyzer_revision_bumped_for_expanded_require_emit() {
-    // Revision 4 (PR-β): const_resolver now emits ImportBinding for
-    // statement / expression / re-export `require(...)` shapes.
-    // The 2nd real use case of PR #220's analyzer-revision staleness
-    // scanner (after Wave 2C's PR-α CJS binding-form expansion).
-    use crate::ANALYZER_REVISION;
-    assert_eq!(ANALYZER_REVISION, 4);
-}
-
 // ─── glue ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -666,7 +656,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "javascript-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 4);
+    assert_eq!(ANALYZER_REVISION, 5);
     assert_eq!(PARSER_ID, "tree-sitter-javascript");
     assert_eq!(RESOLUTION_SOURCE, "tier25-javascript-resolver");
 }
@@ -676,6 +666,222 @@ fn empty_file_does_not_crash() {
     let tmp = tempfile::tempdir().unwrap();
     let res = run(tmp.path(), &[("Empty.js", "")]);
     assert!(res.is_empty());
+}
+
+// ─── 0.7.1 follow-up: resolver correctness fixes ─────────────────────
+
+/// #8: `lookup_class_in_file` must scope to the requested path. Two
+/// files both define `class Foo`; file A's same-file `extends Foo`
+/// must resolve to A's Foo, not B's. Before the fix, the lookup
+/// fell back to "first hit across the workspace", so the test below
+/// would have flapped on insertion order.
+#[test]
+fn lookup_class_in_file_returns_only_same_file_class() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = "class Foo {}\nclass Bar extends Foo {}\n";
+    let b = "class Foo {}\n";
+    let res = run(tmp.path(), &[("a.js", a), ("b.js", b)]);
+    let types = types_of(&res, "a.js");
+    // The `extends Foo` site in a.js must point at a.js's Foo. The
+    // pre-fix bug let it leak to b.js because both classes share
+    // the qualified name and `lookup_class_in_file` returned the
+    // first hit irrespective of path.
+    assert!(
+        types
+            .iter()
+            .any(|t| t.target_qualified.as_deref() == Some("Foo")
+                && t.target_path.as_deref() == Some("a.js")),
+        "extends Foo in a.js must resolve to a.js, not b.js; got {:#?}",
+        types
+    );
+    assert!(
+        types
+            .iter()
+            .all(|t| t.target_path.as_deref() != Some("b.js")),
+        "no a.js type ref should leak into b.js; got {:#?}",
+        types
+    );
+}
+
+/// #9: `new Foo().bar()` in the file that declares `Foo` must
+/// resolve even when another file also defines a same-named class.
+/// Pre-fix, `lookup_unique_class` returned None on the ambiguous
+/// name and `NewExpr` had no same-file fallback (unlike
+/// `Cls.method()`).
+#[test]
+fn new_expr_same_file_class_resolves_when_duplicate_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = "class Foo { bar() {} }\nfunction main() { new Foo().bar(); }\n";
+    let b = "class Foo {}\n";
+    let res = run(tmp.path(), &[("a.js", a), ("b.js", b)]);
+    let calls = calls_of(&res, "a.js");
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.target_path.as_deref() == Some("a.js")
+                && c.target_qualified.as_deref() == Some("Foo.bar")),
+        "new Foo().bar() in a.js must resolve to a.js Foo.bar even with duplicate class in b.js; got {:#?}",
+        calls
+    );
+}
+
+/// #11: `emit_function` indexes only top-level function declarations.
+/// Nested helpers (`function inner() {}` inside another function)
+/// must not appear in the workspace symbol index, so a sibling call
+/// to `inner()` from outside `outer` cannot statically pin to them.
+#[test]
+fn nested_function_declaration_not_indexed_as_workspace_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    // outer is top-level; inner is nested. A second file calls
+    // `inner()` at module scope — if `inner` had leaked into the
+    // index, dispatch would pin it.
+    let a = "function outer() { function inner() {} }\n";
+    let b = "inner();\n";
+    let res = run(tmp.path(), &[("a.js", a), ("b.js", b)]);
+    // No file should see `inner` as a resolved target.
+    let all_inner_hits: Vec<_> = res
+        .iter()
+        .filter(|r| r.target_qualified.as_deref() == Some("inner"))
+        .collect();
+    assert!(
+        all_inner_hits.is_empty(),
+        "nested `inner` must not be a workspace-addressable target; got {:#?}",
+        all_inner_hits
+    );
+    // Sanity: outer should still be indexed (it's top-level).
+    let outer_calls = run(
+        tmp.path(),
+        &[("a.js", a), ("c.js", "function outer() {}\nouter();\n")],
+    );
+    let c_calls = calls_of(&outer_calls, "c.js");
+    assert!(
+        c_calls
+            .iter()
+            .any(|r| r.target_qualified.as_deref() == Some("outer")),
+        "top-level outer() must remain resolvable; got {:#?}",
+        c_calls
+    );
+}
+
+/// #11 (follow-up): the depth gate must also fire for declarations
+/// nested inside a `function_expression` body, not just inside another
+/// `function_declaration`. Pre-follow-up, the visitor only bumped
+/// `function_depth` around `function_declaration` descents, so
+/// `const outer = function() { function inner(){} };` left
+/// `function_depth == 0` when reaching `inner` and `inner` leaked
+/// into the workspace symbol index.
+#[test]
+fn nested_function_in_function_expression_not_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = "const outer = function() { function inner() {} };
+";
+    let b = "inner();
+";
+    let res = run(tmp.path(), &[("a.js", a), ("b.js", b)]);
+    let all_inner_hits: Vec<_> = res
+        .iter()
+        .filter(|r| r.target_qualified.as_deref() == Some("inner"))
+        .collect();
+    assert!(
+        all_inner_hits.is_empty(),
+        "`inner` declared inside a function_expression body must not be a workspace-addressable target; got {:#?}",
+        all_inner_hits
+    );
+}
+
+/// #11 (follow-up): same as above for `arrow_function` bodies.
+/// `const outer = () => { function inner(){} };` must not leak
+/// `inner`.
+#[test]
+fn nested_function_in_arrow_function_not_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = "const outer = () => { function inner() {} };
+";
+    let b = "inner();
+";
+    let res = run(tmp.path(), &[("a.js", a), ("b.js", b)]);
+    let all_inner_hits: Vec<_> = res
+        .iter()
+        .filter(|r| r.target_qualified.as_deref() == Some("inner"))
+        .collect();
+    assert!(
+        all_inner_hits.is_empty(),
+        "`inner` declared inside an arrow_function body must not be a workspace-addressable target; got {:#?}",
+        all_inner_hits
+    );
+}
+
+/// #11 (follow-up): pin the negative — bumping depth on the
+/// expression-shaped scopes must not over-suppress real top-level
+/// `function_declaration`s. A bare `function exported() {}` at module
+/// scope is still addressable from another file.
+#[test]
+fn top_level_function_declaration_still_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Mirror the sanity shape of
+    // `nested_function_declaration_not_indexed_as_workspace_symbol`:
+    // declaration + call in the same file. If depth-bumping over
+    // expression-shaped function scopes accidentally over-suppressed
+    // real top-level declarations, the call here would fail to resolve.
+    let a = "function exported() {}\nexported();\n";
+    let res = run(tmp.path(), &[("a.js", a)]);
+    let calls = calls_of(&res, "a.js");
+    assert!(
+        calls
+            .iter()
+            .any(|r| r.target_qualified.as_deref() == Some("exported")),
+        "top-level `exported()` must remain workspace-addressable; got {:#?}",
+        calls
+    );
+}
+
+/// #12: `ResolvedBinding` / `AliasTarget` now carry `import_kind`,
+/// so dispatch can distinguish `Foo.bar()` on a default import (a
+/// runtime property of the imported value — not pinnable at
+/// Tier-2.5) from `Foo.bar()` on a namespace import (a named export
+/// — pinnable). Pre-fix, both shapes routed through the
+/// namespace-export lookup, so a default-imported `Foo` calling
+/// `Foo.bar()` would silently re-bind to any same-named export of
+/// the target module.
+#[test]
+fn default_import_dotted_access_resolves_to_property_of_default_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The bug shape: `Mod.Inner.method()` where `Mod` is a default
+    // import. Pre-fix, dispatch's 2-part dotted path treated
+    // `Mod.Inner` as the namespace-style "named export Inner of
+    // ./foo" lookup regardless of import kind, so a default-
+    // imported `Mod` would silently pin `Mod.Inner.method()` to a
+    // sibling named export `Inner` (here: class `Inner` exported
+    // from ./foo) — wrong: `Mod` is the default-exported class, so
+    // `Mod.Inner` is a runtime property access we can't statically
+    // pin at Tier-2.5.
+    let foo = "export default class Mod {}\nexport class Inner { method() {} }\n";
+    let main = "import Mod from './foo';\nMod.Inner.method();\n";
+    let res = run(tmp.path(), &[("foo.js", foo), ("main.js", main)]);
+    let calls = calls_of(&res, "main.js");
+    let leaked = calls.iter().find(|c| {
+        c.target_path.as_deref() == Some("foo.js")
+            && c.target_qualified.as_deref() == Some("Inner.method")
+    });
+    assert!(
+        leaked.is_none(),
+        "default-imported Mod.Inner.method() must not silently route to foo.js::Inner.method (the pre-fix namespace-shape pin); got {:#?}",
+        calls
+    );
+
+    // The namespace import shape *should* still resolve, to pin
+    // the fix the right way around.
+    let ns_main = "import * as Mod from './foo';\nMod.Inner.method();\n";
+    let res_ns = run(tmp.path(), &[("foo.js", foo), ("ns.js", ns_main)]);
+    let ns_calls = calls_of(&res_ns, "ns.js");
+    assert!(
+        ns_calls
+            .iter()
+            .any(|c| c.target_path.as_deref() == Some("foo.js")
+                && c.target_qualified.as_deref() == Some("Inner.method")),
+        "namespace-imported Mod.Inner.method() must still resolve to foo.js::Inner.method; got {:#?}",
+        ns_calls
+    );
 }
 
 #[test]
@@ -692,4 +898,340 @@ fn malformed_js_degrades_to_partial_resolutions() {
         "intact extends Base should still resolve despite parse error; got {:#?}",
         types
     );
+}
+
+// ─── ESM re-export chain (CodeRabbit #7) ──────────────────────────────
+//
+// Coverage for the fix that makes `PackageIndex` ingest `facts.reexports`
+// and `RequireGraph` rewrite a binding's `target_path` through the chain
+// so `import { X } from './barrel'` lands on the file that *defines* X,
+// not the barrel that forwards it.
+
+#[test]
+fn esm_reexport_named_chains_through_barrel() {
+    // `import { X } from './barrel'` where `barrel.js` re-exports `X`
+    // from `./x` must produce a Type resolution for `extends X` that
+    // points at `x.js` (the origin), not `barrel.js`. Before the #7
+    // fix, the binding's target_path stopped at `barrel.js` and the
+    // Type row inherited that wrong file.
+    let tmp = tempfile::tempdir().unwrap();
+    let x = "export class X {}\n";
+    let barrel = "export { X } from './x';\n";
+    let main = "import { X } from './barrel';\nclass Sub extends X {}\n";
+    let res = run(
+        tmp.path(),
+        &[("x.js", x), ("barrel.js", barrel), ("main.js", main)],
+    );
+    let types = types_of(&res, "main.js");
+    assert!(
+        types
+            .iter()
+            .any(|t| t.target_path.as_deref() == Some("x.js")
+                && t.target_qualified.as_deref() == Some("X")),
+        "Sub extends X (via re-export through barrel) should resolve to \
+         x.js / X, not barrel.js; got {:#?}",
+        types
+    );
+}
+
+#[test]
+fn esm_reexport_named_import_row_targets_origin() {
+    // Documented choice: the IMPORT row's `target_path` stays at the
+    // barrel (`barrel.js`) because the row is tied to the import-site
+    // byte range (`from './barrel'`), and the site itself resolves to
+    // the barrel file. The per-symbol re-export walk is a *binding*
+    // concept and surfaces in the Type / Call rows (see
+    // `esm_reexport_named_chains_through_barrel`). This test pins that
+    // contract: import row at the barrel, type row at the origin.
+    let tmp = tempfile::tempdir().unwrap();
+    let x = "export class X {}\n";
+    let barrel = "export { X } from './x';\n";
+    let main = "import { X } from './barrel';\nclass Sub extends X {}\n";
+    let res = run(
+        tmp.path(),
+        &[("x.js", x), ("barrel.js", barrel), ("main.js", main)],
+    );
+    let imps = imports_of(&res, "main.js");
+    assert!(
+        imps.iter()
+            .any(|r| r.target_path.as_deref() == Some("barrel.js")),
+        "import row should still target the barrel (site-level \
+         resolution); got {:#?}",
+        imps
+    );
+    // And the per-symbol type row must follow through.
+    let types = types_of(&res, "main.js");
+    assert!(
+        types
+            .iter()
+            .any(|t| t.target_path.as_deref() == Some("x.js")),
+        "type row should follow the re-export chain to x.js; got {:#?}",
+        types
+    );
+}
+
+#[test]
+fn esm_reexport_default_renamed() {
+    // `export { default as Y } from './x'` exposes `x`'s default
+    // export under the new name `Y`. A consumer's `import { Y } from
+    // './barrel'` should land on `x.js`. The `target_qualified` is
+    // expected to be the *local* name in the origin file — for
+    // `export default class X {}` the local name is `X` (the class
+    // declaration's identifier), so the type row reads `X`, not `Y`
+    // and not `default`. This matches the existing `esm_default_*`
+    // behaviour where the consumer's local alias is invisible to the
+    // resolution layer.
+    let tmp = tempfile::tempdir().unwrap();
+    let x = "export default class X {}\n";
+    let barrel = "export { default as Y } from './x';\n";
+    let main = "import { Y } from './barrel';\nclass Sub extends Y {}\n";
+    let res = run(
+        tmp.path(),
+        &[("x.js", x), ("barrel.js", barrel), ("main.js", main)],
+    );
+    let types = types_of(&res, "main.js");
+    assert!(
+        types
+            .iter()
+            .any(|t| t.target_path.as_deref() == Some("x.js")
+                && t.target_qualified.as_deref() == Some("X")),
+        "Sub extends Y (default re-export renamed) should resolve to \
+         x.js / X; got {:#?}",
+        types
+    );
+}
+
+#[test]
+fn esm_reexport_chain_two_hops() {
+    // a.js → re-exports from b.js → re-exports from c.js (origin).
+    // The flattener in `PackageIndex::build` follows all hops up to
+    // `MAX_REEXPORT_HOPS`, so a consumer's `import { X } from './a'`
+    // should land on `c.js` (the origin), not `b.js` (the intermediate
+    // barrel).
+    let tmp = tempfile::tempdir().unwrap();
+    let c = "export class X {}\n";
+    let b = "export { X } from './c';\n";
+    let a = "export { X } from './b';\n";
+    let main = "import { X } from './a';\nclass Sub extends X {}\n";
+    let res = run(
+        tmp.path(),
+        &[("c.js", c), ("b.js", b), ("a.js", a), ("main.js", main)],
+    );
+    let types = types_of(&res, "main.js");
+    assert!(
+        types
+            .iter()
+            .any(|t| t.target_path.as_deref() == Some("c.js")
+                && t.target_qualified.as_deref() == Some("X")),
+        "two-hop re-export chain a→b→c should resolve consumer's X to \
+         c.js (origin), not the intermediate b.js; got {:#?}",
+        types
+    );
+}
+
+#[test]
+fn esm_reexport_cycle_does_not_recurse_or_emit_binding() {
+    // Cycle: a.js → b.js → a.js (mutual re-export of X with no real
+    // origin). Before the cycle guard, the flattener inserted a
+    // truncated entry that pointed back into the cycle and
+    // `lookup_export`'s recursion blew the stack. The guard now drops
+    // the entry from `reexports_by_path` and `lookup_export` returns
+    // None.
+    //
+    // R2 follow-up (v0.7.0): the original cycle fix still left
+    // `resolve_binding_target` falling through to the Tier-2 barrel-fact
+    // fallback when `lookup_export` returned None, fabricating
+    // `(target_path=a.js, target_qualified=X)` — a Type row pointing
+    // into the cycle for a class that does not exist anywhere. The
+    // `PackageIndex::is_reexport_dropped` gate now suppresses that
+    // fallback whenever the file IS a re-exporter whose chain was
+    // dropped.
+    //
+    // Hard invariants checked here:
+    //   1. `run` terminates normally — reaching the assertion below
+    //      proves no stack overflow / panic happened in the flattener
+    //      or lookup.
+    //   2. The analyzer still records an import row for main.js (the
+    //      file wasn't silently dropped because of the cycle).
+    //   3. NO Type row for `Sub extends X` is pinned to a cycle node:
+    //      neither `target_path = a.js` nor `target_path = b.js`
+    //      with `target_qualified = X` is acceptable. The R2 dogfood
+    //      catch was the previous test's assertion (`Some("a.js") |
+    //      None`) silently accepting the fabricated `Some("a.js")`
+    //      binding; that loophole is now closed.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = "export { X } from './b';\n";
+    let b = "export { X } from './a';\n";
+    let main = "import { X } from './a';\nclass Sub extends X {}\n";
+    let res = run(tmp.path(), &[("a.js", a), ("b.js", b), ("main.js", main)]);
+    // (1) — implicit: we got here without panicking.
+    // (2) — analyzer processed main.js's import.
+    let imports = imports_of(&res, "main.js");
+    assert!(
+        !imports.is_empty(),
+        "cyclic re-export should still record main.js's import row; got {:#?}",
+        res
+    );
+    // (3) — no fabricated binding into the cycle.
+    let types = types_of(&res, "main.js");
+    for t in &types {
+        // Any Type row whose target lands on a cycle node IS the
+        // fabricated binding — the bug R2 caught.
+        let into_cycle = matches!(t.target_path.as_deref(), Some("a.js") | Some("b.js"))
+            && t.target_qualified.as_deref() == Some("X");
+        assert!(
+            !into_cycle,
+            "cyclic re-export must NOT synthesize a Type-row binding \
+             pointing into the cycle (a.js / b.js with qualified=X); \
+             got {:#?}",
+            t
+        );
+    }
+}
+
+#[test]
+fn esm_reexport_cycle_does_not_emit_fabricated_binding() {
+    // Targeted regression for the R2 v0.7.0 dogfood catch: even though
+    // the cycle flatten guard prevents stack overflow, the
+    // `resolve_binding_target` fallback used to fabricate
+    // `(target_path=cycle-a.js, target_qualified=X)` because
+    // `lookup_export` returning None is ambiguous between "the file has
+    // a local X" and "the file re-exports X but the chain was dropped".
+    // `PackageIndex::is_reexport_dropped` disambiguates them; this test
+    // pins the resulting external behaviour.
+    //
+    // Asserted shape:
+    //   * The analyzer terminates.
+    //   * main.js still gets an import row (the file isn't dropped).
+    //   * NO Type row for `CycleSub extends X` resolves to either
+    //     cycle-a.js or cycle-b.js with target_qualified=X. The only
+    //     acceptable shapes are: no Type row at all, or a row with
+    //     target_path=None (unresolved).
+    let tmp = tempfile::tempdir().unwrap();
+    let cycle_a = "export { X } from './cycle-b';\n";
+    let cycle_b = "export { X } from './cycle-a';\n";
+    let cycle_main = "import { X } from './cycle-a';\nclass CycleSub extends X {}\n";
+    let res = run(
+        tmp.path(),
+        &[
+            ("cycle-a.js", cycle_a),
+            ("cycle-b.js", cycle_b),
+            ("cycle-main.js", cycle_main),
+        ],
+    );
+    let imports = imports_of(&res, "cycle-main.js");
+    assert!(
+        !imports.is_empty(),
+        "cyclic re-export should still record cycle-main.js's import \
+         row; got {:#?}",
+        res
+    );
+    let types = types_of(&res, "cycle-main.js");
+    // R2 rc3 catch: previously the row survived as
+    //   { kind: Type, target_path: None, target_qualified: None }
+    // because `resolve_dotted_type` happily rebuilt the row from the
+    // alias even after `resolve_binding_target` returned (None, None).
+    // Strengthened contract: NO tier25 Type row may key off the
+    // cycle-dropped alias `X`. The Tier-2 syntactic backend still
+    // emits the bare `extends` fact at its own confidence level.
+    for t in &types {
+        let into_cycle = matches!(
+            t.target_path.as_deref(),
+            Some("cycle-a.js") | Some("cycle-b.js")
+        ) && t.target_qualified.as_deref() == Some("X");
+        assert!(
+            !into_cycle,
+            "CycleSub extends X must NOT fabricate a binding pointing \
+             into the cycle (cycle-a.js / cycle-b.js with \
+             target_qualified=X); got {:#?}",
+            t
+        );
+        // The fallthrough (None, None) row is also banned now.
+        let unresolved_x = t.target_path.is_none()
+            && (t.target_qualified.as_deref() == Some("X") || t.target_qualified.is_none());
+        assert!(
+            !unresolved_x,
+            "cycle-dropped alias must produce zero tier25 Type rows \
+             (no fact-shaped (None, None) row attributed to the \
+             resolver). got {:#?}",
+            t
+        );
+    }
+}
+
+#[test]
+fn esm_reexport_chain_over_hop_budget_terminates() {
+    // 9-hop chain a→b→c→d→e→f→g→h→i→j.js (j defines X). The chain has
+    // 9 re-export edges; `MAX_REEXPORT_HOPS = 8` permits at most 8
+    // iterations of the flatten loop, so it must abort *before* reaching
+    // `j`. Per the cycle/over-budget policy in `PackageIndex::build`,
+    // the entry is then dropped entirely (rather than inserting a
+    // truncated mid-chain target that would misresolve consumers).
+    // Consumers importing X from `a` therefore must *not* end up
+    // pinned to `j.js` (origin) or to any intermediate barrel (a.js,
+    // b.js, …, i.js). The R2 v0.7.0 follow-up additionally requires
+    // that the over-budget drop NOT fall through to the Tier-2
+    // barrel-fact fallback either — `a.js` syntactically re-exports
+    // `X`, so fabricating `(a.js, "X")` would be wrong for the same
+    // reason as the cycle case (no local `class X {}` exists at any
+    // of the intermediate barrels). After the
+    // `PackageIndex::is_reexport_dropped` gate, the only acceptable
+    // outcomes are: no Type row at all, or a row with
+    // target_path=None (unresolved).
+    let tmp = tempfile::tempdir().unwrap();
+    let j = "export class X {}\n";
+    let i = "export { X } from './j';\n";
+    let h = "export { X } from './i';\n";
+    let g = "export { X } from './h';\n";
+    let f = "export { X } from './g';\n";
+    let e = "export { X } from './f';\n";
+    let d = "export { X } from './e';\n";
+    let c = "export { X } from './d';\n";
+    let b = "export { X } from './c';\n";
+    let a = "export { X } from './b';\n";
+    let main = "import { X } from './a';\nclass Sub extends X {}\n";
+    let res = run(
+        tmp.path(),
+        &[
+            ("j.js", j),
+            ("i.js", i),
+            ("h.js", h),
+            ("g.js", g),
+            ("f.js", f),
+            ("e.js", e),
+            ("d.js", d),
+            ("c.js", c),
+            ("b.js", b),
+            ("a.js", a),
+            ("main.js", main),
+        ],
+    );
+    let types = types_of(&res, "main.js");
+    let intermediate: [&str; 10] = [
+        "a.js", "b.js", "c.js", "d.js", "e.js", "f.js", "g.js", "h.js", "i.js", "j.js",
+    ];
+    for t in &types {
+        // R2 rc3 strengthening: like the cycle case, an over-budget
+        // chain must produce ZERO tier25 Type rows for the dropped
+        // alias `X` — neither origin-pinned, intermediate-barrel-
+        // pinned, NOR fact-shaped (None, None).
+        if let Some(tp) = t.target_path.as_deref() {
+            assert!(
+                !intermediate.contains(&tp),
+                "9-hop re-export chain a→…→j (over MAX_REEXPORT_HOPS=8) \
+                 must not pin consumer's X to any chain file (origin or \
+                 intermediate barrel). got {:#?}",
+                t
+            );
+        }
+        let unresolved_x = t.target_path.is_none()
+            && (t.target_qualified.as_deref() == Some("X") || t.target_qualified.is_none());
+        assert!(
+            !unresolved_x,
+            "over-budget alias must produce zero tier25 Type rows \
+             (no fact-shaped (None, None) row attributed to the \
+             resolver). got {:#?}",
+            t
+        );
+    }
 }

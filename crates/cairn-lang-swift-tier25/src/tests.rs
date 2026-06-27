@@ -354,39 +354,54 @@ struct Point {
 }
 
 // ─── require_graph (imports → workspace files) ───────────────────────────
+//
+// Phase 1 contract: persisted Import resolutions carry `target_path`
+// only — `target_qualified` is always `None` (matches Ruby /
+// JavaScript). The qualified name still lives on the require_graph
+// internally for binding lookup; we just don't leak it into the row,
+// because persist.rs path-scoped lookup would otherwise spuriously
+// pin a workspace symbol_id to the import edge.
 
 #[test]
-fn apple_framework_import_records_qualified_without_path() {
+fn apple_framework_import_records_neither_path_nor_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let main = "import Foundation\n";
     let res = run(tmp.path(), &[("Main.swift", main)]);
     let imps = imports_of(&res, "Main.swift");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("Foundation"))
-        .expect("Foundation import should record qualified");
     assert!(
-        hit.target_path.is_none(),
-        "Apple framework import must have no target_path; got {:?}",
-        hit.target_path
+        !imps.is_empty(),
+        "Foundation import should still emit a row; got {:#?}",
+        imps
     );
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import rows must never carry target_qualified (Phase 1 contract); got {:?}",
+            r.target_qualified
+        );
+        assert!(
+            r.target_path.is_none(),
+            "Apple framework import must have no target_path; got {:?}",
+            r.target_path
+        );
+    }
 }
 
 #[test]
-fn dotted_apple_framework_import_records_full_path_qualified() {
+fn dotted_apple_framework_import_records_neither_path_nor_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let main = "import UIKit.UIView\n";
     let res = run(tmp.path(), &[("Main.swift", main)]);
     let imps = imports_of(&res, "Main.swift");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("UIKit.UIView"))
-        .expect("UIKit.UIView import should record qualified");
     assert!(
-        hit.target_path.is_none(),
-        "UIKit framework import must have no target_path; got {:?}",
-        hit.target_path
+        !imps.is_empty(),
+        "UIKit.UIView import should still emit a row; got {:#?}",
+        imps
     );
+    for r in &imps {
+        assert!(r.target_qualified.is_none());
+        assert!(r.target_path.is_none());
+    }
 }
 
 #[test]
@@ -401,7 +416,33 @@ fn import_emits_resolution_at_path_byte_range() {
         .iter()
         .find(|r| r.site_byte_range.start == path_start && r.site_byte_range.end == path_end)
         .expect("import resolution must be pinned at the dotted path span");
-    assert_eq!(hit.target_qualified.as_deref(), Some("Foundation"));
+    assert!(
+        hit.target_qualified.is_none(),
+        "Import rows must never carry target_qualified; got {:?}",
+        hit.target_qualified
+    );
+}
+
+#[test]
+fn import_target_qualified_is_none_even_when_require_graph_resolved() {
+    // Regression for CodeRabbit PR #231 finding C-2 (swift): even
+    // when the require_graph internally resolves a qualified target
+    // (here "Foundation"), the persisted Import WorkspaceResolution
+    // must carry `target_qualified = None`. Otherwise persist.rs
+    // path-scoped `(blob_sha, parser_id, qualified)` lookup would
+    // spuriously pin a workspace symbol_id to the import edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = "import Foundation\n";
+    let res = run(tmp.path(), &[("Main.swift", main)]);
+    let imps = imports_of(&res, "Main.swift");
+    assert!(!imps.is_empty(), "expected at least one import row");
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must have target_qualified=None even when binding resolved internally; got {:?}",
+            r
+        );
+    }
 }
 
 // ─── 諦め: things Tier-2.5 must NOT resolve ─────────────────────────────
@@ -516,7 +557,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "swift-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 3);
+    assert_eq!(ANALYZER_REVISION, 4);
     assert_eq!(PARSER_ID, "tree-sitter-swift");
     assert_eq!(RESOLUTION_SOURCE, "tier25-swift-resolver");
 }

@@ -383,41 +383,62 @@ fn partial_class_methods_merge_across_files() {
 }
 
 // ─── require_graph (using → workspace files) ──────────────────────────
+//
+// Phase 1 contract: persisted Import resolutions carry `target_path`
+// only — `target_qualified` is always `None` (matches Ruby /
+// JavaScript). The qualified namespace / type still lives on the
+// require_graph internally for binding lookup; we just don't leak it
+// into the row, because persist.rs path-scoped lookup would otherwise
+// spuriously pin a workspace symbol_id to the import edge.
 
 #[test]
-fn using_workspace_namespace_records_qualified() {
+fn using_workspace_namespace_emits_row_without_qualified() {
+    // `using Co.App;` targets a namespace (not a single file); the
+    // require_graph records no target_path for namespace imports and
+    // Phase 1 forces target_qualified to None at the lib.rs persist
+    // boundary. The import row still exists so query-time queries
+    // can locate the using directive.
     let tmp = tempfile::tempdir().unwrap();
     let widget = "namespace Co.App;\npublic class Widget {}\n";
     let main = "using Co.App;\nnamespace M;\n";
     let res = run(tmp.path(), &[("W.cs", widget), ("M.cs", main)]);
     let imps = imports_of(&res, "M.cs");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("Co.App")),
-        "workspace using should record namespace qualified; got {:#?}",
+        !imps.is_empty(),
+        "workspace using should still emit an import row; got {:#?}",
         imps
     );
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must not carry target_qualified (Phase 1 contract); got {:?}",
+            r.target_qualified
+        );
+    }
 }
 
 #[test]
-fn external_using_records_qualified_without_path() {
+fn external_using_records_neither_path_nor_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let main = "using System.Collections.Generic;\nnamespace M;\n";
     let res = run(tmp.path(), &[("M.cs", main)]);
     let imps = imports_of(&res, "M.cs");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("System.Collections.Generic"))
-        .expect("external using should record qualified");
     assert!(
-        hit.target_path.is_none(),
-        "BCL using must have no target_path; got {:?}",
-        hit.target_path
+        !imps.is_empty(),
+        "external using should still emit an import row; got {:#?}",
+        imps
     );
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import rows must never carry target_qualified (Phase 1 contract); got {:?}",
+            r.target_qualified
+        );
+    }
 }
 
 #[test]
-fn alias_using_resolution_uses_target_fqn() {
+fn alias_using_resolution_keeps_path_no_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let widget = "namespace Co.App;\npublic class Widget {}\n";
     let main = "using W = Co.App.Widget;\nnamespace M;\n";
@@ -425,13 +446,17 @@ fn alias_using_resolution_uses_target_fqn() {
     let imps = imports_of(&res, "M.cs");
     let hit = imps
         .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("Co.App.Widget"))
-        .expect("aliased using should resolve to target FQN");
-    assert_eq!(hit.target_path.as_deref(), Some("Widget.cs"));
+        .find(|r| r.target_path.as_deref() == Some("Widget.cs"))
+        .expect("aliased using should pin target_path to Widget.cs");
+    assert!(
+        hit.target_qualified.is_none(),
+        "aliased using import must not leak target_qualified; got {:?}",
+        hit.target_qualified
+    );
 }
 
 #[test]
-fn using_static_records_type_qualified() {
+fn using_static_records_path_no_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let helpers = "namespace Lib;\npublic static class Helpers {}\n";
     let main = "using static Lib.Helpers;\nnamespace M;\n";
@@ -439,13 +464,21 @@ fn using_static_records_type_qualified() {
     let imps = imports_of(&res, "M.cs");
     let hit = imps
         .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("Lib.Helpers"))
-        .expect("using static should record type qualified");
-    assert_eq!(hit.target_path.as_deref(), Some("H.cs"));
+        .find(|r| r.target_path.as_deref() == Some("H.cs"))
+        .expect("using static should pin target_path");
+    assert!(
+        hit.target_qualified.is_none(),
+        "using static import must not leak target_qualified; got {:?}",
+        hit.target_qualified
+    );
 }
 
 #[test]
 fn import_emits_resolution_at_path_byte_range() {
+    // Pins the byte range contract for find_imports JOIN. A namespace
+    // `using` does not pin a single target file (namespace can span
+    // many files), so target_path/qualified are both None — only the
+    // byte range matters here.
     let tmp = tempfile::tempdir().unwrap();
     let widget = "namespace Co.App;\npublic class Widget {}\n";
     let main = "using Co.App;\nnamespace M;\n";
@@ -457,10 +490,64 @@ fn import_emits_resolution_at_path_byte_range() {
         .iter()
         .find(|r| r.site_byte_range.start == path_start && r.site_byte_range.end == path_end)
         .expect("import resolution must be pinned at the dotted path span");
-    assert_eq!(hit.target_qualified.as_deref(), Some("Co.App"));
+    assert!(hit.target_qualified.is_none());
+}
+
+#[test]
+fn import_target_qualified_is_none_even_when_require_graph_resolved() {
+    // Regression for CodeRabbit PR #231 finding C-2 (csharp): even
+    // when the require_graph internally resolves a qualified target
+    // (here "Co.App.Widget" for an alias `using` directive),
+    // the persisted Import WorkspaceResolution must carry
+    // `target_qualified = None`. Otherwise persist.rs path-scoped
+    // `(blob_sha, parser_id, qualified)` lookup would spuriously
+    // pin a workspace symbol_id to the import edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let widget = "namespace Co.App;\npublic class Widget {}\n";
+    let main = "using W = Co.App.Widget;\nnamespace M;\n";
+    let res = run(tmp.path(), &[("Widget.cs", widget), ("M.cs", main)]);
+    let imps = imports_of(&res, "M.cs");
+    assert!(
+        !imps.is_empty(),
+        "expected at least one import row for alias using"
+    );
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must have target_qualified=None even when binding resolved internally; got {:?}",
+            r
+        );
+    }
 }
 
 // ─── 諦め: things Tier-2.5 must NOT resolve ──────────────────────────────
+
+#[test]
+fn csharp_dispatch_unverified_namespace_candidate_not_returned() {
+    // Regression for CodeRabbit PR #231 finding C-6:
+    // `resolve_dotted_to_qualified` used to rewrite receivers like
+    // `Co.App.Registry.Build()` inside namespace `Other` to
+    // `Other.Co.App.Registry` without validating that the prefix
+    // existed. If `Build` was a unique method name in the workspace
+    // (here `Other.Local.Build`), the unique-name fallback (branch
+    // 4) then matched it spuriously even though the user wrote
+    // `Co.App.Registry.Build()`. The fix validates candidate FQNs
+    // against PackageIndex before adopting them (Kotlin
+    // `lookup_via_binding` discipline, PR #219).
+    let tmp = tempfile::tempdir().unwrap();
+    let local = "namespace Other;\npublic class Local { public static void Build() {} }\n";
+    let caller =
+        "namespace Other;\npublic class C { public void Go() { Co.App.Registry.Build(); } }\n";
+    let res = run(tmp.path(), &[("Local.cs", local), ("Caller.cs", caller)]);
+    let calls = calls_of(&res, "Caller.cs");
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.target_qualified.as_deref() != Some("Other.Local.Build")),
+        "Co.App.Registry.Build() must not spuriously resolve to Other.Local.Build via unique-name fallback; got {:#?}",
+        calls
+    );
+}
 
 #[test]
 fn unknown_receiver_method_call_is_not_resolved() {
@@ -552,7 +639,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "csharp-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 3);
+    assert_eq!(ANALYZER_REVISION, 4);
     assert_eq!(PARSER_ID, "tree-sitter-c-sharp");
     assert_eq!(RESOLUTION_SOURCE, "tier25-csharp-resolver");
 }
