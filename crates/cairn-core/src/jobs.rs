@@ -750,7 +750,7 @@ impl JobManager {
     ///   invocation, or the analyzer enqueue path bubble up
     ///   unchanged.
     pub fn enqueue_full_repo_reindex(
-        self: &Arc<Self>,
+        &self,
         alias: &str,
         reason: ReindexReason,
     ) -> Result<FullReindexEnqueueOutcome> {
@@ -782,7 +782,7 @@ impl JobManager {
             manifest_id: outcome.tentative_manifest,
             blobs_parsed: outcome.blobs_parsed,
             jobs_enqueued: outcome.analyzer_jobs.len(),
-            skip_analyzers_for_unchanged_manifest: outcome.analyzers_skipped_due_to_dedup,
+            skip_analyzers_for_unchanged_manifest: outcome.skip_analyzers_for_unchanged_manifest,
         })
     }
 
