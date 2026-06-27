@@ -246,10 +246,25 @@ cairn ctl daemon status
 A repo can carry more than one alias; removing one keeps the on-disk
 store alive while any other label still references it.
 
-Tier-3 workspace analyzers run in daemon background jobs. Use
-`cairn ctl jobs list --alias my-proj` to inspect queued/running/completed
-analyzer work, or `cairn ctl repo reindex my-proj --wait` when a
-script needs to block until the current jobs finish.
+Workspace analyzers (Tier-2.5 and Tier-3) run in daemon background
+jobs. Use `cairn ctl jobs list --alias my-proj` to inspect
+queued/running/completed analyzer work, or `cairn ctl repo reindex
+my-proj --wait` when a script needs to block until the current
+jobs finish.
+
+When a newly installed cairn binary first opens a previously
+registered repo, the daemon's startup scanners detect
+analyzer-revision and parser-revision drift and enqueue the
+appropriate reruns (parser-revision drift triggers a full repo
+reindex; analyzer-revision drift enqueues a targeted analyzer
+rerun). The watcher comes up first so the scanner runs against
+live state; no manual `cairn ctl repo reindex <alias>` is needed
+in the common case. If a rerun is lost (e.g. the worktree was
+inaccessible at scan time), `cairn ctl daemon doctor` surfaces
+the gap as an `analyzer rerun health` check with operator-facing
+remediation (failed-at-current, queued, missing-row, or a
+chain-broken Fail if drift persists despite a successful
+analyzer pass) and a concrete next-step.
 
 ## Languages
 
@@ -284,6 +299,22 @@ without `include_noise=true`), and import edges. The four-label
 taxonomy `inherit` / `implement` / `mixin` / `extension` is shared
 across every backend so `find_subtypes` / `find_supertypes` compare
 cleanly across languages.
+
+Tier-2.5 runs in-process workspace analyzers for Tier-2.5-enabled
+languages (Kotlin, Swift, C#, JavaScript / TypeScript, Python,
+Ruby, PHP today). These analyzers build cross-file graphs without
+an external LSP, persist manifest-scoped resolutions, and attach
+`target_path` to imports, subtype / supertype edges, references,
+callers, and callees — so a `find_subtypes` query against an
+interface returns the workspace file each implementation lives in
+directly, even when no Tier-3 LSP runs. The runner reads each
+file's bytes once per pass and hands them to the analyzer through
+the `WorkspaceFile::source_bytes` contract; a transiently
+inaccessible worktree marks the run as `Failed` and preserves
+prior facts rather than silently emitting an empty result. Tier-3
+analyzers are not pre-read on this path so the LSP-driven workflow
+keeps its existing memory profile. Tier-2.5 analyzer jobs share
+the workspace analyzer scheduler with Tier-3.
 
 Tier-3 runs local language servers once per snapshot when their
 binaries are discoverable by the daemon. Every supported language
