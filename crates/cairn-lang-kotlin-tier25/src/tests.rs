@@ -361,6 +361,13 @@ fn fully_qualified_static_call_resolves() {
 }
 
 // ─── require_graph (imports → workspace files) ───────────────────────────
+//
+// Phase 1 contract: persisted Import resolutions carry `target_path`
+// only — `target_qualified` is always `None` (matches Ruby /
+// JavaScript). The qualified name still lives on the require_graph
+// internally for binding lookup / wildcard expansion; we just don't
+// leak it into the row, because persist.rs path-scoped lookup would
+// otherwise spuriously pin a workspace symbol_id to the import edge.
 
 #[test]
 fn plain_import_emits_resolution_for_workspace_class() {
@@ -371,45 +378,58 @@ fn plain_import_emits_resolution_for_workspace_class() {
     let imps = imports_of(&res, "Main.kt");
     let hit = imps
         .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("com.foo.Widget"))
-        .expect("import should emit a resolution");
-    assert_eq!(hit.target_path.as_deref(), Some("Widget.kt"));
-}
-
-#[test]
-fn external_import_records_qualified_without_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let main = "package app\n\nimport kotlinx.coroutines.delay\n";
-    let res = run(tmp.path(), &[("Main.kt", main)]);
-    let imps = imports_of(&res, "Main.kt");
-    let hit = imps
-        .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("kotlinx.coroutines.delay"))
-        .expect("external import should still record the qualified name");
+        .find(|r| r.target_path.as_deref() == Some("Widget.kt"))
+        .expect("import should emit a resolution pinned to Widget.kt");
     assert!(
-        hit.target_path.is_none(),
-        "external import must have no target_path; got {:?}",
-        hit.target_path
+        hit.target_qualified.is_none(),
+        "Import row must not carry target_qualified; got {:?}",
+        hit.target_qualified
     );
 }
 
 #[test]
-fn wildcard_import_records_package_qualified() {
+fn external_import_records_neither_path_nor_qualified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = "package app\n\nimport kotlinx.coroutines.delay\n";
+    let res = run(tmp.path(), &[("Main.kt", main)]);
+    let imps = imports_of(&res, "Main.kt");
+    assert!(
+        !imps.is_empty(),
+        "external import should still emit an import row; got {:#?}",
+        imps
+    );
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import rows must never carry target_qualified (Phase 1 contract); got {:?}",
+            r.target_qualified
+        );
+    }
+}
+
+#[test]
+fn wildcard_import_emits_import_row_without_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let widget = "package com.foo\n\nclass Widget\n";
     let main = "package app\n\nimport com.foo.*\n";
     let res = run(tmp.path(), &[("Widget.kt", widget), ("Main.kt", main)]);
     let imps = imports_of(&res, "Main.kt");
     assert!(
-        imps.iter()
-            .any(|r| r.target_qualified.as_deref() == Some("com.foo")),
-        "wildcard import should record package qualified; got {:#?}",
+        !imps.is_empty(),
+        "wildcard import should emit an import row; got {:#?}",
         imps,
     );
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "wildcard import row must not carry target_qualified; got {:?}",
+            r.target_qualified
+        );
+    }
 }
 
 #[test]
-fn aliased_import_resolution_uses_target_fqn() {
+fn aliased_import_resolution_pins_path_not_qualified() {
     let tmp = tempfile::tempdir().unwrap();
     let widget = "package com.foo\n\nclass Widget\n";
     let main = "package app\n\nimport com.foo.Widget as W\n";
@@ -417,9 +437,13 @@ fn aliased_import_resolution_uses_target_fqn() {
     let imps = imports_of(&res, "Main.kt");
     let hit = imps
         .iter()
-        .find(|r| r.target_qualified.as_deref() == Some("com.foo.Widget"))
-        .expect("aliased import should still resolve to the target FQN");
-    assert_eq!(hit.target_path.as_deref(), Some("Widget.kt"));
+        .find(|r| r.target_path.as_deref() == Some("Widget.kt"))
+        .expect("aliased import should still pin target_path to Widget.kt");
+    assert!(
+        hit.target_qualified.is_none(),
+        "aliased import row must not leak target_qualified; got {:?}",
+        hit.target_qualified
+    );
 }
 
 #[test]
@@ -438,7 +462,32 @@ fn import_emits_resolution_at_path_byte_range() {
         .iter()
         .find(|r| r.site_byte_range.start == path_start && r.site_byte_range.end == path_end)
         .expect("import resolution must be pinned at the dotted path span");
-    assert_eq!(hit.target_qualified.as_deref(), Some("com.foo.Widget"));
+    assert_eq!(hit.target_path.as_deref(), Some("Widget.kt"));
+    assert!(hit.target_qualified.is_none());
+}
+
+#[test]
+fn import_target_qualified_is_none_even_when_require_graph_resolved() {
+    // Regression for CodeRabbit PR #231 finding C-2 (kotlin): even
+    // when the require_graph internally resolves a qualified target
+    // (here "com.foo.Widget"), the persisted Import
+    // WorkspaceResolution must carry `target_qualified = None`.
+    // Otherwise persist.rs path-scoped `(blob_sha, parser_id,
+    // qualified)` lookup would spuriously pin a workspace symbol_id
+    // to the import edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let widget = "package com.foo\n\nclass Widget\n";
+    let main = "package app\n\nimport com.foo.Widget\n";
+    let res = run(tmp.path(), &[("Widget.kt", widget), ("Main.kt", main)]);
+    let imps = imports_of(&res, "Main.kt");
+    assert!(!imps.is_empty(), "expected at least one import row");
+    for r in &imps {
+        assert!(
+            r.target_qualified.is_none(),
+            "Import row must have target_qualified=None even when binding resolved internally; got {:?}",
+            r
+        );
+    }
 }
 
 // ─── 諦め: things Tier-2.5 must NOT resolve ─────────────────────────────
@@ -619,7 +668,7 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "kotlin-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 5);
+    assert_eq!(ANALYZER_REVISION, 6);
     assert_eq!(PARSER_ID, "tree-sitter-kotlin-ng");
     assert_eq!(RESOLUTION_SOURCE, "tier25-kotlin-resolver");
 }
@@ -637,6 +686,31 @@ fn root_package_file_resolves_class() {
         .find(|t| t.target_qualified.as_deref() == Some("Widget"))
         .expect("root-package Widget should resolve");
     assert_eq!(hit.target_path.as_deref(), Some("Widget.kt"));
+}
+
+#[test]
+fn kotlin_dispatch_root_package_top_level_function_resolves() {
+    // Regression for CodeRabbit PR #231 finding C-10:
+    // `MethodIndex::build` was indexing top-level callables into
+    // `by_package` only when `Some(m.owner.as_str()) ==
+    // facts.package.as_deref()`. For root-package files, the
+    // top-level owner is `""` and `facts.package` is `None`, so
+    // `Some("") == None` was false and the callable never entered
+    // the package index. Bare `helper()` calls from sibling root-
+    // package files then never resolved.
+    let tmp = tempfile::tempdir().unwrap();
+    let defn = "fun helper() {}\n";
+    let caller = "fun main() {\n    helper()\n}\n";
+    let res = run(tmp.path(), &[("Defn.kt", defn), ("Caller.kt", caller)]);
+    let calls = calls_of(&res, "Caller.kt");
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.target_qualified.as_deref() == Some("helper")
+                && c.target_path.as_deref() == Some("Defn.kt")),
+        "root-package helper() should resolve to Defn.kt#helper; got {:#?}",
+        calls
+    );
 }
 
 // ─── path-aware dispatch (Sub-fix A / A0 / B / C) ────────────────────────

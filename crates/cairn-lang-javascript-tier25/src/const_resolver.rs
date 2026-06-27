@@ -196,6 +196,14 @@ struct Visitor<'a> {
     /// call site itself (not the module-literal range) so two distinct
     /// calls to the same specifier don't collide.
     seen_require_sites: HashSet<(u32, u32)>,
+    /// How many `function_declaration` / `method_definition` frames we
+    /// are currently inside. Used to gate `emit_function` so that
+    /// nested function declarations (`function outer(){ function inner(){} }`
+    /// or methods containing locally-declared helpers) don't leak into
+    /// the workspace-wide `function_defs` index. Tier-2.5 only models
+    /// top-level (module-scoped) functions as dispatch targets; nested
+    /// helpers are file-local and not addressable from other files.
+    function_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +221,7 @@ impl<'a> Visitor<'a> {
             facts: FileConstFacts::default(),
             container_stack: Vec::new(),
             seen_require_sites: HashSet::new(),
+            function_depth: 0,
         }
     }
 
@@ -262,9 +271,34 @@ impl<'a> Visitor<'a> {
                 self.enter_class(node);
                 return;
             }
-            "function_declaration" => {
+            "function_declaration" | "generator_function_declaration" => {
+                // `emit_function` checks `function_depth` and only
+                // records the top-level case. We bump *after* the
+                // emit (the declaration name itself is at the parent
+                // scope) and around the body descent so any nested
+                // `function inner() {}` is suppressed.
                 self.emit_function(node);
+                self.function_depth = self.function_depth.saturating_add(1);
                 self.descend_children(node);
+                self.function_depth = self.function_depth.saturating_sub(1);
+                return;
+            }
+            // Anonymous / expression-shaped function scopes. tree-sitter-
+            // javascript exposes four kinds that introduce a new function
+            // body but do *not* themselves declare a workspace-addressable
+            // name: `function_expression` (named or anonymous function
+            // expression), `arrow_function`, `generator_function`
+            // (anonymous `function* () {}`), and the bare `function` kind
+            // used for some anonymous function expressions. Bump
+            // `function_depth` around their descent so any
+            // `function inner() {}` declared inside their body is gated
+            // by `emit_function`'s top-level check. Without this, e.g.
+            // `const f = () => { function helper(){} };` would leak
+            // `helper` into the workspace symbol index.
+            "function_expression" | "arrow_function" | "generator_function" | "function" => {
+                self.function_depth = self.function_depth.saturating_add(1);
+                self.descend_children(node);
+                self.function_depth = self.function_depth.saturating_sub(1);
                 return;
             }
             "lexical_declaration" | "variable_declaration" => {
@@ -373,13 +407,28 @@ impl<'a> Visitor<'a> {
     // ─── top-level functions ─────────────────────────────────────────
 
     fn emit_function(&mut self, node: Node<'_>) {
+        // Top-level-only gate. Tier-2.5 dispatch (`bare foo()` callee
+        // resolution, etc.) addresses functions by `(path, name)` —
+        // there is no lexical scoping in that contract. Indexing a
+        // nested `function inner() {}` would let other call sites in
+        // the same file resolve to it (or with classes_by_name-style
+        // shadowing, hide a real top-level `inner`), which is a
+        // file-local leakage of a private helper.
+        //
+        // `function_depth` is bumped not only around
+        // `function_declaration` / `generator_function_declaration`
+        // bodies but also around every expression-shaped function
+        // scope (`function_expression`, `arrow_function`,
+        // `generator_function`, bare `function`), so a declaration
+        // nested inside e.g. `const f = function(){ ... }` or
+        // `const f = () => { ... }` is also suppressed.
+        if self.function_depth > 0 || !self.container_stack.is_empty() {
+            return;
+        }
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
         let name = self.text(name_node).to_string();
-        // Only top-level functions count for cross-file dispatch
-        // resolution. Nested function declarations still record their
-        // qualified form for completeness.
         let qualified = self.qualify_in_scope(&name);
         self.facts.function_defs.push(FunctionDef {
             qualified,
@@ -1264,17 +1313,71 @@ pub struct PackageIndex {
     /// resolution uses this to map `import { X } from './foo'` to
     /// `(foo.js, "X")` (or whatever local name X was exported under).
     exports_by_path: HashMap<String, HashMap<String, String>>,
+    /// path → (exported_as → (origin_path, origin_exported_as)) for
+    /// `export { X } from './x'` / `export { default as Y } from './x'`
+    /// re-export chains. A consumer's `import { X } from './barrel'`
+    /// should follow the chain to the origin file, not stop at the
+    /// barrel. Populated from `facts.reexports` at build time and
+    /// recursively flattened (depth-bounded — see [`MAX_REEXPORT_HOPS`]).
+    reexports_by_path: HashMap<String, HashMap<String, (String, String)>>,
+    /// `(path, exported_as)` entries whose re-export chain was *dropped*
+    /// by [`PackageIndex::build`] because the chain was cyclic or
+    /// exceeded [`MAX_REEXPORT_HOPS`]. Distinct from "the file does not
+    /// re-export this name at all" — the file DOES syntactically re-export
+    /// it (the raw `export { X } from './...'` is present), but we cannot
+    /// resolve where it ultimately lands. Consumers of `lookup_export`
+    /// (notably `resolve_binding_target`) must consult this set before
+    /// falling through to the Tier-2 barrel-fact fallback: if the entry
+    /// is dropped, the fallback would fabricate a binding pointing into
+    /// the cycle / mid-chain barrel, which is strictly worse than
+    /// returning unresolved.
+    dropped_reexports: HashSet<(String, String)>,
     /// Class name → all files that define a class with that name.
     /// Used for best-effort unique-name resolution when no import
     /// binding pins the class.
     classes_by_name: HashMap<String, Vec<PackageTarget>>,
 }
 
+/// Maximum number of re-export hops we follow when flattening a
+/// `barrel → barrel → … → origin` chain. Cycles among re-export files
+/// are nonsense at the language level but we still bound the walk
+/// defensively. Eight hops is well above any sane real-world depth.
+const MAX_REEXPORT_HOPS: usize = 8;
+
 impl PackageIndex {
     pub fn build(per_file: &[(String, Vec<u8>, FileConstFacts)]) -> Self {
         let mut by_file_qualified: HashMap<(String, String), PackageTarget> = HashMap::new();
         let mut exports_by_path: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut classes_by_name: HashMap<String, Vec<PackageTarget>> = HashMap::new();
+        // First pass: collect the raw re-export table per file. Each
+        // entry maps `exported_as` (as seen by importers of `path`) to
+        // `(source_path, source_exported_as)` — the immediate one-hop
+        // target file and the name that file in turn exports. We
+        // resolve the module specifier via the same workspace probe
+        // that `RequireGraph` uses so we converge on the same file id.
+        let path_set: std::collections::HashSet<&str> =
+            per_file.iter().map(|(p, _, _)| p.as_str()).collect();
+        let mut raw_reexports: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+        for (path, _, facts) in per_file {
+            let mut entries: HashMap<String, (String, String)> = HashMap::new();
+            for r in &facts.reexports {
+                // `export * from './bar'` records an empty `names` list
+                // — we can't enumerate `./bar`'s exports here, so skip
+                // wildcard re-exports for now (consumers fall back to
+                // the existing barrel-targeted resolution).
+                let Some(target_path) =
+                    crate::require_graph::resolve_module(path, &r.module, &path_set)
+                else {
+                    continue;
+                };
+                for (src_name, exported_as) in &r.names {
+                    entries.insert(exported_as.clone(), (target_path.clone(), src_name.clone()));
+                }
+            }
+            if !entries.is_empty() {
+                raw_reexports.insert(path.clone(), entries);
+            }
+        }
 
         for (path, _, facts) in per_file {
             for class in &facts.class_defs {
@@ -1314,11 +1417,102 @@ impl PackageIndex {
             exports_by_path.insert(path.clone(), ex);
         }
 
+        // Flatten re-export chains: walk each `(path, exported_as)`
+        // entry until we land on a file that *defines* (not re-exports)
+        // the symbol. The flattened map is what `lookup_export`
+        // consults; downstream consumers can treat it as a single-hop
+        // alias from the barrel's exported name to the origin file's
+        // local symbol name.
+        //
+        // Two failure modes deliberately produce *no* entry (so
+        // `lookup_export` returns None rather than a nonsensical or
+        // truncated origin):
+        //   1. Cycle — e.g. `a re-exports X from b; b re-exports X from
+        //      a`. We track `visited: HashSet<(path, name)>` along the
+        //      chain; revisiting any node aborts the walk without
+        //      inserting. Without this guard, the flattened entry would
+        //      point back into the cycle and `lookup_export`'s recursion
+        //      would stack-overflow.
+        //   2. Chain longer than [`MAX_REEXPORT_HOPS`]. Inserting a
+        //      truncated mid-chain entry would (a) misresolve consumers
+        //      to a non-origin barrel and (b) risk lookup_export
+        //      recursing through a chain that still has more re-export
+        //      hops left. Dropping the entry entirely is safer than
+        //      silently lying.
+        let mut reexports_by_path: HashMap<String, HashMap<String, (String, String)>> =
+            HashMap::new();
+        let mut dropped_reexports: HashSet<(String, String)> = HashSet::new();
+        for (path, entries) in &raw_reexports {
+            let mut flat: HashMap<String, (String, String)> = HashMap::new();
+            for (exported_as, (first_path, first_name)) in entries {
+                let mut visited: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                visited.insert((path.clone(), exported_as.clone()));
+                let mut cur_path = first_path.clone();
+                let mut cur_name = first_name.clone();
+                let mut terminated = false;
+                let mut cycled = false;
+                for _ in 0..MAX_REEXPORT_HOPS {
+                    if !visited.insert((cur_path.clone(), cur_name.clone())) {
+                        // Already on the chain — cycle. Abort without
+                        // inserting (see comment above).
+                        cycled = true;
+                        break;
+                    }
+                    match raw_reexports.get(&cur_path).and_then(|m| m.get(&cur_name)) {
+                        Some((next_path, next_name)) => {
+                            cur_path = next_path.clone();
+                            cur_name = next_name.clone();
+                        }
+                        None => {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                }
+                if cycled || !terminated {
+                    // Either looped or ran out of hop budget without
+                    // landing on a file that locally defines the symbol.
+                    // Drop the entry so consumers fall back to None — and
+                    // record `(path, exported_as)` in `dropped_reexports`
+                    // so `resolve_binding_target` can distinguish "file
+                    // re-exports this name but the chain was unresolvable"
+                    // from "file doesn't re-export this name at all". The
+                    // former must NOT fall through to the Tier-2 barrel-
+                    // fact fallback (it would fabricate a binding pointing
+                    // into the cycle / mid-chain barrel — see R2 dogfood
+                    // catch in v0.7.0 cycle-fix follow-up).
+                    dropped_reexports.insert((path.clone(), exported_as.clone()));
+                    continue;
+                }
+                flat.insert(exported_as.clone(), (cur_path, cur_name));
+            }
+            if !flat.is_empty() {
+                reexports_by_path.insert(path.clone(), flat);
+            }
+        }
+
         Self {
             by_file_qualified,
             exports_by_path,
+            reexports_by_path,
+            dropped_reexports,
             classes_by_name,
         }
+    }
+
+    /// Returns `true` when `path` syntactically re-exports `exported_as`
+    /// (`export { exported_as } from './…'`) but its chain was dropped
+    /// at build time because of a cycle or because it exceeded
+    /// [`MAX_REEXPORT_HOPS`]. Callers use this to distinguish a
+    /// genuine "the file has its own local `exported_as`" miss in
+    /// `lookup_export` from "the file re-exports it but we cannot
+    /// pin where it lands" — only the latter must suppress the
+    /// Tier-2 barrel-fact fallback to avoid fabricating a binding
+    /// pointing into the cycle.
+    pub fn is_reexport_dropped(&self, path: &str, exported_as: &str) -> bool {
+        self.dropped_reexports
+            .contains(&(path.to_string(), exported_as.to_string()))
     }
 
     /// Find a symbol in `path` by qualified name (short FQN, e.g. "X"
@@ -1330,11 +1524,77 @@ impl PackageIndex {
 
     /// Find an exported name in a target file: returns the
     /// PackageTarget for the local definition behind that export name.
+    ///
+    /// If `target_path` is a barrel that re-exports `exported_as` from
+    /// another file (`export { X } from './x'`), this follows the
+    /// re-export chain to the origin file (depth-bounded by
+    /// [`MAX_REEXPORT_HOPS`], chains pre-flattened at build time) and
+    /// returns the PackageTarget in the origin file. This is what makes
+    /// `import { X } from './barrel'` consumers land on `x.js` rather
+    /// than the barrel.
     pub fn lookup_export(&self, target_path: &str, exported_as: &str) -> Option<&PackageTarget> {
-        let local = self.exports_by_path.get(target_path)?.get(exported_as)?;
-        // The local name is the qualified name in that file.
-        self.by_file_qualified
-            .get(&(target_path.to_string(), local.clone()))
+        // Iterative walk with a `visited` guard. Build-time flattening
+        // already drops cyclic and over-budget chains (see
+        // `PackageIndex::build`), so `reexports_by_path` is guaranteed
+        // to point at a terminal origin — but we keep the guard here
+        // as a belt-and-suspenders defense against future regressions
+        // that could otherwise blow the stack on adversarial input.
+        let mut cur_path = target_path.to_string();
+        let mut cur_name = exported_as.to_string();
+        let mut visited: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for _ in 0..=MAX_REEXPORT_HOPS {
+            if !visited.insert((cur_path.clone(), cur_name.clone())) {
+                return None;
+            }
+            // 1. Direct local export at the current file.
+            if let Some(local) = self
+                .exports_by_path
+                .get(&cur_path)
+                .and_then(|m| m.get(&cur_name))
+            {
+                if let Some(hit) = self
+                    .by_file_qualified
+                    .get(&(cur_path.clone(), local.clone()))
+                {
+                    return Some(hit);
+                }
+            }
+            // 2. Re-export chain: barrel forwards `cur_name` to
+            //    `(origin_path, origin_exported_as)`. Because the build
+            //    step pre-flattens to a terminal origin, this loop
+            //    normally takes at most one extra iteration.
+            match self
+                .reexports_by_path
+                .get(&cur_path)
+                .and_then(|m| m.get(&cur_name))
+            {
+                Some((origin_path, origin_exported)) => {
+                    cur_path = origin_path.clone();
+                    cur_name = origin_exported.clone();
+                }
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// Resolve a barrel-forwarded name to its origin `(path,
+    /// exported_as)` pair without requiring the origin file to have
+    /// indexed the corresponding class/function. Returns `None` if the
+    /// barrel doesn't re-export `exported_as`. Used by the require-
+    /// graph binding resolver so an import row's `target_path` follows
+    /// the re-export chain even when the origin lives outside the
+    /// indexed symbol table (e.g. plain `export const X = ...`).
+    pub fn resolve_reexport(
+        &self,
+        target_path: &str,
+        exported_as: &str,
+    ) -> Option<(String, String)> {
+        self.reexports_by_path
+            .get(target_path)
+            .and_then(|m| m.get(exported_as))
+            .cloned()
     }
 
     /// Same as `lookup_in_file` but doesn't require knowing the path
@@ -1348,11 +1608,22 @@ impl PackageIndex {
         }
     }
 
-    /// Lookup a class by its short qualified name, returning the first
-    /// hit. Used by `resolve_dotted_type`'s same-file fast path when
-    /// the visitor already knows the qualified short name lives here.
-    pub fn lookup_class_in_file(&self, qualified: &str) -> Option<&PackageTarget> {
+    /// Lookup a class by its short qualified name *within the given
+    /// file*. Used by `resolve_dotted_type`'s same-file fast path: the
+    /// visitor knows the qualified short name lives in `path`, and we
+    /// must scope the lookup so that workspaces with multiple files
+    /// defining the same class name don't bleed into the wrong one
+    /// (e.g. file A's `extends Foo` resolving to file B's `Foo` just
+    /// because B was indexed first).
+    pub fn lookup_class_in_file(&self, path: &str, qualified: &str) -> Option<&PackageTarget> {
+        let target = self
+            .by_file_qualified
+            .get(&(path.to_string(), qualified.to_string()))?;
+        // Scope-check: the (path, qualified) index also carries
+        // method / function entries; restrict to classes by verifying
+        // the qualified name appears in the class bucket for this
+        // path.
         let bucket = self.classes_by_name.get(qualified)?;
-        bucket.first()
+        bucket.iter().find(|t| t.path == path).map(|_| target)
     }
 }

@@ -84,8 +84,23 @@ impl MethodIndex {
                     .entry((m.owner.clone(), m.name.clone()))
                     .or_insert(entry.clone());
                 // Top-level functions: indexed under their package FQN
-                // (the owner *is* the package).
-                if Some(m.owner.as_str()) == facts.package.as_deref() {
+                // (the owner *is* the package). Both sides are
+                // normalized to `""` for the root package — `owner`
+                // comes through as `""` from `top_level_owner` and
+                // `facts.package` is `None` — so a naive
+                // `Some(m.owner.as_str()) == facts.package.as_deref()`
+                // check (`Some("") == None`) misses root-package
+                // callables. Without this fix, bare `helper()` calls
+                // and synthetic `FileKt.helper()` calls in root-
+                // package files never reach `by_package` and the
+                // dispatcher cannot resolve them. Regression for
+                // CodeRabbit PR #231 finding C-10.
+                let owner_pkg = if m.owner.is_empty() {
+                    None
+                } else {
+                    Some(m.owner.as_str())
+                };
+                if owner_pkg == facts.package.as_deref() {
                     by_package
                         .entry((m.owner.clone(), m.name.clone()))
                         .or_insert(entry.clone());
@@ -186,14 +201,17 @@ pub fn resolve_call(
                     });
                 }
             }
-            // 3. Current-package top-level function.
-            if let Some(pkg) = file_facts.package.as_deref() {
-                if let Some(hit) = methods.get_package_callable(pkg, name) {
-                    return Some(DispatchResolution {
-                        path: hit.path.clone(),
-                        qualified: hit.qualified.clone(),
-                    });
-                }
+            // 3. Current-package top-level function. Root-package
+            // files have `package == None`; the matching `by_package`
+            // bucket is keyed by `""` (see `MethodIndex::build`), so
+            // we look that up explicitly. Regression for CodeRabbit
+            // PR #231 finding C-10.
+            let current_pkg = file_facts.package.as_deref().unwrap_or("");
+            if let Some(hit) = methods.get_package_callable(current_pkg, name) {
+                return Some(DispatchResolution {
+                    path: hit.path.clone(),
+                    qualified: hit.qualified.clone(),
+                });
             }
             // 4. Wildcard-imported package top-level function.
             for b in &file_facts.import_bindings {

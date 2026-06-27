@@ -68,7 +68,7 @@ pub mod require_graph;
 #[cfg(test)]
 mod tests;
 
-use const_resolver::{FileConstFacts, PackageIndex};
+use const_resolver::{FileConstFacts, ImportKind, PackageIndex};
 use dispatch::MethodIndex;
 use mro::Mro;
 use require_graph::RequireGraph;
@@ -97,7 +97,14 @@ pub const TIER_PREFIX: &str = "tier25";
 // rerun of `const_resolver` / `require_graph` is driven by PR #220's
 // analyzer-revision staleness scanner; this is the 2nd real use case
 // of that scanner after Wave 2C's PR-α (CJS binding-form expansion).
-pub const ANALYZER_REVISION: u32 = 4;
+// Bumped to 5 for CodeRabbit follow-ups #8/#9/#11/#12: same-file class
+// lookup is path-aware (`lookup_class_in_file`), `NewExpr` gets a
+// same-file fallback parallel to `Cls.method()`, nested
+// `function_declaration` is no longer indexed as a workspace symbol,
+// and `ResolvedBinding` / `AliasTarget` preserve `ImportKind` so
+// dotted dispatch (`Foo.bar()`) on default imports no longer silently
+// rebinds to a sibling named export. Cached runs need invalidation.
+pub const ANALYZER_REVISION: u32 = 5;
 pub const PARSER_ID: &str = "tree-sitter-javascript";
 pub const RESOLUTION_SOURCE: &str = "tier25-javascript-resolver";
 
@@ -215,6 +222,8 @@ pub fn analyze_files(
                 AliasTarget {
                     target_path: binding.target_path.clone(),
                     target_qualified: binding.target_qualified.clone(),
+                    import_kind: binding.import_kind,
+                    dropped_chain: binding.dropped_chain,
                 },
             );
         }
@@ -226,7 +235,25 @@ pub fn analyze_files(
 
         // Type references (base classes / interfaces).
         for tref in &facts.type_refs {
-            let resolved = resolve_dotted_type(&tref.parts, &aliases, facts, &package_index);
+            // R2 v0.7.0 dogfood follow-up: if the head of the dotted
+            // type reference resolves through an alias whose re-export
+            // chain was dropped (cycle / over-budget), do NOT emit a
+            // tier25 Type row. The alias has `target_path = None,
+            // target_qualified = None`, so the row would otherwise be
+            // a fact-shaped lie attributed to the tier25 resolver. The
+            // Tier-2 syntactic backend still emits the bare `extends`
+            // fact, which is the correct level of confidence for this
+            // case. Restricted to dropped-chain aliases so genuine
+            // external (npm) imports — which also yield `(None, None)`
+            // — keep their existing Type row + fact fallback.
+            if let Some(head) = tref.parts.first() {
+                if let Some(alias) = aliases.get(head) {
+                    if alias.dropped_chain {
+                        continue;
+                    }
+                }
+            }
+            let resolved = resolve_dotted_type(path, &tref.parts, &aliases, facts, &package_index);
             resolutions.push(WorkspaceResolution {
                 source_path: path.clone(),
                 site_byte_range: tref.byte_start..tref.byte_end,
@@ -272,10 +299,38 @@ fn read_blob(file: &WorkspaceFile) -> Option<Vec<u8>> {
 /// None` means the alias points outside the workspace (bare specifier
 /// or `node:` builtin); `target_qualified` is still recorded for fact
 /// fallback at query time.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AliasTarget {
     pub target_path: Option<String>,
     pub target_qualified: Option<String>,
+    /// Carried from `ResolvedBinding::import_kind`. Lets dispatch /
+    /// type-resolution differentiate `Foo.bar` semantics across
+    /// import shapes: namespace import → `bar` is a named export of
+    /// the module; default / named / CJS import → `bar` is a runtime
+    /// property of the imported value and can't be statically pinned
+    /// at Tier-2.5.
+    pub import_kind: ImportKind,
+    /// Carried from `ResolvedBinding::dropped_chain`. True when the
+    /// import binding traced through a re-export chain that was
+    /// dropped (cycle / over-budget). Type and dispatch emit sites
+    /// must suppress rows keyed off a dropped-chain alias: there is no
+    /// resolvable origin in the workspace, and surfacing a row with
+    /// `target_path = None, target_qualified = None` would fabricate
+    /// a tier25-source edge into a non-existent symbol. External
+    /// (npm) bindings have `dropped_chain = false` and are unaffected.
+    pub dropped_chain: bool,
+}
+
+impl Default for AliasTarget {
+    fn default() -> Self {
+        Self {
+            target_path: None,
+            target_qualified: None,
+            // Restrictive default — see `ResolvedBinding::default`.
+            import_kind: ImportKind::SideEffect,
+            dropped_chain: false,
+        }
+    }
 }
 
 /// Resolve a dotted type reference in a base-class position.
@@ -287,6 +342,7 @@ pub struct AliasTarget {
 ///   * `parts[0]` is a same-file class → return it directly.
 ///   * Otherwise we can't pin (return None).
 fn resolve_dotted_type(
+    source_path: &str,
     parts: &[String],
     aliases: &HashMap<String, AliasTarget>,
     facts: &FileConstFacts,
@@ -301,15 +357,22 @@ fn resolve_dotted_type(
     if let Some(alias) = aliases.get(head) {
         // Namespace alias (`import * as Ns from './foo'`) with member:
         // `Ns.Foo` → look up `Foo` as an export of the target module.
+        // Only the namespace shape lets us re-bind `Ns.Foo` to the
+        // module's named export `Foo`; for default / named / CJS
+        // imports, `Foo.bar` in type position would be `<runtime
+        // property>` and cannot be resolved at Tier-2.5.
         if parts.len() > 1 {
-            if let Some(target_path) = &alias.target_path {
-                let member = parts[1..].join(".");
-                if let Some(hit) = package_index.lookup_export(target_path, &member) {
-                    return Some((Some(hit.path.clone()), hit.qualified.clone()));
+            if alias.import_kind == ImportKind::EsmNamespace {
+                if let Some(target_path) = &alias.target_path {
+                    let member = parts[1..].join(".");
+                    if let Some(hit) = package_index.lookup_export(target_path, &member) {
+                        return Some((Some(hit.path.clone()), hit.qualified.clone()));
+                    }
                 }
             }
-            // Couldn't resolve through namespace; still surface the
-            // qualified form for fact fallback.
+            // Couldn't resolve through namespace (either non-namespace
+            // alias shape, or namespace lookup missed); still surface
+            // the qualified form for fact fallback.
             return Some((
                 alias.target_path.clone(),
                 format!(
@@ -330,11 +393,15 @@ fn resolve_dotted_type(
     }
 
     // 2. Same-file top-level class.
+    //
+    // The visitor saw this ClassDef in `facts` (i.e. it lives in
+    // `source_path`); we must pass `source_path` through so
+    // `lookup_class_in_file` scopes to *this* file. Otherwise a
+    // workspace with two files defining `class Foo` would have
+    // file A's `extends Foo` arbitrarily resolve to file B's `Foo`.
     for class in &facts.class_defs {
         if class.qualified == *head {
-            // FileConstFacts doesn't carry the path; PackageIndex
-            // canonicalizes per-file class FQNs and remembers the path.
-            if let Some(hit) = package_index.lookup_class_in_file(&class.qualified) {
+            if let Some(hit) = package_index.lookup_class_in_file(source_path, &class.qualified) {
                 return Some((Some(hit.path.clone()), hit.qualified.clone()));
             }
         }
