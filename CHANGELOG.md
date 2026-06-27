@@ -19,14 +19,14 @@ versions follow [SemVer](https://semver.org/).
   manifest:
 
   - **Fail** when drift is reported but the analyzer run is
-    `succeeded` at the current revision (the D PR silent data loss
-    class observability safety net — the analyzer chain says "all
-    good" yet the parser layer says "still stale", meaning the
-    full-reindex chain wrote analyzer rows without bumping
-    `blobs.parser_revision`). Remediation framing is conservative:
-    "run `cairn ctl repo reindex <alias>` to recover (legacy state
-    from before v0.7.0 D PR ship is possible); if it recurs after a
-    fresh reindex, please file an issue."
+    `succeeded` **at the current revision** (the observability
+    safety net for the Tier-2.5 materialization fix below — the
+    analyzer chain says "all good" yet the parser layer says
+    "still stale", meaning the full-reindex chain wrote analyzer
+    rows without bumping `blobs.parser_revision`). Remediation
+    framing is conservative: "run `cairn ctl repo reindex <alias>`
+    to recover (legacy state from before v0.7.0 is possible); if
+    it recurs after a fresh reindex, please file an issue."
   - **Warn** when the rerun ran and terminated with
     `failed`/`timed_out`/`cancelled`, with the row's error message
     surfaced inline and a `cairn ctl jobs list <alias>` hint.
@@ -39,12 +39,12 @@ versions follow [SemVer](https://semver.org/).
     grep recipe (`alias name + staleness`) and a `cairn ctl repo
     reindex <alias>` manual-recovery fallback.
 
-  Parser-drift evaluation walks every analyzer in
-  `expected_tier3_analyzer_ids` and surfaces the worst case, so a
-  mixed picture — one analyzer succeeded, another failed — surfaces
-  the failure rather than misclassifying as the Case A Fail on the
-  succeeded slice. Aliases with no drift produce zero rerun-health
-  checks; doctor noise stays minimal.
+  Parser-drift evaluation walks every expected workspace analyzer
+  for the manifest and surfaces the worst case, so a mixed picture
+  — one analyzer succeeded, another failed — surfaces the failure
+  rather than misclassifying as the Case A Fail on the succeeded
+  slice. Aliases with no drift produce zero rerun-health checks;
+  doctor noise stays minimal.
 
 - **Automatic revision-staleness rerun at daemon startup.** When an
   analyzer's compiled-in `revision()` is higher than the value
@@ -82,6 +82,101 @@ versions follow [SemVer](https://semver.org/).
   is detected for each, why `config_hash` is *not* a stale criterion
   in the auto-rerun path, and why the rollback case (`<` comparison)
   intentionally produces no spurious rerun.
+
+- **CLI pretty output for `target_path` (Phase 4).** `cairn query
+  imports / subtypes / supertypes / refs / callers / callees` now
+  append `\ttarget=<path>` to each non-JSON row when the Tier-2.5
+  resolver pinned the edge to a workspace file. JSON / MCP output
+  already carried the field since Phase 1 / 2; this closes the
+  drift between wire and human-readable surfaces.
+- **JavaScript Tier-2.5 backend (Phase 3 integration of the
+  Wave 2B canary).** In-process tree-sitter resolver for JavaScript:
+  binding-form module imports (`const X = require(...)`,
+  `import X from '...'`, named / default / namespace / destructured
+  shapes), ES-class hierarchy, and static call dispatch within the
+  workspace. Adds `cairn-lang-javascript-tier25` (analyzer id
+  `javascript-resolver`), binding-form CommonJS `require()` import
+  emission on the Tier-1 `cairn-lang-typescript` backend across all
+  three dialects, and the same Phase 1 contract on import edges:
+  `target_qualified = None`, `target_path` is the source of truth,
+  persist.rs sanitises the path against the manifest, and the
+  cross-parser-id symbol fallback adopts a sibling-parser symbol
+  whenever a JS analyzer emits a unique qualified target. JS
+  analyzer revision starts at 2 so the same
+  `cairn ctl repo reindex <alias>` migration story applies to
+  JavaScript repos that were registered before this release.
+
+  Phase 3 originally shipped binding-form only; later in this
+  release the JavaScript / TypeScript Tier-1 emitter (see the
+  `require('./x')` entry above) was extended to statement-position,
+  expression-position, and `module.exports = require('./x')`
+  re-export shapes. The remaining limitations are the named
+  re-export pattern `exports.X = require('./x')` and downstream
+  re-export graph semantics (resolving an `import { X } from
+  './outer'` through a re-export chain).
+- **Tier-2.5 resolution `target_path` surface on refs / calls
+  (Phase 2).** `find_references`, `find_callers` and `find_callees`
+  now return `target_path: Option<String>` on `FindReferenceHit` /
+  `CallHit`, sourced directly from `resolutions.target_path` via the
+  same projection added to `find_imports` / `find_subtypes` /
+  `find_supertypes` in Phase 1. Surface-additive: no SQL semantics
+  change for the existing resolved-noise filter, dedup ordering, or
+  `kind_source` precedence — the new column is appended to the
+  `best_resolution` CTE and the inner SELECT, and the resolved /
+  noise gates continue to read `sym.qualified` via `COALESCE`. No
+  new schema migration in Phase 2; the column reads come from
+  Phase 1's v10.
+- **Tier-2.5 resolution `target_path` persistence (Phase 1).** New
+  schema migration v10 adds `resolutions.target_path TEXT` plus a
+  partial index. Workspace analyzers now persist the file path of the
+  resolved target (import edges, cross-parser type/call edges) as a
+  source of truth that is independent of `target_symbol_id`, so the
+  resolver can pin "which workspace file" even when no symbol-level
+  identity is recoverable. `ImportHit.target_path` (`find_imports`)
+  and `ImplHit.target_path` (`find_subtypes` / `find_supertypes`)
+  surface the new column on the wire as additive `Option<String>`
+  fields. The persist layer additionally gains a cross-parser-id
+  symbol-lookup fallback (unique-hit only, with manifest-wide
+  qualified-only branch gated to analyzer-emitted
+  `target_path = None`) so cross-language hierarchies (Kotlin
+  extending Java, Swift importing Objective-C, etc.) now pin
+  `target_symbol_id` whenever a single sibling-parser symbol
+  matches.
+- **Ruby require-graph contract fix.** `RequireEdge.target_qualified`
+  for `require_relative` edges is now `None` (was a path string,
+  which never matched `symbols.qualified` and silently dropped the
+  lookup). `target_path` remains the source of truth for these
+  edges.
+
+### Changed
+
+- All seven Tier-2.5 analyzers had their revisions bumped during
+  `release/0.7.0` development. The final shipped revisions are
+  Ruby = 4, PHP / Python / Swift / C# = 3, Kotlin = 5, JavaScript
+  = 4. JavaScript ships in the same release as part of the
+  Tier-2.5 JavaScript backend integration, with the same
+  `target_path` contract as the other Tier-2.5 backends. On
+  upgrade the daemon's CAS treats existing resolutions rows as
+  stale: cached Tier-2.5 facts for the bumped analyzers are
+  dropped on the next analyzer run and rewritten with the new
+  `target_path` column populated.
+
+  **Normal upgrade path is now automatic**: the daemon's
+  startup analyzer-revision and parser-revision drift scanners
+  (see entries above) detect the bumps after the watcher comes
+  up and enqueue the appropriate rerun or full repo reindex.
+  `cairn ctl repo reindex <alias>` remains the canonical
+  *recovery* path when auto-reindex cannot run — missing
+  worktree root, failing LSP, pool / DB error, or legacy
+  corrupted state from a previous bug. Newly-registered
+  repositories get the current shape automatically on first
+  index.
+- `find_references` / `find_callers` / `find_callees` results for
+  cross-parser-id codebases (Kotlin → Java, Swift → Objective-C,
+  etc.) may surface previously-missed resolved hits as the
+  cross-parser symbol fallback newly fills in `target_symbol_id`
+  for sites the same-parser lookup used to miss. This is false-
+  negative recovery, not a semantic change.
 
 ### Fixed
 
@@ -157,8 +252,8 @@ versions follow [SemVer](https://semver.org/).
   materializes every selected Tier-2.5 file at once into an
   `Arc<[u8]>`, so a single-pass over a multi-GB monorepo allocates
   peak memory proportional to the parsed input. Acceptable for the
-  v0.7.0 hotfix scope; chunked / streaming materialization is the
-  follow-up shape.
+  v0.7.0 release-blocker fix scope; chunked / streaming
+  materialization is the follow-up shape.
 
 - **Manifest dedup shortcut no longer skips the workspace analyzer
   pass when blobs were re-parsed or analyzer revision drifted (F-A
@@ -272,11 +367,12 @@ versions follow [SemVer](https://semver.org/).
   Constructors are not pushed as nesting parents — `val`/`var`
   primary-constructor parameters continue to attach as properties of
   the enclosing class, not of the synthetic ctor symbol. Kotlin
-  `parser_revision` 3 → 4 — the daemon's PR-#220 startup
-  staleness scanner auto-enqueues a reindex when an upgraded build
-  first opens an existing workspace. No manual
-  `cairn ctl repo reindex <alias>` is required; this is the first
-  real-world exercise of that auto-rerun pathway.
+  `parser_revision` 3 → 4 — the daemon's parser-revision drift
+  scanner (see the dedicated entry above) detects the bump at
+  startup and enqueues a full repo reindex automatically when the
+  alias's worktree is readable; manual
+  `cairn ctl repo reindex <alias>` remains the recovery path when
+  the auto-reindex cannot run.
 - **Kotlin Tier-2.5 absorbs the JVM `<File>Kt` synthetic class.**
   Java callers cross-calling Kotlin top-level functions write
   `FooKt.bar()` (or `com.x.FooKt.bar()`); the JVM compiler
@@ -292,8 +388,8 @@ versions follow [SemVer](https://semver.org/).
   the alias-bound terminal contract is preserved end-to-end
   (`import pkg.b.FooKt; FooKt.bar()` does not fall through to a
   same-package `bar` when `pkg.b` has no `bar`). Kotlin Tier-2.5
-  `analyzer_revision` 4 → 5; the same PR-#220 startup scanner
-  auto-enqueues the rerun.
+  `analyzer_revision` 4 → 5; the daemon's analyzer-revision drift
+  scanner enqueues a targeted rerun automatically on startup.
 - Known limitation: `@file:JvmName("Custom")` is not handled. The
   annotation rewrites the synthetic class name from `<File>Kt` to
   `Custom`, but tree-sitter-kotlin-ng does not surface that
@@ -391,137 +487,36 @@ versions follow [SemVer](https://semver.org/).
   already discriminates, so this is a future-proof against new
   `resolutions.kind` values rather than a behaviour change.
 
-### Added
-
-- **CLI pretty output for `target_path` (Phase 4).** `cairn query
-  imports / subtypes / supertypes / refs / callers / callees` now
-  append `\ttarget=<path>` to each non-JSON row when the Tier-2.5
-  resolver pinned the edge to a workspace file. JSON / MCP output
-  already carried the field since Phase 1 / 2; this closes the
-  drift between wire and human-readable surfaces.
-- **JavaScript Tier-2.5 backend (Phase 3 integration of the
-  Wave 2B canary).** In-process tree-sitter resolver for JavaScript:
-  binding-form module imports (`const X = require(...)`,
-  `import X from '...'`, named / default / namespace / destructured
-  shapes), ES-class hierarchy, and static call dispatch within the
-  workspace. Adds `cairn-lang-javascript-tier25` (analyzer id
-  `javascript-resolver`), binding-form CommonJS `require()` import
-  emission on the Tier-1 `cairn-lang-typescript` backend across all
-  three dialects, and the same Phase 1 contract on import edges:
-  `target_qualified = None`, `target_path` is the source of truth,
-  persist.rs sanitises the path against the manifest, and the
-  cross-parser-id symbol fallback adopts a sibling-parser symbol
-  whenever a JS analyzer emits a unique qualified target. JS
-  analyzer revision starts at 2 so the same
-  `cairn ctl repo reindex <alias>` migration story applies to
-  JavaScript repos that were registered before this release.
-
-  **Not yet covered (follow-up):** expression-position and
-  side-effect `require()` calls (`require('./setup')` as a
-  statement, `app.use(require('./routes'))`,
-  `module.exports = require('./x')`) are not emitted to ImportFact
-  yet — only binding-form lexical declarations are. Tracked as a
-  Tier-1 `extract_cjs_requires` extension; until that lands these
-  sites fall through to the Tier-2 fact layer with no
-  `target_path`.
-- **Tier-2.5 resolution `target_path` surface on refs / calls
-  (Phase 2).** `find_references`, `find_callers` and `find_callees`
-  now return `target_path: Option<String>` on `FindReferenceHit` /
-  `CallHit`, sourced directly from `resolutions.target_path` via the
-  same projection added to `find_imports` / `find_subtypes` /
-  `find_supertypes` in Phase 1. Surface-additive: no SQL semantics
-  change for the existing resolved-noise filter, dedup ordering, or
-  `kind_source` precedence — the new column is appended to the
-  `best_resolution` CTE and the inner SELECT, and the resolved /
-  noise gates continue to read `sym.qualified` via `COALESCE`. No
-  new schema migration in Phase 2; the column reads come from
-  Phase 1's v10.
-- **Tier-2.5 resolution `target_path` persistence (Phase 1).** New
-  schema migration v10 adds `resolutions.target_path TEXT` plus a
-  partial index. Workspace analyzers now persist the file path of the
-  resolved target (import edges, cross-parser type/call edges) as a
-  source of truth that is independent of `target_symbol_id`, so the
-  resolver can pin "which workspace file" even when no symbol-level
-  identity is recoverable. `ImportHit.target_path` (`find_imports`)
-  and `ImplHit.target_path` (`find_subtypes` / `find_supertypes`)
-  surface the new column on the wire as additive `Option<String>`
-  fields. The persist layer additionally gains a cross-parser-id
-  symbol-lookup fallback (unique-hit only, with manifest-wide
-  qualified-only branch gated to analyzer-emitted
-  `target_path = None`) so cross-language hierarchies (Kotlin
-  extending Java, Swift importing Objective-C, etc.) now pin
-  `target_symbol_id` whenever a single sibling-parser symbol
-  matches.
-- **Ruby require-graph contract fix.** `RequireEdge.target_qualified`
-  for `require_relative` edges is now `None` (was a path string,
-  which never matched `symbols.qualified` and silently dropped the
-  lookup). `target_path` remains the source of truth for these
-  edges.
-
-### Changed
-
-- All seven Tier-2.5 analyzers in `release/0.7.0` had their
-  revisions bumped (Ruby 2→3; PHP / Python / Kotlin / Swift / C# /
-  JavaScript 1→2). JavaScript ships in the same release as part of
-  the Phase 3 PR #212 integration, with the same v10 contract
-  applied. On upgrade the
-  daemon's CAS treats existing resolutions rows as stale: cached
-  Tier-2.5 facts for the bumped analyzers are dropped on the next
-  analyzer run and rewritten with the new `target_path` column
-  populated. **Existing repositories require a manual nudge** to
-  trigger the rerun; the daemon's watcher does not auto-detect
-  revision bumps as a re-index signal. Run
-  `cairn ctl repo reindex <alias>` (or remove + re-register) once
-  per repo — this re-enqueues the analyzer jobs, the next successful
-  pass replays `persist_resolutions` for the affected source string
-  and the `target_path` column is populated as part of that pass.
-  Newly-registered repositories get the new shape automatically on
-  first index. A scheduler change that detects revision-bump and
-  enqueues automatically is tracked as a follow-up.
-- `find_references` / `find_callers` / `find_callees` results for
-  cross-parser-id codebases (Kotlin → Java, Swift → Objective-C,
-  etc.) may surface previously-missed resolved hits as the
-  cross-parser symbol fallback newly fills in `target_symbol_id`
-  for sites the same-parser lookup used to miss. This is false-
-  negative recovery, not a semantic change.
-
 ### Migration notes
 
 - **Schema v10** is applied automatically when the new binary opens
   an existing index (the migration is an additive `ALTER TABLE` +
   partial index). No data loss; legacy resolutions rows keep
   `target_path = NULL` until the analyzer that wrote them re-runs.
-- **`cairn ctl repo reindex <alias>`** is the canonical
-  upgrade-completion command for existing repos; the analyzer
-  revision bump invalidates the cached run, the reindex schedules
-  the rerun, and the new column gets populated on the next
-  successful analyzer pass. A future scheduler change may make this
-  step automatic; for now, surface the command in upgrade docs.
+- **Schema v11** is applied automatically on first open and is a
+  **correctness-first destructive migration**: every workspace-aware
+  legacy row whose `manifest_id IS NULL` (`tier3-*` / `tier25-*`
+  sources) is deleted so the wrong-manifest leakage stops at the
+  migration point. Existing repositories will see fewer cross-file
+  resolved hits and `target_path` values until the daemon's startup
+  scanners (analyzer-revision + parser-revision drift) repopulate
+  the workspace-aware rows. The repopulation is automatic on a
+  readable worktree; `cairn ctl repo reindex <alias>` is the
+  recovery fallback when the auto-reindex cannot run. Newly
+  registered repositories are unaffected. Tier-2 direct rows
+  (syntactic-only) keep `manifest_id NULL` by design and stay valid
+  across every manifest that contains the blob.
+- **Daemon startup now performs revision-drift detection
+  automatically.** When the daemon opens an existing index built
+  with a previous binary, the analyzer-revision and parser-revision
+  drift scanners enqueue the appropriate reruns once the file
+  watcher is up. In the common case there is no manual step on
+  upgrade; `cairn ctl repo reindex <alias>` is reserved for
+  recovery (the `cairn ctl doctor` `analyzer rerun health` check
+  routes operators to this command when auto-reindex did not
+  complete).
 
 ### Known limitations
-
-- Cross-manifest divergence of `resolutions` rows pre-dates this
-  release: the table is keyed by `(site_blob_sha,
-  site_parser_id, byte_range, source)` and does not carry
-  `manifest_id`. The same source blob shared across
-  branches/tags/manifests reads the last-writer-wins
-  `target_symbol_id` / `target_path`. v10 exposes the existing
-  `target_symbol_id` issue for `target_path` as well (wrong-manifest
-  reads can now surface user-visible incorrect file paths in
-  addition to incorrect symbol ids). Phase 4 added the
-  `best_resolution` CTE in every query path on top of this same
-  manifest-agnostic table, so `target_path` returned by
-  `find_imports` / `find_impls` / `find_references` for a query
-  scoped to manifest B may carry a path that the analyzer originally
-  pinned while indexing manifest A — write-time
-  `blob_for_path(manifest_id, ...)` validates the path against the
-  *writing* manifest, not the *reading* one. The root fix is the
-  same v11 follow-up: add `resolutions.manifest_id` plus
-  manifest-scoped query joins; reading-side CTEs gain `manifest_id`
-  filters once that column exists. Until then, single-manifest /
-  single-branch dogfood is unaffected; the issue surfaces only when
-  the same blob is shared across manifests with different on-disk
-  file layouts.
 
 - **Kotlin Tier-2.5 dispatch is static-receiver scope only.**
   `adapter.fromJson(json)` where `adapter` is a local variable bound
@@ -537,28 +532,23 @@ versions follow [SemVer](https://semver.org/).
 
 ### Follow-up
 
-- **`parser_revision` drift staleness scanner.** The PR #220 startup
-  staleness scanner currently checks only
-  `workspace_analysis_runs.analyzer_revision` against the linked-in
-  `revision()`. A `blobs.parser_revision` drift between persisted and
-  linked-in values — the F-A trigger in this release — should also
-  surface and auto-reindex. The fix landing here closes the dedup-gate
-  side of that bug; the scanner side is a separate PR. When that
-  scanner ships, the **parser-drift path must schedule a full repo
-  reindex, not `enqueue_analyzer_run`**: a parser_revision bump
-  invalidates Tier-1 facts, and the corresponding Tier-2.5 / Tier-3
-  passes can only run after Tier-1 has been re-emitted. The PR #220
-  lesson — don't hand a low-level stamp to a caller that needs a
-  higher-level rebuild — applies here.
-
-- **Post-enqueue job tracking.** The startup staleness scanner enqueues
-  jobs but does not surface their downstream outcome (failed /
-  timed_out / cancelled). Add a per-job follow-up surface to doctor
-  and a structured log line at scanner exit. **Job tracking truth
-  must be DB state, not memory**: a daemon restart must still be able
-  to recover the post-scan job outcome from `workspace_analysis_runs`
-  and the job table, not from an in-process tracker that vanishes
-  with the process.
+- **Structured scanner-outcome persistence.** The startup
+  analyzer-revision and parser-revision drift scanners now run on
+  daemon boot and the doctor `analyzer rerun health` check
+  cross-references each drift against the persisted
+  `workspace_analysis_runs` state, so the operator-facing surface
+  is in place. What is **not yet persisted** is a per-scan-pass
+  history of "drift detected → enqueue attempted → enqueue outcome"
+  (success / coalesced / unknown analyzer / scan-time error). A
+  scheduled follow-up adds a `staleness_scan_passes` table (or a
+  `latest_staleness_scan_alias_outcomes` snapshot) with a bounded
+  retention policy so operators can audit a single scan pass after
+  the fact instead of grepping the daemon log.
+- **Chunked / streaming materialization for very large monorepos.**
+  The Tier-2.5 runner materializes every selected file at once into
+  an `Arc<[u8]>`, so a single-pass over a multi-GB monorepo
+  allocates peak memory proportional to the parsed input. Chunked /
+  streaming materialization is the future shape.
 
 ## [0.6.2] — 2026-06-24
 
