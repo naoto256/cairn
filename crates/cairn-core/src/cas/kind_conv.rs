@@ -102,14 +102,18 @@ pub fn symbol_scope_to_str(scope: SymbolScope) -> &'static str {
 }
 
 #[must_use]
-/// Rehydrates a `symbols.scope` TEXT value. Unknown tags collapse to
-/// `TopLevel` so historical rows without the column (legacy NULLs
-/// were eliminated by the v12 default, but unknown future tags can
-/// still surface) stay queryable.
+/// Rehydrates a `symbols.scope` TEXT value. Unknown tags fail closed
+/// to `Nested` so that a future scope variant written by a newer
+/// binary (e.g. `private`, `local`) stays hidden from
+/// `find_symbols`' top-level workspace search instead of leaking
+/// into it. The v12 schema's `DEFAULT 'top_level'` covers legacy
+/// rows, so no live row will hit the unknown branch under normal
+/// upgrade flow — this is purely a forward-compat safety belt.
 pub fn symbol_scope_from_str(s: &str) -> SymbolScope {
     match s {
+        "top_level" => SymbolScope::TopLevel,
         "nested" => SymbolScope::Nested,
-        _ => SymbolScope::TopLevel,
+        _ => SymbolScope::Nested,
     }
 }
 
@@ -236,6 +240,17 @@ mod tests {
             SymbolKind::Other(s) => assert_eq!(s, "future_kind"),
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn symbol_scope_roundtrips_and_unknown_fails_closed() {
+        assert_eq!(symbol_scope_from_str("top_level"), SymbolScope::TopLevel);
+        assert_eq!(symbol_scope_from_str("nested"), SymbolScope::Nested);
+        // Unknown future tag must fail closed to Nested so it stays
+        // hidden from `find_symbols` top-level filter rather than
+        // leaking into workspace search.
+        assert_eq!(symbol_scope_from_str("future_scope"), SymbolScope::Nested);
+        assert_eq!(symbol_scope_from_str(""), SymbolScope::Nested);
     }
 
     #[test]
