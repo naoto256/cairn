@@ -102,7 +102,8 @@ fn run_find_symbols(
             AND me.blob_sha = s.blob_sha
            JOIN blobs b
              ON b.blob_sha = s.blob_sha
-          WHERE 1=1",
+          WHERE 1=1
+            AND s.scope = 'top_level'",
     );
     let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0)];
 
@@ -174,4 +175,86 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
             SourceTier::Syntactic
         },
     })
+}
+
+#[cfg(test)]
+mod scope_filter_tests {
+    use super::*;
+    use crate::cas::store;
+    use rusqlite::Connection;
+
+    /// Build a minimal store with one manifest, one blob, and two
+    /// symbols (one `top_level`, one `nested`) sharing the same name.
+    fn fixture_with_top_level_and_nested() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('HEAD', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/app.js', 'sha-js')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('sha-js', 'tree-sitter-javascript', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source, scope)
+             VALUES
+               ('sha-js', 'tree-sitter-javascript', 'outer', 'outer', 'function',
+                0, 100, 1, 5, 'syntactic', 'top_level'),
+               ('sha-js', 'tree-sitter-javascript', 'helper', 'outer.helper', 'function',
+                20, 60, 2, 4, 'syntactic', 'nested')",
+            [],
+        )
+        .unwrap();
+        (tmp, conn)
+    }
+
+    #[test]
+    fn find_symbols_excludes_nested_scope_by_default() {
+        let (_tmp, conn) = fixture_with_top_level_and_nested();
+        let hits = find_symbols(
+            &conn,
+            &crate::anchor::AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some("helper".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            hits.is_empty(),
+            "nested helper must not surface as a workspace lookup hit, got {hits:?}"
+        );
+
+        // The top-level outer is still reachable.
+        let hits = find_symbols(
+            &conn,
+            &crate::anchor::AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some("outer".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "outer");
+    }
 }

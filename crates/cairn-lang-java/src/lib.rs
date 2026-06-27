@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use cairn_lang_api::{
     Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
-    SyntacticFacts, Visibility,
+    SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     DocCommentPart, NestingTracker, Visitor, child_by_field, collapse_ws, end_line_of, extract,
@@ -191,6 +191,7 @@ impl JavaVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         });
         idx
     }

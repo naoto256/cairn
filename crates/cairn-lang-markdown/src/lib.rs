@@ -15,7 +15,8 @@
 #![forbid(unsafe_code)]
 
 use cairn_lang_api::{
-    ExtractError, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind, SyntacticFacts,
+    ExtractError, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind, SymbolScope,
+    SyntacticFacts,
 };
 use cairn_lang_treesitter_generic::{Visitor, end_line_of, extract, line_of, node_text};
 use linkme::distributed_slice;
@@ -118,6 +119,7 @@ impl Visitor for MarkdownVisitor {
             // signature, which is what readers expect.
             body_start: None,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         });
 
         self.parents.push((idx, level));

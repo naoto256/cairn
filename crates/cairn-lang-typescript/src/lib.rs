@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use cairn_lang_api::{
     Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
-    SyntacticFacts, Visibility,
+    SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
@@ -62,6 +62,13 @@ impl LanguageBackend for TypescriptBackend {
         "tree-sitter-typescript"
     }
 
+    /// Revision 4: nested function declarations now carry
+    /// `SymbolScope::Nested` so `find_symbols` filters them out of
+    /// workspace lookup while `get_outline` keeps showing them. Same
+    /// input yields the same symbol rows but with a new `scope`
+    /// column value, so the CAS-cached syntactic snapshot must be
+    /// invalidated.
+    ///
     /// Revision 3: `require('./x')` is now emitted as `ImportFact` for
     /// statement-position (`require('./setup')` as a top-level
     /// expression statement), expression-position (`app.use(require(...))`,
@@ -70,7 +77,7 @@ impl LanguageBackend for TypescriptBackend {
     /// that revision 2 introduced. Same input yields more `ImportFact`
     /// rows, so the CAS-cached syntactic snapshot must be invalidated.
     fn parser_revision(&self) -> u32 {
-        3
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -109,7 +116,7 @@ impl LanguageBackend for TsxBackend {
 
     /// See [`TypescriptBackend::parser_revision`].
     fn parser_revision(&self) -> u32 {
-        3
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -150,7 +157,7 @@ impl LanguageBackend for JavascriptBackend {
 
     /// See [`TypescriptBackend::parser_revision`].
     fn parser_revision(&self) -> u32 {
-        3
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -180,6 +187,19 @@ struct TypescriptVisitor {
     /// would conflate distinct sites that happen to share the same
     /// specifier.
     seen_require_sites: HashSet<(usize, usize)>,
+    /// End-byte positions of every function-body frame currently open.
+    /// `function_declaration` / `function_expression` / `arrow_function`
+    /// / `generator_function` / `generator_function_declaration` /
+    /// bare `function` / `method_definition` all push their end byte
+    /// here; the stack is drained from the top on every visit by
+    /// dropping entries whose end byte is at or before the current
+    /// node start. A symbol declared while this stack is non-empty is
+    /// `SymbolScope::Nested` — file-local, not workspace-addressable.
+    /// Mirrors the `function_depth` counter the Tier-2.5 JS backend
+    /// uses for the same purpose, expressed as a byte-end stack so the
+    /// generic top-down `Visitor::visit_node` walk (which has no
+    /// pre/post hook to bracket descents) stays correct.
+    function_frame_ends: Vec<usize>,
 }
 
 impl TypescriptVisitor {
@@ -187,13 +207,45 @@ impl TypescriptVisitor {
         Self {
             nesting: NestingTracker::new("."),
             seen_require_sites: HashSet::new(),
+            function_frame_ends: Vec::new(),
+        }
+    }
+
+    fn pop_function_frames(&mut self, byte_start: usize) {
+        while let Some(&end) = self.function_frame_ends.last() {
+            if end <= byte_start {
+                self.function_frame_ends.pop();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn current_scope(&self) -> SymbolScope {
+        if self.function_frame_ends.is_empty() {
+            SymbolScope::TopLevel
+        } else {
+            SymbolScope::Nested
         }
     }
 }
 
 impl Visitor for TypescriptVisitor {
     fn visit_node(&mut self, node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
+        self.pop_function_frames(node.start_byte());
         self.nesting.pop_outside(node.start_byte());
+
+        // Anonymous / expression-shaped function scopes that don't emit
+        // their own SymbolFact: opening their body must still mark any
+        // declarations inside as Nested. Named function/method bodies
+        // are pushed at the bottom of this function so the symbol's own
+        // name keeps the outer scope.
+        if matches!(
+            node.kind(),
+            "function_expression" | "arrow_function" | "generator_function" | "function"
+        ) {
+            self.function_frame_ends.push(node.end_byte());
+        }
 
         if node.kind() == "import_statement" {
             extract_imports(node, source, facts);
@@ -252,6 +304,16 @@ impl Visitor for TypescriptVisitor {
         let doc = extract_jsdoc(node, source);
         let parent_idx = self.nesting.current_parent();
 
+        // Resolve scope *before* pushing the function-body frame
+        // below: the declared name itself lives in the enclosing
+        // scope, so a top-level `function foo` is TopLevel even
+        // though its body opens a frame. Nested declarations
+        // (declared while a function frame is already open) get
+        // SymbolScope::Nested so `find_symbols` can filter them out
+        // of workspace lookup without dropping them from
+        // `get_outline`.
+        let scope = self.current_scope();
+
         let idx = facts.symbols.len();
         facts.symbols.push(SymbolFact {
             name,
@@ -264,10 +326,21 @@ impl Visitor for TypescriptVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start,
             parent_idx,
+            scope,
         });
 
         if is_container(&kind) {
             self.nesting.push(idx, node.end_byte());
+        }
+
+        // Open a function-body frame so anything declared inside is
+        // marked `Nested`. Includes named declarations and method
+        // bodies (whose own name was just emitted in the outer scope).
+        if matches!(
+            node.kind(),
+            "function_declaration" | "generator_function_declaration" | "method_definition"
+        ) {
+            self.function_frame_ends.push(node.end_byte());
         }
     }
 }
@@ -284,7 +357,7 @@ fn match_typescript_item(
     source: &[u8],
 ) -> Option<(SymbolKind, String, Option<usize>)> {
     match node.kind() {
-        "function_declaration" => {
+        "function_declaration" | "generator_function_declaration" => {
             let name = child_by_field(node, "name")?;
             let body = child_by_field(node, "body").map(|n| n.start_byte());
             Some((
@@ -1237,9 +1310,9 @@ const { join } = require('path');
         // now also emit `ImportFact` rows. Bump signals the CAS-cached
         // syntactic snapshot to invalidate so the same input yields the
         // wider fact set without a manual reindex.
-        assert_eq!(TypescriptBackend.parser_revision(), 3);
-        assert_eq!(TsxBackend.parser_revision(), 3);
-        assert_eq!(JavascriptBackend.parser_revision(), 3);
+        assert_eq!(TypescriptBackend.parser_revision(), 4);
+        assert_eq!(TsxBackend.parser_revision(), 4);
+        assert_eq!(JavascriptBackend.parser_revision(), 4);
     }
 
     // ─── PR-β: expanded require() ImportFact emit ────────────────
@@ -1405,5 +1478,125 @@ const bar = require('./b');
             .collect::<Vec<_>>();
         names.sort_unstable();
         assert_eq!(names, ["javascript", "tsx", "typescript"]);
+    }
+
+    // ─── scope distinction (find_symbols vs get_outline) ────────────
+
+    fn scope_by_name(facts: &SyntacticFacts, name: &str) -> SymbolScope {
+        facts
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.scope)
+            .expect("symbol not found")
+    }
+
+    #[test]
+    fn tier1_typescript_top_level_function_has_scope_top_level() {
+        let facts = TypescriptBackend
+            .extract_syntactic(
+                b"function exported(x: number) { return x; }
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "exported"), SymbolScope::TopLevel);
+    }
+
+    #[test]
+    fn tier1_typescript_nested_function_in_function_declaration_has_scope_nested() {
+        // Inner `helper` is declared inside `outer`'s body: it must
+        // not be reachable as a workspace symbol but must still appear
+        // in the outline.
+        let facts = TypescriptBackend
+            .extract_syntactic(
+                b"function outer() { function helper() {} }
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "outer"), SymbolScope::TopLevel);
+        assert_eq!(scope_by_name(&facts, "helper"), SymbolScope::Nested);
+    }
+
+    #[test]
+    fn tier1_typescript_nested_function_in_arrow_body_has_scope_nested() {
+        // Arrow function bodies open a function frame even though the
+        // arrow itself doesn't emit a SymbolFact.
+        let facts = JavascriptBackend
+            .extract_syntactic(
+                b"const f = () => { function helper() {} };
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "helper"), SymbolScope::Nested);
+    }
+
+    #[test]
+    fn tier1_typescript_class_method_has_scope_top_level() {
+        // A method of a top-level class is workspace-addressable
+        // (the class container does not make it nested — only an
+        // enclosing function body does).
+        let facts = TypescriptBackend
+            .extract_syntactic(
+                b"class C { m(): void {} }
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "C"), SymbolScope::TopLevel);
+        assert_eq!(scope_by_name(&facts, "m"), SymbolScope::TopLevel);
+    }
+
+    #[test]
+    fn tier1_typescript_iife_nested_function_has_scope_nested() {
+        // `(function(){ function x(){} })()` — x is declared inside an
+        // immediately-invoked function expression's body.
+        let facts = JavascriptBackend
+            .extract_syntactic(
+                b"(function() { function x() {} })();
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "x"), SymbolScope::Nested);
+    }
+
+    #[test]
+    fn tier1_typescript_method_inside_class_inside_function_has_scope_nested() {
+        // Class declared inside a function body — the class and its
+        // methods are nested.
+        let facts = TypescriptBackend
+            .extract_syntactic(
+                b"function outer() { class Inner { m(): void {} } }
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "Inner"), SymbolScope::Nested);
+        assert_eq!(scope_by_name(&facts, "m"), SymbolScope::Nested);
+    }
+
+    #[test]
+    fn tier1_typescript_nested_function_in_generator_function_body_has_scope_nested() {
+        // Regression: `generator_function_declaration` previously was
+        // not matched by `match_typescript_item`, so the visitor
+        // returned early before pushing the body frame. As a result,
+        // function declarations nested inside `function* gen() { ... }`
+        // leaked into workspace lookup as TopLevel.
+        let facts = JavascriptBackend
+            .extract_syntactic(
+                b"function* gen() { function nested4() {} }
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "gen"), SymbolScope::TopLevel);
+        assert_eq!(scope_by_name(&facts, "nested4"), SymbolScope::Nested);
+    }
+
+    #[test]
+    fn tier1_typescript_default_export_named_function_is_top_level() {
+        let facts = TypescriptBackend
+            .extract_syntactic(
+                b"export default function foo() {}
+",
+            )
+            .unwrap();
+        assert_eq!(scope_by_name(&facts, "foo"), SymbolScope::TopLevel);
     }
 }

@@ -14,7 +14,7 @@
 //! consistent recovery rather than an `Err` every caller has to
 //! decide what to do with.
 
-use cairn_lang_api::Visibility;
+use cairn_lang_api::{SymbolScope, Visibility};
 use cairn_proto::common::{RefKind, SymbolKind, TypeRole};
 
 // ─── SymbolKind ────────────────────────────────────────────────────────────
@@ -84,6 +84,32 @@ pub fn symbol_kind_from_str(s: &str) -> SymbolKind {
         "test" => SymbolKind::Test,
         "section" => SymbolKind::Section,
         other => SymbolKind::Other(other.to_string()),
+    }
+}
+
+// ─── SymbolScope ──────────────────────────────────────────────────────────
+
+#[must_use]
+/// Converts a [`SymbolScope`] into the CAS TEXT tag stored on
+/// `symbols.scope`. The default `TopLevel` corresponds to the schema
+/// column default so backends that don't distinguish nested
+/// declarations keep producing prior rows verbatim.
+pub fn symbol_scope_to_str(scope: SymbolScope) -> &'static str {
+    match scope {
+        SymbolScope::TopLevel => "top_level",
+        SymbolScope::Nested => "nested",
+    }
+}
+
+#[must_use]
+/// Rehydrates a `symbols.scope` TEXT value. Unknown tags collapse to
+/// `TopLevel` so historical rows without the column (legacy NULLs
+/// were eliminated by the v12 default, but unknown future tags can
+/// still surface) stay queryable.
+pub fn symbol_scope_from_str(s: &str) -> SymbolScope {
+    match s {
+        "nested" => SymbolScope::Nested,
+        _ => SymbolScope::TopLevel,
     }
 }
 

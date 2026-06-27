@@ -36,6 +36,23 @@ pub struct SyntacticFacts {
     pub imports: Vec<ImportFact>,
 }
 
+/// Whether a symbol is reachable as a workspace lookup target
+/// (`TopLevel`) or only exists inside an enclosing function body
+/// (`Nested`). The `find_symbols` query filters to `TopLevel` so
+/// nested helpers do not pollute workspace lookup; `get_outline`
+/// ignores the distinction so file-structure views stay complete.
+///
+/// Default is `TopLevel` so backends that don't distinguish (most
+/// languages, where nested-function semantics are uncommon) keep
+/// emitting workspace-addressable symbols unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolScope {
+    #[default]
+    TopLevel,
+    Nested,
+}
+
 /// A symbol declaration. `parent_idx` is an index into `SyntacticFacts.symbols`
 /// (forward reference within the same fact bundle).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +73,10 @@ pub struct SymbolFact {
     /// reading the body.
     pub body_start: Option<usize>,
     pub parent_idx: Option<usize>,
+    /// See [`SymbolScope`]. Defaults to `TopLevel` for backends that
+    /// don't distinguish nested declarations.
+    #[serde(default)]
+    pub scope: SymbolScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

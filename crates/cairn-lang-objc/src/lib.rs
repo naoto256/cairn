@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use cairn_lang_api::{
     Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, RefFact, RefKind,
-    SymbolFact, SymbolKind, SyntacticFacts, Visibility,
+    SymbolFact, SymbolKind, SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
@@ -353,6 +353,7 @@ impl ObjcVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         });
         idx
     }
@@ -398,6 +399,7 @@ fn emit_symbol_flat(
         line_range: line_of(node)..end_line_of(node),
         body_start: parts.body_start,
         parent_idx: parts.parent_idx,
+        scope: SymbolScope::TopLevel,
     });
     facts.symbols.len() - 1
 }
