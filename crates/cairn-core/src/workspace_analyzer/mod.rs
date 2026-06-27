@@ -338,6 +338,34 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         None
     }
 
+    /// Whether the runner must read every workspace file's bytes from
+    /// disk and attach them to [`WorkspaceFile::source_bytes`] before
+    /// invoking [`Self::analyze_workspace`].
+    ///
+    /// **Default `false`**: LSP-class analyzers operate through a
+    /// language server that owns its own file I/O, so the runner
+    /// must NOT pre-read on their behalf — doing so would double the
+    /// memory footprint on a large monorepo for no benefit.
+    ///
+    /// **Set to `true` for Tier-2.5 analyzers** (every crate in
+    /// `cairn-lang-*-tier25`) that previously called `std::fs::read`
+    /// on `worktree_path` themselves. When this returns `true`, the
+    /// runner becomes the **single source of truth** for read policy:
+    /// a missing path or read error on any selected file forces the
+    /// run into `Failed` *before* the analyzer is called, and the
+    /// persist layer is not invoked, so prior `tier25-*` resolutions
+    /// stay intact.
+    ///
+    /// This is the structural defense against the v0.7.0 release
+    /// blocker where a transiently inaccessible worktree caused
+    /// Tier-2.5 analyzers to silently return empty facts and the
+    /// persist layer to delete prior rows under a `Succeeded` run.
+    /// See the D PR establishment of reviewer protocol #7
+    /// (exhaustive-path applicability audit).
+    fn requires_materialized_files(&self) -> bool {
+        false
+    }
+
     /// Analyze one manifest worth of files rooted at `repo_root`.
     /// The runner calls this once per selected manifest/analyzer pair and only
     /// persists facts returned in `Ok`; errors leave prior successful output
@@ -374,6 +402,14 @@ pub fn compute_analyzer_run_inputs(
 }
 
 /// One file visible to a [`WorkspaceAnalyzer`] within a manifest.
+///
+/// [`Self::source_bytes`] is the snapshot input contract for analyzers
+/// that opted in via [`WorkspaceAnalyzer::requires_materialized_files`]:
+/// when present, the bytes are the exact content the runner read from
+/// disk just before invoking the analyzer, and the analyzer must use
+/// these instead of opening the file itself. Analyzers that do not
+/// opt in (the LSP-class default) see `source_bytes = None` and
+/// continue to drive their own I/O through the language server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFile {
     /// Path relative to the registered repository root.
@@ -382,6 +418,12 @@ pub struct WorkspaceFile {
     pub blob_sha: String,
     /// Absolute path when the file is materialized in the worktree.
     pub worktree_path: Option<PathBuf>,
+    /// File bytes materialized by the runner for analyzers that
+    /// returned `true` from
+    /// [`WorkspaceAnalyzer::requires_materialized_files`]. `None`
+    /// for LSP-class analyzers (the default), where the language
+    /// server owns the file I/O.
+    pub source_bytes: Option<std::sync::Arc<[u8]>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,6 +736,7 @@ mod tests {
             path: "src/lib.rs".into(),
             blob_sha: "sha1".into(),
             worktree_path: Some(PathBuf::from("/tmp/repo/src/lib.rs")),
+            source_bytes: None,
         }];
 
         let facts = analyzer

@@ -423,6 +423,7 @@ end
                 path: "main.rb".into(),
                 blob_sha: "blob".into(),
                 worktree_path: Some(source.to_path_buf()),
+                source_bytes: None,
             }],
             &AnalyzerProgress::default(),
         )
