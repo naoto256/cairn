@@ -922,7 +922,7 @@ fn analyzer_drift_rerun_check(
                         "Inspect `cairn ctl jobs list {alias}` for the failed job details, then `cairn ctl repo reindex {alias}` to retry.",
                     )),
                 ),
-                ("queued" | "running", _) => doctor_check(
+                ("queued" | "running", true) => doctor_check(
                     name,
                     DoctorStatus::Pass,
                     Some(format!(
@@ -931,6 +931,25 @@ fn analyzer_drift_rerun_check(
                     )),
                     Some(format!(
                         "Run `cairn ctl jobs list {alias}` to watch progress; the rerun will land on its own.",
+                    )),
+                ),
+                // `JobManager::enqueue_analyzer_run` stamps the current
+                // `analyzer_revision` when it enqueues a current rerun,
+                // so a `queued` / `running` row at an OLDER revision is
+                // NOT an in-flight current rerun — it is either an old
+                // binary's row that remained, a `restore_from_db` of an
+                // old `running` re-listed as `queued`, or a current
+                // rerun that was never stamped / was coalesced. The
+                // "rerun will land on its own" framing would be a lie.
+                ("queued" | "running", false) => doctor_check(
+                    name,
+                    DoctorStatus::Warn,
+                    Some(format!(
+                        "analyzer rerun `{}` is at stale revision {} (expected {}); the current rerun has not landed — an old-binary row may be stuck or the rerun was never stamped",
+                        run.status, run.analyzer_revision, stale.expected_rev
+                    )),
+                    Some(format!(
+                        "Inspect `cairn ctl jobs list {alias}` for the stuck row, then `cairn ctl repo reindex {alias}` to force a current-revision rerun.",
                     )),
                 ),
                 _ => doctor_check(
@@ -962,7 +981,8 @@ fn parser_drift_rerun_check(
 ) -> DoctorCheck {
     let name = format!("repo `{alias}` parser drift rerun health");
     let mut any_failed = None;
-    let mut any_pending = false;
+    let mut any_pending_current = false;
+    let mut any_pending_stale: Option<(String, String, u32, Option<u32>)> = None;
     let mut any_row_missing = false;
     let mut any_stale_succeeded: Option<(String, u32, u32)> = None;
     let mut every_succeeded_at_current = !expected_analyzer_ids.is_empty();
@@ -1015,7 +1035,26 @@ fn parser_drift_rerun_check(
                         every_succeeded_at_current = false;
                     }
                     "queued" | "running" => {
-                        any_pending = true;
+                        // R2 v0.7.0 finding #5: a `queued` / `running`
+                        // row at an OLDER revision (or with no expected
+                        // revision known) is NOT an in-flight current
+                        // rerun — `JobManager::enqueue_analyzer_run`
+                        // stamps the current `analyzer_revision` on
+                        // enqueue. Treat stale pending rows as Warn,
+                        // not Pass.
+                        match expected_rev {
+                            Some(exp) if run.analyzer_revision == exp => {
+                                any_pending_current = true;
+                            }
+                            _ => {
+                                any_pending_stale.get_or_insert((
+                                    analyzer_id.clone(),
+                                    run.status.clone(),
+                                    run.analyzer_revision,
+                                    expected_rev,
+                                ));
+                            }
+                        }
                         every_succeeded_at_current = false;
                     }
                     _ => {
@@ -1070,21 +1109,32 @@ fn parser_drift_rerun_check(
             )),
         );
     }
-    // Case C — at least one analyzer pending.
-    if any_pending {
+    // Case B-like — at least one analyzer is `queued` / `running`
+    // at a stale (or unknown) revision. R2 v0.7.0 finding #5: this
+    // would otherwise be masked by Case C Pass because the prior
+    // implementation lumped all pending into a single flag without
+    // checking the row's `analyzer_revision`. A stale pending row is
+    // NOT an in-flight current rerun (the JobManager stamps the
+    // current revision on enqueue), so the operator must be warned.
+    if let Some((analyzer_id, status, persisted, expected_rev)) = any_pending_stale {
+        let exp_str = expected_rev
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         return doctor_check(
             name,
-            DoctorStatus::Pass,
+            DoctorStatus::Warn,
             Some(format!(
-                "parser drift rerun pending (one or more expected analyzers queued/running). Parser drift summary: {parser_summary}",
+                "parser drift remains and at least one analyzer rerun is `{status}` at stale revision: `{analyzer_id}` at revision {persisted}, expected {exp_str} — the current rerun has not landed. Parser drift summary: {parser_summary}",
             )),
             Some(format!(
-                "Run `cairn ctl jobs list {alias}` to watch progress; the rerun will land on its own.",
+                "Inspect `cairn ctl jobs list {alias}` for the stuck row, then `cairn ctl repo reindex {alias}` to force a current-revision rerun.",
             )),
         );
     }
-    // Case D — at least one analyzer row missing (and no pending /
-    // no failed).
+    // Case D — at least one analyzer row missing.
+    // R2 v0.7.0 finding #5: must run BEFORE Case C Pass so a mixed
+    // (pending-current + missing-row) state surfaces as Warn rather
+    // than being masked by the pending Pass.
     if any_row_missing {
         return doctor_check(
             name,
@@ -1102,7 +1152,9 @@ fn parser_drift_rerun_check(
     // scanner did not enqueue the analyzer-revision rerun, or it
     // was dropped before the worker landed it (R2 catch: this state
     // would otherwise be misclassified as the safety-net Case A
-    // because all rows are `succeeded`).
+    // because all rows are `succeeded`). Must run BEFORE Case C Pass
+    // (R2 v0.7.0 finding #5) so a mixed pending-current + stale-
+    // succeeded state surfaces as Warn rather than masked by Pass.
     if let Some((stale_analyzer, persisted, expected_rev)) = any_stale_succeeded {
         return doctor_check(
             name,
@@ -1112,6 +1164,20 @@ fn parser_drift_rerun_check(
             )),
             Some(format!(
                 "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
+            )),
+        );
+    }
+    // Case C — at least one analyzer pending at the current revision
+    // (and no failed / stale-pending / missing / stale-succeeded).
+    if any_pending_current {
+        return doctor_check(
+            name,
+            DoctorStatus::Pass,
+            Some(format!(
+                "parser drift rerun pending (one or more expected analyzers queued/running at the current revision). Parser drift summary: {parser_summary}",
+            )),
+            Some(format!(
+                "Run `cairn ctl jobs list {alias}` to watch progress; the rerun will land on its own.",
             )),
         );
     }
@@ -2830,6 +2896,162 @@ mod tests {
         assert!(
             detail.contains("stuck") && detail.contains("queued"),
             "expected stuck framing for queued row, got: {detail}"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // v0.7.0 R2 findings #4 / #5 — pin the stale-pending fixes
+    // ───────────────────────────────────────────────────────────────
+    //
+    // The C PR's rerun-health framework treated any `queued` /
+    // `running` row as an in-flight current rerun and returned Pass.
+    // `JobManager::enqueue_analyzer_run` stamps the current
+    // `analyzer_revision` on enqueue, so a pending row at an OLDER
+    // revision is NOT an in-flight current rerun — it is a stuck
+    // old-binary row, a `restore_from_db` artifact, or a coalesced
+    // enqueue. These tests pin that the fixed code surfaces Warn for
+    // those cases (analyzer-side: finding #4, parser-side: finding
+    // #5) and that mixed parser-drift cases (pending-current plus
+    // missing-row or stale-succeeded) are no longer masked by the
+    // Case C Pass.
+
+    /// Finding #4 — analyzer drift + `queued` at stale revision MUST
+    /// be `Warn`. The prior code matched `("queued" | "running", _)`
+    /// unconditionally Pass, hiding stuck old-binary rows.
+    #[test]
+    fn analyzer_drift_queued_at_stale_revision_is_warn_not_pass() {
+        let probes = vec![analyzer_drift_probe(
+            "moshi",
+            "kotlin-resolver",
+            5,
+            Some(run_row("kotlin-resolver", 4, "queued", None)),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "queued at stale revision must NOT be Pass (rerun will land on its own would be a lie)"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("stale revision")
+                && detail.contains("revision 4")
+                && detail.contains("expected 5"),
+            "detail must surface persisted-vs-expected revision so the operator can see the row is stuck at an old revision: {detail}"
+        );
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(remediation.contains("cairn ctl jobs list moshi"));
+        assert!(remediation.contains("cairn ctl repo reindex moshi"));
+    }
+
+    /// Finding #4 sibling — analyzer drift + `running` at stale
+    /// revision MUST be `Warn` (queued/running share the branch).
+    #[test]
+    fn analyzer_drift_running_at_stale_revision_is_warn_not_pass() {
+        let probes = vec![analyzer_drift_probe(
+            "moshi",
+            "kotlin-resolver",
+            5,
+            Some(run_row("kotlin-resolver", 4, "running", None)),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "running at stale revision must NOT be Pass"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("running") && detail.contains("stale revision"),
+            "detail must mark the running row as stale: {detail}"
+        );
+    }
+
+    /// Finding #5 — parser drift cascade: one analyzer queued at the
+    /// current revision PLUS another analyzer with no row MUST be
+    /// `Warn`. The prior cascade returned Case C Pass on `any_pending`
+    /// before checking `any_row_missing`, masking the missing-row
+    /// failure mode.
+    #[test]
+    fn parser_drift_pending_plus_missing_row_is_warn_not_pass() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
+            vec![run_row("kotlin-resolver", 5, "queued", None)],
+            // jdtls-lsp row intentionally absent.
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "pending-current + missing-row must NOT be masked by Case C Pass"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("no rerun row"),
+            "detail must surface the missing-row mode rather than the pending Pass framing: {detail}"
+        );
+    }
+
+    /// Finding #5 — pending-current PLUS another analyzer succeeded
+    /// at an OLD revision MUST be `Warn`. The prior cascade returned
+    /// Case C Pass on `any_pending` before checking
+    /// `any_stale_succeeded`, masking the "rerun never landed" mode.
+    #[test]
+    fn parser_drift_pending_plus_stale_succeeded_is_warn_not_pass() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &[("kotlin-resolver", 5), ("jdtls-lsp", 1)],
+            vec![
+                run_row("kotlin-resolver", 5, "queued", None),
+                run_row("jdtls-lsp", 0, "succeeded", None),
+            ],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "pending-current + stale-succeeded must NOT be masked by Case C Pass"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("never landed"),
+            "detail must use the 'never landed' framing for the stale-succeeded analyzer: {detail}"
+        );
+        assert!(
+            detail.contains("jdtls-lsp"),
+            "detail must name the stale analyzer so the operator can target it: {detail}"
+        );
+    }
+
+    /// Finding #5 — single analyzer `queued` at an OLD revision (no
+    /// other analyzers) MUST be `Warn`. The prior queued/running
+    /// branch did not split on `analyzer_revision == expected_rev`
+    /// and would have returned Case C Pass.
+    #[test]
+    fn parser_drift_queued_at_stale_revision_is_warn_not_pass() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &[("kotlin-resolver", 5)],
+            vec![run_row("kotlin-resolver", 4, "queued", None)],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "queued at stale revision must NOT be Case C Pass"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("stale revision")
+                && detail.contains("revision 4")
+                && detail.contains("expected 5"),
+            "detail must surface the stale pending row's persisted-vs-expected revision: {detail}"
         );
     }
 }
