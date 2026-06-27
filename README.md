@@ -10,24 +10,9 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.6.2**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.7.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
-
-Upgrading from 0.2.x: the `find_impls` MCP tool is gone — use
-`find_subtypes` (who implements / extends X) and `find_supertypes`
-(what X extends / implements / mixes in) instead. The new
-`find_callers` / `find_callees` pair replaces composing
-`find_references` with a direction filter when you just want the
-call graph. The CLI moves with it: `cairn query find` is now `cairn
-query symbols`, `cairn query impls --type/--trait` becomes `cairn
-query supertypes/subtypes`, `cairn query imports --file <path>` and
-`cairn query outline <alias> <file>` take the path positionally, and
-`cairn query source` no longer requires `--repo`. The Java backend's
-inheritance edges now use `inherit` / `implement` (matching every
-other backend) instead of the old `extends` / `implements`; clients
-matching on those strings need to update. Reindex picks up the new
-labels on the next pass.
 
 ## Why
 
@@ -112,10 +97,13 @@ systemctl --user enable --now cairn.service
 ### Claude Code and Codex plugin
 
 Install the Cairn plugin in your agent host after the binary is on
-`PATH` and the daemon is running. The plugin registers `cairn mcp` and
-adds a non-blocking hook that nudges broad text searches toward the
-matching structural tool when the current directory belongs to a
-registered repo.
+`PATH` and the daemon is running. The plugin registers `cairn mcp`
+and, via a `SessionStart` hook, injects
+`plugin/SERVER_INSTRUCTIONS.md` into each session so the agent
+reaches for cairn's structural tools (`find_symbols`, `get_outline`,
+`find_references`, etc.) before grep / Read on structure questions.
+The guidance is loaded once per session (matchers:
+`startup|resume|clear|compact`), not per tool call.
 
 Claude Code:
 
@@ -131,9 +119,9 @@ codex plugin marketplace add naoto256/cairn
 codex plugin add cairn@naoto256-cairn
 ```
 
-For a local checkout, replace `naoto256/cairn` with the absolute path to
-this repository. Restart the agent session after install so the MCP
-server registration and hook take effect.
+For a local checkout, replace `naoto256/cairn` with the absolute path
+to this repository. Restart the agent session after install so the
+MCP server registration and the `SessionStart` hook take effect.
 
 ## Use
 
@@ -268,62 +256,62 @@ analyzer pass) and a concrete next-step.
 
 ## Languages
 
-| Language | Tier-1 (syntax) | Tier-2 (semantic) | Tier-3 (cross-file) |
-|---|---|---|---|
-| Rust | ✅ | ✅ | ✅ (rust-analyzer) |
-| Python | ✅ | ✅ | ✅ (pyright-langserver) |
-| Go | ✅ | ✅ | ✅ (gopls) |
-| TypeScript / TSX (`.ts` / `.mts` / `.cts` / `.tsx`) | ✅ | ✅ | ✅ (typescript-language-server) |
-| JavaScript (`.js` / `.mjs` / `.cjs` / `.jsx`) | ✅ | ✅ | ✅ (typescript-language-server) |
-| Java (`.java`) | ✅ | ✅ | ✅ (jdtls) |
-| C# (`.cs`) | ✅ | ✅ | ✅ (csharp-ls) |
-| Kotlin (`.kt` / `.kts`) | ✅ | ✅ | ✅ (kotlin-language-server) |
-| Swift (`.swift`) | ✅ | ✅ | ✅ (sourcekit-lsp) |
-| C (`.c` / `.h`) | ✅ | ✅ | ✅ (clangd) |
-| C++ (`.cpp` / `.cc` / `.cxx` / `.hpp` / `.hxx` / `.hh` / `.h++` / `.C` / `.H`) | ✅ | ✅ | ✅ (clangd) |
-| Objective-C (`.m`) | ✅ | ✅ | ✅ (clangd) |
-| Ruby (`.rb` / `.rake` / `Gemfile` / `Rakefile`) | ✅ | ✅ | ✅ (ruby-lsp) |
-| PHP (`.php`) | ✅ | ✅ | ✅ (phpantom-lsp) |
-| Markdown | ✅ | – | – |
+| Language | Tier-1 (syntax) | Tier-2 (semantic) | Tier-2.5 (in-process) | Tier-3 (cross-file) |
+|---|---|---|---|---|
+| Rust | ✅ | ✅ | – | ✅ (rust-analyzer) |
+| Python | ✅ | ✅ | ✅ | ✅ (pyright-langserver) |
+| Go | ✅ | ✅ | – | ✅ (gopls) |
+| TypeScript / TSX (`.ts` / `.mts` / `.cts` / `.tsx`) | ✅ | ✅ | – | ✅ (typescript-language-server) |
+| JavaScript (`.js` / `.mjs` / `.cjs` / `.jsx`) | ✅ | ✅ | ✅ | ✅ (typescript-language-server) |
+| Java (`.java`) | ✅ | ✅ | – | ✅ (jdtls) |
+| C# (`.cs`) | ✅ | ✅ | ✅ | ✅ (csharp-ls) |
+| Kotlin (`.kt` / `.kts`) | ✅ | ✅ | ✅ | ✅ (kotlin-language-server) |
+| Swift (`.swift`) | ✅ | ✅ | ✅ | ✅ (sourcekit-lsp) |
+| C (`.c` / `.h`) | ✅ | ✅ | – | ✅ (clangd) |
+| C++ (`.cpp` / `.cc` / `.cxx` / `.hpp` / `.hxx` / `.hh` / `.h++` / `.C` / `.H`) | ✅ | ✅ | – | ✅ (clangd) |
+| Objective-C (`.m`) | ✅ | ✅ | – | ✅ (clangd) |
+| Ruby (`.rb` / `.rake` / `Gemfile` / `Rakefile`) | ✅ | ✅ | ✅ | ✅ (ruby-lsp) |
+| PHP (`.php`) | ✅ | ✅ | ✅ | ✅ (phpantom-lsp) |
+| Markdown | ✅ | – | – | – |
 
 Tier-1 is the tree-sitter syntax floor: symbols, outlines, imports,
-and other facts that can be extracted from one file. Fourteen
-first-class language backends ship with 0.6.2, plus a generic
-tree-sitter fallback for additional grammars.
+and other facts extractable from one file. Fourteen first-class
+language backends ship with 0.7.0 (plus Markdown for outlines),
+and a generic tree-sitter fallback covers additional grammars.
 
 Tier-2 adds language-specific semantic facts from one file —
-inheritance / interface / mixin / extension edges, call refs (with
-same-file callees resolved so the default `find_callees` and
-`find_references(outgoing)` views show a meaningful call graph
-without `include_noise=true`), and import edges. The four-label
+inheritance / interface / mixin / extension edges, call refs with
+same-file callees resolved, and import edges. The four-label
 taxonomy `inherit` / `implement` / `mixin` / `extension` is shared
 across every backend so `find_subtypes` / `find_supertypes` compare
 cleanly across languages.
 
-Tier-2.5 runs in-process workspace analyzers for Tier-2.5-enabled
-languages (Kotlin, Swift, C#, JavaScript / TypeScript, Python,
-Ruby, PHP today). These analyzers build cross-file graphs without
-an external LSP, persist manifest-scoped resolutions, and attach
-`target_path` to imports, subtype / supertype edges, references,
-callers, and callees — so a `find_subtypes` query against an
-interface returns the workspace file each implementation lives in
-directly, even when no Tier-3 LSP runs. The runner reads each
-file's bytes once per pass and hands them to the analyzer through
-the `WorkspaceFile::source_bytes` contract; a transiently
-inaccessible worktree marks the run as `Failed` and preserves
-prior facts rather than silently emitting an empty result. Tier-3
-analyzers are not pre-read on this path so the LSP-driven workflow
-keeps its existing memory profile. Tier-2.5 analyzer jobs share
-the workspace analyzer scheduler with Tier-3.
+Tier-2.5 is the in-process workspace analyzer layer for cross-file
+resolution without an external LSP. Seven languages ship Tier-2.5
+backends today — Python, PHP, Ruby, C#, JavaScript, Kotlin, and
+Swift. These analyzers build manifest-scoped resolutions and
+attach `target_path` to imports, subtype / supertype edges,
+references, callers, and callees, so a `find_subtypes` query
+against an interface returns the workspace file each implementation
+lives in directly, even when no Tier-3 LSP runs. Languages without
+a Tier-2.5 backend (Rust, Go, TypeScript, Java, C, C++,
+Objective-C) skip the layer and rely on Tier-3 for cross-file
+resolution.
+
+The runner reads each Tier-2.5 file's bytes once per pass and
+hands them to the analyzer through the `WorkspaceFile::source_bytes`
+contract; a transiently inaccessible worktree marks the run as
+`Failed` and preserves prior facts rather than silently emitting an
+empty result. Tier-3 analyzers are not pre-read on this path so the
+LSP-driven workflow keeps its existing memory profile. Tier-2.5
+jobs share the workspace analyzer scheduler with Tier-3.
 
 Tier-3 runs local language servers once per snapshot when their
 binaries are discoverable by the daemon. Every supported language
-except Markdown now has a Tier-3 analyzer: Rust uses
-`rust-analyzer` (`source = tier3-rust-analyzer-lsp`), Python uses
-`pyright-langserver` (`source = tier3-pyright-lsp`), Go uses `gopls`
-(`source = tier3-gopls-lsp`), and the remaining LSPs are listed in
-the table above. Missing binaries or unsuitable workspaces are
-recorded as `Skipped`; Tier-1 / Tier-2 facts remain available.
+except Markdown has a Tier-3 analyzer; the LSP for each language is
+listed in the table above. Missing binaries or unsuitable
+workspaces are recorded as `Skipped`; Tier-1 / Tier-2 / Tier-2.5
+facts remain available.
 
 Files are picked by extension first (`*.py`, `*.rs`, `*.md`, `*.ts`,
 `*.go`, ...). Extensionless executables (`bin/foo` with mode `0755+`)
