@@ -406,6 +406,55 @@ pub struct EnqueueReindex<'a> {
     pub now_ns: i64,
 }
 
+/// Why a full-repo reindex is being enqueued.
+///
+/// Recorded on every [`FullReindexEnqueueOutcome`] so call sites
+/// (manual operator request vs. auto-recovery from drift detection)
+/// can be told apart in logs and metrics. The variant set is open
+/// for future drivers (e.g. a watcher heuristic that escalates to
+/// full reindex) — add a new entry rather than overloading an
+/// existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReindexReason {
+    /// Operator invoked `cairn ctl repo reindex <alias>`.
+    Manual,
+    /// Daemon-startup scanner detected a `parser_revision` drift
+    /// (the linked-in backend's `parser_revision()` no longer
+    /// matches the `blobs.parser_revision` persisted for an
+    /// expected parse unit, or the row is missing entirely).
+    ParserRevisionDrift,
+}
+
+/// Outcome of a successful [`JobManager::enqueue_full_repo_reindex`]
+/// call.
+///
+/// The shape is wider than `Result<()>` so callers can distinguish:
+///   * `jobs_enqueued == 0` (analyzer registry produced no jobs for
+///     this manifest — e.g. a `.gitignore`-only repo)
+///   * `skip_analyzers_for_unchanged_manifest == true` (the
+///     register dedup gate decided the tentative manifest is
+///     byte-identical and reused it; analyzer pass skipped)
+///   * `blobs_parsed == 0` paired with the dedup skip (no work
+///     was actually needed — should never co-occur with
+///     `ReindexReason::ParserRevisionDrift`, see the test in
+///     `staleness::e2e`)
+///
+/// `coalesced: bool` is intentionally absent. A single
+/// `enqueue_full_repo_reindex` request can drive *multiple* analyzer
+/// rows; collapsing the per-row coalesce decisions to one boolean
+/// would lose detail. `jobs_enqueued` already reports the resulting
+/// row count.
+#[derive(Debug, Clone)]
+pub struct FullReindexEnqueueOutcome {
+    pub alias: String,
+    pub repo_hash: String,
+    pub reason: ReindexReason,
+    pub manifest_id: ManifestId,
+    pub blobs_parsed: usize,
+    pub jobs_enqueued: usize,
+    pub skip_analyzers_for_unchanged_manifest: bool,
+}
+
 /// Public enqueue request for one specific (manifest, analyzer) pair.
 ///
 /// Caller supplies the routing identity (`alias`, `repo_hash`,
@@ -677,6 +726,64 @@ impl JobManager {
             return Ok(jobs);
         }
         Ok(jobs)
+    }
+
+    /// High-level "reindex this whole repo right now" entry point.
+    ///
+    /// Looks the alias up in the registry, opens its CAS store,
+    /// walks the register hot path with the dedup gate **off** (=
+    /// analyzers are always re-queued), and returns a structured
+    /// outcome.
+    ///
+    /// # Why the surface is intentionally narrow
+    ///
+    /// Callers (operator-driven reindex, parser-revision drift
+    /// recovery, future watcher heuristics) supply only `alias` and
+    /// `reason`. All the routing identity (`repo_hash`, `repo_root`,
+    /// `manifest_id`, `entries`, `now_ns`) is derived inside this
+    /// method from the registry + clock. A buggy caller cannot
+    /// hand-stamp the wrong store path or a stale timestamp.
+    ///
+    /// # Errors
+    /// * [`Error::RepoNotFound`] if `alias` is not registered.
+    /// * SQLite / IO errors from the registry, store open, git
+    ///   invocation, or the analyzer enqueue path bubble up
+    ///   unchanged.
+    pub fn enqueue_full_repo_reindex(
+        self: &Arc<Self>,
+        alias: &str,
+        reason: ReindexReason,
+    ) -> Result<FullReindexEnqueueOutcome> {
+        let entry = {
+            let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+            cas_registry::lookup_by_alias(&index, alias)?
+        };
+        let entry = entry.ok_or_else(|| Error::RepoNotFound {
+            alias: alias.to_string(),
+        })?;
+
+        let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
+        let mut conn = cas_store::open(&store_path)?;
+        let repo_root = PathBuf::from(&entry.root_path);
+
+        let outcome = crate::register::register_repo_force_analyzers_enqueue(
+            &mut conn,
+            &entry.alias,
+            &entry.repo_hash,
+            &repo_root,
+            now_ns(),
+            self,
+        )?;
+
+        Ok(FullReindexEnqueueOutcome {
+            alias: entry.alias.clone(),
+            repo_hash: entry.repo_hash.clone(),
+            reason,
+            manifest_id: outcome.tentative_manifest,
+            blobs_parsed: outcome.blobs_parsed,
+            jobs_enqueued: outcome.analyzer_jobs.len(),
+            skip_analyzers_for_unchanged_manifest: outcome.analyzers_skipped_due_to_dedup,
+        })
     }
 
     fn queue_analyzer_run(
