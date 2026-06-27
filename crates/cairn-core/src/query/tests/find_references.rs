@@ -797,6 +797,65 @@ fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
         hits.is_empty(),
         "PHP-style FQN must not coincidentally match an unrelated cross-parser hit"
     );
+
+    // Positive companion (CodeRabbit PR #231 finding C-15): the
+    // negative assertion above also passes when `\` is *not*
+    // recognised as a qualified separator (the query then falls
+    // through to bare-name and finds nothing). Pin that `\` truly
+    // enters the qualified strict path by adding a matching
+    // `Vendor\Pkg\Foo` symbol + cross-parser resolution row and
+    // asserting the strict-FQN incoming query finds it.
+    conn.execute(
+        "INSERT INTO symbols
+               (id, blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source)
+             VALUES
+               (99, 'sha-java', 'tree-sitter-java', 'Foo', 'Vendor\\Pkg\\Foo', 'class',
+                300, 320, 30, 31, 'syn')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 1, 'Foo', NULL, 'call',
+                60, 70, 7, 'tree-sitter-kotlin-ng')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 60, 70, 'call', NULL, 99,
+                'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        [],
+    )
+    .unwrap();
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "Vendor\\Pkg\\Foo".into(),
+            direction: ReferenceDirection::Incoming,
+            kind: Some(RefKind::Call),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "PHP-style `Vendor\\Pkg\\Foo` must enter strict-FQN path and find the cross-parser resolution; got {hits:?}"
+    );
+    assert_eq!(
+        hits[0].target_qualified.as_deref(),
+        Some("Vendor\\Pkg\\Foo"),
+        "strict-FQN hit must surface the qualified name via COALESCE; got {hits:?}"
+    );
 }
 
 // ──── MF-1: cross-manifest isolation for find_references ────
