@@ -1129,8 +1129,7 @@ mod tests {
     fn shebang_fallback_rejects_shell_script() {
         let backends = python_backends();
         assert!(
-            pick_backend_with_fallbacks(&backends, "bin/foo", b"#!/bin/bash\necho hi\n")
-                .is_none()
+            pick_backend_with_fallbacks(&backends, "bin/foo", b"#!/bin/bash\necho hi\n").is_none()
         );
     }
 
@@ -1143,8 +1142,7 @@ mod tests {
     #[test]
     fn shebang_fallback_keeps_path_based_match() {
         let backends = python_backends();
-        let backend =
-            pick_backend_with_fallbacks(&backends, "foo.py", b"print('hi')\n").unwrap();
+        let backend = pick_backend_with_fallbacks(&backends, "foo.py", b"print('hi')\n").unwrap();
         assert_eq!(backend.parser_id(), "tree-sitter-python");
     }
 
