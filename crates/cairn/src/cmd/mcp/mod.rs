@@ -100,37 +100,6 @@ pub static MCP_TOOLS: [fn() -> Box<dyn McpTool>] = [..];
 /// Server-wide cockpit guidance returned in `initialize.instructions`.
 /// Keep this MCP-facing policy concise; data-RPC remains primitive and
 /// composition stays with the agent.
-const SERVER_INSTRUCTIONS: &str = "\
-As you navigate code, you will hit recurring failures when you reach \
-for grep/Read on structural questions:\n\
-\n\
-- grep on a name returns 50+ matches mixing definition, uses, \
-  comments, and same-name shadows in other modules\n\
-- the file you need is named differently than you'd guess, so \
-  locating one definition costs a whole-repo scan\n\
-- \"who calls this?\" can't be separated from comments and unrelated \
-  same-name functions by text alone\n\
-- extends / implements / mixins / protocol conformance aren't \
-  text-shaped; grep can't model type hierarchies\n\
-- zero results doesn't mean the symbol doesn't exist — the Tier-3 \
-  index might not be ready yet\n\
-- JSX `<Foo />` semantically calls Foo but doesn't grep as a call\n\
-\n\
-These fire hardest on *structure*, not *text*. On a question about \
-where a definition lives, who calls / extends / implements something, \
-what's in a file or directory, or what depends on what — grep loses \
-it by construction. Reach for cairn before you grep.\n\
-\n\
-What comes back: precise location, kind, signature, doc — with \
-`tier3_status` so you can tell \"doesn't exist\" from \"index not \
-ready\", `completeness` for truncation, and `hints` for empty-result \
-recovery.\n\
-\n\
-You will sometimes grep first anyway — the reflex is faster than this \
-text. Recovery is one call: when you're reading >2 files to locate \
-one definition, or about to conclude \"no such symbol\" without \
-checking tier3 readiness, that is the signal to reach for cairn.";
-
 // ─── run loop ──────────────────────────────────────────────────────────────
 
 #[derive(ClapArgs, Debug)]
@@ -491,7 +460,12 @@ fn initialize_result() -> InitializeResult {
             name: SERVER_NAME.into(),
             version: SERVER_VERSION.into(),
         },
-        instructions: Some(SERVER_INSTRUCTIONS.into()),
+        // MCP serverInstructions retired in v0.7.0; the same guidance now
+        // ships as `plugin/SERVER_INSTRUCTIONS.md` and is injected via the
+        // plugin's `SessionStart` hook so it survives Claude Code's
+        // serverInstructions size cap and reaches Codex hosts that ignore
+        // the field. Keep `None` here to avoid two copies drifting.
+        instructions: None,
     }
 }
 
@@ -630,25 +604,19 @@ mod tests {
         }
     }
 
+    /// MCP serverInstructions are intentionally `None` from v0.7.0
+    /// onward; the equivalent guidance is shipped as
+    /// `plugin/SERVER_INSTRUCTIONS.md` and injected via the plugin's
+    /// `SessionStart` hook. This pins the omission so a future
+    /// well-meaning revert that re-adds a `Some(...)` here trips the
+    /// test instead of silently re-introducing the two-copy drift.
     #[test]
-    fn mcp_server_instructions_frames_structural_pain_and_recovery() {
+    fn mcp_serverinstructions_omitted_in_favor_of_plugin_session_hook() {
         let r = initialize_result();
-        assert_eq!(r.protocol_version, MCP_PROTOCOL_VERSION);
-        let instructions = r.instructions.unwrap();
-        for phrase in [
-            "recurring failures when you reach",
-            "grep on a name returns 50+",
-            "Tier-3 index might not be ready yet",
-            "JSX `<Foo />` semantically calls Foo",
-            "fire hardest on *structure*, not *text*",
-            "Reach for cairn before you grep",
-            "tier3_status",
-            "completeness",
-            "hints",
-            "Recovery is one call",
-        ] {
-            assert!(instructions.contains(phrase), "missing {phrase}");
-        }
+        assert!(
+            r.instructions.is_none(),
+            "MCP serverInstructions should be None — guidance now ships via the plugin SessionStart hook"
+        );
     }
 
     #[tokio::test]

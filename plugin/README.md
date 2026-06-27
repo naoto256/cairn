@@ -2,9 +2,8 @@
 
 Cairn is a local symbol-aware code index served over MCP. This plugin
 wires the `cairn` MCP server into the host (Claude Code or Codex) and
-installs a `PreToolUse` Bash hook that nudges grep-first habits toward
-the matching cairn tool when the current working directory belongs to
-a cairn-registered repo.
+installs a `SessionStart` hook that injects cairn's structural-tool
+guidance into the host's context at the start of every session.
 
 ## What it does
 
@@ -14,27 +13,24 @@ a cairn-registered repo.
   `find_callees` / `find_references` / `find_imports` /
   `get_symbol_source` / `register_repo` / `reindex_repo` without any
   per-project setup.
-- **`grep` nudge hook** (`hooks/hooks.json` →
-  `tools/cairn-nudge.sh`). Inspects every Bash call. If the command
-  starts with `grep` / `rg` / `ag` / `ack` / `egrep` / `fgrep` AND the
-  `cwd` is a cairn-registered repo, the hook **lets the call run** and
-  emits a `hookSpecificOutput.additionalContext` advisory that names
-  the closest cairn tool (`find_symbols`, `find_subtypes` /
-  `find_supertypes`, `find_callers` / `find_callees`,
-  `find_imports`, or `find_references`) with a one-line explanation
-  of what it returns. The advisory surfaces in the agent's next-turn
-  context so the next call defaults to the index, but the current
-  `grep` is not interrupted. Non-grep commands and non-registered
-  cwds pass through silently. Any dependency / runtime failure
-  (missing `cairn` or `jq` on `PATH`, daemon down, parse error) is a
-  no-op so a broken hook never breaks a turn.
+- **`SessionStart` guidance injection** (`hooks/hooks.json` →
+  `SERVER_INSTRUCTIONS.md`). On `startup`, `resume`, `clear`, and
+  `compact` events, the host runs `cat
+  "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/SERVER_INSTRUCTIONS.md"` and the
+  hook's stdout becomes additional context for the next agent turn.
+  This is where the "reach for cairn before grep" framing, the
+  structural-failure catalog, and the `tier3_status` / `completeness`
+  / `hints` recovery guidance live. Before v0.7.0 the same text was
+  shipped as MCP `serverInstructions`; in v0.7.0 it moved to the
+  plugin's `SessionStart` hook so it survives Claude Code's
+  `serverInstructions` size cap and reaches Codex hosts that ignore
+  the field.
 
 ## Prerequisites
 
 - `cairn daemon` is running. (`cairn daemon` is the long-lived index
   service the MCP server talks to.)
 - `cairn` is available on `PATH`.
-- `jq` is available on `PATH` for the nudge hook.
 
 ## Install
 
@@ -93,21 +89,16 @@ hook contract.
 
 The `${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}` expansion in
 `hooks/hooks.json` handles either host's plugin-path environment
-variable, and `tools/cairn-nudge.sh` emits the same
-`hookSpecificOutput.additionalContext` payload for both hosts —
-non-blocking advisory on `PreToolUse`.
+variable so the same `SERVER_INSTRUCTIONS.md` is loaded under both.
 
 ## Configuration
 
-The MCP server is discovered as `cairn mcp` on `PATH`; the nudge hook
-detects cairn-registered cwds by calling `cairn query repos --json` and
-matching the cwd against `.repos[].root` as a directory prefix (the cwd
-is either an exact root or starts with `root/`).
+The MCP server is discovered as `cairn mcp` on `PATH`. The
+`SessionStart` hook has no runtime dependencies; both Claude Code
+and Codex honor it and load the guidance once per session.
 
-To silence the nudge, either uninstall the plugin:
+To silence the guidance injection, uninstall the plugin:
 
 ```sh
 /plugin uninstall cairn@naoto256-cairn
 ```
-
-or set `CAIRN_NUDGE_DISABLED=1` in your shell before launching the host.

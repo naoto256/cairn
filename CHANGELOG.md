@@ -150,6 +150,22 @@ versions follow [SemVer](https://semver.org/).
 
 ### Changed
 
+- **Plugin guidance moved from MCP `serverInstructions` /
+  PreToolUse Bash nudge to a SessionStart hook.** The Cairn plugin
+  now ships `plugin/SERVER_INSTRUCTIONS.md` and injects it via a
+  `SessionStart` hook (matchers: `startup|resume|clear|compact`)
+  that simply `cat`s the file. The previous PreToolUse
+  `cairn-nudge.sh` (fired on every `Bash` tool use, required `jq`,
+  produced one-line "consider find_symbols" nudges) is retired and
+  the script removed. The MCP server's `serverInstructions` field
+  is now always `None`; hosts that load the plugin receive the same
+  guidance from the agent-host-side `SessionStart` hook instead, so
+  guidance no longer depends on the MCP handshake being read by the
+  model. Hosts that connect to `cairn mcp` *without* installing the
+  plugin get no inline guidance; install the plugin (or paste
+  `plugin/SERVER_INSTRUCTIONS.md` into the host's system prompt) to
+  restore the structural-tool reflex. `CAIRN_NUDGE_DISABLED`
+  and the `jq` prerequisite no longer apply.
 - All seven Tier-2.5 analyzers had their revisions bumped during
   `release/0.7.0` development. The final shipped revisions are
   Ruby = 4, PHP / Python / Swift / C# = 3, Kotlin = 5, JavaScript

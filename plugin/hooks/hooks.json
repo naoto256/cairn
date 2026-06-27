@@ -1,13 +1,13 @@
 {
   "hooks": {
-    "PreToolUse": [
+    "SessionStart": [
       {
-        "matcher": "Bash",
+        "matcher": "startup|resume|clear|compact",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/tools/cairn-nudge.sh\"",
-            "timeout": 3
+            "command": "cat \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/SERVER_INSTRUCTIONS.md\"",
+            "statusMessage": "Loading Cairn guidance"
           }
         ]
       }
