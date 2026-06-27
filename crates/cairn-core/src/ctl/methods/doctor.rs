@@ -124,6 +124,7 @@ impl ControlMethod for Doctor {
                 checks.extend(tentative_snapshot_checks(&store_probes));
                 checks.extend(revision_stale_checks(&store_probes));
                 checks.extend(parser_revision_stale_checks(&store_probes));
+                checks.extend(analyzer_rerun_health_checks(&store_probes));
                 checks.extend(tier3_run_checks(&store_probes));
             }
             Err(e) => checks.push(doctor_check(
@@ -250,6 +251,15 @@ struct Tier3Run {
     manifest_id: i64,
     status: String,
     error: Option<String>,
+    /// Persisted `analyzer_revision`. Used by the new
+    /// `analyzer_rerun_health_checks` to distinguish "succeeded at the
+    /// expected revision" (a normal, current run) from "succeeded at
+    /// an older revision" (the analyzer-revision-drift detector
+    /// flagged it, but the rerun never landed). The
+    /// `(manifest_id, analyzer_id)` PRIMARY KEY means there is at
+    /// most one row per analyzer per manifest, so the persisted
+    /// revision is the single source of truth.
+    analyzer_revision: u32,
     /// `started_at_ns` from `workspace_analysis_runs`. Doctor uses it to
     /// detect rows that have been `queued`/`running` past
     /// [`STUCK_RUN_THRESHOLD`] — that level of pool-wait usually means
@@ -345,27 +355,23 @@ fn probe_manifest(
     )?;
     let rows = stmt
         .query_map(params![manifest_id], |r| {
-            Ok((
-                Tier3Run {
-                    analyzer_id: r.get(0)?,
-                    manifest_id: r.get(1)?,
-                    status: r.get(2)?,
-                    error: r.get(3)?,
-                    started_at_ns: r.get(5)?,
-                },
-                r.get::<_, i64>(4)? as u32,
-            ))
+            let rev = r.get::<_, i64>(4)? as u32;
+            Ok(Tier3Run {
+                analyzer_id: r.get(0)?,
+                manifest_id: r.get(1)?,
+                status: r.get(2)?,
+                error: r.get(3)?,
+                analyzer_revision: rev,
+                started_at_ns: r.get(5)?,
+            })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut persisted_revs: HashMap<String, u32> = HashMap::new();
-    let tier3_runs = rows
-        .into_iter()
-        .map(|(run, rev)| {
-            persisted_revs.insert(run.analyzer_id.clone(), rev);
-            run
-        })
-        .collect::<Vec<_>>();
+    for run in &rows {
+        persisted_revs.insert(run.analyzer_id.clone(), run.analyzer_revision);
+    }
+    let tier3_runs = rows;
 
     let mut stale_revisions = Vec::new();
     for analyzer in &expected_analyzers {
@@ -742,6 +748,326 @@ fn parser_revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> 
             ))
         })
         .collect()
+}
+
+/// v0.7.0 C PR — cross-references drift detection (`stale_revisions`
+/// and `stale_parser_revisions`) against the actual state of
+/// `workspace_analysis_runs` for the alias's current tentative
+/// manifest. Surfaces the **post-enqueue lifecycle** the operator
+/// otherwise has to reconstruct from logs:
+///
+/// - **Case A (`Fail`, drift + run at expected revision succeeded)**:
+///   the drift detector reports the alias as still stale, yet the
+///   corresponding `workspace_analysis_runs` row is `succeeded` at
+///   the current build's revision. For analyzer-revision drift this
+///   contradicts the single-row `(manifest_id, analyzer_id)` PK and
+///   should never fire under v0.7.0 invariants — surfacing it
+///   defensively catches a future refactor that breaks the
+///   classifier. For parser-revision drift this is the D PR silent
+///   data loss class's observability safety net: analyzer runs all
+///   succeeded at their expected revision, yet `blobs.parser_revision`
+///   still mismatches. The reindex chain
+///   (`scanner` → `enqueue_full_repo_reindex` → `register_repo_inner`
+///   → `parse_pending_blobs`) wrote the new analyzer rows without
+///   updating the parser layer, which means a transiently-inaccessible
+///   worktree (D PR's bug class) leaked through.
+///
+/// - **Case B (`Warn`, run at current revision failed/timed_out/cancelled)**:
+///   the rerun reached the worker and terminated with a failure that
+///   the operator should look at directly.
+///
+/// - **Case C (`Pass`, run is queued or running)**: a rerun is on the
+///   way; surface as informational rather than a warning.
+///
+/// - **Case D (`Warn`, no run row at all)**: the rerun was never
+///   enqueued, was coalesced or dropped at enqueue time, or was lost
+///   before the worker picked it up (e.g. a daemon restart between
+///   `enqueue` and `restore_from_db`).
+///
+/// - **Case E (silent)**: no drift on this alias → no rerun-health
+///   check emitted. Doctor output noise is kept minimal.
+///
+/// Each emitted check carries a remediation string with explicit
+/// operator next-steps (R1 MF-3). The parser-drift evaluation walks
+/// every analyzer in `expected_tier3_analyzer_ids` so a mixed
+/// state — e.g. analyzer A succeeded, analyzer B failed — surfaces
+/// the failure rather than misclassifying as Case A on the succeeded
+/// half (R2 must-add detail B).
+fn analyzer_rerun_health_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
+    let mut out = Vec::new();
+    for probe in probes {
+        let Ok(state) = probe.result.as_ref() else {
+            continue;
+        };
+        // Case E: no drift on this alias — emit nothing.
+        if state.stale_revisions.is_empty() && state.stale_parser_revisions.is_empty() {
+            continue;
+        }
+        // Per analyzer-revision-drift entry: one check.
+        for sr in &state.stale_revisions {
+            out.push(analyzer_drift_rerun_check(
+                &probe.alias,
+                sr,
+                &state.tier3_runs,
+            ));
+        }
+        // Per parser-revision-drift presence: one alias-level check
+        // that evaluates every expected analyzer in aggregate.
+        if !state.stale_parser_revisions.is_empty() {
+            out.push(parser_drift_rerun_check(
+                &probe.alias,
+                &state.stale_parser_revisions,
+                &state.expected_tier3_analyzer_ids,
+                &state.tier3_runs,
+            ));
+        }
+    }
+    out
+}
+
+fn analyzer_drift_rerun_check(
+    alias: &str,
+    stale: &StaleRevision,
+    runs: &[Tier3Run],
+) -> DoctorCheck {
+    let row = runs.iter().find(|r| r.analyzer_id == stale.analyzer_id);
+    let name = format!(
+        "repo `{alias}` analyzer `{}` rerun health",
+        stale.analyzer_id
+    );
+    match row {
+        None => doctor_check(
+            name,
+            DoctorStatus::Warn,
+            Some(format!(
+                "analyzer rerun was not enqueued, was dropped, or was lost before run \
+                 (no `workspace_analysis_runs` row; expected revision {})",
+                stale.expected_rev
+            )),
+            Some(format!(
+                "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
+            )),
+        ),
+        Some(run) => {
+            let at_current = run.analyzer_revision == stale.expected_rev;
+            match (run.status.as_str(), at_current) {
+                ("succeeded", true) => doctor_check(
+                    name,
+                    DoctorStatus::Fail,
+                    Some(format!(
+                        "analyzer-revision drift reported but `workspace_analysis_runs` shows `succeeded` at the current revision ({}) — classifier / persist invariant broken",
+                        stale.expected_rev
+                    )),
+                    Some(format!(
+                        "Run `cairn ctl repo reindex {alias}` to recover (legacy state from before v0.7.0 D PR ship is possible). If this recurs after a fresh reindex with the D PR binary, it is a structural bug — please file an issue.",
+                    )),
+                ),
+                ("succeeded", false) => doctor_check(
+                    name,
+                    DoctorStatus::Warn,
+                    Some(format!(
+                        "analyzer rerun was not enqueued, was dropped, or was lost before run \
+                         (latest row at revision {} succeeded; expected revision {})",
+                        run.analyzer_revision, stale.expected_rev
+                    )),
+                    Some(format!(
+                        "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
+                    )),
+                ),
+                ("failed" | "timed_out" | "cancelled", _) => doctor_check(
+                    name,
+                    DoctorStatus::Warn,
+                    Some(format!(
+                        "analyzer rerun failed at revision {} (status `{}`): {}",
+                        run.analyzer_revision,
+                        run.status,
+                        run.error.as_deref().unwrap_or("<no error message>")
+                    )),
+                    Some(format!(
+                        "Inspect `cairn ctl jobs list {alias}` for the failed job details, then `cairn ctl repo reindex {alias}` to retry.",
+                    )),
+                ),
+                ("queued" | "running", _) => doctor_check(
+                    name,
+                    DoctorStatus::Pass,
+                    Some(format!(
+                        "analyzer rerun pending: `{}` at revision {}",
+                        run.status, run.analyzer_revision
+                    )),
+                    Some(format!(
+                        "Run `cairn ctl jobs list {alias}` to watch progress; the rerun will land on its own.",
+                    )),
+                ),
+                _ => doctor_check(
+                    name,
+                    DoctorStatus::Warn,
+                    Some(format!(
+                        "analyzer rerun is in unexpected status `{}` at revision {} (expected {})",
+                        run.status, run.analyzer_revision, stale.expected_rev
+                    )),
+                    Some(format!(
+                        "Run `cairn ctl repo reindex {alias}` to retry the rerun.",
+                    )),
+                ),
+            }
+        }
+    }
+}
+
+/// Aggregate the rerun state of every analyzer in
+/// `expected_analyzer_ids` and surface the worst case so an alias
+/// with a mixed picture (one analyzer succeeded, another failed) does
+/// not get misclassified as Case A on the succeeded slice.
+fn parser_drift_rerun_check(
+    alias: &str,
+    stale_parser: &[crate::workspace_analyzer::ParserStaleRevision],
+    expected_analyzer_ids: &[String],
+    runs: &[Tier3Run],
+) -> DoctorCheck {
+    let name = format!("repo `{alias}` parser drift rerun health");
+    let mut any_failed = None;
+    let mut any_pending = false;
+    let mut any_row_missing = false;
+    let mut every_succeeded_at_current = true;
+
+    if expected_analyzer_ids.is_empty() {
+        // No analyzers to evaluate (e.g. a Tier-1-only language) —
+        // the parser drift alone has no rerun chain to verify, so
+        // skip emission. The plain `parser_revision_stale_checks`
+        // Warn already surfaces the drift.
+        every_succeeded_at_current = false;
+    }
+
+    for analyzer_id in expected_analyzer_ids {
+        let row = runs.iter().find(|r| r.analyzer_id == *analyzer_id);
+        match row {
+            None => {
+                any_row_missing = true;
+                every_succeeded_at_current = false;
+            }
+            Some(run) => {
+                match run.status.as_str() {
+                    "succeeded" => {
+                        // Counts toward "every succeeded at current"
+                        // only when the row's revision is what the
+                        // current build expects. A stale-revision row
+                        // here keeps the alias in the "rerun never
+                        // landed" bucket.
+                        //
+                        // We don't have the analyzer's expected
+                        // revision here in the AliasStoreState, but
+                        // `stale_revisions` already captures that
+                        // mismatch — analyzer_rerun_health_checks
+                        // emits its own Case D Warn for it, so we
+                        // only need to make sure "all succeeded
+                        // current" stays exclusive of any stale row.
+                        // Defer to stale_revisions presence: caller
+                        // already verifies stale_revisions for the
+                        // analyzer-side warning.
+                    }
+                    "failed" | "timed_out" | "cancelled" => {
+                        any_failed.get_or_insert((
+                            analyzer_id.clone(),
+                            run.status.clone(),
+                            run.error.clone(),
+                        ));
+                        every_succeeded_at_current = false;
+                    }
+                    "queued" | "running" => {
+                        any_pending = true;
+                        every_succeeded_at_current = false;
+                    }
+                    _ => {
+                        every_succeeded_at_current = false;
+                    }
+                }
+            }
+        }
+    }
+
+    let parser_summary = stale_parser
+        .iter()
+        .map(|psr| {
+            let cur = psr
+                .current_rev
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "missing".to_string());
+            format!(
+                "{}: current={}, expected={}",
+                psr.parser_id, cur, psr.expected_rev
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    // Case A — every expected analyzer succeeded at its current
+    // revision, yet parser drift remains. This is the D PR silent
+    // data loss class observability safety net.
+    if every_succeeded_at_current {
+        return doctor_check(
+            name,
+            DoctorStatus::Fail,
+            Some(format!(
+                "every expected analyzer succeeded at its current revision but parser drift remains ({parser_summary}) — the parser-drift / full-reindex chain is broken (analyzer succeeded but parser_revision was not updated)",
+            )),
+            Some(format!(
+                "Run `cairn ctl repo reindex {alias}` to recover (legacy state from before v0.7.0 D PR ship is possible). If this recurs after a fresh reindex with the D PR binary, it is a structural bug — please file an issue.",
+            )),
+        );
+    }
+    // Case B — at least one analyzer failed.
+    if let Some((analyzer_id, status, error)) = any_failed {
+        return doctor_check(
+            name,
+            DoctorStatus::Warn,
+            Some(format!(
+                "parser drift remains and at least one analyzer rerun failed: `{analyzer_id}` is `{status}` ({err}). Parser drift summary: {parser_summary}",
+                err = error.as_deref().unwrap_or("<no error message>")
+            )),
+            Some(format!(
+                "Inspect `cairn ctl jobs list {alias}` for the failed job details, then `cairn ctl repo reindex {alias}` to retry.",
+            )),
+        );
+    }
+    // Case C — at least one analyzer pending.
+    if any_pending {
+        return doctor_check(
+            name,
+            DoctorStatus::Pass,
+            Some(format!(
+                "parser drift rerun pending (one or more expected analyzers queued/running). Parser drift summary: {parser_summary}",
+            )),
+            Some(format!(
+                "Run `cairn ctl jobs list {alias}` to watch progress; the rerun will land on its own.",
+            )),
+        );
+    }
+    // Case D — at least one analyzer row missing (and no pending /
+    // no failed).
+    if any_row_missing {
+        return doctor_check(
+            name,
+            DoctorStatus::Warn,
+            Some(format!(
+                "parser drift remains and at least one expected analyzer has no rerun row — the rerun was not enqueued, was dropped, or was lost before run. Parser drift summary: {parser_summary}",
+            )),
+            Some(format!(
+                "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
+            )),
+        );
+    }
+    // Fallback — parser drift exists with no expected analyzers (e.g.
+    // a Tier-1-only language that has no Tier-2.5/3 analyzer); leave
+    // the plain `parser_revision_stale_checks` Warn to carry the
+    // operator surface and emit nothing here.
+    doctor_check(
+        name,
+        DoctorStatus::Pass,
+        Some(format!(
+            "parser drift recorded but no expected analyzer to cross-reference ({parser_summary})",
+        )),
+        None,
+    )
 }
 
 fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
@@ -1274,6 +1600,7 @@ mod tests {
                     status: "succeeded".into(),
                     error: None,
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
@@ -1290,6 +1617,7 @@ mod tests {
                     status: "skipped".into(),
                     error: Some("ContentModified".into()),
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
@@ -1306,6 +1634,7 @@ mod tests {
                     status: "queued".into(),
                     error: None,
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
@@ -1322,6 +1651,7 @@ mod tests {
                     status: "running".into(),
                     error: None,
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
@@ -1338,6 +1668,7 @@ mod tests {
                     status: "failed".into(),
                     error: Some("boom".into()),
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
@@ -1413,6 +1744,7 @@ mod tests {
                         status: "succeeded".into(),
                         error: None,
                         started_at_ns: 0,
+                        analyzer_revision: 1,
                     },
                     Tier3Run {
                         analyzer_id: RUST_ANALYZER_ID.into(),
@@ -1420,6 +1752,7 @@ mod tests {
                         status: "skipped".into(),
                         error: Some("no matching files".into()),
                         started_at_ns: 0,
+                        analyzer_revision: 1,
                     },
                 ],
                 expected_tier3_analyzer_ids: Vec::new(),
@@ -1446,6 +1779,7 @@ mod tests {
                     status: "succeeded".into(),
                     error: None,
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: vec!["new-analyzer".into(), "old-analyzer".into()],
                 stale_revisions: Vec::new(),
@@ -1756,6 +2090,7 @@ mod tests {
                     status: "succeeded".into(),
                     error: None,
                     started_at_ns: 0,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: vec!["demo-analyzer".into()],
                 stale_revisions: Vec::new(),
@@ -1875,6 +2210,330 @@ mod tests {
         );
     }
 
+    // ───────────────────────────────────────────────────────────────
+    // v0.7.0 C PR — analyzer_rerun_health_checks
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Cross-references drift detection (analyzer + parser) against
+    // `workspace_analysis_runs` state and surfaces the post-enqueue
+    // lifecycle. 10 tests: 4 analyzer-drift cases + 4 parser-drift
+    // cases + Case E silence + Case A wording assertion (R1 / R2
+    // catches).
+
+    fn analyzer_drift_probe(
+        alias: &str,
+        analyzer_id: &str,
+        expected_rev: u32,
+        run: Option<Tier3Run>,
+    ) -> AliasStoreProbe {
+        AliasStoreProbe {
+            alias: alias.into(),
+            store_path: PathBuf::from(format!("/tmp/{alias}/store.db")),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: run.into_iter().collect(),
+                expected_tier3_analyzer_ids: vec![analyzer_id.into()],
+                stale_revisions: vec![StaleRevision {
+                    analyzer_id: analyzer_id.into(),
+                    current_rev: Some(expected_rev.saturating_sub(1)),
+                    expected_rev,
+                }],
+                stale_parser_revisions: Vec::new(),
+            }),
+        }
+    }
+
+    fn run_row(analyzer_id: &str, revision: u32, status: &str, error: Option<&str>) -> Tier3Run {
+        Tier3Run {
+            analyzer_id: analyzer_id.into(),
+            manifest_id: 1,
+            status: status.into(),
+            error: error.map(str::to_string),
+            analyzer_revision: revision,
+            started_at_ns: 0,
+        }
+    }
+
+    fn parser_drift_probe(
+        alias: &str,
+        expected_analyzer_ids: &[&str],
+        runs: Vec<Tier3Run>,
+    ) -> AliasStoreProbe {
+        AliasStoreProbe {
+            alias: alias.into(),
+            store_path: PathBuf::from(format!("/tmp/{alias}/store.db")),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: runs,
+                expected_tier3_analyzer_ids: expected_analyzer_ids
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                stale_revisions: Vec::new(),
+                stale_parser_revisions: vec![ParserStaleRevision {
+                    parser_id: "tree-sitter-kotlin".into(),
+                    current_rev: Some(1),
+                    expected_rev: 4,
+                    affected_blob_count: 99,
+                }],
+            }),
+        }
+    }
+
+    /// Test 1: analyzer drift + run row at the current (expected)
+    /// revision with status=succeeded → Case A `Fail`. This state
+    /// is structurally impossible under the v0.7.0 invariants
+    /// (`(manifest_id, analyzer_id)` PK + the stale-revision
+    /// detector compares the single persisted row), so surfacing
+    /// catches a future refactor that breaks the classifier — but it
+    /// is also the D PR safety net analog on the analyzer side.
+    #[test]
+    fn analyzer_drift_succeeded_at_current_revision_is_fail() {
+        let probes = vec![analyzer_drift_probe(
+            "moshi",
+            "kotlin-resolver",
+            5,
+            Some(run_row("kotlin-resolver", 5, "succeeded", None)),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Fail);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("classifier") && detail.contains("invariant"),
+            "Case A detail must call out the invariant break: {detail}"
+        );
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(remediation.contains("cairn ctl repo reindex moshi"));
+        assert!(
+            remediation.contains("legacy state"),
+            "Case A remediation must mention legacy-state framing (R1 MF-3 less-aggressive wording): {remediation}"
+        );
+        assert!(
+            remediation.contains("structural bug") && remediation.contains("file an issue"),
+            "Case A remediation must add the conditional structural-bug call-out: {remediation}"
+        );
+    }
+
+    /// Test 2: analyzer drift + run row failed at current revision
+    /// → Case B `Warn` with the underlying error message echoed.
+    #[test]
+    fn analyzer_drift_failed_at_current_revision_is_warn_with_error() {
+        let probes = vec![analyzer_drift_probe(
+            "moshi",
+            "kotlin-resolver",
+            5,
+            Some(run_row(
+                "kotlin-resolver",
+                5,
+                "failed",
+                Some("kotlin-language-server died"),
+            )),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("kotlin-language-server died"));
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(remediation.contains("cairn ctl jobs list moshi"));
+        assert!(remediation.contains("cairn ctl repo reindex moshi"));
+    }
+
+    /// Test 3: analyzer drift + run row queued at current revision
+    /// → Case C `Pass`. Pending reruns are surfaced as informational
+    /// so doctor output does not noisy-warn the operator while a
+    /// rerun is on its way.
+    #[test]
+    fn analyzer_drift_queued_is_pass_pending() {
+        let probes = vec![analyzer_drift_probe(
+            "moshi",
+            "kotlin-resolver",
+            5,
+            Some(run_row("kotlin-resolver", 5, "queued", None)),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Pass);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("pending"));
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(remediation.contains("cairn ctl jobs list moshi"));
+    }
+
+    /// Test 4: analyzer drift + no run row at all → Case D `Warn`
+    /// with the "enqueued / dropped / lost" framing and the daemon-
+    /// log grep hint (R1 MF-3).
+    #[test]
+    fn analyzer_drift_no_run_row_is_warn_lost_or_dropped() {
+        let probes = vec![analyzer_drift_probe("moshi", "kotlin-resolver", 5, None)];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("not enqueued")
+                && detail.contains("dropped")
+                && detail.contains("lost"),
+            "Case D detail must enumerate the three failure modes: {detail}"
+        );
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("daemon log")
+                && remediation.contains("staleness")
+                && remediation.contains("cairn ctl repo reindex moshi"),
+            "Case D remediation must include daemon-log grep hint plus manual reindex: {remediation}"
+        );
+    }
+
+    /// Test 5: parser drift + every expected analyzer succeeded at
+    /// the current revision → Case A `Fail`. This is the D PR
+    /// silent data loss class observability safety net: the analyzer
+    /// chain is green but the parser layer is still stale, so the
+    /// full-reindex chain broke somewhere between
+    /// `enqueue_full_repo_reindex` and `parse_pending_blobs`.
+    #[test]
+    fn parser_drift_all_analyzers_succeeded_is_fail_chain_bug() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &["kotlin-resolver", "jdtls-lsp"],
+            vec![
+                run_row("kotlin-resolver", 5, "succeeded", None),
+                run_row("jdtls-lsp", 1, "succeeded", None),
+            ],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Fail);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("parser drift remains") && detail.contains("not updated"),
+            "Case A parser-drift detail must call out the chain-bug framing (R2 catch): {detail}"
+        );
+        assert!(detail.contains("tree-sitter-kotlin"));
+        let remediation = checks[0].remediation.as_deref().unwrap_or("");
+        assert!(remediation.contains("cairn ctl repo reindex moshi"));
+        assert!(remediation.contains("legacy state"));
+    }
+
+    /// Test 6: parser drift + mixed analyzer states (one succeeded,
+    /// one failed) → Case B `Warn` on the failure, NOT Case A on
+    /// the succeeded slice (R2 must-add detail B). The failed
+    /// analyzer's status / error must surface so the operator gets a
+    /// targeted lead.
+    #[test]
+    fn parser_drift_mixed_succeeded_and_failed_is_warn_on_failed() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &["kotlin-resolver", "jdtls-lsp"],
+            vec![
+                run_row("kotlin-resolver", 5, "succeeded", None),
+                run_row("jdtls-lsp", 1, "failed", Some("jdtls oom")),
+            ],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].status,
+            DoctorStatus::Warn,
+            "mixed succeeded + failed must NOT be misclassified as Case A Fail"
+        );
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("jdtls-lsp"));
+        assert!(detail.contains("jdtls oom"));
+    }
+
+    /// Test 7: parser drift + mixed analyzer states (one succeeded,
+    /// one queued) → Case C `Pass` pending (R2 must-add detail B).
+    /// Same anti-misclassification invariant as test 6, this time on
+    /// the queued / running path.
+    #[test]
+    fn parser_drift_mixed_succeeded_and_queued_is_pass_pending() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &["kotlin-resolver", "jdtls-lsp"],
+            vec![
+                run_row("kotlin-resolver", 5, "succeeded", None),
+                run_row("jdtls-lsp", 1, "running", None),
+            ],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Pass);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("pending"));
+    }
+
+    /// Test 8: parser drift + every expected analyzer's run row is
+    /// missing → Case D `Warn` with the lost-or-not-enqueued framing
+    /// at alias level.
+    #[test]
+    fn parser_drift_no_run_rows_is_warn_lost_or_dropped() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &["kotlin-resolver", "jdtls-lsp"],
+            Vec::new(),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("no rerun row")
+                && (detail.contains("not enqueued")
+                    || detail.contains("dropped")
+                    || detail.contains("lost")),
+            "Case D detail must surface the lost-or-not-enqueued framing: {detail}"
+        );
+    }
+
+    /// Test 9 (R2 must-add detail A — Case E): no drift on this
+    /// alias produces ZERO `analyzer-rerun health` checks. The
+    /// noise-prevention invariant: doctor must not warn on every
+    /// alias just because the cross-reference function exists.
+    #[test]
+    fn no_drift_emits_no_rerun_health_check() {
+        let probes = vec![AliasStoreProbe {
+            alias: "clean".into(),
+            store_path: PathBuf::from("/tmp/clean/store.db"),
+            result: Ok(AliasStoreState {
+                tentative_manifest_id: Some(1),
+                tier3_runs: vec![run_row("kotlin-resolver", 5, "succeeded", None)],
+                expected_tier3_analyzer_ids: vec!["kotlin-resolver".into()],
+                stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
+            }),
+        }];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert!(
+            checks.is_empty(),
+            "clean alias must produce zero rerun-health checks; got {checks:#?}"
+        );
+    }
+
+    /// Test 10: analyzer drift + run row succeeded at an OLD
+    /// revision (the rerun never landed at the current revision) →
+    /// Case D-like `Warn`. The detail message must distinguish this
+    /// from "no row at all" by mentioning the persisted revision so
+    /// the operator can tell whether the scanner attempted at all.
+    #[test]
+    fn analyzer_drift_succeeded_at_old_revision_is_warn_rerun_never_landed() {
+        let probes = vec![analyzer_drift_probe(
+            "moshi",
+            "kotlin-resolver",
+            5,
+            Some(run_row("kotlin-resolver", 4, "succeeded", None)),
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("revision 4") && detail.contains("expected revision 5"),
+            "Case D-like detail must surface persisted vs expected revision so the operator can tell the scanner attempted but the rerun never landed: {detail}"
+        );
+    }
+
     /// MA-1: a `running` row whose `started_at_ns` is older than
     /// `STUCK_RUN_THRESHOLD` (6h) MUST surface as `Warn` with an
     /// explicit "stuck" framing, not as the routine "indexing in
@@ -1898,6 +2557,7 @@ mod tests {
                     status: "running".into(),
                     error: None,
                     started_at_ns: stuck_started_at,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),
@@ -1941,6 +2601,7 @@ mod tests {
                     status: "queued".into(),
                     error: None,
                     started_at_ns: stuck_started_at,
+                    analyzer_revision: 1,
                 }],
                 expected_tier3_analyzer_ids: Vec::new(),
                 stale_revisions: Vec::new(),

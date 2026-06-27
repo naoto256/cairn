@@ -9,6 +9,43 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **`cairn ctl doctor` cross-references drift with the rerun
+  lifecycle (`analyzer rerun health` check).** Drift detection
+  (`analyzer revision drift` and `parser revision drift`) tells the
+  operator *that* the alias is stale; the rerun-health check now
+  tells them *what happened post-enqueue*. Each (alias, drift)
+  combination is classified against the latest
+  `workspace_analysis_runs` row for the alias's current tentative
+  manifest:
+
+  - **Fail** when drift is reported but the analyzer run is
+    `succeeded` at the current revision (the D PR silent data loss
+    class observability safety net — the analyzer chain says "all
+    good" yet the parser layer says "still stale", meaning the
+    full-reindex chain wrote analyzer rows without bumping
+    `blobs.parser_revision`). Remediation framing is conservative:
+    "run `cairn ctl repo reindex <alias>` to recover (legacy state
+    from before v0.7.0 D PR ship is possible); if it recurs after a
+    fresh reindex, please file an issue."
+  - **Warn** when the rerun ran and terminated with
+    `failed`/`timed_out`/`cancelled`, with the row's error message
+    surfaced inline and a `cairn ctl jobs list <alias>` hint.
+  - **Pass** (informational) when the rerun is `queued`/`running` —
+    no operator action needed, the rerun will land on its own.
+  - **Warn** when no run row exists at all, or when the latest row
+    is at an older revision than the current build expects (the
+    "scanner enqueue lost/dropped or never ran" case). The
+    remediation points operators at the daemon log with a concrete
+    grep recipe (`alias name + staleness`) and a `cairn ctl repo
+    reindex <alias>` manual-recovery fallback.
+
+  Parser-drift evaluation walks every analyzer in
+  `expected_tier3_analyzer_ids` and surfaces the worst case, so a
+  mixed picture — one analyzer succeeded, another failed — surfaces
+  the failure rather than misclassifying as the Case A Fail on the
+  succeeded slice. Aliases with no drift produce zero rerun-health
+  checks; doctor noise stays minimal.
+
 - **Automatic revision-staleness rerun at daemon startup.** When an
   analyzer's compiled-in `revision()` is higher than the value
   persisted in `workspace_analysis_runs.analyzer_revision`, the daemon
