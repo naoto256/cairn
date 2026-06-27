@@ -1134,6 +1134,337 @@ mod tests {
         );
     }
 
+    // ───────────────────────────────────────────────────────────────
+    // Runner-level integration tests (R2 must-fix)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // The materializer unit tests above pin the helper in isolation;
+    // these pin the runner control flow that ties the materialization
+    // outcome to `mark_run`, `persist_resolutions`, and the analyzer
+    // call. Without them, a future refactor of
+    // `run_one_workspace_analyzer_with_timeout` could mark the run
+    // `Skipped`, call the analyzer with a partial snapshot, or
+    // forget to bail out before `persist_resolutions` — and the unit
+    // tests above would not catch it.
+
+    /// Test analyzer that counts how many times `analyze_workspace`
+    /// was actually invoked. The materialization gate must keep this
+    /// at zero whenever any selected file is unreadable.
+    struct CallCountingAnalyzer {
+        requires_materialized: bool,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+        facts: WorkspaceFacts,
+    }
+
+    impl WorkspaceAnalyzer for CallCountingAnalyzer {
+        fn id(&self) -> &'static str {
+            "test-analyzer"
+        }
+        fn tier_prefix(&self) -> &'static str {
+            "tier25"
+        }
+        fn revision(&self) -> u32 {
+            1
+        }
+        fn language(&self) -> &'static str {
+            "test"
+        }
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-test"
+        }
+        fn requires_materialized_files(&self) -> bool {
+            self.requires_materialized
+        }
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.facts.clone())
+        }
+    }
+
+    /// Set up a CAS store with one manifest, one blob, and one
+    /// pre-existing `tier25-test-analyzer` resolution row pinned to
+    /// that manifest. The fixture is the "before" state the runner
+    /// must either preserve (Failed) or delete (Succeeded) depending
+    /// on the new gate.
+    fn seed_fixture(store_path: &Path, repo_relative_path: &str) -> (Connection, ManifestEntry) {
+        let mut conn = crate::cas::store::open(store_path).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns) VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('test-blob', 'tree-sitter-test', 1, 0)",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, ?1, 'test-blob')",
+            params![repo_relative_path],
+        )
+        .unwrap();
+        // Prior `tier25-test-analyzer` resolution row — the bug class
+        // this PR exists to prevent silently deleted rows like this.
+        tx.execute(
+            "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, source, manifest_id)
+             VALUES ('test-blob', 'tree-sitter-test', 0, 10,
+                     'type', 'tier25-test-analyzer', 1)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let entry = ManifestEntry {
+            path: repo_relative_path.into(),
+            blob_sha: "test-blob".into(),
+        };
+        (conn, entry)
+    }
+
+    fn tier25_resolution_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolutions WHERE source = 'tier25-test-analyzer'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn workspace_analysis_run_row(conn: &Connection) -> (String, Option<String>) {
+        conn.query_row(
+            "SELECT status, error FROM workspace_analysis_runs WHERE analyzer_id = 'test-analyzer'",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// **R2 must-fix #1**: a `requires_materialized_files() == true`
+    /// analyzer whose workspace files are unreadable at the moment
+    /// the runner tries to read them must:
+    ///   - mark the run `Failed` (not Succeeded, not Skipped);
+    ///   - NOT call `analyze_workspace`;
+    ///   - NOT call `persist_resolutions`, so the prior
+    ///     `tier25-test-analyzer` resolution row stays put;
+    ///   - stamp an `error` message that contains the repo-relative
+    ///     path of at least one unreadable file.
+    ///
+    /// Whole-chain pin: unit tests above only cover the materializer
+    /// in isolation; this is the run-level guarantee the v0.7.0
+    /// release blocker turned on.
+    #[test]
+    fn materialization_failure_marks_failed_and_preserves_prior_resolutions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut conn, entry) = seed_fixture(&tmp.path().join("store.db"), "src/Missing.kt");
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        // Note: src/Missing.kt deliberately not created — the runner
+        // will see `worktree_path = None` for it.
+
+        assert_eq!(
+            tier25_resolution_count(&conn),
+            1,
+            "fixture must start with the prior tier25 row in place"
+        );
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let analyzer = Box::new(CallCountingAnalyzer {
+            requires_materialized: true,
+            call_count: call_count.clone(),
+            facts: WorkspaceFacts::default(),
+        });
+        let outcome = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer,
+                repo_root: &repo_root,
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 0,
+                analyzer_stall_timeout: Duration::from_secs(30),
+                job_id: None,
+                progress_observer: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            RunStatus::Failed,
+            "unreadable input must produce Failed (not Skipped, not Succeeded)"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "analyzer must NOT be called when materialization fails"
+        );
+        let (status, error) = workspace_analysis_run_row(&conn);
+        assert_eq!(status, "failed");
+        let error_text = error.expect("Failed runs must stamp an operator-facing error");
+        assert!(
+            error_text.contains("src/Missing.kt"),
+            "error text must carry the repo-relative path so doctor can route the operator: got {error_text}"
+        );
+
+        assert_eq!(
+            tier25_resolution_count(&conn),
+            1,
+            "prior tier25 resolution row must be preserved when materialization fails — \
+             this is the core invariant of the v0.7.0 fix"
+        );
+    }
+
+    /// **R2 must-fix #2**: a `requires_materialized_files() == true`
+    /// analyzer that successfully reads its input *and* legitimately
+    /// returns `WorkspaceFacts::default()` must:
+    ///   - mark the run `Succeeded`;
+    ///   - call `persist_resolutions`, which deletes the prior
+    ///     `tier25-test-analyzer` rows (legit zero is allowed to
+    ///     overwrite the prior state).
+    ///
+    /// This is the half of the contract that prevents the persist
+    /// layer from becoming an all-or-nothing no-op for empty facts:
+    /// analyzer-improvement runs that *legitimately* zero out a fact
+    /// class must still clear stale rows.
+    #[test]
+    fn readable_empty_facts_succeeds_and_deletes_prior_resolutions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut conn, entry) = seed_fixture(&tmp.path().join("store.db"), "src/Ok.kt");
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        // Real file present and readable — the runner attaches its
+        // bytes to source_bytes and the analyzer is allowed to run.
+        fs::write(repo_root.join("src/Ok.kt"), b"class Ok").unwrap();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let analyzer = Box::new(CallCountingAnalyzer {
+            requires_materialized: true,
+            call_count: call_count.clone(),
+            facts: WorkspaceFacts::default(),
+        });
+        let outcome = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer,
+                repo_root: &repo_root,
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 0,
+                analyzer_stall_timeout: Duration::from_secs(30),
+                job_id: None,
+                progress_observer: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "analyzer must be called once when input is readable"
+        );
+        let (status, _err) = workspace_analysis_run_row(&conn);
+        assert_eq!(status, "succeeded");
+        assert_eq!(
+            tier25_resolution_count(&conn),
+            0,
+            "legit empty WorkspaceFacts must still DELETE prior rows — \
+             persist_resolutions cannot be made an empty-facts no-op, \
+             or analyzer-improvement runs would leak stale state"
+        );
+    }
+
+    /// **R2 must-fix #3** (optional but recommended): LSP / default
+    /// analyzers must NOT be pre-read, even when their selected
+    /// files have `worktree_path = None`. The default
+    /// `requires_materialized_files() == false` is what protects a
+    /// 50k-blob monorepo from a double-read tax on every LSP boot.
+    /// This test pins both the perf regression case (LSP analyzer is
+    /// called even with missing `worktree_path`) and the contract
+    /// that the analyzer sees `source_bytes = None` (= the runner
+    /// did not materialize on its behalf).
+    #[test]
+    fn default_analyzer_does_not_materialize_missing_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut conn, entry) = seed_fixture(&tmp.path().join("store.db"), "src/LspOwned.kt");
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        // File deliberately absent — an LSP analyzer (e.g. jdtls)
+        // would still be able to operate via the language server.
+
+        let observed_source_bytes_is_some = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = observed_source_bytes_is_some.clone();
+        struct LspAnalyzer {
+            observed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl WorkspaceAnalyzer for LspAnalyzer {
+            fn id(&self) -> &'static str {
+                "test-analyzer"
+            }
+            fn tier_prefix(&self) -> &'static str {
+                "tier3"
+            }
+            fn revision(&self) -> u32 {
+                1
+            }
+            fn language(&self) -> &'static str {
+                "test"
+            }
+            fn parser_id(&self) -> &'static str {
+                "tree-sitter-test"
+            }
+            // requires_materialized_files() inherits the default `false`.
+            fn analyze_workspace(
+                &self,
+                _repo_root: &Path,
+                _manifest_id: ManifestId,
+                files: &[WorkspaceFile],
+                _progress: &AnalyzerProgress,
+            ) -> Result<WorkspaceFacts> {
+                // Record whether the runner pre-read on our behalf.
+                let any_some = files.iter().any(|f| f.source_bytes.is_some());
+                self.observed
+                    .store(any_some, std::sync::atomic::Ordering::SeqCst);
+                Ok(WorkspaceFacts::default())
+            }
+        }
+        let analyzer = Box::new(LspAnalyzer { observed });
+        let outcome = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer,
+                repo_root: &repo_root,
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 0,
+                analyzer_stall_timeout: Duration::from_secs(30),
+                job_id: None,
+                progress_observer: None,
+            },
+        )
+        .unwrap();
+
+        // The analyzer was called (default capability skips the
+        // materialization gate) and its outcome drives the run.
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert!(
+            !observed_source_bytes_is_some.load(std::sync::atomic::Ordering::SeqCst),
+            "LSP / default analyzers must see source_bytes = None — \
+             pre-reading them would double the I/O on a large monorepo"
+        );
+    }
+
     /// Test #9 (Skipped vs Failed boundary) — concrete fixtures pin
     /// the two paths produced by the runner gate side-by-side:
     ///
