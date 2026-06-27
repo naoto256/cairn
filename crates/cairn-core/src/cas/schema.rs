@@ -520,6 +520,22 @@ DELETE FROM resolutions
    AND (source LIKE 'tier3-%' OR source LIKE 'tier25-%');
 "#,
     },
+    Migration {
+        version: 12,
+        sql: r#"
+-- Per-symbol "scope" distinction: 'top_level' (workspace-addressable)
+-- vs 'nested' (file-local, declared inside a function body and not
+-- meaningfully reachable as a workspace symbol). Wired by Tier-1
+-- backends that have nested-function semantics worth distinguishing
+-- (JS / TS / TSX today). All other backends keep emitting the
+-- default, preserving prior behavior.
+--
+-- `find_symbols` filters to `scope = 'top_level'` so nested helpers
+-- don't pollute workspace lookup; `get_outline` ignores `scope` so
+-- the file-structure view stays complete.
+ALTER TABLE symbols ADD COLUMN scope TEXT NOT NULL DEFAULT 'top_level';
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -543,7 +559,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 11);
+        assert_eq!(v, 12);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).
@@ -719,7 +735,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 11);
+        assert_eq!(v, 12);
     }
 
     // ──── EXPLAIN QUERY PLAN: v11 composite partial indexes ────

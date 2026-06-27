@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::Result;
 use crate::cas::kind_conv::{
-    ref_kind_to_str, symbol_kind_to_str, type_role_to_str, visibility_to_str,
+    ref_kind_to_str, symbol_kind_to_str, symbol_scope_to_str, type_role_to_str, visibility_to_str,
 };
 use crate::resolution::{ResolutionKind, SemanticKind};
 
@@ -268,12 +268,14 @@ fn insert_symbol(
     let byte_end = i64::try_from(sym.byte_range.end).unwrap_or(i64::MAX);
     let body_start = sym.body_start.map(|b| i64::try_from(b).unwrap_or(i64::MAX));
 
+    let scope_str = symbol_scope_to_str(sym.scope);
+
     tx.execute(
         "INSERT INTO symbols
            (blob_sha, parser_id, parent_id, name, qualified, kind,
             signature, visibility, doc, byte_start, byte_end,
-            line_start, line_end, body_start, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            line_start, line_end, body_start, source, scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             blob_sha,
             parser_id,
@@ -290,6 +292,7 @@ fn insert_symbol(
             line_end,
             body_start,
             "syntactic",
+            scope_str,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -556,7 +559,9 @@ fn resolve_enclosing(
 mod tests {
     use super::*;
     use crate::cas::store;
-    use cairn_lang_api::{DocOverride, ImportFact, RefFact, RefKind, SymbolFact, SymbolKind};
+    use cairn_lang_api::{
+        DocOverride, ImportFact, RefFact, RefKind, SymbolFact, SymbolKind, SymbolScope,
+    };
 
     fn fresh() -> (tempfile::TempDir, Connection) {
         let tmp = tempfile::tempdir().unwrap();
@@ -576,6 +581,7 @@ mod tests {
             line_range: 1..1,
             body_start: None,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         }
     }
 
@@ -713,6 +719,7 @@ mod tests {
                     line_range: 1..1,
                     body_start: None,
                     parent_idx: None,
+                    scope: SymbolScope::TopLevel,
                 }],
                 ..Default::default()
             },
@@ -761,6 +768,7 @@ mod tests {
                         line_range: 1..1,
                         body_start: None,
                         parent_idx: None,
+                        scope: SymbolScope::TopLevel,
                     },
                     SymbolFact {
                         name: "Foo".into(),
@@ -773,6 +781,7 @@ mod tests {
                         line_range: 5..5,
                         body_start: None,
                         parent_idx: None,
+                        scope: SymbolScope::TopLevel,
                     },
                     SymbolFact {
                         name: "Foo".into(),
@@ -785,6 +794,7 @@ mod tests {
                         line_range: 10..10,
                         body_start: None,
                         parent_idx: None,
+                        scope: SymbolScope::TopLevel,
                     },
                 ],
                 ..Default::default()

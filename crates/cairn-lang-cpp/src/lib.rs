@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use cairn_lang_api::{
     Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
-    SyntacticFacts, Visibility,
+    SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     DocCommentPart, NestingTracker, Visitor, child_by_field, collapse_ws, end_line_of, extract,
@@ -267,6 +267,7 @@ impl CppVisitor {
                 line_range: line_of(node)..end_line_of(node),
                 body_start,
                 parent_idx,
+                scope: SymbolScope::TopLevel,
             });
             self.nesting.push(idx, scope_end);
         }
@@ -308,6 +309,7 @@ impl CppVisitor {
                 line_range: line_of(node)..end_line_of(node),
                 body_start,
                 parent_idx,
+                scope: SymbolScope::TopLevel,
             });
             Some(idx)
         } else {
@@ -348,6 +350,7 @@ impl CppVisitor {
                 line_range: line_of(node)..end_line_of(node),
                 body_start,
                 parent_idx: self.nesting.current_parent(),
+                scope: SymbolScope::TopLevel,
             });
             Some((idx, qualified))
         } else {
@@ -382,6 +385,7 @@ impl CppVisitor {
                 line_range: line_of(enumerator)..end_line_of(enumerator),
                 body_start: None,
                 parent_idx,
+                scope: SymbolScope::TopLevel,
             });
         }
     }
@@ -420,6 +424,7 @@ impl CppVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         });
     }
 
@@ -466,6 +471,7 @@ impl CppVisitor {
                     line_range: line_of(node)..end_line_of(node),
                     body_start: None,
                     parent_idx,
+                    scope: SymbolScope::TopLevel,
                 });
             } else {
                 let kind = if static_storage && is_const {
@@ -485,6 +491,7 @@ impl CppVisitor {
                     line_range: line_of(node)..end_line_of(node),
                     body_start: None,
                     parent_idx: self.nesting.current_parent(),
+                    scope: SymbolScope::TopLevel,
                 });
             }
         }
@@ -533,6 +540,7 @@ impl CppVisitor {
                 line_range: line_of(node)..end_line_of(node),
                 body_start: None,
                 parent_idx,
+                scope: SymbolScope::TopLevel,
             });
         }
     }
@@ -559,6 +567,7 @@ impl CppVisitor {
                 line_range: line_of(node)..end_line_of(node),
                 body_start: None,
                 parent_idx: self.nesting.current_parent(),
+                scope: SymbolScope::TopLevel,
             });
         }
     }
@@ -580,6 +589,7 @@ impl CppVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start: None,
             parent_idx: self.nesting.current_parent(),
+            scope: SymbolScope::TopLevel,
         });
     }
 
@@ -831,6 +841,7 @@ fn emit_macro(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
         line_range: line_of(node)..end_line_of(node),
         body_start,
         parent_idx: None,
+        scope: SymbolScope::TopLevel,
     });
 }
 

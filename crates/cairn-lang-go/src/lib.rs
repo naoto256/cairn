@@ -10,7 +10,7 @@
 
 use cairn_lang_api::{
     ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
-    SyntacticFacts, Visibility,
+    SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
@@ -166,6 +166,7 @@ fn emit_symbol(
         line_range: line_of(node)..end_line_of(node),
         body_start,
         parent_idx,
+        scope: SymbolScope::TopLevel,
     });
 }
 

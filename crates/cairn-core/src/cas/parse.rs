@@ -43,7 +43,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use cairn_lang_api::{Analyzer, SymbolFact, SymbolKind, SyntacticFacts, Visibility};
+    use cairn_lang_api::{
+        Analyzer, SymbolFact, SymbolKind, SymbolScope, SyntacticFacts, Visibility,
+    };
     use cairn_lang_rust::RustBackend;
 
     #[test]
@@ -115,6 +117,7 @@ mod tests {
                     line_range: 1..1,
                     body_start: None,
                     parent_idx: None,
+                    scope: SymbolScope::TopLevel,
                 }],
                 ..SyntacticFacts::default()
             })

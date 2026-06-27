@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use cairn_lang_api::{
     Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
-    SyntacticFacts, Visibility,
+    SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
@@ -141,6 +141,7 @@ impl Visitor for CsharpVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         });
 
         if container {
@@ -192,6 +193,7 @@ impl CsharpVisitor {
                 line_range: line_of(node)..end_line_of(node),
                 body_start: None,
                 parent_idx: self.nesting.current_parent(),
+                scope: SymbolScope::TopLevel,
             });
         }
     }

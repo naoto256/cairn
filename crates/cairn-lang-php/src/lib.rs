@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use cairn_lang_api::{
     Analyzer, ExtractError, ImportFact, LANGUAGE_BACKENDS, LanguageBackend, SymbolFact, SymbolKind,
-    SyntacticFacts, Visibility,
+    SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
     NestingTracker, Visitor, child_by_field, end_line_of, extract, line_of, node_text,
@@ -170,6 +170,7 @@ impl PhpVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start: child_by_field(node, "body").map(|b| b.start_byte()),
             parent_idx: None,
+            scope: SymbolScope::TopLevel,
         });
         self.namespace = Some(NamespaceScope {
             prefix: name,
@@ -203,6 +204,7 @@ impl PhpVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start,
             parent_idx,
+            scope: SymbolScope::TopLevel,
         });
 
         if is_container(&kind) {
@@ -241,6 +243,7 @@ impl PhpVisitor {
                 line_range: line_of(element)..end_line_of(element),
                 body_start: None,
                 parent_idx: self.current_parent(),
+                scope: SymbolScope::TopLevel,
             });
         }
     }
@@ -271,6 +274,7 @@ impl PhpVisitor {
                 line_range: line_of(element)..end_line_of(element),
                 body_start: None,
                 parent_idx: self.current_parent(),
+                scope: SymbolScope::TopLevel,
             });
         }
     }
@@ -299,6 +303,7 @@ impl PhpVisitor {
             line_range: line_of(node)..end_line_of(node),
             body_start: None,
             parent_idx: self.current_parent(),
+            scope: SymbolScope::TopLevel,
         });
     }
 }

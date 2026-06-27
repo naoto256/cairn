@@ -163,3 +163,73 @@ pub fn get_outline_under_path(
         .collect();
     Ok(rows?)
 }
+
+#[cfg(test)]
+mod scope_outline_tests {
+    use super::*;
+    use crate::cas::store;
+    use rusqlite::Connection;
+
+    fn fixture_with_top_level_and_nested() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('HEAD', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/app.js', 'sha-js')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('sha-js', 'tree-sitter-javascript', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols
+               (blob_sha, parser_id, name, qualified, kind, byte_start, byte_end,
+                line_start, line_end, source, scope)
+             VALUES
+               ('sha-js', 'tree-sitter-javascript', 'outer', 'outer', 'function',
+                0, 100, 1, 5, 'syntactic', 'top_level'),
+               ('sha-js', 'tree-sitter-javascript', 'helper', 'outer.helper', 'function',
+                20, 60, 2, 4, 'syntactic', 'nested')",
+            [],
+        )
+        .unwrap();
+        (tmp, conn)
+    }
+
+    #[test]
+    fn get_outline_includes_nested_scope() {
+        // File-structure view stays complete: both top-level and
+        // nested declarations show up. Only the workspace lookup
+        // (`find_symbols`) filters out nested.
+        let (_tmp, conn) = fixture_with_top_level_and_nested();
+        let items = get_outline(
+            &conn,
+            &crate::anchor::AnchorName::head(),
+            "src/app.js",
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"outer"), "outline missing outer: {names:?}");
+        assert!(
+            names.contains(&"helper"),
+            "outline must show nested helper: {names:?}"
+        );
+    }
+}
