@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "cairn",
-      "description": "Wires the cairn MCP server and a PreToolUse Bash hook that, in cairn-registered cwds, lets grep / rg / ag / ack / egrep / fgrep run and adds a hookSpecificOutput.additionalContext advisory pointing at the closest cairn tool so the next call defaults to the index.",
+      "description": "Wires the cairn MCP server and a SessionStart hook that injects cairn's structural-tool guidance (reach for find_symbols / find_subtypes / find_supertypes / find_callers / find_callees / find_references / find_imports before grep on structural questions; tier3_status / completeness / hints for empty-result recovery) into the host's context at the start of every session.",
       "author": {
         "name": "Naoto Morishima"
       },

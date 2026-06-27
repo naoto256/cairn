@@ -1,6 +1,6 @@
 {
   "name": "cairn",
-  "description": "Local symbol-aware code index. Wires the cairn MCP server and nudges grep-first habits toward find_symbols / get_outline / find_references when the cwd is a cairn-registered repo.",
+  "description": "Local symbol-aware code index. Wires the cairn MCP server and injects SessionStart guidance so agents reach for find_symbols / get_outline / find_references before grep / Read on structure questions.",
   "version": "0.6.2",
   "author": {
     "name": "Naoto Morishima"
