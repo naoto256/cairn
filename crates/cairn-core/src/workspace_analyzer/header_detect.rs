@@ -16,10 +16,10 @@
 //! ObjC++ (`.mm`) is out of scope here — those files are not `.h` and
 //! are not currently claimed by any backend.
 //!
-//! Split out of `register.rs` so the dispatch helpers in the parent
-//! module stay focused on orchestration, and to leave room for
-//! additional backend-routing heuristics without growing `register.rs`
-//! further.
+//! Lives under `workspace_analyzer/` so both the register hot path and
+//! the daemon-startup staleness scanner can use it without a cross-
+//! module cycle (register depends on workspace_analyzer, not the
+//! other way around).
 
 use std::path::Path;
 
@@ -27,11 +27,11 @@ use cairn_lang_api::LanguageBackend;
 
 const C_FAMILY_HEADER_SCAN_LIMIT: usize = 64 * 1024;
 
-pub(super) fn is_c_family_header_path(path: &str) -> bool {
+pub(crate) fn is_c_family_header_path(path: &str) -> bool {
     Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("h")
 }
 
-pub(super) fn pick_c_family_header_backend<'a>(
+pub(crate) fn pick_c_family_header_backend<'a>(
     backends: &'a [Box<dyn LanguageBackend>],
     path: &str,
     content: &[u8],
@@ -75,7 +75,7 @@ pub(super) fn pick_c_family_header_backend<'a>(
 /// or comment. The `#import` scan needs the raw bytes because masking
 /// blanks the quotes / brackets that distinguish a real include from
 /// a bare `#import` token.
-pub(super) fn header_looks_objc(masked: &[u8], raw: &[u8]) -> bool {
+pub(crate) fn header_looks_objc(masked: &[u8], raw: &[u8]) -> bool {
     const DIRECTIVES: &[&[u8]] = &[
         b"@interface",
         b"@implementation",
