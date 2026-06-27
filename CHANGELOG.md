@@ -48,6 +48,81 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Tier-2.5 analyzer-only reruns no longer silently destroy prior
+  resolutions when the worktree is transiently inaccessible.** The
+  daemon-startup analyzer-revision-drift scanner enqueues a single
+  analyzer rerun via `JobManager::enqueue_analyzer_run` (not a full
+  reindex). The seven Tier-2.5 analyzers
+  (`tier25-kotlin-resolver`, `tier25-swift-resolver`,
+  `tier25-csharp-resolver`, `tier25-python-resolver`,
+  `tier25-javascript-resolver`, `tier25-ruby-resolver`,
+  `tier25-php-resolver`) each read their input by calling
+  `std::fs::read(worktree_path)` directly. If the worktree was
+  transiently inaccessible at that moment (a git checkout in
+  flight, a file move, a permissions blip), every read returned
+  `None`, the analyzer returned an empty `WorkspaceFacts`, and
+  `persist_resolutions` committed the `DELETE` half of its
+  delete-then-insert with zero `INSERT`s — deleting every prior
+  `tier25-*` row under a `Succeeded` run status. `doctor` showed
+  the run as current+succeeded and the operator had no signal that
+  the workspace facts were gone.
+
+  Fix: the runner is now the single source of truth for analyzer
+  input I/O. `WorkspaceAnalyzer` gained
+  `requires_materialized_files() -> bool` (default `false`; LSP
+  analyzers stay on their own server-driven file I/O); the seven
+  Tier-2.5 analyzers override it to `true`. When `true`, the runner
+  reads every selected file into `WorkspaceFile::source_bytes:
+  Option<Arc<[u8]>>` before invoking the analyzer. Any missing
+  `worktree_path` or `std::fs::read` failure on any selected file
+  becomes a single run-level `Failed` (not `Succeeded`, not
+  `Skipped`) with an operator-facing error message
+  (`"N of M workspace files unreadable: <path>: <os error>, … (showing first 3 of N)"`),
+  and `persist_resolutions` is not called — prior rows stay intact.
+  Partial unreadable is also `Failed`: an incomplete cross-file
+  graph silently produces wrong fallbacks instead of correct partial
+  truth. The Tier-2.5 analyzers now read from
+  `file.source_bytes.as_deref()` exclusively; the race window
+  between the runner's readiness check and the analyzer's
+  `std::fs::read` is gone by construction.
+
+  Tests pin: all unreadable / partial unreadable / read error all
+  produce `Failed` with prior rows preserved; readable-but-
+  legitimately-empty facts still produce `Succeeded` with prior
+  rows deleted (preserving the analyzer-evolution case where a
+  revision bump genuinely zeroes out a fact class); the LSP /
+  default analyzers are NOT pre-read (so a 50k-blob monorepo does
+  not pay a double-read tax); and the consumer-side migration is
+  pinned by a Kotlin smoke test that fails if the analyzer regresses
+  to reading from disk.
+
+  Recovery for existing users: this fix prevents new workspace-
+  analyzer runs from marking unreadable input as succeeded and
+  deleting prior Tier-2.5 facts. It does NOT repair stores that
+  already contain a current-revision succeeded run with empty
+  `tier25-*` resolutions from the previous bug. Symptoms to look
+  for after upgrading:
+
+  - `cairn ctl daemon doctor` previously surfaced
+    `analyzer revision drift` for an alias.
+  - A `find_subtypes` / `find_callers` / `find_references` query
+    that was returning `tier25-<lang>-resolver` with a `target_path`
+    now returns `tier2-fact` fallback with `target_path = null`.
+  - Particularly affected: Kotlin / Swift / C# / JavaScript /
+    Python / Ruby / PHP Tier-2.5 in repos that registered before
+    the upgrade.
+
+  If any of those match, run `cairn ctl repo reindex <alias>` once
+  per affected alias to rebuild the lost facts. New registrations
+  and new revisions are protected structurally.
+
+  Out-of-scope nit (deferred to a future perf epic): the runner
+  materializes every selected Tier-2.5 file at once into an
+  `Arc<[u8]>`, so a single-pass over a multi-GB monorepo allocates
+  peak memory proportional to the parsed input. Acceptable for the
+  v0.7.0 hotfix scope; chunked / streaming materialization is the
+  follow-up shape.
+
 - **Manifest dedup shortcut no longer skips the workspace analyzer
   pass when blobs were re-parsed or analyzer revision drifted (F-A
   regression).** v11 introduced `resolutions.manifest_id ON DELETE
