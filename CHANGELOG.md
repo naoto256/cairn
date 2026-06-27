@@ -7,9 +7,188 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.7.0] — 2026-06-27
 
+### Fixed (CodeRabbit-driven pre-ship review)
+
+- **`cairn ctl daemon doctor` `analyzer rerun health` now distinguishes
+  current-revision pending from stale-revision pending.** Two
+  observability bugs were collapsing distinct doctor states into a
+  spurious `Pass`:
+  - For analyzer drift, `queued`/`running` rows were classified as
+    `Pass` regardless of the persisted `analyzer_revision`. Because
+    `JobManager::enqueue_analyzer_run` stamps the current expected
+    revision when enqueueing, a `queued`/`running` row at an *older*
+    revision is not an in-flight current rerun — it is a stale
+    artifact (old binary's row, restored-from-db running→queued, or
+    coalesced/unstamped rerun). Now `(queued|running, at_current=true)`
+    → `Pass`; `(queued|running, at_current=false)` → `Warn` with a
+    "rerun has not landed at current revision" detail and a
+    `cairn ctl jobs list <alias>` / `cairn ctl repo reindex <alias>`
+    remediation pointer.
+  - For parser drift, the per-analyzer accumulation in
+    `parser_drift_rerun_check` collapsed every `queued`/`running` row
+    into a single `any_pending` flag without checking the row's
+    revision against expected, and the Case C `Pass` for `any_pending`
+    ran *before* the `Warn` cases for missing rows / stale-succeeded
+    rows. Mixed bad states (one analyzer queued-current + another
+    analyzer with missing or stale-succeeded row) were reported as
+    `Pass`. The branch now splits into `pending_current` vs
+    `pending_stale`, and the decision cascade evaluates every `Warn`
+    case (`any_failed`, `any_pending_stale`, `any_row_missing`,
+    `any_stale_succeeded`) before the Case C `Pass` for
+    `any_pending_current`. New tests pin both classes of false `Pass`.
+
+### Fixed (Tier-2.5 resolver correctness — CodeRabbit-driven)
+
+- **JavaScript Tier-2.5 same-file class lookup is now path-aware.**
+  `lookup_class_in_file` previously returned the first class with the
+  given qualified name across the workspace; with duplicate class
+  names the same-file `extends Foo` could resolve to another file.
+  The lookup now keys on `(path, qualified)` so the resolver scopes
+  correctly.
+- **JavaScript Tier-2.5 `new Foo()` resolves to the declaring file
+  even when another file defines `Foo`.** `CallReceiver::NewExpr`
+  previously only consulted `resolve_class_target`; it now chains a
+  same-file fallback parallel to the existing `Cls.method()` path so
+  `new Foo().bar()` in a file that locally declares `class Foo`
+  resolves correctly when a duplicate `Foo` exists elsewhere.
+- **Nested function declarations no longer appear as workspace
+  symbols across both Tier-1 and Tier-2.5 JS/TS layers.** Two-part
+  fix:
+  - Tier-2.5 (`cairn-lang-javascript-tier25`): the visitor tracks
+    `function_depth` and suppresses nested function declarations
+    from the `function_defs` dispatch index. Six tree-sitter node
+    kinds open function-body frames: `function_declaration`,
+    `generator_function_declaration`, `function_expression`,
+    `arrow_function`, `generator_function`, and bare `function`.
+    Nested function call resolution can no longer reach a
+    private file-local helper as a workspace target.
+  - Tier-1 (`cairn-lang-typescript`, the shared JS/TS Tier-1
+    backend): symbols now carry a `scope` field (`TopLevel` /
+    `Nested`) added in schema v12. `find_symbols` filters to
+    `scope = 'top_level'` by default so nested function
+    declarations no longer surface in workspace name lookups,
+    while `get_outline` returns all scopes so file structure
+    remains complete. Tier-1 parser revisions for TypeScript,
+    TSX, and JavaScript bump 3 → 4 so registered repos
+    auto-reindex JS/TS files on next daemon startup. Existing
+    rows for all other backends get the default `'top_level'`
+    via the v12 migration, preserving prior behavior. Top-level
+    classes' methods stay top-level; methods nested inside a
+    function body become nested. Nine new tests pin the scope
+    semantics (Tier-1 visitor + `find_symbols` filter +
+    `get_outline` no-filter).
+- **JavaScript Tier-2.5 dispatch preserves `ImportKind` through
+  alias projection.** `ResolvedBinding` / `AliasTarget` previously
+  discarded the original `ImportKind` (`Default` / `Named` / `CJS` /
+  `EsmNamespace` / `SideEffect`), so `Foo.bar()` on a default
+  import could silently re-bind to a sibling named export `bar` of
+  the module. The kind now rides through to dispatch, and the
+  namespace-export lookup gates on `EsmNamespace`. Default-imported
+  `Foo.X.method()` correctly returns no Tier-2.5 resolution (rather
+  than a wrong one) — Tier-3 fallback continues to handle that
+  shape.
+- **C# Tier-2.5 dispatch validates namespace candidates before
+  adopting them.** `resolve_dotted_to_qualified` rewrote receivers
+  like `Co.App.Registry.Build()` to `Other.Co.App.Registry` inside
+  namespace `Other` without checking whether the rewritten target
+  existed. It now enumerates candidates from each containing-
+  namespace prefix, wildcard imports, and bare form, and adopts only
+  the first that passes the workspace-symbol lookup, matching the
+  validate-before-adopt discipline kotlin-tier25 introduced in
+  PR #219. Single-part receivers stay on the permissive path so
+  extension-method resolution via unique-name match is preserved.
+- **Kotlin Tier-2.5 indexes root-package top-level functions in the
+  package callable map.** `MethodIndex::build` keyed on
+  `Some(owner) == package`, but root-package files have `owner=""`
+  and `package=None`, so top-level callables never entered the
+  index — bare `helper()` calls and synthetic `FileKt.helper()`
+  calls in root-package files failed to resolve. The `owner=""`
+  case is now normalized to `None` before the comparison.
+
+### Fixed (contract clean-up — CodeRabbit #2 across Tier-2.5 backends)
+
+- **Import-edge resolutions now set `target_qualified = None`
+  uniformly.** The `WorkspaceResolution` contract treats import
+  edges as file-level identities; the persistence layer's
+  path-scoped `(blob_sha, qualified)` lookup (which runs before
+  the `Import` kind manifest-wide gate at `persist.rs:508`) could
+  pin a `target_symbol_id` for imports that happened to carry
+  `target_qualified=Some` from the analyzer. Five Tier-2.5 backend
+  lib layers (`csharp` / `kotlin` / `php` / `python` / `swift`)
+  previously forwarded `edge.target_qualified.clone()` into the
+  persisted `WorkspaceResolution`; they now hard-set `None` for
+  `ResolutionKind::Import`. The internal `target_qualified`
+  computed by each `require_graph` is still used for in-analyzer
+  alias / binding resolution; only the persisted row honors the
+  contract. Existing tests that encoded the old behavior have been
+  updated; each backend got an
+  `import_target_qualified_is_none_even_when_require_graph_resolved`
+  regression test. Ruby and JavaScript backends were checked and
+  already correct at the require_graph layer.
+
+### Fixed (ESM re-export resolution — CodeRabbit #7)
+
+- **`PackageIndex` now folds `facts.reexports` into the export
+  index, transitively.** Previously `index.js` with `export { X }
+  from './x'` emitted an import row but importers of `index.js`
+  saw `target_path = index.js` (the barrel) instead of `x.js` (the
+  origin) — `PackageIndex::build` ingested only `facts.exports`,
+  not `facts.reexports`. The build pass now collects raw `(barrel,
+  exported_as) → (immediate_origin, origin_name)` from
+  `facts.reexports` (resolving the module specifier via the same
+  `RequireGraph` workspace probe), then flattens chains up to a
+  fixed hop budget (8 hops, terminating at the file that defines
+  the symbol locally or at the hop limit). `lookup_export`
+  consults local exports first and falls back to the flattened
+  re-export table. Per-binding `target_path` for consumer imports
+  now points at the origin file; the import-statement row keeps
+  the barrel `target_path` (site-level resolution). The `#2`
+  contract for persisted `WorkspaceResolution.target_qualified =
+  None` is preserved. Wildcard `export * from './bar'` is not
+  flattened (no enumerated targets). Cyclic chains and chains
+  exceeding the hop budget are dropped entirely from the
+  flattened table — `PackageIndex::build` walks each chain with
+  a `visited: HashSet<(path, name)>` guard plus the hop budget,
+  and `lookup_export` is iterative with its own visited / budget
+  guard as defense in depth, so neither the build flatten nor
+  any consumer lookup can recurse indefinitely. Cycle / over-
+  budget detection also records the dropped `(path, name)`
+  pairs in a `dropped_reexports: HashSet<(String, String)>` so
+  the consumer (`require_graph::resolve_binding_target`) can
+  distinguish "this file genuinely has no export named X"
+  from "this file re-exports X but the chain was unresolvable"
+  — the latter returns `(None, None)` instead of falling back
+  to a fabricated `(target_path = re-exporter, target_qualified
+  = X)` binding that would synthesize an edge into the cyclic
+  re-export ring. Seven regression tests pin named, default-
+  renamed, per-site vs per-binding distinction, two-hop chains,
+  cycle no-recursion, cycle no-fabricated-binding, and over-
+  budget termination.
+
+### Fixed (docs and test hygiene — CodeRabbit-driven)
+
+- CHANGELOG `[0.7.0]` references to `cairn ctl doctor` corrected to
+  `cairn ctl daemon doctor` (matching the actual CLI shape). Pre-0.6
+  historical entries are preserved as contemporaneous.
+- `find_references` PHP `\\` separator test gained a positive
+  assertion (a `Vendor\\Pkg\\Foo` qualified ref is found by the
+  strict-FQN incoming query) alongside the existing negative
+  assertion. The previous test would have passed even if `\\` were
+  no longer treated as a qualifier separator.
+
+### Analyzer revisions
+
+- All seven Tier-2.5 analyzers are now at their v0.7.0 ship
+  revisions, picking up the CodeRabbit-driven fixes above:
+  Ruby = 4, PHP / Python / Swift = 4 (was 3), C# = 4 (was 3),
+  Kotlin = 6 (was 5), JavaScript = 5 (was 4). The startup
+  analyzer-revision staleness scanner enqueues the appropriate
+  reruns on next daemon launch; no manual `cairn ctl repo reindex
+  <alias>` is needed in the common case.
+
 ### Added
 
-- **`cairn ctl doctor` cross-references drift with the rerun
+- **`cairn ctl daemon doctor` cross-references drift with the rerun
   lifecycle (`analyzer rerun health` check).** Drift detection
   (`analyzer revision drift` and `parser revision drift`) tells the
   operator *that* the alias is stale; the rerun-health check now
@@ -59,14 +238,14 @@ versions follow [SemVer](https://semver.org/).
   drift. Failure modes (per-alias error, DB unavailable, JobManager
   full) log a `warn`/`error` and the daemon keeps running; doctor
   picks up the shadow case (see below).
-- **`cairn ctl doctor` surfaces analyzer-revision drift.** A new
+- **`cairn ctl daemon doctor` surfaces analyzer-revision drift.** A new
   per-alias `analyzer revision drift` check Warns whenever the
   persisted `analyzer_revision` is lower than the linked-in build's
   `revision()`, listing the analyzer ids and the version delta. Acts
   as a shadow-case fallback if the startup auto-rerun failed to
   enqueue (DB error, pool full); the operator sees the drift either
   way and can run `cairn ctl repo reindex <alias>` to resolve.
-- **`cairn ctl doctor` detects wedged analyzer runs.** A `queued` or
+- **`cairn ctl daemon doctor` detects wedged analyzer runs.** A `queued` or
   `running` `workspace_analysis_runs` row whose `started_at_ns` is
   older than `STUCK_RUN_THRESHOLD` (6h) now surfaces as a distinct
   "stuck in `running` for ~Xh" Warn with a `reindex_repo`
@@ -110,10 +289,12 @@ versions follow [SemVer](https://semver.org/).
   release the JavaScript / TypeScript Tier-1 emitter (see the
   `require('./x')` entry above) was extended to statement-position,
   expression-position, and `module.exports = require('./x')`
-  re-export shapes. The remaining limitations are the named
-  re-export pattern `exports.X = require('./x')` and downstream
-  re-export graph semantics (resolving an `import { X } from
-  './outer'` through a re-export chain).
+  re-export shapes. Downstream ESM re-export graph semantics —
+  resolving `import { X } from './outer'` through a re-export
+  chain — were folded in via the CodeRabbit #7 fix above (see
+  `### Fixed (ESM re-export resolution — CodeRabbit #7)`). The
+  remaining limitation is the named CommonJS re-export pattern
+  `exports.X = require('./x')`.
 - **Tier-2.5 resolution `target_path` surface on refs / calls
   (Phase 2).** `find_references`, `find_callers` and `find_callees`
   now return `target_path: Option<String>` on `FindReferenceHit` /
@@ -167,9 +348,10 @@ versions follow [SemVer](https://semver.org/).
   restore the structural-tool reflex. `CAIRN_NUDGE_DISABLED`
   and the `jq` prerequisite no longer apply.
 - All seven Tier-2.5 analyzers had their revisions bumped during
-  `release/0.7.0` development. The final shipped revisions are
-  Ruby = 4, PHP / Python / Swift / C# = 3, Kotlin = 5, JavaScript
-  = 4. JavaScript ships in the same release as part of the
+  `release/0.7.0` development; see the **Analyzer revisions** section
+  above for the final shipped values (Ruby = 4, PHP / Python / Swift
+  / C# = 4, Kotlin = 6, JavaScript = 5 after CodeRabbit-driven
+  resolver fixes). JavaScript ships in the same release as part of the
   Tier-2.5 JavaScript backend integration, with the same
   `target_path` contract as the other Tier-2.5 backends. On
   upgrade the daemon's CAS treats existing resolutions rows as
@@ -528,7 +710,7 @@ versions follow [SemVer](https://semver.org/).
   drift scanners enqueue the appropriate reruns once the file
   watcher is up. In the common case there is no manual step on
   upgrade; `cairn ctl repo reindex <alias>` is reserved for
-  recovery (the `cairn ctl doctor` `analyzer rerun health` check
+  recovery (the `cairn ctl daemon doctor` `analyzer rerun health` check
   routes operators to this command when auto-reindex did not
   complete).
 
