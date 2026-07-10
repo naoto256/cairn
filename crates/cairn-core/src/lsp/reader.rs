@@ -78,6 +78,18 @@ struct ProgressSnapshot {
 }
 
 impl ProgressState {
+    /// Clear every field so the readiness state does not persist
+    /// across `LspClient::spawn_process` restarts. Without this,
+    /// a respawned child inherits `saw_begin = true` from the
+    /// prior server and readiness completes prematurely (no
+    /// `begin` was actually observed for the new session).
+    pub(super) async fn reset(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.active_tokens.clear();
+        inner.saw_begin = false;
+        inner.change_seq = 0;
+    }
+
     pub(super) async fn record(&self, message: &Value) {
         let Some(params) = message.get("params") else {
             return;
@@ -235,8 +247,26 @@ pub(super) fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
 }
 
 async fn fail_pending(pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>, err: Error) {
+    // Two shapes reach here:
+    //
+    // 1. Clean EOF (`read_lsp_message` returns `Ok(None)`) —
+    //    passed in as `Error::ServerExited(None)`. Reconstructed
+    //    per receiver so downstream `matches!(_, Err(ServerExited(_)
+    //    | ServerExitedWithStderr {..}))` in `PoolEntry::with_lsp_client`
+    //    actually fires; a Protocol fallback would silently
+    //    turn the respawn cleanup into dead code.
+    // 2. Transport / protocol read errors (`Err(_)` from
+    //    `read_lsp_message`) — `Error` is not `Clone` (it wraps
+    //    `std::io::Error`), so per-receiver we render the text
+    //    into `Error::Protocol` as a lossy fallback. When a new
+    //    failure shape needs variant preservation, add it to the
+    //    match rather than extending the Protocol fallback.
     let mut pending = pending.lock().await;
     for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(Error::Protocol(err.to_string())));
+        let replica = match &err {
+            Error::ServerExited(_) => Error::ServerExited(None.into()),
+            other => Error::Protocol(other.to_string()),
+        };
+        let _ = tx.send(Err(replica));
     }
 }
