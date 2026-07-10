@@ -304,9 +304,15 @@ async fn early_server_exit_surfaces_as_server_exited() {
         .await
         .unwrap_err();
 
+    // Tightened after `reader::fail_pending` was fixed to
+    // preserve the `ServerExited` variant instead of falling
+    // back to `Protocol` text — the pool's `ServerExited`
+    // cleanup branch depends on this variant being surfaced
+    // upward. Any regression that silently converts to Protocol
+    // must be caught here.
     assert!(
-        matches!(err, Error::ServerExited(_)) || matches!(err, Error::Protocol(_)),
-        "unexpected error: {err:?}"
+        matches!(err, Error::ServerExited(_)),
+        "unexpected error variant: {err:?}"
     );
 }
 

@@ -176,15 +176,17 @@ impl LspClient {
             return Err(Error::ServerExited(None.into()));
         };
 
-        {
-            let mut child_slot = self.child.lock().await;
-            if let Some(child) = child_slot.as_mut() {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-            }
-            *child_slot = None;
-        }
+        // Fail closed if the prior child's termination cannot be
+        // proven — spawning a fresh child alongside a
+        // possibly-still-live orphan would violate the "no two
+        // instances per key" invariant callers rely on.
+        self.force_terminate().await?;
 
+        // `kill_on_drop(true)` is the last-resort backstop: an
+        // unexpected drop of the `LspClient` (panic in caller,
+        // future cancellation) still SIGKILLs the child.
+        // `force_terminate` is preferred on every explicit failure
+        // path because it also reaps the child via `wait()`.
         let mut child = Command::new(binary_path)
             .args(&self.args)
             .envs(self.env.iter().map(|(key, value)| (key, value)))
@@ -192,17 +194,24 @@ impl LspClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(Error::Spawn)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Handshake("missing child stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Handshake("missing child stdout".into()))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => return Err(reap_local_child(&mut child, "missing child stdin").await),
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => return Err(reap_local_child(&mut child, "missing child stdout").await),
+        };
         self.stderr_tail.lock().await.clear();
+        // Clear readiness state before installing the new
+        // transport — otherwise a respawn inherits `saw_begin`
+        // from the prior server and `wait_for_workspace_load`
+        // returns before the new server has actually announced
+        // any `$/progress` begin.
+        self.progress.reset().await;
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(capture_stderr(stderr, Arc::clone(&self.stderr_tail)));
         }
@@ -210,9 +219,78 @@ impl LspClient {
         self.install_transport(stdout, stdin).await;
         *self.child.lock().await = Some(child);
         if let Err(err) = self.initialize().await {
-            return Err(self.with_stderr_context(err).await);
+            let contextual = self.with_stderr_context(err).await;
+            return Err(match self.force_terminate().await {
+                Ok(()) => contextual,
+                Err(cleanup_err) => Error::OperationWithCleanupFailure {
+                    original: Box::new(contextual),
+                    cleanup: Box::new(cleanup_err),
+                },
+            });
         }
         Ok(())
+    }
+
+    /// Terminate the child and reap it via `wait()`. Returns
+    /// `Ok(())` when either the child was successfully reaped, or
+    /// there was no child slot to begin with. Returns
+    /// [`Error::ChildTerminationFailed`] when `wait()` errors after
+    /// the kill attempt — that is our termination-proof signal, and
+    /// callers must fail-closed rather than spawn a replacement.
+    ///
+    /// `kill()`'s own return value is ignored on purpose: a
+    /// concurrently-exited child returns an error from `kill()`,
+    /// but the subsequent `wait()` still succeeds and provides the
+    /// termination proof.
+    ///
+    /// The narrow ownership contract this helper enforces is:
+    /// "when we are abandoning a `Child` that we (or another
+    /// caller) placed in `self.child`, `force_terminate` is the
+    /// canonical path — it drops the writer, clears pending
+    /// oneshots, kills the child, and reaps it via `wait()`."
+    ///
+    /// Not every failure path in this module routes through it:
+    /// missing-stdio uses an inline `reap_local_child` shape
+    /// because the `Child` isn't in `self.child` yet; the
+    /// availability probes are standalone `Command::spawn` +
+    /// `wait()` outside `LspClient` entirely; the graceful
+    /// `shutdown(self)` calls `force_terminate` only when its
+    /// bounded graceful wait fails or the child slot needs kill +
+    /// reap. Those variants are documented at their call sites.
+    pub(crate) async fn force_terminate(&self) -> Result<()> {
+        self.alive.store(false, Ordering::SeqCst);
+        // Drop the writer first so the reader task observes EOF
+        // and exits cleanly.
+        {
+            let mut writer = self.writer.lock().await;
+            *writer = None;
+        }
+        // Fail any in-flight requests: the writer is gone and the
+        // child is going away, so their oneshot senders will never
+        // fire otherwise.
+        {
+            let mut pending = self.pending.lock().await;
+            pending.clear();
+        }
+        let mut child_slot = self.child.lock().await;
+        let termination_err: Option<Error> = if let Some(child) = child_slot.as_mut() {
+            let _ = child.kill().await;
+            match child.wait().await {
+                Ok(_) => None,
+                Err(e) => Some(Error::ChildTerminationFailed(format!(
+                    "wait() after kill: {e}"
+                ))),
+            }
+        } else {
+            None
+        };
+        // Drop the child handle regardless — `kill_on_drop(true)`
+        // is the final backstop for the child process itself.
+        *child_slot = None;
+        match termination_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn install_transport<R, W>(&self, reader: R, writer: W)
@@ -383,32 +461,82 @@ impl LspClient {
         .await
     }
 
-    /// Gracefully stop the server.
+    /// Gracefully stop the server. Always terminates and reaps the
+    /// child before returning: after a bounded graceful window
+    /// (`SHUTDOWN_TIMEOUT`), any remaining child is force-terminated
+    /// via [`Self::force_terminate`]. Graceful protocol errors and
+    /// termination-unproven errors are surfaced *distinctly*:
+    ///
+    /// - Both clean → `Ok(())`
+    /// - Graceful protocol failed, cleanup OK → `Err(protocol)`
+    /// - Graceful OK, cleanup failed → `Err(ChildTerminationFailed)`
+    /// - Both failed → `Err(OperationWithCleanupFailure)` wrapping
+    ///   the original protocol error and the termination signal.
     ///
     /// # Errors
-    /// Returns protocol errors from the `shutdown` request. The final
-    /// kill fallback is best-effort.
+    /// See the mapping above.
     pub async fn shutdown(self) -> Result<()> {
+        let mut protocol_err: Option<Error> = None;
         if self.alive.load(Ordering::SeqCst) {
-            let _: Value = self.request("shutdown", Value::Null).await?;
-            self.notify("exit", Value::Null).await?;
-        }
-        self.alive.store(false, Ordering::SeqCst);
-        *self.writer.lock().await = None;
-
-        let mut child_slot = self.child.lock().await;
-        if let Some(child) = child_slot.as_mut() {
-            match timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(Error::Protocol(format!("wait failed: {e}"))),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+            match self.request::<Value>("shutdown", Value::Null).await {
+                Ok(_) => {
+                    if let Err(e) = self.notify("exit", Value::Null).await {
+                        protocol_err = Some(e);
+                    }
                 }
+                Err(e) => protocol_err = Some(e),
             }
         }
-        *child_slot = None;
-        Ok(())
+        // Give the child a bounded grace period to exit on its own,
+        // then delegate to `force_terminate` for any remaining
+        // cleanup. If the graceful wait succeeds we drop the child
+        // handle immediately so `force_terminate` has nothing to
+        // do; if it errored or timed out we let `force_terminate`
+        // handle kill + wait uniformly.
+        let graceful_reaped = {
+            let mut child_slot = self.child.lock().await;
+            match child_slot.as_mut() {
+                None => true,
+                Some(child) => match timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+                    Ok(Ok(_)) => {
+                        *child_slot = None;
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        if protocol_err.is_none() {
+                            protocol_err = Some(Error::Protocol(format!("wait failed: {e}")));
+                        }
+                        false
+                    }
+                    Err(_) => false,
+                },
+            }
+        };
+        let cleanup = if graceful_reaped {
+            // Still clear alive/writer/pending so the state is
+            // consistent even without a live child.
+            self.alive.store(false, Ordering::SeqCst);
+            {
+                let mut writer = self.writer.lock().await;
+                *writer = None;
+            }
+            {
+                let mut pending = self.pending.lock().await;
+                pending.clear();
+            }
+            Ok(())
+        } else {
+            self.force_terminate().await
+        };
+        match (protocol_err, cleanup) {
+            (None, Ok(())) => Ok(()),
+            (Some(e), Ok(())) => Err(e),
+            (None, Err(e)) => Err(e),
+            (Some(orig), Err(cleanup)) => Err(Error::OperationWithCleanupFailure {
+                original: Box::new(orig),
+                cleanup: Box::new(cleanup),
+            }),
+        }
     }
 
     async fn ensure_running(&self) -> Result<()> {
@@ -505,25 +633,90 @@ fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
     })
 }
 
-async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -> Result<()> {
-    let output = timeout(
-        request_timeout,
-        Command::new(binary_path).arg("--version").output(),
-    )
-    .await
-    .map_err(|_| Error::RequestTimeout)?
-    .map_err(|e| {
+/// Kill + reap a `Child` that was just spawned but never handed
+/// off to `self.child`. Used by the missing-stdio paths: the local
+/// `child` isn't visible to `force_terminate` yet, so we do the
+/// same kill + wait shape inline and surface both the handshake
+/// error and any termination-unproven signal.
+async fn reap_local_child(child: &mut Child, original: &str) -> Error {
+    let _ = child.kill().await;
+    match child.wait().await {
+        Ok(_) => Error::Handshake(original.into()),
+        Err(e) => Error::OperationWithCleanupFailure {
+            original: Box::new(Error::Handshake(original.into())),
+            cleanup: Box::new(Error::ChildTerminationFailed(format!(
+                "wait() after kill: {e}"
+            ))),
+        },
+    }
+}
+
+/// Single-source availability probe: spawn `binary args`, wait
+/// with the given timeout, and treat exit-status success as
+/// availability. Stdin / stdout / stderr are all set to null
+/// stdio (the probe only cares about the exit status);
+/// `kill_on_drop(true)` is the last-resort backstop; on timeout
+/// the probe explicitly runs `kill` + `wait` so the caller sees
+/// a proof of termination — a `wait()` failure surfaces as a
+/// `ChildTerminationFailed` (composite with `RequestTimeout` on
+/// timeout), which the central `LspClientPool::with_lsp` exit
+/// point can act on to poison the pool.
+///
+/// Callers:
+/// - [`LspClient::start_with_timeout`] passes `["--version"]`.
+/// - `pool::check_lsp_available` uses this via the
+///   `AvailabilityStrategy` args dispatch.
+///
+/// The two production probe paths must not fork — a divergence in
+/// termination-proof / signal handling would produce silent orphan
+/// probes on one code path but not the other.
+pub(super) async fn probe_binary(
+    binary_path: &Path,
+    args: &[&str],
+    timeout_duration: Duration,
+) -> Result<()> {
+    let mut command = Command::new(binary_path);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinaryMissing(binary_path.to_path_buf())
         } else {
             Error::Spawn(e)
         }
     })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::BinaryMissing(binary_path.to_path_buf()))
+    match timeout(timeout_duration, child.wait()).await {
+        Ok(Ok(status)) => {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(Error::BinaryMissing(binary_path.to_path_buf()))
+            }
+        }
+        Ok(Err(wait_err)) => Err(Error::ChildTerminationFailed(format!(
+            "probe wait() failed: {wait_err}"
+        ))),
+        Err(_) => {
+            let _ = child.kill().await;
+            match child.wait().await {
+                Ok(_) => Err(Error::RequestTimeout),
+                Err(e) => Err(Error::OperationWithCleanupFailure {
+                    original: Box::new(Error::RequestTimeout),
+                    cleanup: Box::new(Error::ChildTerminationFailed(format!(
+                        "probe wait() after kill: {e}"
+                    ))),
+                }),
+            }
+        }
     }
+}
+
+async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -> Result<()> {
+    probe_binary(binary_path, &["--version"], request_timeout).await
 }
 
 #[derive(Default)]

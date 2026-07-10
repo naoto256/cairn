@@ -50,6 +50,69 @@ versions follow [SemVer](https://semver.org/).
   indexes. If the daemon exits at startup, inspect the daemon log
   for the underlying error, repair the affected store, and restart.
 
+- **Daemon-global LSP pool is now cardinality-bounded and cleans up
+  every failure path.** The pool previously kept an unbounded
+  `HashMap<PoolKey, PoolEntry>`, so the number of live LSP child
+  processes grew monotonically with the set of `(repo, language,
+  analyzer, binary, config)` combinations the daemon had ever seen.
+  Failure paths left children behind: `spawn_process`'s
+  `initialize` failure left the child in the slot with a running
+  process, readiness (`$/progress`) failure returned the readiness
+  error but never terminated the freshly-spawned child, and
+  `LspClient::shutdown` exited early on the graceful `shutdown` /
+  `exit` request errors and skipped the child `kill` + `wait`
+  fallback.
+
+  The pool now caps live entries at a hard capacity (default 16;
+  override via `CAIRN_LSP_POOL_MAX_ENTRIES`, range `1..=64`;
+  invalid / 0 / negative → default with a warn; `>64` → clamp with
+  a warn). Every acquire is held under a RAII lease that prevents
+  eviction while the entry is in use. When the pool is full and an
+  idle entry can be evicted, the victim is shut down *outside* the
+  registry lock and a replacement is only inserted after the
+  victim's shutdown completes — a live victim child cannot coexist
+  with its replacement. If the pool is full and no `Ready` idle
+  victim can be evicted (all entries are either leased or already
+  in an `Evicting` placeholder for a concurrent eviction), the
+  acquire returns a typed `PoolAtCapacity` error (analyzer jobs
+  on the affected key land as `Failed`; retry after a lease is
+  released or run `cairn ctl repo reindex <alias>`).
+
+  `LspClient` now spawns children with `kill_on_drop(true)` as a
+  last-resort backstop. `force_terminate(&self)` returns typed
+  `ChildTerminationFailed` when `wait()` cannot confirm the child
+  died — callers treat that as fail-closed rather than spawning a
+  replacement. Explicit failure paths (initialize failure,
+  readiness failure, missing-stdio, `ServerExited(WithStderr)`
+  cleanup, LRU eviction victim shutdown) surface the original
+  error and any cleanup error via
+  `OperationWithCleanupFailure`; a central exit point in
+  `LspClientPool::with_lsp` inspects the returned error and, when
+  it is termination-unproven, poisons the pool (Stopped-preserving)
+  so no key can spawn a replacement child while a possibly-live
+  orphan may still hold resources. Availability probes
+  (`--version`, `version`) run as `Command::spawn` + explicit
+  `child.wait()` under an outer timeout; on timeout the caller
+  runs `kill` + `wait` and surfaces `RequestTimeout` (or, if
+  `wait` also fails, a composite `OperationWithCleanupFailure`
+  that the central-poison path can act on). The graceful
+  `shutdown(self)` is cleanup-finally: it preserves the first
+  protocol error, reaps the child within a bounded graceful wait
+  where possible, and delegates to `force_terminate` only when
+  that graceful wait fails or times out.
+
+  `force_shutdown_all` (invoked after analyzer stall detection) is
+  now atomic against acquire: the pool transitions to `Draining`
+  while cleanup runs, rejects new acquisitions with a typed
+  `PoolDraining` error, and iterates every entry's shutdown up to
+  a per-entry timeout. If every entry cleanly terminates the pool
+  returns to `Running`; if any entry's cleanup times out the pool
+  becomes `Poisoned` and permanently rejects new acquisitions
+  until the daemon restarts — the daemon cannot silently spawn a
+  replacement child alongside an orphan whose termination it could
+  not prove. `shutdown_all` (daemon-final) transitions to
+  `Stopped` and rejects further acquires.
+
 ### Security
 
 - Bump `anyhow` to 1.0.103 (RUSTSEC-2026-0190) and `crossbeam-epoch`
