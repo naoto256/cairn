@@ -124,10 +124,15 @@ enum SchedulerMsg {
     Shutdown,
 }
 
-/// A single `queued` row observed during `restore_from_db`, tagged
-/// with the store it lives in. Used to build the cross-store
-/// `job_id -> Vec<RestoreRow>` collision map before the recycle
-/// rewrite in phase 3.
+/// A single row observed during `restore_from_db`, tagged with the
+/// store it lives in and whether it is dispatch-active (queued or a
+/// running row that was flipped back to queued). Used to build the
+/// cross-store `job_id -> Vec<RestoreRow>` collision map before the
+/// recycle rewrite in phase 3. `is_active == false` rows are
+/// non-active (any terminal status) — they must still participate
+/// in collision detection because `JobId` is an external identifier
+/// that clients can still hold, but they are never advertised to
+/// the memory queue in phase 4.
 #[derive(Debug, Clone)]
 struct RestoreRow {
     alias: String,
@@ -136,6 +141,7 @@ struct RestoreRow {
     repo_root: PathBuf,
     manifest_id: ManifestId,
     analyzer_id: String,
+    is_active: bool,
 }
 
 #[derive(Debug)]
@@ -736,22 +742,20 @@ impl JobManager {
             )?;
         }
 
-        // Phase 2: collect every active queued row across every store.
-        // Rows with a concrete `job_id` are grouped by id for collision
-        // detection; rows with `job_id IS NULL` are collected
-        // separately and get fresh globally-unique ids assigned from
-        // the daemon-global allocator *after* seeding.
-        //
-        // `observed_max` must span **every historical row**, not just
-        // currently `queued` ones: `JobId` is an external identifier
-        // (surfaced via `jobs list` etc.) so re-issuing an id that
-        // already named a terminal run would break identifier
-        // stability. The active queued rows are still the only
-        // source for the collision grouping (terminal rows can't
-        // collide with anything — they're not going to be
-        // re-dispatched) but the allocator floor must clear the
-        // whole-store historical max.
-        let mut active_by_id: HashMap<JobId, Vec<RestoreRow>> = HashMap::new();
+        // Phase 2: collect every row across every store — all
+        // statuses, not just `queued`. `JobId` is an external
+        // identifier (`jobs.list` / `jobs.cancel`), so a terminal
+        // row that shares an id with a queued row in a sibling store
+        // is a collision even though the terminal row is never
+        // re-dispatched: a stale client's `cancel(old_id)` would
+        // otherwise silently target the queued sibling. Rows with a
+        // concrete `job_id` are grouped by id for collision
+        // detection; rows with `job_id IS NULL` (queued only,
+        // realistically) get fresh globally-unique ids assigned from
+        // the allocator *after* seeding. `observed_max` spans every
+        // historical row so the allocator floor clears the whole
+        // history.
+        let mut all_by_id: HashMap<JobId, Vec<RestoreRow>> = HashMap::new();
         let mut missing_id_rows: Vec<RestoreRow> = Vec::new();
         let mut observed_max: JobId = 0;
         // Tombstoned ids are permanently retired. Historical store
@@ -779,9 +783,8 @@ impl JobManager {
                 observed_max = observed_max.max(m);
             }
             let mut stmt = conn.prepare(
-                "SELECT job_id, manifest_id, analyzer_id
+                "SELECT job_id, manifest_id, analyzer_id, status
                  FROM workspace_analysis_runs
-                 WHERE status = 'queued'
                  ORDER BY started_at_ns ASC, analyzer_id ASC",
             )?;
             let rows = stmt
@@ -790,10 +793,12 @@ impl JobManager {
                         r.get::<_, Option<i64>>(0)?,
                         ManifestId(r.get::<_, i64>(1)?),
                         r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (maybe_id, manifest_id, analyzer_id) in rows {
+            for (maybe_id, manifest_id, analyzer_id, status) in rows {
+                let is_active = status == "queued";
                 let row = RestoreRow {
                     alias: entry.alias.clone(),
                     repo_hash: entry.repo_hash.clone(),
@@ -801,10 +806,19 @@ impl JobManager {
                     repo_root: PathBuf::from(&entry.root_path),
                     manifest_id,
                     analyzer_id,
+                    is_active,
                 };
                 match maybe_id {
-                    Some(id) => active_by_id.entry(id).or_default().push(row),
-                    None => missing_id_rows.push(row),
+                    Some(id) => all_by_id.entry(id).or_default().push(row),
+                    None => {
+                        // A NULL `job_id` on a terminal row is
+                        // meaningless (it was never externally
+                        // named) — skip it. Only queued rows realistically
+                        // land here.
+                        if is_active {
+                            missing_id_rows.push(row);
+                        }
+                    }
                 }
             }
         }
@@ -824,13 +838,17 @@ impl JobManager {
         for row in missing_id_rows {
             let new_id = self.allocate_job_id()?;
             let conn = cas_store::open(&row.store_path)?;
+            // Identity-only: assign the new `job_id` without
+            // touching `cancel_requested`. A queued row whose
+            // cancel had already been requested must remain
+            // scheduled for cancellation.
             conn.execute(
                 "UPDATE workspace_analysis_runs
-                 SET job_id = ?1, cancel_requested = 0
+                 SET job_id = ?1
                  WHERE manifest_id = ?2 AND analyzer_id = ?3",
                 params![new_id, row.manifest_id.0, row.analyzer_id],
             )?;
-            active_by_id.entry(new_id).or_default().push(row);
+            all_by_id.entry(new_id).or_default().push(row);
         }
 
         // Phase 3: rewrite collision groups. A group needs recycling
@@ -857,7 +875,7 @@ impl JobManager {
         // unknown, and the next restart sees the surviving row's id
         // in `existing_tombstones` and recycles it.
         let mut new_ambiguous_ids: Vec<JobId> = Vec::new();
-        for (old_id, rows) in &active_by_id {
+        for (old_id, rows) in &all_by_id {
             if rows.len() > 1 && !existing_tombstones.contains(old_id) {
                 new_ambiguous_ids.push(*old_id);
             }
@@ -869,25 +887,31 @@ impl JobManager {
             tx.commit()?;
         }
         let mut recycled: Vec<(JobId, JobId)> = Vec::new();
-        let mut active_after_recycle: Vec<(JobId, RestoreRow)> = Vec::new();
-        for (old_id, rows) in active_by_id {
+        let mut rows_after_recycle: Vec<(JobId, RestoreRow)> = Vec::new();
+        for (old_id, rows) in all_by_id {
             let must_recycle = rows.len() > 1 || existing_tombstones.contains(&old_id);
             if !must_recycle {
                 let row = rows.into_iter().next().expect("len checked");
-                active_after_recycle.push((old_id, row));
+                rows_after_recycle.push((old_id, row));
                 continue;
             }
             for row in rows {
                 let new_id = self.allocate_job_id()?;
                 let conn = cas_store::open(&row.store_path)?;
+                // Identity-only rewrite: `cancel_requested` is a
+                // scheduling flag, not part of the identity, so it
+                // must survive the recycle. Otherwise a queued row
+                // whose cancel was requested pre-restart would be
+                // silently re-armed, and a terminal row's
+                // historical `cancel_requested` value would be lost.
                 conn.execute(
                     "UPDATE workspace_analysis_runs
-                     SET job_id = ?1, cancel_requested = 0
+                     SET job_id = ?1
                      WHERE manifest_id = ?2 AND analyzer_id = ?3",
                     params![new_id, row.manifest_id.0, row.analyzer_id],
                 )?;
                 recycled.push((old_id, new_id));
-                active_after_recycle.push((new_id, row));
+                rows_after_recycle.push((new_id, row));
             }
         }
         if !recycled.is_empty() {
@@ -897,11 +921,16 @@ impl JobManager {
             );
         }
 
-        // Phase 4: advertise every active row to the memory queue.
-        // `JobKey` now carries `repo_hash`, so `reserve_existing`
-        // cannot coalesce two stores that happen to share
-        // `(manifest_id, analyzer_id)`.
-        for (id, row) in active_after_recycle {
+        // Phase 4: advertise every *active* row to the memory queue.
+        // Terminal rows are still part of `rows_after_recycle` for
+        // collision purposes but must not be dispatched — they are
+        // filtered out here by the `is_active` flag. `JobKey` carries
+        // `repo_hash`, so `reserve_existing` cannot coalesce two
+        // stores that happen to share `(manifest_id, analyzer_id)`.
+        for (id, row) in rows_after_recycle {
+            if !row.is_active {
+                continue;
+            }
             let key = JobKey {
                 repo_hash: row.repo_hash.clone(),
                 manifest_id: row.manifest_id,
@@ -2742,6 +2771,17 @@ mod tests {
         status: &str,
         job_id: Option<i64>,
     ) {
+        insert_job_run_with_cancel(conn, manifest_id, analyzer_id, status, job_id, 0);
+    }
+
+    fn insert_job_run_with_cancel(
+        conn: &rusqlite::Connection,
+        manifest_id: i64,
+        analyzer_id: &str,
+        status: &str,
+        job_id: Option<i64>,
+        cancel_requested: i64,
+    ) {
         let finished_at_ns = RunStatus::from_str(status)
             .filter(|state| state.is_terminal())
             .map(|_| 20_i64);
@@ -2749,10 +2789,31 @@ mod tests {
             "INSERT INTO workspace_analysis_runs
                (manifest_id, analyzer_id, analyzer_revision, config_hash, status,
                 started_at_ns, finished_at_ns, error, job_id, cancel_requested)
-             VALUES (?1, ?2, 1, 'cfg', ?3, 10, ?4, NULL, ?5, 0)",
-            rusqlite::params![manifest_id, analyzer_id, status, finished_at_ns, job_id],
+             VALUES (?1, ?2, 1, 'cfg', ?3, 10, ?4, NULL, ?5, ?6)",
+            rusqlite::params![
+                manifest_id,
+                analyzer_id,
+                status,
+                finished_at_ns,
+                job_id,
+                cancel_requested
+            ],
         )
         .unwrap();
+    }
+
+    fn persisted_cancel_requested(
+        conn: &rusqlite::Connection,
+        manifest_id: i64,
+        analyzer_id: &str,
+    ) -> i64 {
+        conn.query_row(
+            "SELECT cancel_requested FROM workspace_analysis_runs
+             WHERE manifest_id = ?1 AND analyzer_id = ?2",
+            rusqlite::params![manifest_id, analyzer_id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     fn count_runs(conn: &rusqlite::Connection, manifest_id: i64, analyzer_id: &str) -> i64 {
@@ -3374,6 +3435,166 @@ mod tests {
         assert!(
             format!("{err}").contains("job id allocator overflowed"),
             "restore must fail closed when allocator overflows, got {err}"
+        );
+    }
+
+    #[test]
+    fn restore_recycles_terminal_plus_queued_collision_and_cancel_cannot_target_active_with_old_id()
+    {
+        // Cross-store collision where one side is terminal and the
+        // other is queued. `JobId` is an external identifier, so a
+        // stale client that recorded "job 42 succeeded" for store A
+        // must not be able to cancel store B's still-queued job 42
+        // just because A's row is not on the dispatch path. Restore
+        // must rewrite BOTH the terminal and the queued row to fresh
+        // globally-unique ids, tombstone 42, and reject `cancel(42)`.
+        let manifest_id = ManifestId(1);
+        let (_data, _repo_a, _repo_b, manager, conn_a, conn_b) = two_store_fixture(manifest_id);
+        insert_job_run(&conn_a, manifest_id.0, "pyright-lsp", "succeeded", Some(42));
+        insert_job_run(&conn_b, manifest_id.0, "pyright-lsp", "queued", Some(42));
+
+        manager.restore_from_db().unwrap();
+
+        let a_id = persisted_job_id(&conn_a, manifest_id.0, "pyright-lsp");
+        let b_id = persisted_job_id(&conn_b, manifest_id.0, "pyright-lsp");
+        assert_ne!(a_id, 42, "terminal side must be recycled");
+        assert_ne!(b_id, 42, "queued side must be recycled");
+        assert_ne!(a_id, b_id, "both sides must land on distinct ids");
+
+        // `cancel(42)` must return unknown, not silently target B.
+        let err = manager.cancel(42).unwrap_err();
+        assert!(format!("{err}").contains("unknown job id"));
+        let status_b: String = conn_b
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'pyright-lsp'",
+                rusqlite::params![manifest_id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_b, "queued", "B's queued row must be untouched");
+    }
+
+    #[test]
+    fn restore_recycles_terminal_terminal_collision_for_globally_unique_job_list() {
+        // Two terminal rows sharing a `JobId` also constitute a
+        // collision from the `jobs.list` / external-identifier
+        // perspective: two distinct historical runs cannot share the
+        // same id. Restore must rewrite both to fresh ids and record
+        // the tombstone for the shared old id.
+        let manifest_id = ManifestId(1);
+        let (data, _repo_a, _repo_b, manager, conn_a, conn_b) = two_store_fixture(manifest_id);
+        insert_job_run(&conn_a, manifest_id.0, "pyright-lsp", "succeeded", Some(99));
+        insert_job_run(&conn_b, manifest_id.0, "pyright-lsp", "failed", Some(99));
+
+        manager.restore_from_db().unwrap();
+
+        let a_id = persisted_job_id(&conn_a, manifest_id.0, "pyright-lsp");
+        let b_id = persisted_job_id(&conn_b, manifest_id.0, "pyright-lsp");
+        assert_ne!(a_id, 99);
+        assert_ne!(b_id, 99);
+        assert_ne!(a_id, b_id);
+        let index = cas_registry::open(&data.path().join("index.db")).unwrap();
+        assert!(
+            cas_registry::is_ambiguous_job_id(&index, 99).unwrap(),
+            "the shared terminal id must be tombstoned"
+        );
+        // Neither terminal row is dispatchable — JobIndex must NOT
+        // list them (Phase 4 filters by is_active).
+        assert!(manager.job_index.get(a_id).is_none());
+        assert!(manager.job_index.get(b_id).is_none());
+    }
+
+    #[test]
+    fn pruning_terminal_collision_cannot_remove_other_store_active_job_index() {
+        // Composed invariant: even when a terminal row and an active
+        // row shared a `JobId` at persist time, a later `prune_jobs`
+        // must not touch the active sibling's `JobIndex` entry.
+        // Restore's terminal recycling is what makes this safe —
+        // after rewrite the terminal side's id no longer matches
+        // the active side's, so `prune_jobs_in_store`'s
+        // `remove_many(&orphan_terminal_ids)` on store A cannot
+        // touch store B's entry.
+        let manifest_id = ManifestId(1);
+        let (_data, _repo_a, _repo_b, manager, conn_a, conn_b) = two_store_fixture(manifest_id);
+        // Terminal orphan in store A (no anchor references
+        // manifest_id=1, so it satisfies the prune predicate).
+        insert_job_run(&conn_a, manifest_id.0, "pyright-lsp", "succeeded", Some(7));
+        // Queued row in store B with the same id.
+        insert_job_run(&conn_b, manifest_id.0, "pyright-lsp", "queued", Some(7));
+
+        manager.restore_from_db().unwrap();
+
+        let b_id = persisted_job_id(&conn_b, manifest_id.0, "pyright-lsp");
+        assert_ne!(b_id, 7);
+        assert!(
+            manager.job_index.get(b_id).is_some(),
+            "B's active row must be registered under its fresh id"
+        );
+
+        // Prune terminal orphans across both stores.
+        manager.prune_jobs(None, false).unwrap();
+
+        // B's active JobIndex entry must survive — its id is fresh
+        // and unrelated to A's terminal orphan.
+        assert!(
+            manager.job_index.get(b_id).is_some(),
+            "prune must not evict B's active locator via the shared old id"
+        );
+    }
+
+    #[test]
+    fn collision_recycle_preserves_cancel_requested_on_queued_row() {
+        // Identity-only rewrite: a queued row whose cancel was
+        // requested pre-restart must NOT be silently re-armed by
+        // the collision-recycle SQL. `cancel_requested = 1` must
+        // survive the id rewrite so the worker still treats the
+        // job as cancelled once it drains from the memory queue.
+        let manifest_id = ManifestId(1);
+        let (_data, _repo_a, _repo_b, manager, conn_a, conn_b) = two_store_fixture(manifest_id);
+        insert_job_run_with_cancel(&conn_a, manifest_id.0, "pyright-lsp", "queued", Some(3), 1);
+        insert_job_run(&conn_b, manifest_id.0, "pyright-lsp", "queued", Some(3));
+
+        manager.restore_from_db().unwrap();
+
+        // A's row was recycled to a fresh id but its cancel flag
+        // must be intact.
+        assert_ne!(persisted_job_id(&conn_a, manifest_id.0, "pyright-lsp"), 3);
+        assert_eq!(
+            persisted_cancel_requested(&conn_a, manifest_id.0, "pyright-lsp"),
+            1,
+            "collision recycle must preserve cancel_requested = 1"
+        );
+        // B's row was untouched by the cancel flag.
+        assert_eq!(
+            persisted_cancel_requested(&conn_b, manifest_id.0, "pyright-lsp"),
+            0
+        );
+    }
+
+    #[test]
+    fn collision_recycle_preserves_cancel_requested_on_terminal_row() {
+        // Terminal rows also carry `cancel_requested` as historical
+        // record. The recycle must not clobber it.
+        let manifest_id = ManifestId(1);
+        let (_data, _repo_a, _repo_b, manager, conn_a, conn_b) = two_store_fixture(manifest_id);
+        insert_job_run_with_cancel(
+            &conn_a,
+            manifest_id.0,
+            "pyright-lsp",
+            "cancelled",
+            Some(8),
+            1,
+        );
+        insert_job_run(&conn_b, manifest_id.0, "pyright-lsp", "queued", Some(8));
+
+        manager.restore_from_db().unwrap();
+
+        assert_ne!(persisted_job_id(&conn_a, manifest_id.0, "pyright-lsp"), 8);
+        assert_eq!(
+            persisted_cancel_requested(&conn_a, manifest_id.0, "pyright-lsp"),
+            1,
+            "terminal recycle must preserve cancel_requested = 1"
         );
     }
 
