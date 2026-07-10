@@ -1,9 +1,18 @@
-//! Top-level alias → store mapping for CAS-managed repos.
+//! `index.db` — daemon-global metadata for CAS-managed repos.
 //!
-//! Each registered repo gets one row keyed by the user-facing alias.
-//! `repo_hash` names the per-repo store directory under `repos/`; the
-//! daemon consults this index whenever a query references a repo by
-//! alias.
+//! Two responsibilities live in this module:
+//!
+//! - **Alias registry.** Each registered repo gets one row in
+//!   `aliases`, keyed by the user-facing alias. `repo_hash` names
+//!   the per-repo store directory under `repos/`; the daemon
+//!   consults this index whenever a query references a repo by
+//!   alias.
+//! - **Retired ambiguous `JobId` tombstones.** `ambiguous_job_ids`
+//!   records every `JobId` value that was ambiguous across stores
+//!   at some restart. See `JobManager::restore_from_db` for the
+//!   collision-recycle protocol; the tombstone guarantees that
+//!   `cancel(retired_id)` returns `unknown job id` even after a
+//!   partial cross-store rewrite crashed midway.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
