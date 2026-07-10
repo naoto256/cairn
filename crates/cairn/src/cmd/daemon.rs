@@ -42,10 +42,7 @@ pub async fn run(args: Args) -> Result<()> {
     });
     cas_data_dir.ensure()?;
     info!(root = %cas_data_dir.root().display(), "storage open");
-    let job_manager = JobManager::new(cas_data_dir.clone());
-    if let Err(err) = job_manager.restore_from_db() {
-        tracing::warn!(error = %err, "failed to restore queued analyzer jobs");
-    }
+    let job_manager = init_job_manager(cas_data_dir.clone())?;
     job_manager.start_workers();
     let watch_manager = Arc::new(WatchManager::with_jobs(
         cas_data_dir.clone(),
@@ -99,6 +96,25 @@ fn spawn_signal_handler(shutdown: Arc<Notify>) {
     });
 }
 
+/// Construct the `JobManager` and run `restore_from_db` up front.
+/// `restore_from_db` is load-bearing: it seeds the daemon-global
+/// `JobId` allocator above every store's historical + tombstoned
+/// max, recycles cross-store collisions, and reserves tracked keys
+/// / `JobIndex` for still-active rows. Continuing after a restore
+/// failure would leave the allocator unseeded against persisted
+/// ids and omit active rows from `JobIndex` / `TrackedJobKeys`, so
+/// later enqueues or `cancel(job_id)` calls could collide with or
+/// misroute onto a still-live sibling. Fail closed so the
+/// supervisor (systemd / launchd / operator) surfaces the failure
+/// and the DB state can be repaired before the daemon comes up.
+fn init_job_manager(cas_data_dir: Arc<CasDataDir>) -> Result<Arc<JobManager>> {
+    let job_manager = JobManager::new(cas_data_dir);
+    job_manager
+        .restore_from_db()
+        .map_err(|e| anyhow::anyhow!("failed to restore queued analyzer jobs: {e}"))?;
+    Ok(job_manager)
+}
+
 async fn start_registered_watchers(watch_manager: Arc<WatchManager>) {
     let result = tokio::task::spawn_blocking(move || {
         if let Err(err) = watch_manager.start_registered() {
@@ -116,6 +132,42 @@ mod tests {
     use super::*;
     use cairn_core::cas::registry as cas_registry;
     use cairn_core::paths::{CasDataDir, path_hash};
+
+    #[test]
+    fn init_job_manager_propagates_restore_failure() {
+        // Fail-closed contract: if `restore_from_db` errors, daemon
+        // startup must not construct a working `JobManager`.
+        // Otherwise `start_workers` would run with an unseeded
+        // allocator and an empty `JobIndex` / `TrackedJobKeys`,
+        // breaking the global identity invariants restore is
+        // responsible for establishing. Trigger the failure by
+        // inserting a tombstone at `i64::MAX` — the allocator seed
+        // bump then overflows and fails closed.
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        {
+            let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::insert_ambiguous_ids(&tx, &[i64::MAX], 1).unwrap();
+            tx.commit().unwrap();
+        }
+        let err = init_job_manager(cas).err().expect("restore must fail");
+        assert!(
+            format!("{err:#}").contains("failed to restore queued analyzer jobs"),
+            "restore failure must be surfaced as a startup error, got {err:#}"
+        );
+    }
+
+    #[test]
+    fn init_job_manager_returns_ok_on_clean_data_dir() {
+        // Baseline: on a fresh data dir with no aliases, restore
+        // succeeds and `init_job_manager` returns the manager.
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        assert!(init_job_manager(cas).is_ok());
+    }
 
     #[tokio::test]
     async fn start_registered_watchers_waits_until_alias_is_watched() {
