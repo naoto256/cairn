@@ -1,19 +1,53 @@
 //! Long-lived LSP client pool for workspace analyzers.
+//!
+//! The pool caps the number of live child processes at a hard
+//! capacity (default 16, override via `CAIRN_LSP_POOL_MAX_ENTRIES`,
+//! range `1..=64`; invalid/0 → default; >64 → clamp + warn), and
+//! acquires each entry under a RAII lease that prevents eviction
+//! while in use. Full lifecycle contract:
+//!
+//! - Acquire: existing Ready key → bump lease + LRU; existing
+//!   Evicting key → [`Error::PoolDraining`] (same-key acquire may
+//!   not join an in-flight eviction); new key + slot free →
+//!   insert; full + a Ready idle victim → mark victim `Evicting`
+//!   (record stays in registry so it still counts toward capacity)
+//!   → shutdown outside the registry lock → on
+//!   termination-proven completion (clean `Ok(())` OR
+//!   termination-proven `Err`) remove the placeholder and retry;
+//!   full + no Ready idle victim → [`Error::PoolAtCapacity`]. A
+//!   termination-unproven shutdown keeps the placeholder AND
+//!   poisons the pool globally — no other key can spawn a
+//!   replacement while a possibly-live orphan may still hold
+//!   resources.
+//! - Force-shutdown: transitions `Running → Draining`, rejects new
+//!   acquisitions, iterates cleanup with a per-entry timeout, and
+//!   transitions back to `Running` on complete success; if any entry
+//!   cleanup times out, the pool becomes `Poisoned` and permanently
+//!   rejects new acquisitions until the daemon restarts (the daemon
+//!   cannot silently spawn a replacement child alongside a
+//!   possibly-still-live orphan).
+//! - Final shutdown transitions to `Stopped` and rejects new
+//!   acquisitions.
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::process::Command;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tracing::{debug, warn};
 
-use super::{LspClient, Position, Result, Url};
+use super::{Error, LspClient, Position, Result, Url};
+
+const DEFAULT_POOL_CAPACITY: usize = 16;
+const MAX_POOL_CAPACITY: usize = 64;
+const POOL_CAPACITY_ENV: &str = "CAIRN_LSP_POOL_MAX_ENTRIES";
 
 type ClientWork<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
@@ -129,28 +163,297 @@ impl PooledLsp<'_> {
     }
 }
 
-/// Daemon-scoped pool of long-lived LSP clients.
+/// Daemon-scoped pool of long-lived LSP clients with a hard
+/// capacity, LRU eviction, and fail-closed drain/poison states.
 pub struct LspClientPool {
     runtime: Runtime,
-    entries: RwLock<HashMap<PoolKey, Arc<PoolEntry>>>,
+    registry: Arc<StdMutex<PoolRegistry>>,
+    capacity: NonZeroUsize,
+}
+
+struct PoolRegistry {
+    mode: PoolMode,
+    entries: HashMap<PoolKey, PoolRecord>,
+    /// Monotonic counter; every acquire bumps it and stamps the
+    /// record's `last_used`. Overflow at `u64::MAX` is a
+    /// (theoretical) fail-closed error rather than a wrap.
+    access_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolMode {
+    /// Normal operation. Acquire, evict, insert all permitted.
+    Running,
+    /// A `force_shutdown_all` is in flight. New acquires reject
+    /// with `PoolDraining`; the drain iterator has already taken
+    /// the entries out of the registry.
+    Draining,
+    /// A prior `force_shutdown_all` could not prove that at least
+    /// one child terminated. All future acquires reject.
+    Poisoned,
+    /// Daemon-level final shutdown. All future acquires reject.
+    Stopped,
+}
+
+struct PoolRecord {
+    entry: Arc<PoolEntry>,
+    active_leases: usize,
+    last_used: u64,
+    state: RecordState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordState {
+    /// Normal entry — acquire may lease it, LRU may pick it as a
+    /// victim when idle.
+    Ready,
+    /// LRU eviction reserved this record as a victim. It still
+    /// counts toward `capacity`, so a concurrent `acquire` cannot
+    /// spawn a replacement child in its place, but it is not
+    /// leasable (same-key acquires reject with `PoolDraining` and
+    /// LRU never picks another Evicting record). The eviction
+    /// caller holds the `Arc<PoolEntry>` and runs `entry.shutdown()`
+    /// outside the registry lock. On any **termination-proven
+    /// completion** — clean `Ok(())` or an error whose
+    /// `is_termination_unproven` is false — the record is removed
+    /// from the registry so its capacity slot is freed. Only a
+    /// termination-unproven error keeps the record in place AND
+    /// poisons the pool globally, so the possibly-live orphan
+    /// cannot be forgotten and no replacement child can be spawned
+    /// anywhere until the daemon restarts.
+    Evicting,
+}
+
+/// RAII lease held for the duration of one `with_lsp` call. The
+/// `Arc<PoolEntry>` inside is stable across concurrent acquires of
+/// the same key (they share this record). On drop the record's
+/// `active_leases` is decremented, but only if the record we
+/// registered against is still the one the registry holds — a
+/// force-shutdown that evicted us and let a replacement be
+/// installed must not have its lease counter mutated by our drop.
+struct PoolLease {
+    key: PoolKey,
+    entry: Arc<PoolEntry>,
+    registry: Arc<StdMutex<PoolRegistry>>,
+}
+
+impl std::fmt::Debug for PoolLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolLease")
+            .field("key.language", &self.key.language)
+            .field("key.analyzer_id", &self.key.analyzer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        let mut reg = match self.registry.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(record) = reg.entries.get_mut(&self.key)
+            && Arc::ptr_eq(&record.entry, &self.entry)
+        {
+            // Underflow is a lease-accounting bug (double-release
+            // of the same lease), not a benign clamp: silently
+            // saturating would let the counter drift below zero
+            // and allow an incorrectly-tracked "idle" entry to be
+            // evicted while its Arc is still in use. Fail-closed
+            // by poisoning the pool so no further acquisitions
+            // can proceed until the daemon restarts.
+            match record.active_leases.checked_sub(1) {
+                Some(new) => record.active_leases = new,
+                None => {
+                    warn!(
+                        language = %self.key.language,
+                        analyzer = %self.key.analyzer_id,
+                        "lsp pool: lease counter underflow on drop; poisoning pool"
+                    );
+                    reg.mode = PoolMode::Poisoned;
+                }
+            }
+        }
+    }
+}
+
+/// Resolve `CAIRN_LSP_POOL_MAX_ENTRIES` to a capacity. Pure function
+/// over the raw env value so tests can pin the parse contract
+/// without mutating the process-global env. The contract:
+///
+/// | input                     | result                     |
+/// |---------------------------|----------------------------|
+/// | `None` (env unset)        | default (16)               |
+/// | empty / whitespace-only   | default                    |
+/// | non-numeric               | default + warn             |
+/// | negative (`-N`)           | default + warn             |
+/// | `0`                       | default + warn             |
+/// | `1..=MAX_POOL_CAPACITY`   | value                      |
+/// | positive numeric > MAX (including strings that overflow `u128`) | clamp to MAX + warn |
+///
+/// Values that would overflow `i64` (e.g. `"9" * 40`) are treated
+/// as "positive numeric > MAX" and clamped — they do NOT fall into
+/// the invalid-non-numeric bucket. This means "invalid string" and
+/// "positive overflow" are semantically distinguished by whether
+/// the input is all ASCII digits.
+fn capacity_from_env_value(raw: Option<&str>) -> NonZeroUsize {
+    let default = NonZeroUsize::new(DEFAULT_POOL_CAPACITY).expect("compile-time constant > 0");
+    let max = NonZeroUsize::new(MAX_POOL_CAPACITY).expect("compile-time constant > 0");
+    let Some(raw) = raw else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    // Reject any leading `-` explicitly so `-5` doesn't parse as a
+    // valid non-negative via later fall-through.
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        // `-` alone or `-<non-digit>` → non-numeric; `-<digits>` →
+        // negative. Both are user errors that fall back to default.
+        let label = if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+            "lsp pool capacity must be > 0; using default"
+        } else {
+            "invalid lsp pool capacity; using default"
+        };
+        warn!(env = POOL_CAPACITY_ENV, value = %raw, default = DEFAULT_POOL_CAPACITY, "{}", label);
+        return default;
+    }
+    // Non-negative. Parse as `u128` so very large positive values
+    // clamp to MAX rather than falling into the invalid bucket.
+    // If the string is all ASCII digits but overflows u128
+    // (>~10^38), still treat as "positive numeric > MAX" and clamp.
+    let all_digits = trimmed.chars().all(|c| c.is_ascii_digit());
+    let parsed: u128 = match trimmed.parse::<u128>() {
+        Ok(v) => v,
+        Err(_) if all_digits => {
+            warn!(
+                env = POOL_CAPACITY_ENV,
+                value = %raw,
+                max = MAX_POOL_CAPACITY,
+                "lsp pool capacity exceeds max; clamping"
+            );
+            return max;
+        }
+        Err(_) => {
+            warn!(
+                env = POOL_CAPACITY_ENV,
+                value = %raw,
+                default = DEFAULT_POOL_CAPACITY,
+                "invalid lsp pool capacity; using default"
+            );
+            return default;
+        }
+    };
+    if parsed == 0 {
+        warn!(
+            env = POOL_CAPACITY_ENV,
+            value = %raw,
+            default = DEFAULT_POOL_CAPACITY,
+            "lsp pool capacity must be > 0; using default"
+        );
+        return default;
+    }
+    if parsed > MAX_POOL_CAPACITY as u128 {
+        warn!(
+            env = POOL_CAPACITY_ENV,
+            value = %raw,
+            max = MAX_POOL_CAPACITY,
+            "lsp pool capacity exceeds max; clamping"
+        );
+        return max;
+    }
+    // 1..=MAX_POOL_CAPACITY: safe to cast.
+    NonZeroUsize::new(parsed as usize).unwrap_or(default)
+}
+
+fn parse_capacity_env() -> NonZeroUsize {
+    capacity_from_env_value(std::env::var(POOL_CAPACITY_ENV).ok().as_deref())
+}
+
+/// Aggregated per-entry outcomes for `force_shutdown_all`. Split
+/// into regular-error and termination-unproven-error slots so an
+/// unproven signal that arrived after a regular protocol error is
+/// still surfaced — the safety-critical cause must not be lost to
+/// order-of-arrival.
+#[derive(Debug, Default)]
+struct ForceShutdownOutcome {
+    /// First non-termination-proof error observed (protocol
+    /// failure, etc.). Termination-proven Errs whose child WAS
+    /// reaped.
+    first_regular_err: Option<Error>,
+    /// First termination-unproven error observed. Preserved
+    /// separately so its identity survives even when a regular
+    /// error came first.
+    first_unproven_err: Option<Error>,
+    /// Set when the outer per-entry `timeout(..)` actually fired
+    /// (as opposed to `entry.shutdown()` returning an unproven
+    /// error under its own steam). Drives whether the finalize
+    /// generates the synthetic "outer timeout" ChildTerminationFailed.
+    timed_out: bool,
+}
+
+impl ForceShutdownOutcome {
+    fn termination_unproven(&self) -> bool {
+        self.first_unproven_err.is_some() || self.timed_out
+    }
+}
+
+fn classify_force_shutdown_results(
+    results: Vec<std::result::Result<Result<()>, tokio::time::error::Elapsed>>,
+    entry_timeout: Duration,
+) -> ForceShutdownOutcome {
+    let mut out = ForceShutdownOutcome::default();
+    for outcome in results {
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if e.is_termination_unproven() {
+                    if out.first_unproven_err.is_none() {
+                        out.first_unproven_err = Some(e);
+                    }
+                } else if out.first_regular_err.is_none() {
+                    out.first_regular_err = Some(e);
+                }
+            }
+            Err(_) => {
+                out.timed_out = true;
+                warn!(
+                    timeout_ms = entry_timeout.as_millis(),
+                    "timed out shutting down stalled LSP pool entry"
+                );
+            }
+        }
+    }
+    out
 }
 
 impl LspClientPool {
-    /// Create an empty pool.
+    /// Create an empty pool sized from the environment.
     ///
     /// # Errors
     /// Returns an LSP protocol error if the dedicated Tokio runtime
     /// cannot be created.
     pub fn new() -> Result<Self> {
+        Self::with_capacity(parse_capacity_env())
+    }
+
+    fn with_capacity(capacity: NonZeroUsize) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .thread_name("cairn-lsp-pool")
             .build()
-            .map_err(|e| super::Error::Protocol(format!("lsp pool runtime: {e}")))?;
+            .map_err(|e| Error::Protocol(format!("lsp pool runtime: {e}")))?;
+        debug!(capacity = capacity.get(), "lsp pool initialized");
         Ok(Self {
             runtime,
-            entries: RwLock::new(HashMap::new()),
+            registry: Arc::new(StdMutex::new(PoolRegistry {
+                mode: PoolMode::Running,
+                entries: HashMap::new(),
+                access_seq: 0,
+            })),
+            capacity,
         })
     }
 
@@ -158,92 +461,437 @@ impl LspClientPool {
     /// when needed according to `spawn_spec`.
     ///
     /// # Errors
-    /// Returns LSP spawn/readiness/protocol errors from the pooled
-    /// client.
+    /// - [`Error::PoolAtCapacity`] if the pool is full and no idle
+    ///   entry is available to evict.
+    /// - [`Error::PoolDraining`] / [`Error::PoolPoisoned`] /
+    ///   [`Error::PoolStopped`] if the pool is not accepting new
+    ///   acquisitions.
+    /// - LSP spawn/readiness/protocol errors from the pooled client.
     pub fn with_lsp<T, F>(&self, key: PoolKey, spawn_spec: LspSpawnSpec, work: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut PooledLsp<'a>) -> ClientWork<'a, T>,
     {
-        let entry = self.entry(key)?;
-        self.runtime
-            .block_on(async move { entry.with_lsp_client(spawn_spec, work).await })
-    }
-
-    /// Gracefully stop all live clients and clear the registry.
-    ///
-    /// # Errors
-    /// Returns the first LSP shutdown error observed.
-    pub fn shutdown_all(&self) -> Result<()> {
-        let entries = {
-            let mut registry = self
-                .entries
-                .write()
-                .map_err(|_| super::Error::Protocol("lsp pool registry poisoned".into()))?;
-            registry.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
-        };
-        self.runtime.block_on(async move {
-            for entry in entries {
-                entry.shutdown().await?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Evict all live clients from the registry and give each entry a
-    /// bounded grace period to shut down. This is used after analyzer stall
-    /// detection so the next analyzer run does not inherit a wedged pool key.
-    ///
-    /// # Errors
-    /// Returns the first LSP shutdown error observed before a timeout.
-    pub fn force_shutdown_all(&self, entry_timeout: Duration) -> Result<()> {
-        let entries = {
-            let mut registry = self
-                .entries
-                .write()
-                .map_err(|_| super::Error::Protocol("lsp pool registry poisoned".into()))?;
-            registry.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
-        };
-        self.runtime.block_on(async move {
-            for entry in entries {
-                match timeout(entry_timeout, entry.shutdown()).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_ms = entry_timeout.as_millis(),
-                            "timed out shutting down stalled LSP pool entry"
-                        );
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
-
-    fn entry(&self, key: PoolKey) -> Result<Arc<PoolEntry>> {
+        let lease = self
+            .runtime
+            .block_on(async { self.acquire_lease(key).await })?;
+        let entry = Arc::clone(&lease.entry);
+        let result = self
+            .runtime
+            .block_on(async move { entry.with_lsp_client(spawn_spec, work).await });
+        drop(lease);
+        // Central poison propagation: any termination-unproven
+        // error observed on the normal path (spawn/initialize/
+        // readiness/ServerExited cleanup) must poison the pool so
+        // no replacement can spawn alongside a possibly-still-live
+        // orphan. Same helper the LRU eviction path uses; both
+        // preserve `Stopped`.
+        if let Err(ref e) = result
+            && e.is_termination_unproven()
         {
-            let registry = self
-                .entries
-                .read()
-                .map_err(|_| super::Error::Protocol("lsp pool registry poisoned".into()))?;
-            if let Some(entry) = registry.get(&key) {
-                return Ok(Arc::clone(entry));
+            self.poison_from_unproven_cleanup(&e.to_string());
+        }
+        result
+    }
+
+    fn poison_from_unproven_cleanup(&self, context: &str) {
+        let Ok(mut reg) = self.registry.lock() else {
+            return;
+        };
+        match reg.mode {
+            PoolMode::Stopped => {}
+            _ => {
+                warn!(
+                    context = context,
+                    "lsp pool: termination unproven; poisoning pool"
+                );
+                reg.mode = PoolMode::Poisoned;
             }
         }
+    }
 
-        let mut registry = self
-            .entries
-            .write()
-            .map_err(|_| super::Error::Protocol("lsp pool registry poisoned".into()))?;
-        Ok(Arc::clone(
-            registry
-                .entry(key)
-                .or_insert_with(|| Arc::new(PoolEntry::default())),
-        ))
+    /// Acquire a lease on `key`, evicting an idle LRU victim outside
+    /// the registry lock when the pool is at capacity. If the
+    /// victim's shutdown fails, the current acquisition fails with
+    /// that shutdown error rather than silently spawning a
+    /// replacement.
+    async fn acquire_lease(&self, key: PoolKey) -> Result<PoolLease> {
+        loop {
+            // Under the registry lock: either satisfy the acquire
+            // directly (existing Ready key or free capacity slot)
+            // and return, or reserve a victim for eviction. When
+            // reserving a victim we set `state = Evicting` and keep
+            // the record in the registry so it still counts toward
+            // `capacity` — no other thread can spawn a replacement
+            // child in its slot while the victim's shutdown is in
+            // flight outside the lock.
+            let (victim_key, victim_entry) = {
+                let mut reg = self.lock_registry()?;
+                match reg.mode {
+                    PoolMode::Running => {}
+                    PoolMode::Draining => return Err(Error::PoolDraining),
+                    PoolMode::Poisoned => return Err(Error::PoolPoisoned),
+                    PoolMode::Stopped => return Err(Error::PoolStopped),
+                }
+                // Existing key — Ready → bump lease; Evicting →
+                // reject with `PoolDraining` (same-key concurrent
+                // acquire cannot join an in-flight eviction, and
+                // must not spawn a replacement while the victim
+                // may still hold the child).
+                if let Some(record) = reg.entries.get(&key) {
+                    match record.state {
+                        RecordState::Evicting => return Err(Error::PoolDraining),
+                        RecordState::Ready => {}
+                    }
+                    let bumped_seq = reg
+                        .access_seq
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Protocol("pool access_seq overflow".into()))?;
+                    reg.access_seq = bumped_seq;
+                    let record = reg
+                        .entries
+                        .get_mut(&key)
+                        .expect("contains_key just checked");
+                    let bumped_leases = record
+                        .active_leases
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Protocol("pool lease counter overflow".into()))?;
+                    record.active_leases = bumped_leases;
+                    record.last_used = bumped_seq;
+                    return Ok(PoolLease {
+                        key,
+                        entry: Arc::clone(&record.entry),
+                        registry: Arc::clone(&self.registry),
+                    });
+                }
+                // New key — slot available? (Evicting records also
+                // count toward `entries.len()`, so a live victim
+                // holds its slot until its shutdown completes.)
+                if reg.entries.len() < self.capacity.get() {
+                    let bumped_seq = reg
+                        .access_seq
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Protocol("pool access_seq overflow".into()))?;
+                    reg.access_seq = bumped_seq;
+                    let entry = Arc::new(PoolEntry::default());
+                    reg.entries.insert(
+                        key.clone(),
+                        PoolRecord {
+                            entry: Arc::clone(&entry),
+                            active_leases: 1,
+                            last_used: bumped_seq,
+                            state: RecordState::Ready,
+                        },
+                    );
+                    return Ok(PoolLease {
+                        key,
+                        entry,
+                        registry: Arc::clone(&self.registry),
+                    });
+                }
+                // Full — find an idle LRU victim in the `Ready`
+                // state. `Evicting` records are skipped: their
+                // eviction is already reserved by another thread.
+                let victim_key = reg
+                    .entries
+                    .iter()
+                    .filter(|(_, r)| r.state == RecordState::Ready && r.active_leases == 0)
+                    .min_by_key(|(_, r)| r.last_used)
+                    .map(|(k, _)| k.clone());
+                let Some(victim_key) = victim_key else {
+                    return Err(Error::PoolAtCapacity {
+                        capacity: self.capacity.get(),
+                    });
+                };
+                let record = reg
+                    .entries
+                    .get_mut(&victim_key)
+                    .expect("victim key just discovered");
+                record.state = RecordState::Evicting;
+                let victim_entry = Arc::clone(&record.entry);
+                debug!(
+                    language = %victim_key.language,
+                    analyzer = %victim_key.analyzer_id,
+                    "lsp pool: reserving idle LRU entry as eviction victim"
+                );
+                (victim_key, victim_entry)
+            };
+            // Shutdown victim OUTSIDE the registry lock. The
+            // record stays in the registry as an `Evicting`
+            // placeholder throughout — capacity is preserved so no
+            // concurrent acquire can spawn a replacement.
+            match victim_entry.shutdown().await {
+                Ok(()) => {
+                    // Termination proven. Safe to remove the
+                    // placeholder and loop to re-acquire; the
+                    // freed slot is now available for our key
+                    // (unless another thread beat us to it, in
+                    // which case we retry eviction).
+                    let mut reg = self.lock_registry()?;
+                    reg.entries.remove(&victim_key);
+                }
+                Err(e) if e.is_termination_unproven() => {
+                    // Cannot prove the victim's child died.
+                    // Preserve the `Evicting` placeholder so a
+                    // replacement can never be spawned in its
+                    // slot, and poison the pool globally — the
+                    // possibly-live orphan may hold stdio / port /
+                    // cache locks that collide with any new
+                    // spawn.
+                    self.poison_from_unproven_cleanup(&format!("LRU eviction: {e}"));
+                    return Err(e);
+                }
+                Err(e) => {
+                    // Termination-proven error (e.g. graceful
+                    // protocol failure but the child was reaped).
+                    // Safe to remove the placeholder before
+                    // returning.
+                    let mut reg = self.lock_registry()?;
+                    reg.entries.remove(&victim_key);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, PoolRegistry>> {
+        self.registry
+            .lock()
+            .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))
+    }
+
+    /// Gracefully stop all live clients and mark the pool `Stopped`.
+    /// Further acquisitions will return [`Error::PoolStopped`].
+    ///
+    /// # Errors
+    /// Returns the first LSP shutdown error observed after
+    /// attempting every entry.
+    pub fn shutdown_all(&self) -> Result<()> {
+        let entries = {
+            let mut reg = self.lock_registry()?;
+            reg.mode = PoolMode::Stopped;
+            reg.entries
+                .drain()
+                .map(|(_, r)| r.entry)
+                .collect::<Vec<_>>()
+        };
+        self.runtime.block_on(async move {
+            // Shutdown entries concurrently — same rationale as
+            // `force_shutdown_all` (independent children, no
+            // cross-entry contention).
+            let results: Vec<_> = futures::future::join_all(
+                entries
+                    .into_iter()
+                    .map(|entry| async move { entry.shutdown().await }),
+            )
+            .await;
+            let mut first_err: Option<Error> = None;
+            for r in results {
+                if let Err(e) = r
+                    && first_err.is_none()
+                {
+                    first_err = Some(e);
+                }
+            }
+            match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// Evict all live clients and give each entry a bounded grace
+    /// period to shut down. Used after analyzer stall detection so
+    /// the next analyzer run does not inherit a wedged pool key.
+    ///
+    /// New acquisitions are rejected with [`Error::PoolDraining`]
+    /// while this call is in flight. Mode transitions on finalize:
+    ///
+    /// - Every entry clean (no timeout, no termination-unproven)
+    ///   → pool returns to `Running`.
+    /// - Any termination-unproven signal (either an outer timeout
+    ///   or an entry that returned `ChildTerminationFailed`) →
+    ///   pool becomes `Poisoned` and rejects all future
+    ///   acquisitions until the daemon restarts.
+    /// - A concurrent `shutdown_all` transitioned the pool to
+    ///   `Stopped` while we were mid-drain → we preserve
+    ///   `Stopped`; the pool is stopped, not poisoned.
+    ///
+    /// # Errors
+    /// - [`Error::PoolPoisoned`] when the finalize mode is
+    ///   `Poisoned` (whether via our own local outcome or a
+    ///   concurrent path).
+    /// - `ChildTerminationFailed` when the mode is `Stopped` /
+    ///   `Running` but a termination-unproven signal was
+    ///   observed. If a non-unproven `first_err` was also
+    ///   present, the two are combined into an
+    ///   `OperationWithCleanupFailure`.
+    /// - The `first_err` alone (no cleanup err) when the only
+    ///   signal was a clean protocol failure whose child was
+    ///   still reaped.
+    pub fn force_shutdown_all(&self, entry_timeout: Duration) -> Result<()> {
+        let entries = {
+            let mut reg = self.lock_registry()?;
+            match reg.mode {
+                PoolMode::Running => reg.mode = PoolMode::Draining,
+                PoolMode::Draining => return Err(Error::PoolDraining),
+                PoolMode::Poisoned => return Err(Error::PoolPoisoned),
+                PoolMode::Stopped => return Err(Error::PoolStopped),
+            }
+            reg.entries
+                .drain()
+                .map(|(_, r)| r.entry)
+                .collect::<Vec<_>>()
+        };
+        debug!(entries = entries.len(), "lsp pool: force-shutdown begin");
+        // Cleanup entries CONCURRENTLY: the wall-clock cost of a
+        // force-shutdown is bounded by ~one entry timeout rather
+        // than `capacity × entry_timeout`. Each entry owns its own
+        // child process; there is no cross-entry contention on
+        // shutdown.
+        // Classify each entry's outcome into three orthogonal
+        // signals so we don't conflate "the actual shutdown
+        // returned a termination-unproven error" with "the outer
+        // per-entry timeout fired" — those are DIFFERENT causes
+        // of `termination_unproven` and only the second one
+        // warrants a synthetic "timeout" error message.
+        let outcome = self.runtime.block_on(async move {
+            let results: Vec<_> = futures::future::join_all(
+                entries
+                    .into_iter()
+                    .map(|entry| async move { timeout(entry_timeout, entry.shutdown()).await }),
+            )
+            .await;
+            classify_force_shutdown_results(results, entry_timeout)
+        });
+        let termination_unproven = outcome.termination_unproven();
+        let ForceShutdownOutcome {
+            first_regular_err,
+            first_unproven_err,
+            timed_out,
+        } = outcome;
+        // Finalize mode under lock. Preserve BOTH `Stopped` and
+        // `Poisoned`: a concurrent `shutdown_all` may have raced
+        // ahead of us (Stopped wins), OR a concurrent normal-path
+        // cleanup (`with_lsp` central exit, LRU eviction) may have
+        // observed a termination-unproven signal on a DIFFERENT
+        // path while our own drain was clean (Poisoned must not
+        // regress to Running). Only when the mode is still
+        // `Draining` — which means nobody else transitioned it
+        // during our drain — do we apply our local outcome.
+        let final_mode = {
+            let mut reg = self.lock_registry()?;
+            match reg.mode {
+                PoolMode::Stopped => PoolMode::Stopped,
+                PoolMode::Poisoned => PoolMode::Poisoned,
+                PoolMode::Draining => {
+                    // Only the `termination_unproven` signal (from
+                    // either an actual unproven error or an outer
+                    // timeout) drives the mode transition. A
+                    // clean `first_err` (e.g. protocol failure on
+                    // an entry whose child was cleanly reaped) is
+                    // NOT a safety hazard for future spawns.
+                    reg.mode = if termination_unproven {
+                        PoolMode::Poisoned
+                    } else {
+                        PoolMode::Running
+                    };
+                    reg.mode
+                }
+                PoolMode::Running => {
+                    // Should not happen — we set Draining above and
+                    // no other path writes Running. Preserve
+                    // whatever the current state is defensively.
+                    reg.mode
+                }
+            }
+        };
+        // Build the caller-visible error in two layers so that
+        // the safety-critical termination-unproven cause is never
+        // dropped by ordering.
+        //
+        // 1. `safety_cause` combines the first unproven error
+        //    (from `entry.shutdown()`) with the synthetic outer
+        //    timeout error (only fabricated when the outer
+        //    `timeout(..)` actually fired).
+        // 2. `combined` composes the first regular error (protocol
+        //    etc.) with the safety cause. The safety cause is
+        //    placed in the `cleanup` slot of
+        //    `OperationWithCleanupFailure` so `is_termination_unproven`
+        //    recursion still fires on the top-level err.
+        let timeout_err = if timed_out {
+            Some(Error::ChildTerminationFailed(
+                "force-shutdown outer timeout — child termination could not be proven".into(),
+            ))
+        } else {
+            None
+        };
+        let safety_cause = match (first_unproven_err, timeout_err) {
+            (None, None) => None,
+            (Some(e), None) | (None, Some(e)) => Some(e),
+            (Some(unproven), Some(timeout)) => Some(Error::OperationWithCleanupFailure {
+                original: Box::new(unproven),
+                cleanup: Box::new(timeout),
+            }),
+        };
+        let combined = match (first_regular_err, safety_cause) {
+            (None, None) => None,
+            (Some(e), None) | (None, Some(e)) => Some(e),
+            (Some(orig), Some(safety)) => Some(Error::OperationWithCleanupFailure {
+                original: Box::new(orig),
+                cleanup: Box::new(safety),
+            }),
+        };
+        if final_mode == PoolMode::Poisoned {
+            // Log the actual cause on the way out so operators
+            // debugging a poisoned pool have the evidence
+            // (previously we swallowed it).
+            if let Some(e) = combined.as_ref() {
+                warn!(
+                    error = %e,
+                    "lsp pool: force-shutdown finalize observed Poisoned mode; pool poisoned until daemon restart"
+                );
+            } else {
+                warn!(
+                    "lsp pool: force-shutdown finalize observed Poisoned mode; pool poisoned until daemon restart"
+                );
+            }
+            return Err(Error::PoolPoisoned);
+        }
+        if final_mode == PoolMode::Stopped {
+            // A concurrent `shutdown_all` won on the mode
+            // transition. We still surface any accumulated
+            // termination-unproven / first_err so the caller can
+            // see the evidence.
+            return match combined {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
+        }
+        debug!("lsp pool: force-shutdown complete; pool running");
+        match combined {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.entries.read().unwrap().len()
+        self.registry.lock().unwrap().entries.len()
+    }
+
+    #[cfg(test)]
+    fn mode(&self) -> PoolMode {
+        self.registry.lock().unwrap().mode
+    }
+
+    #[cfg(test)]
+    fn active_leases(&self, key: &PoolKey) -> Option<usize> {
+        self.registry
+            .lock()
+            .unwrap()
+            .entries
+            .get(key)
+            .map(|r| r.active_leases)
     }
 }
 
@@ -265,7 +913,12 @@ async fn check_lsp_available(
 ) -> Result<()> {
     match strategy {
         AvailabilityStrategy::VersionFlag | AvailabilityStrategy::VersionNoFlag => {
-            check_version_command(
+            // Single source: the pool and `LspClient` both route
+            // through `client::probe_binary`. Diverging the two
+            // probe implementations previously produced silent
+            // orphan children on one path but not the other, so
+            // this consumer just dispatches the correct args.
+            super::client::probe_binary(
                 binary_path,
                 availability_probe_args(strategy).unwrap_or(&[]),
                 request_timeout,
@@ -281,31 +934,6 @@ fn availability_probe_args(strategy: &AvailabilityStrategy) -> Option<&'static [
         AvailabilityStrategy::VersionFlag => Some(&["--version"]),
         AvailabilityStrategy::VersionNoFlag => Some(&["version"]),
         AvailabilityStrategy::PathExistsExecutable => None,
-    }
-}
-
-async fn check_version_command(
-    binary_path: &Path,
-    args: &[&str],
-    request_timeout: Duration,
-) -> Result<()> {
-    let output = timeout(
-        request_timeout,
-        Command::new(binary_path).args(args).output(),
-    )
-    .await
-    .map_err(|_| super::Error::RequestTimeout)?
-    .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            super::Error::BinaryMissing(binary_path.to_path_buf())
-        } else {
-            super::Error::Spawn(e)
-        }
-    })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(super::Error::BinaryMissing(binary_path.to_path_buf()))
     }
 }
 
@@ -368,10 +996,26 @@ impl PoolEntry {
                 spec.request_timeout,
             )
             .await?;
-            dispatch_readiness(&spec.readiness, |timeout| {
+            // Readiness check runs against a spawned + initialized
+            // child. If it fails (timeout or `$/progress` error),
+            // we must terminate the child before returning — the
+            // child is not yet inside `state.client`, so nothing
+            // else will reap it. Any cleanup error is surfaced
+            // alongside the original readiness failure so the
+            // caller / test can inspect both.
+            if let Err(err) = dispatch_readiness(&spec.readiness, |timeout| {
                 client.wait_for_workspace_load(timeout)
             })
-            .await?;
+            .await
+            {
+                return Err(match client.force_terminate().await {
+                    Ok(()) => err,
+                    Err(cleanup) => Error::OperationWithCleanupFailure {
+                        original: Box::new(err),
+                        cleanup: Box::new(cleanup),
+                    },
+                });
+            }
             state.client = Some(client);
             state.opened_documents.clear();
         }
@@ -389,11 +1033,30 @@ impl PoolEntry {
             language_id: spec.language_id,
         };
         let result = work(&mut pooled).await;
-        if matches!(result, Err(super::Error::ServerExited(_))) {
+        // Both `ServerExited` and `ServerExitedWithStderr` are
+        // terminal server-exit signals — a live client cannot
+        // recover from either. Take the client out of the state
+        // (so the next `with_lsp_client` call spawns fresh) and
+        // force-terminate the child; `opened_documents` is cleared
+        // so the respawn starts from `didOpen` instead of
+        // `didChange` against a document the new server never saw.
+        // If the cleanup itself cannot prove the child terminated,
+        // surface both errors via `OperationWithCleanupFailure` so
+        // the central `with_lsp` poison path fires.
+        if matches!(
+            result,
+            Err(super::Error::ServerExited(_)) | Err(super::Error::ServerExitedWithStderr { .. })
+        ) {
             let client = state.client.take();
             state.opened_documents.clear();
-            if let Some(client) = client {
-                let _ = client.shutdown().await;
+            if let Some(client) = client
+                && let Err(cleanup) = client.force_terminate().await
+            {
+                let original = result.err().expect("just matched Err above");
+                return Err(super::Error::OperationWithCleanupFailure {
+                    original: Box::new(original),
+                    cleanup: Box::new(cleanup),
+                });
             }
         }
         result
@@ -465,255 +1128,5 @@ pub fn force_shutdown_global_if_initialized(entry_timeout: Duration) -> Result<(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lsp::Error;
-
-    #[cfg(unix)]
-    struct FakeProbeBinary {
-        _dir: tempfile::TempDir,
-        path: PathBuf,
-    }
-
-    #[cfg(unix)]
-    impl FakeProbeBinary {
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    #[cfg(unix)]
-    fn fake_probe_binary(expected_arg: &'static str) -> FakeProbeBinary {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake-lsp");
-        fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"{expected_arg}\" ]; then exit 0; fi\nexit 1"
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
-        FakeProbeBinary { _dir: dir, path }
-    }
-
-    #[test]
-    fn pool_key_uses_launch_configuration() {
-        let repo = tempfile::tempdir().unwrap();
-        let key_a = PoolKey::lsp(
-            "rust",
-            repo.path(),
-            "rust-analyzer-lsp",
-            Path::new("ra"),
-            "cfg-a",
-        )
-        .unwrap();
-        let key_b = PoolKey::lsp(
-            "rust",
-            repo.path(),
-            "rust-analyzer-lsp",
-            Path::new("ra"),
-            "cfg-b",
-        )
-        .unwrap();
-        let key_go =
-            PoolKey::lsp("go", repo.path(), "gopls-lsp", Path::new("gopls"), "cfg-a").unwrap();
-
-        assert_eq!(
-            key_a.canonical_repo_root,
-            std::fs::canonicalize(repo.path()).unwrap()
-        );
-        assert_ne!(key_a, key_b);
-        assert_eq!(key_a.language, "rust");
-        assert_eq!(key_go.analyzer_id, "gopls-lsp");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lsp_pool_runs_version_flag_availability_probe() {
-        let binary = fake_probe_binary("--version");
-        let runtime = Runtime::new().unwrap();
-
-        runtime
-            .block_on(check_lsp_available(
-                binary.path(),
-                &AvailabilityStrategy::VersionFlag,
-                Duration::from_secs(1),
-            ))
-            .unwrap();
-        assert!(matches!(
-            runtime.block_on(check_lsp_available(
-                binary.path(),
-                &AvailabilityStrategy::VersionNoFlag,
-                Duration::from_secs(1),
-            )),
-            Err(Error::BinaryMissing(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lsp_pool_runs_version_no_flag_availability_probe() {
-        let binary = fake_probe_binary("version");
-        let runtime = Runtime::new().unwrap();
-
-        runtime
-            .block_on(check_lsp_available(
-                binary.path(),
-                &AvailabilityStrategy::VersionNoFlag,
-                Duration::from_secs(1),
-            ))
-            .unwrap();
-        assert!(matches!(
-            runtime.block_on(check_lsp_available(
-                binary.path(),
-                &AvailabilityStrategy::VersionFlag,
-                Duration::from_secs(1),
-            )),
-            Err(Error::BinaryMissing(_))
-        ));
-    }
-
-    #[test]
-    fn lsp_pool_checks_path_exists_executable_availability_without_spawning() {
-        let binary = tempfile::NamedTempFile::new().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut perms = binary.as_file().metadata().unwrap().permissions();
-            perms.set_mode(0o755);
-            binary.as_file().set_permissions(perms).unwrap();
-        }
-        let runtime = Runtime::new().unwrap();
-
-        runtime
-            .block_on(check_lsp_available(
-                binary.path(),
-                &AvailabilityStrategy::PathExistsExecutable,
-                Duration::from_secs(1),
-            ))
-            .unwrap();
-
-        let missing = binary.path().with_file_name("missing-lsp");
-        assert!(matches!(
-            runtime.block_on(check_lsp_available(
-                &missing,
-                &AvailabilityStrategy::PathExistsExecutable,
-                Duration::from_secs(1),
-            )),
-            Err(Error::BinaryMissing(_))
-        ));
-    }
-
-    #[test]
-    fn lsp_pool_dispatches_availability_strategy_per_server() {
-        assert_eq!(
-            availability_probe_args(&AvailabilityStrategy::VersionFlag),
-            Some(&["--version"][..])
-        );
-        assert_eq!(
-            availability_probe_args(&AvailabilityStrategy::VersionNoFlag),
-            Some(&["version"][..])
-        );
-        assert_eq!(
-            availability_probe_args(&AvailabilityStrategy::PathExistsExecutable),
-            None
-        );
-    }
-
-    #[test]
-    fn lsp_pool_dispatches_progress_quiescence_readiness_to_wait_hook() {
-        let runtime = Runtime::new().unwrap();
-        let timeout = Duration::from_secs(2);
-        let mut waited = None;
-
-        runtime
-            .block_on(dispatch_readiness(
-                &ReadinessStrategy::ProgressQuiescence { timeout },
-                |timeout| {
-                    waited = Some(timeout);
-                    async { Ok(()) }
-                },
-            ))
-            .unwrap();
-
-        assert_eq!(waited, Some(timeout));
-    }
-
-    #[test]
-    fn lsp_pool_skips_wait_hook_for_initialize_response_readiness() {
-        let runtime = Runtime::new().unwrap();
-        let mut waited = false;
-
-        runtime
-            .block_on(dispatch_readiness(
-                &ReadinessStrategy::InitializeResponseOnly,
-                |timeout| {
-                    let _ = timeout;
-                    waited = true;
-                    async { Ok(()) }
-                },
-            ))
-            .unwrap();
-
-        assert!(!waited);
-    }
-
-    #[test]
-    fn lsp_pool_dispatches_readiness_strategy_per_server() {
-        let rust = LspSpawnSpec {
-            binary: PathBuf::from("rust-analyzer"),
-            workspace_root: PathBuf::from("/tmp/repo"),
-            config_hash: "cfg".into(),
-            request_timeout: Duration::from_secs(1),
-            availability: AvailabilityStrategy::VersionFlag,
-            readiness: ReadinessStrategy::ProgressQuiescence {
-                timeout: Duration::from_secs(2),
-            },
-            language_id: "rust",
-            launch_args: Vec::new(),
-            env: Vec::new(),
-            initialization_options: serde_json::json!({
-                "experimental": {
-                    "serverStatusNotification": true
-                }
-            }),
-        };
-        let pyright = LspSpawnSpec {
-            readiness: ReadinessStrategy::InitializeResponseOnly,
-            language_id: "python",
-            launch_args: vec!["--stdio".to_string()],
-            initialization_options: serde_json::json!({}),
-            ..rust.clone()
-        };
-
-        assert!(matches!(
-            rust.readiness,
-            ReadinessStrategy::ProgressQuiescence { .. }
-        ));
-        assert!(matches!(
-            pyright.readiness,
-            ReadinessStrategy::InitializeResponseOnly
-        ));
-        assert_eq!(
-            rust.initialization_options["experimental"]["serverStatusNotification"],
-            true
-        );
-        assert_eq!(pyright.launch_args, vec!["--stdio"]);
-        assert_eq!(pyright.initialization_options, serde_json::json!({}));
-    }
-
-    #[test]
-    fn empty_pool_shutdown_is_noop() {
-        let pool = LspClientPool::new().unwrap();
-        assert_eq!(pool.len(), 0);
-        pool.shutdown_all().unwrap();
-        assert_eq!(pool.len(), 0);
-    }
-}
+#[path = "pool_tests.rs"]
+mod tests;
