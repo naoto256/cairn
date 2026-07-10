@@ -5,6 +5,45 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [Unreleased] — 0.7.1
+
+### Fixed
+
+- **Cross-store `JobKey` / `JobId` collisions no longer coalesce or
+  misroute analyzer reruns.** Two independent stores that happened to
+  share a `(manifest_id, analyzer_id)` pair (a routine consequence of
+  per-store `manifest_id` being an `INTEGER PRIMARY KEY`, not globally
+  unique) could:
+  - be silently coalesced by `TrackedJobKeys` because `JobKey` did not
+    carry `repo_hash`, so a second store's rerun was dropped rather
+    than queued — leaving that store's index stale until the next
+    rebuild;
+  - be handed the same `JobId` because each store's allocator was
+    `MAX(job_id)+1` scoped to a single store's `workspace_analysis_runs`
+    table, so `JobManager::cancel(job_id)` could silently target
+    whichever store was scanned first.
+
+  `JobKey` now carries `repo_hash`; `JobId` is issued from a single
+  daemon-global `AtomicI64` allocator that uses `checked_add` (overflow
+  fails closed) and CAS-based floor helpers so `_at_least(floor)`
+  advances the counter past the returned value even when `floor`
+  jumped the counter forward.
+
+  `restore_from_db` is now collision-safe across restarts: it dedupes
+  alias entries by `repo_hash` (so two aliases pointing at the same
+  store are not double-scanned), seeds the allocator above the
+  whole-store historical max *and* any tombstoned ids, assigns fresh
+  globally-unique ids to any row with `NULL job_id` from the allocator
+  (no more per-store `MAX+1`), and rewrites every row in an ambiguous
+  collision group to a fresh id.
+
+  Retired ambiguous `JobId` values are recorded in a new
+  `ambiguous_job_ids` table in `index.db` (Migration v3, applied
+  automatically — no manual action required) *before* any per-store
+  rewrite, so a partial rewrite followed by a crash still guarantees
+  `cancel(retired_id)` returns `unknown job id` and the next restart
+  recycles the surviving row.
+
 ## [0.7.0] — 2026-06-27
 
 ### Fixed (CodeRabbit-driven pre-ship review)

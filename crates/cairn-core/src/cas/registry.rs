@@ -40,7 +40,80 @@ ALTER TABLE aliases_v2 RENAME TO aliases;
 CREATE INDEX idx_aliases_repo_hash ON aliases(repo_hash);
 "#,
     },
+    Migration {
+        // Durable tombstone for `JobId` values that were ambiguous
+        // across stores at some restart. See
+        // `crates/cairn-core/src/jobs.rs::restore_from_db` for the
+        // full rationale — the collision-group rewrite is not
+        // cross-store atomic (per-store `workspace_analysis_runs`
+        // UPDATEs can fail after the first one succeeded, leaving
+        // one sibling row still carrying the old ambiguous id), and
+        // the subsequent `cancel(old_id)` would otherwise silently
+        // target whichever store still holds the row. Committing
+        // the ambiguous id set to `ambiguous_job_ids` *before*
+        // touching any store bounds the failure: even on partial
+        // rewrite, a stale client's cancel is rejected as `unknown
+        // job id`, and a later restart re-recycles the remaining
+        // rows.
+        version: 3,
+        sql: r#"
+CREATE TABLE ambiguous_job_ids (
+    job_id        INTEGER PRIMARY KEY,
+    retired_at_ns INTEGER NOT NULL
+);
+"#,
+    },
 ];
+
+/// Insert every id in `ids` into the `ambiguous_job_ids` tombstone
+/// table using `INSERT OR IGNORE`. Callers are expected to invoke
+/// this inside their own transaction so the whole set commits
+/// atomically before any per-store rewrite is attempted.
+///
+/// # Errors
+/// SQLite failures.
+pub fn insert_ambiguous_ids(tx: &Transaction<'_>, ids: &[i64], retired_at_ns: i64) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO ambiguous_job_ids (job_id, retired_at_ns) VALUES (?1, ?2)",
+    )?;
+    for id in ids {
+        stmt.execute(rusqlite::params![id, retired_at_ns])?;
+    }
+    Ok(())
+}
+
+/// True when `job_id` has been retired as ambiguous by a prior
+/// collision-recycle pass. `cancel(job_id)` checks this before any
+/// store scan so a stale pre-restart client cannot silently target a
+/// still-live sibling row that survived a partial rewrite.
+///
+/// # Errors
+/// SQLite failures.
+pub fn is_ambiguous_job_id(conn: &Connection, job_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM ambiguous_job_ids WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Load every retired ambiguous id from the tombstone table. Used by
+/// `restore_from_db` phase 2 so a surviving row that still carries an
+/// ambiguous id from a prior restart is recycled even when no
+/// sibling row is present this time.
+///
+/// # Errors
+/// SQLite failures.
+pub fn all_ambiguous_job_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT job_id FROM ambiguous_job_ids")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    Ok(rows)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasEntry {
