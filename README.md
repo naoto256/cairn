@@ -224,6 +224,18 @@ Runs in the foreground. Data dir defaults to
 `~/Library/Caches/cairn/` (macOS) or `$XDG_RUNTIME_DIR/cairn/` (Linux),
 both clamped to mode 0700.
 
+**Environment variables** (all optional):
+
+- `CAIRN_LSP_POOL_MAX_ENTRIES` — hard cap on the number of live
+  LSP child processes the daemon keeps around. Default `16`.
+  Valid range `1..=64`; values above 64 are clamped to `64` (with
+  a warning). Non-numeric, `0`, or negative values fall back to
+  the default (with a warning). When the pool is at capacity and
+  no idle entry can be evicted, subsequent `with_lsp` calls fail
+  closed with `PoolAtCapacity` and the affected analyzer job
+  lands as `Failed` (retry after a lease is released, the current
+  eviction completes, or via `cairn ctl repo reindex <alias>`).
+
 ### Register a repo
 
 ```sh
