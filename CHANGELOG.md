@@ -44,6 +44,17 @@ versions follow [SemVer](https://semver.org/).
   `cancel(retired_id)` returns `unknown job id` and the next restart
   recycles the surviving row.
 
+  Daemon startup now fails closed when job-state restoration cannot
+  establish the global identity invariants, instead of starting
+  workers with an unseeded allocator and incomplete active-job
+  indexes. If the daemon exits at startup, inspect the daemon log
+  for the underlying error, repair the affected store, and restart.
+
+### Security
+
+- Bump `anyhow` to 1.0.103 (RUSTSEC-2026-0190) and `crossbeam-epoch`
+  to 0.9.20 (RUSTSEC-2026-0204). Lockfile-only; no API impact.
+
 ## [0.7.0] — 2026-06-27
 
 ### Fixed (CodeRabbit-driven pre-ship review)
