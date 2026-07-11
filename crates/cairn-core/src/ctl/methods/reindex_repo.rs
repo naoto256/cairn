@@ -1,5 +1,13 @@
-//! `reindex_repo` — re-run the register flow for an already-registered
-//! repo so its store catches up with the current worktree / HEAD.
+//! `reindex_repo` — force a fresh reindex pass for a registered
+//! repository.
+//!
+//! With a reconcile driver wired (production path), this handler
+//! records durable force intent via
+//! [`RepoReconcileManager::request_force_by_alias`] and returns
+//! immediately with the accepted generation; the worker executes
+//! the register/analyzer enqueue asynchronously. The old
+//! synchronous inline path is retained as a fallback for
+//! reconcile-less setups (tests / degraded startup).
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,11 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cairn_proto::control::Ack;
 use cairn_proto::methods::ReindexArgs;
 use linkme::distributed_slice;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::info;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::reconcile::ReconcileTrigger;
 use crate::register::{
     register_repo_force_analyzers as cas_register, register_repo_force_analyzers_enqueue,
 };
@@ -27,8 +36,40 @@ impl ControlMethod for ReindexRepo {
 
     async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
         let args: ReindexArgs = parse_params(params)?;
-        let cas_data_dir = ctx.cas_data_dir.clone();
         let alias = args.alias.clone();
+
+        if let Some(reconcile) = ctx.reconcile.clone() {
+            let outcome = reconcile
+                .request_force_by_alias(alias.clone(), ReconcileTrigger::ManualReindex)
+                .await?;
+            info!(
+                alias = %alias,
+                generation = outcome.generation,
+                "reindex_repo scheduled via reconcile manager"
+            );
+            let mut value = serde_json::to_value(Ack::with_alias(args.alias)).unwrap();
+            if let Value::Object(obj) = &mut value {
+                obj.insert(
+                    "reconcile".into(),
+                    json!({
+                        "repo_hash": outcome.repo_hash,
+                        "generation": outcome.generation,
+                        "forced": outcome.forced,
+                        "scheduled": outcome.scheduled,
+                    }),
+                );
+                // `jobs` was the pre-Phase-2 field name for the
+                // analyzer job list. Preserve as an empty list
+                // for wire compatibility; downstream consumers
+                // will start reading `reconcile` in Phase 3+.
+                obj.insert("jobs".into(), Value::Array(Vec::new()));
+            }
+            return Ok(value);
+        }
+
+        // Fallback path: no reconcile driver (test / degraded
+        // startup). Run inline like the pre-Phase-2 behaviour.
+        let cas_data_dir = ctx.cas_data_dir.clone();
         let now_ns = i64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -37,12 +78,12 @@ impl ControlMethod for ReindexRepo {
         )
         .unwrap_or(i64::MAX);
         let job_manager = ctx.job_manager.clone();
-
+        let alias_task = alias.clone();
         let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entry = cas_registry::lookup_by_alias(&index, &alias)?.ok_or_else(|| {
+            let entry = cas_registry::lookup_by_alias(&index, &alias_task)?.ok_or_else(|| {
                 Error::RepoNotFound {
-                    alias: alias.clone(),
+                    alias: alias_task.clone(),
                 }
             })?;
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
@@ -50,7 +91,7 @@ impl ControlMethod for ReindexRepo {
             match job_manager.as_deref() {
                 Some(manager) => register_repo_force_analyzers_enqueue(
                     &mut conn,
-                    &alias,
+                    &alias_task,
                     &entry.repo_hash,
                     &PathBuf::from(&entry.root_path),
                     now_ns,
@@ -66,10 +107,10 @@ impl ControlMethod for ReindexRepo {
             alias = %args.alias,
             head = %outcome.head_commit,
             blobs_parsed = outcome.blobs_parsed,
-            "reindex_repo complete"
+            "reindex_repo complete (inline fallback)"
         );
         let mut value = serde_json::to_value(Ack::with_alias(args.alias)).unwrap();
-        if let serde_json::Value::Object(obj) = &mut value {
+        if let Value::Object(obj) = &mut value {
             obj.insert(
                 "jobs".into(),
                 serde_json::to_value(&outcome.analyzer_jobs).unwrap(),
