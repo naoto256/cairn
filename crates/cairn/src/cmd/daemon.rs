@@ -81,6 +81,7 @@ pub async fn run(args: Args) -> Result<()> {
         )),
         shutdown,
         job_manager: Some(job_manager),
+        reconcile: Some(reconcile.clone()),
     };
     // Retain the reconcile driver until daemon.run returns so
     // watcher requests keep landing on a live manager.
