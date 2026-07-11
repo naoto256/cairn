@@ -813,6 +813,7 @@ mod tests {
             ],
             job_summary: JobSummary::default(),
             jobs: Vec::new(),
+            reconcile: None,
         };
 
         assert_eq!(
