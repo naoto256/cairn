@@ -64,6 +64,7 @@ pub struct CtlCtx {
     pub shutdown: Arc<Notify>,
     pub watch_manager: Option<Arc<WatchManager>>,
     pub job_manager: Option<Arc<JobManager>>,
+    pub reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
     pub version: &'static str,
     pub started_at: Instant,
 }
@@ -117,6 +118,27 @@ impl CtlHandler {
         watch_manager: Option<Arc<WatchManager>>,
         job_manager: Option<Arc<JobManager>>,
     ) -> Self {
+        Self::with_full_context(
+            cas_data_dir,
+            shutdown,
+            version,
+            watch_manager,
+            job_manager,
+            None,
+        )
+    }
+
+    /// Full constructor including the reconcile driver so manual
+    /// reindex requests route through the durable state machine.
+    #[must_use]
+    pub fn with_full_context(
+        cas_data_dir: Arc<CasDataDir>,
+        shutdown: Arc<Notify>,
+        version: &'static str,
+        watch_manager: Option<Arc<WatchManager>>,
+        job_manager: Option<Arc<JobManager>>,
+        reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+    ) -> Self {
         let methods = jsonrpc_dispatch::method_table(&CONTROL_METHODS);
         Self {
             ctx: CtlCtx {
@@ -124,6 +146,7 @@ impl CtlHandler {
                 shutdown,
                 watch_manager,
                 job_manager,
+                reconcile,
                 version,
                 started_at: Instant::now(),
             },

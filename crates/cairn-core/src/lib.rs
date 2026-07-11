@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod migration;
 pub mod paths;
 pub mod query;
+pub mod reconcile;
 pub mod register;
 pub mod resolution;
 pub mod sockets;

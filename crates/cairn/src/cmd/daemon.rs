@@ -12,6 +12,7 @@ use cairn_core::daemon::Daemon;
 use cairn_core::data_rpc::DataRpc;
 use cairn_core::jobs::JobManager;
 use cairn_core::paths::CasDataDir;
+use cairn_core::reconcile::RepoReconcileManager;
 use cairn_core::sockets::SocketPaths;
 use cairn_core::watcher::WatchManager;
 use clap::Args as ClapArgs;
@@ -44,11 +45,25 @@ pub async fn run(args: Args) -> Result<()> {
     info!(root = %cas_data_dir.root().display(), "storage open");
     let job_manager = init_job_manager(cas_data_dir.clone())?;
     job_manager.start_workers();
-    let watch_manager = Arc::new(WatchManager::with_jobs(
+    let reconcile = RepoReconcileManager::new(cas_data_dir.clone(), Some(job_manager.clone()));
+    // Clear any `attempt_generation` left set by a prior crash
+    // BEFORE spawning workers or starting watchers — a stale
+    // in-flight marker would otherwise block the first real
+    // attempt.
+    if let Err(err) = reconcile.recover_interrupted_attempts().await {
+        tracing::warn!(error = %err, "reconcile: failed to recover interrupted attempts");
+    }
+    let watch_manager = Arc::new(WatchManager::with_reconcile(
         cas_data_dir.clone(),
-        job_manager.clone(),
+        reconcile.clone(),
     ));
     start_registered_watchers(watch_manager.clone()).await;
+    // Kick workers for repos whose dirty gap survived the last
+    // shutdown so `desired > applied` catches up without waiting
+    // for the next watcher event.
+    if let Err(err) = reconcile.wake_dirty_repositories().await {
+        tracing::warn!(error = %err, "reconcile: failed to wake dirty repositories at startup");
+    }
 
     let shutdown = Arc::new(Notify::new());
     spawn_signal_handler(shutdown.clone());
@@ -56,16 +71,20 @@ pub async fn run(args: Args) -> Result<()> {
     let daemon = Daemon {
         paths,
         data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
-        control_handler: Arc::new(CtlHandler::with_watch_manager_and_jobs(
+        control_handler: Arc::new(CtlHandler::with_full_context(
             cas_data_dir,
             shutdown.clone(),
             env!("CARGO_PKG_VERSION"),
             Some(watch_manager),
             Some(job_manager.clone()),
+            Some(reconcile.clone()),
         )),
         shutdown,
         job_manager: Some(job_manager),
     };
+    // Retain the reconcile driver until daemon.run returns so
+    // watcher requests keep landing on a live manager.
+    let _reconcile_owner = reconcile;
     daemon.run().await?;
     Ok(())
 }

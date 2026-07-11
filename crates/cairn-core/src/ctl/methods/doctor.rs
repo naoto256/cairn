@@ -2156,6 +2156,7 @@ mod tests {
                 shutdown: Arc::new(Notify::new()),
                 watch_manager: Some(self.watch_manager.clone()),
                 job_manager: None,
+                reconcile: None,
                 version: "test",
                 started_at: Instant::now(),
             };
