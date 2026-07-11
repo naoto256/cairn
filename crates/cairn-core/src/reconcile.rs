@@ -317,7 +317,7 @@ impl RepoReconcileManager {
         let repo_hash_task = repo_hash.clone();
         let generation = tokio::task::spawn_blocking(move || -> Result<i64> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let g = cas_registry::increment_desired_generation(&tx, &repo_hash_task, now_ns)?;
             tx.commit()?;
             Ok(g)
@@ -351,7 +351,7 @@ impl RepoReconcileManager {
         let repo_hash_task = repo_hash.clone();
         let generation = tokio::task::spawn_blocking(move || -> Result<i64> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let g = cas_registry::increment_force_generation(&tx, &repo_hash_task, now_ns)?;
             tx.commit()?;
             Ok(g)
@@ -381,7 +381,7 @@ impl RepoReconcileManager {
         let cas_data_dir = self.cas_data_dir.clone();
         let hashes = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let hashes = cas_registry::recover_interrupted_attempts(&tx)?;
             tx.commit()?;
             Ok(hashes)
@@ -433,7 +433,7 @@ impl RepoReconcileManager {
         let cas_data_dir = self.cas_data_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::set_watcher_state(&tx, &repo_hash, state, error.as_deref())?;
             tx.commit()?;
             Ok(())
@@ -722,7 +722,7 @@ async fn run_attempt(
         let hash = hash.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::mark_attempt_start(&tx, &hash, generation, now_ns)?;
             tx.commit()?;
             Ok(())
@@ -792,7 +792,7 @@ async fn run_attempt(
         let now_ns_finalize = mgr.clock.now_ns();
         move || -> Result<()> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             match register_result {
                 Ok(()) => {
                     cas_registry::mark_attempt_success(&tx, &hash, generation, now_ns_finalize)?;
