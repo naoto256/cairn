@@ -1,12 +1,27 @@
 //! `index.db` — daemon-global metadata for CAS-managed repos.
 //!
-//! Two responsibilities live in this module:
+//! Responsibilities:
 //!
-//! - **Alias registry.** Each registered repo gets one row in
-//!   `aliases`, keyed by the user-facing alias. `repo_hash` names
-//!   the per-repo store directory under `repos/`; the daemon
-//!   consults this index whenever a query references a repo by
-//!   alias.
+//! - **Repository identity.** `repositories` is the canonical
+//!   owner table: `repo_hash` is the primary key, `root_path` is
+//!   the canonicalized on-disk root. A repository is 1:1 with a
+//!   CAS store directory under `repos/`, a filesystem watcher, and
+//!   a durable reconcile state row.
+//! - **Alias index.** `aliases` maps a user-facing label to a
+//!   repository. Multiple aliases may reference the same
+//!   repository (e.g. `main` + `worker` -> hash H). The FK
+//!   cascades so removing the repository cleans up its labels.
+//!   Retargeting a single label to a different repository is
+//!   done by calling [`upsert`] again with the new
+//!   `(root_path, repo_hash)` — the alias row is replaced in
+//!   place; the underlying `repositories` row is left alone.
+//! - **Durable reconcile state.** `repo_reconcile_state` records
+//!   the generation-counter state machine (`desired` /
+//!   `applied` / `force`), retry metadata, watcher state, and
+//!   last error for each repository. The daemon persists dirty
+//!   state before any reindex debounce sleeps and recovers
+//!   interrupted attempts on startup — no crash window can leave
+//!   pending work invisible to the operator.
 //! - **Retired ambiguous `JobId` tombstones.** `ambiguous_job_ids`
 //!   records every `JobId` value that was ambiguous across stores
 //!   at some restart. See `JobManager::restore_from_db` for the
@@ -72,6 +87,92 @@ CREATE TABLE ambiguous_job_ids (
 );
 "#,
     },
+    Migration {
+        // Canonical repository identity + durable reconcile state.
+        //
+        // Before v4: `aliases` held both label -> repo_hash AND
+        // label -> root_path, so two aliases labelling the same
+        // canonical root could disagree on `root_path` if either
+        // was ever updated with a stale value. That inconsistency
+        // let the daemon report per-alias reconcile status even
+        // though watchers and reindex are inherently per-repo —
+        // status could claim "watcher active" for a label whose
+        // sibling label had actually failed.
+        //
+        // v4 normalises the schema:
+        //
+        // - `repositories` is the canonical owner (repo_hash PK,
+        //   root_path UNIQUE). Each row corresponds 1:1 with a CAS
+        //   store directory under `repos/`, exactly one filesystem
+        //   watcher, and exactly one durable reconcile state row.
+        // - `aliases` becomes a many-to-one index into
+        //   `repositories` via `repo_hash` FK ON DELETE CASCADE.
+        //   `root_path` is JOINed at read time so the public
+        //   `AliasEntry` shape is preserved.
+        // - `repo_reconcile_state` holds the generation state
+        //   machine per repository. Every field either has a
+        //   NOT NULL DEFAULT (so `INSERT (repo_hash)` is enough) or
+        //   permits NULL to mean "not currently in this phase."
+        //
+        // Data migration: the `INSERT INTO repositories` uses
+        // `SELECT DISTINCT repo_hash, root_path` on the existing
+        // aliases; the DISTINCT PK guarantees that if two aliases
+        // ever disagreed on the (repo_hash, root_path) mapping,
+        // the migration FAILS with a UNIQUE / PK violation rather
+        // than silently choosing one via `MIN()`. Daemons whose
+        // existing `aliases` table is consistent (the normal case)
+        // migrate cleanly.
+        version: 4,
+        sql: r#"
+CREATE TABLE repositories (
+    repo_hash        TEXT PRIMARY KEY,
+    root_path        TEXT NOT NULL UNIQUE,
+    registered_at_ns INTEGER NOT NULL
+);
+
+INSERT INTO repositories (repo_hash, root_path, registered_at_ns)
+SELECT repo_hash, root_path, MIN(registered_at_ns)
+FROM (SELECT DISTINCT repo_hash, root_path, registered_at_ns FROM aliases)
+GROUP BY repo_hash, root_path;
+
+CREATE TABLE aliases_v4 (
+    alias            TEXT PRIMARY KEY,
+    repo_hash        TEXT NOT NULL REFERENCES repositories(repo_hash) ON DELETE CASCADE,
+    registered_at_ns INTEGER NOT NULL
+);
+INSERT INTO aliases_v4 (alias, repo_hash, registered_at_ns)
+SELECT alias, repo_hash, registered_at_ns FROM aliases;
+DROP TABLE aliases;
+ALTER TABLE aliases_v4 RENAME TO aliases;
+CREATE INDEX idx_aliases_repo_hash ON aliases(repo_hash);
+
+CREATE TABLE repo_reconcile_state (
+    repo_hash             TEXT PRIMARY KEY REFERENCES repositories(repo_hash) ON DELETE CASCADE,
+    desired_generation    INTEGER NOT NULL DEFAULT 0 CHECK(desired_generation >= 0),
+    applied_generation    INTEGER NOT NULL DEFAULT 0 CHECK(applied_generation >= 0),
+    force_generation      INTEGER NOT NULL DEFAULT 0 CHECK(force_generation >= 0),
+    attempt_generation    INTEGER,
+    dirty_since_ns        INTEGER,
+    last_attempt_ns       INTEGER,
+    last_success_ns       INTEGER,
+    consecutive_failures  INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+    next_retry_at_ns      INTEGER,
+    last_error            TEXT,
+    watcher_state         TEXT NOT NULL DEFAULT 'starting'
+        CHECK(watcher_state IN ('starting','active','failed','stopped')),
+    watcher_error         TEXT,
+    CHECK(applied_generation <= desired_generation),
+    CHECK(force_generation <= desired_generation),
+    CHECK(attempt_generation IS NULL
+          OR (attempt_generation >= 0 AND attempt_generation <= desired_generation))
+);
+
+-- Seed one reconcile state row per pre-existing repository so
+-- callers can always assume the row exists.
+INSERT INTO repo_reconcile_state (repo_hash)
+SELECT repo_hash FROM repositories;
+"#,
+    },
 ];
 
 /// Insert every id in `ids` into the `ambiguous_job_ids` tombstone
@@ -124,12 +225,88 @@ pub fn all_ambiguous_job_ids(conn: &Connection) -> Result<std::collections::Hash
     Ok(rows)
 }
 
+/// Max byte length for durable `last_error` / `watcher_error`
+/// strings. Truncation is UTF-8-safe (never mid-char) so persisted
+/// text is always valid UTF-8 for SQLite and consumer wire types.
+pub const MAX_ERROR_STRING_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasEntry {
     pub alias: String,
     pub root_path: String,
     pub repo_hash: String,
     pub registered_at_ns: i64,
+}
+
+/// A row in `repositories` — the canonical owner of a repo's
+/// on-disk identity. Exactly one exists per (repo_hash,
+/// root_path) pair; `repo_hash` is the primary key and
+/// `root_path` is UNIQUE, so the mapping is a bijection enforced
+/// at the storage layer.
+///
+/// User-facing labels live in `aliases` and reference this row
+/// via `repo_hash` FK with ON DELETE CASCADE — many aliases can
+/// share one repository, and dropping the repository row wipes
+/// its labels and reconcile state atomically.
+///
+/// `registered_at_ns` records when the repository was first
+/// registered (wall-clock ns since UNIX epoch). Subsequent
+/// upserts under the same `(repo_hash, root_path)` do NOT bump
+/// this field — the first-write timestamp wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryEntry {
+    pub repo_hash: String,
+    pub root_path: String,
+    pub registered_at_ns: i64,
+}
+
+/// Watcher lifecycle state — mirrors the `watcher_state` DB column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherState {
+    Starting,
+    Active,
+    Failed,
+    Stopped,
+}
+
+impl WatcherState {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+    fn from_db_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "starting" => Self::Starting,
+            "active" => Self::Active,
+            "failed" => Self::Failed,
+            "stopped" => Self::Stopped,
+            _ => return None,
+        })
+    }
+}
+
+/// One row in `repo_reconcile_state`. All fields mirror the SQL
+/// schema exactly; downstream (`RepoReconcileManager`, doctor,
+/// `repo_status`) map to the wire types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoReconcileState {
+    pub repo_hash: String,
+    pub desired_generation: i64,
+    pub applied_generation: i64,
+    pub force_generation: i64,
+    pub attempt_generation: Option<i64>,
+    pub dirty_since_ns: Option<i64>,
+    pub last_attempt_ns: Option<i64>,
+    pub last_success_ns: Option<i64>,
+    pub consecutive_failures: i64,
+    pub next_retry_at_ns: Option<i64>,
+    pub last_error: Option<String>,
+    pub watcher_state: WatcherState,
+    pub watcher_error: Option<String>,
 }
 
 /// Open (creating if necessary) the alias index DB at `path`.
@@ -140,9 +317,20 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
     open_with_migrations(path, MIGRATIONS)
 }
 
-/// Insert or replace an alias mapping. Replaces only on conflict by
-/// `alias`; other aliases pointing at the same `root_path` are left
-/// alone so two labels can share one on-disk repo.
+/// Insert or replace an alias mapping. Handles both the
+/// `repositories` canonical row (idempotent — the (repo_hash,
+/// root_path) pair is looked up and inserted if absent) and the
+/// `aliases` label row (replaces on conflict by `alias`).
+///
+/// If the `repo_hash` already exists under a *different*
+/// `root_path`, this is a caller bug (canonicalized paths must
+/// match) and the SQL UNIQUE constraint on `repositories.root_path`
+/// or PK on `repositories.repo_hash` fires — the caller must
+/// canonicalize `root_path` before calling.
+///
+/// A fresh repository row also seeds a matching
+/// `repo_reconcile_state` row (all defaults) so state helpers can
+/// always assume the row exists.
 ///
 /// # Errors
 /// SQLite failures.
@@ -153,16 +341,131 @@ pub fn upsert(
     repo_hash: &str,
     registered_at_ns: i64,
 ) -> Result<()> {
+    upsert_repository(tx, repo_hash, root_path, registered_at_ns)?;
     tx.execute(
-        "INSERT INTO aliases (alias, root_path, repo_hash, registered_at_ns)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO aliases (alias, repo_hash, registered_at_ns)
+         VALUES (?1, ?2, ?3)
          ON CONFLICT(alias) DO UPDATE SET
-             root_path = excluded.root_path,
              repo_hash = excluded.repo_hash,
              registered_at_ns = excluded.registered_at_ns",
-        params![alias, root_path, repo_hash, registered_at_ns],
+        params![alias, repo_hash, registered_at_ns],
     )?;
     Ok(())
+}
+
+/// Insert a repository row if not present (idempotent), and seed
+/// the matching `repo_reconcile_state` row. Repeated calls with
+/// the exact same `(repo_hash, root_path)` are no-ops.
+///
+/// Both mapping directions are enforced fail-closed:
+///
+/// - existing `repo_hash` with a different `root_path` →
+///   [`Error::Internal`] "canonical root_path mismatch" (caller
+///   must canonicalize before calling; a mismatch signals hash
+///   collision, corrupted registry, or a stale caller).
+/// - existing `root_path` under a different `repo_hash` → same
+///   contract error, surfaced via the UNIQUE constraint on
+///   `repositories.root_path`.
+///
+/// The pre-check inside a single transaction keeps the invariant
+/// atomic — no alias row / state row is inserted when the
+/// canonical bijection is violated.
+///
+/// # Errors
+/// - [`Error::Internal`] when the canonical bijection is broken.
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
+pub fn upsert_repository(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    root_path: &str,
+    registered_at_ns: i64,
+) -> Result<()> {
+    if let Some(existing_root) = tx
+        .query_row(
+            "SELECT root_path FROM repositories WHERE repo_hash = ?1",
+            params![repo_hash],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        && existing_root != root_path
+    {
+        return Err(crate::Error::Internal(format!(
+            "canonical root_path mismatch: repo_hash={repo_hash} has stored root {existing_root:?} \
+             but caller supplied {root_path:?}; canonicalize the path before calling"
+        )));
+    }
+    tx.execute(
+        "INSERT INTO repositories (repo_hash, root_path, registered_at_ns)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(repo_hash) DO NOTHING",
+        params![repo_hash, root_path, registered_at_ns],
+    )?;
+    tx.execute(
+        "INSERT INTO repo_reconcile_state (repo_hash) VALUES (?1)
+         ON CONFLICT(repo_hash) DO NOTHING",
+        params![repo_hash],
+    )?;
+    Ok(())
+}
+
+/// Look up one repository by hash. Returns `Ok(None)` if absent.
+///
+/// # Errors
+/// SQLite failures.
+pub fn lookup_repository(conn: &Connection, repo_hash: &str) -> Result<Option<RepositoryEntry>> {
+    Ok(conn
+        .query_row(
+            "SELECT repo_hash, root_path, registered_at_ns
+             FROM repositories WHERE repo_hash = ?1",
+            params![repo_hash],
+            row_to_repository,
+        )
+        .optional()?)
+}
+
+/// All registered repositories ordered by `repo_hash`. Cheap
+/// summary; use `aliases_for_repo` to enumerate labels per repo.
+///
+/// # Errors
+/// SQLite failures.
+pub fn list_repositories(conn: &Connection) -> Result<Vec<RepositoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT repo_hash, root_path, registered_at_ns
+         FROM repositories ORDER BY repo_hash",
+    )?;
+    let rows: rusqlite::Result<Vec<RepositoryEntry>> =
+        stmt.query_map([], row_to_repository)?.collect();
+    Ok(rows?)
+}
+
+/// All aliases pointing at `repo_hash`, ordered by alias. Empty
+/// when no labels reference the repository.
+///
+/// # Errors
+/// SQLite failures.
+pub fn aliases_for_repo(conn: &Connection, repo_hash: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT alias FROM aliases WHERE repo_hash = ?1 ORDER BY alias")?;
+    let rows: rusqlite::Result<Vec<String>> = stmt
+        .query_map(params![repo_hash], |r| r.get::<_, String>(0))?
+        .collect();
+    Ok(rows?)
+}
+
+/// Delete a repository row. The FK cascades: every alias pointing
+/// at this repository plus the matching `repo_reconcile_state`
+/// row are removed atomically. Returns `true` if a row was
+/// deleted.
+///
+/// # Errors
+/// SQLite failures.
+pub fn delete_repository(tx: &Transaction<'_>, repo_hash: &str) -> Result<bool> {
+    let n = tx.execute(
+        "DELETE FROM repositories WHERE repo_hash = ?1",
+        params![repo_hash],
+    )?;
+    Ok(n > 0)
 }
 
 /// Count how many aliases reference `repo_hash`. Used by
@@ -179,35 +482,43 @@ pub fn count_aliases_for_repo(conn: &Connection, repo_hash: &str) -> Result<i64>
     )?)
 }
 
-/// Look up one alias. Returns `Ok(None)` if absent.
+/// Look up one alias. Returns `Ok(None)` if absent. The public
+/// `AliasEntry` shape is preserved by JOINing `repositories` to
+/// recover the canonical `root_path`.
 ///
 /// # Errors
 /// SQLite failures.
 pub fn lookup_by_alias(conn: &Connection, alias: &str) -> Result<Option<AliasEntry>> {
     Ok(conn
         .query_row(
-            "SELECT alias, root_path, repo_hash, registered_at_ns
-             FROM aliases WHERE alias = ?1",
+            "SELECT a.alias, r.root_path, a.repo_hash, a.registered_at_ns
+             FROM aliases a JOIN repositories r ON r.repo_hash = a.repo_hash
+             WHERE a.alias = ?1",
             params![alias],
             row_to_entry,
         )
         .optional()?)
 }
 
-/// All registered aliases ordered by alias.
+/// All registered aliases ordered by alias, JOINed with
+/// `repositories` to expose `root_path`.
 ///
 /// # Errors
 /// SQLite failures.
 pub fn list_all(conn: &Connection) -> Result<Vec<AliasEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT alias, root_path, repo_hash, registered_at_ns
-         FROM aliases ORDER BY alias",
+        "SELECT a.alias, r.root_path, a.repo_hash, a.registered_at_ns
+         FROM aliases a JOIN repositories r ON r.repo_hash = a.repo_hash
+         ORDER BY a.alias",
     )?;
     let rows: rusqlite::Result<Vec<AliasEntry>> = stmt.query_map([], row_to_entry)?.collect();
     Ok(rows?)
 }
 
 /// Remove one alias by name. Returns `true` if a row was deleted.
+/// This does NOT cascade to the repository — callers that want
+/// to remove the last alias AND the repository must call
+/// [`delete_repository`] separately.
 ///
 /// # Errors
 /// SQLite failures.
@@ -223,6 +534,369 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<AliasEntry> {
         repo_hash: r.get(2)?,
         registered_at_ns: r.get(3)?,
     })
+}
+
+fn row_to_repository(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryEntry> {
+    Ok(RepositoryEntry {
+        repo_hash: r.get(0)?,
+        root_path: r.get(1)?,
+        registered_at_ns: r.get(2)?,
+    })
+}
+
+fn row_to_reconcile_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepoReconcileState> {
+    let watcher_state_str: String = r.get(11)?;
+    let watcher_state = WatcherState::from_db_str(&watcher_state_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Text,
+            format!("unknown watcher_state: {watcher_state_str}").into(),
+        )
+    })?;
+    Ok(RepoReconcileState {
+        repo_hash: r.get(0)?,
+        desired_generation: r.get(1)?,
+        applied_generation: r.get(2)?,
+        force_generation: r.get(3)?,
+        attempt_generation: r.get(4)?,
+        dirty_since_ns: r.get(5)?,
+        last_attempt_ns: r.get(6)?,
+        last_success_ns: r.get(7)?,
+        consecutive_failures: r.get(8)?,
+        next_retry_at_ns: r.get(9)?,
+        last_error: r.get(10)?,
+        watcher_state,
+        watcher_error: r.get(12)?,
+    })
+}
+
+const RECONCILE_STATE_COLUMNS: &str = "repo_hash, desired_generation, applied_generation, \
+     force_generation, attempt_generation, dirty_since_ns, last_attempt_ns, \
+     last_success_ns, consecutive_failures, next_retry_at_ns, last_error, \
+     watcher_state, watcher_error";
+
+/// Fetch the durable reconcile state for `repo_hash`. Returns
+/// `Ok(None)` when the repository has no row yet (i.e. the
+/// repository is not registered).
+///
+/// # Errors
+/// SQLite failures.
+pub fn get_reconcile_state(
+    conn: &Connection,
+    repo_hash: &str,
+) -> Result<Option<RepoReconcileState>> {
+    let sql =
+        format!("SELECT {RECONCILE_STATE_COLUMNS} FROM repo_reconcile_state WHERE repo_hash = ?1");
+    Ok(conn
+        .query_row(&sql, params![repo_hash], row_to_reconcile_state)
+        .optional()?)
+}
+
+/// Truncate `s` to at most `max_bytes` bytes without splitting a
+/// UTF-8 code point. Returns the (possibly-borrowed) trimmed
+/// value.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// Bump `desired_generation` under `tx` and return the new value.
+/// If `dirty_since_ns` was NULL, set it to `now_ns`. This is the
+/// durable half of the trigger: callers MUST commit the
+/// transaction before starting a debounce window / kicking a
+/// worker; a crash between commit and worker wake still leaves
+/// the desired > applied gap intact.
+///
+/// # Errors
+/// - [`Error::Internal`] if the counter would overflow `i64`.
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
+pub fn increment_desired_generation(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    now_ns: i64,
+) -> Result<i64> {
+    let current: i64 = tx.query_row(
+        "SELECT desired_generation FROM repo_reconcile_state WHERE repo_hash = ?1",
+        params![repo_hash],
+        |r| r.get(0),
+    )?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Internal("reconcile desired_generation overflow".into()))?;
+    tx.execute(
+        "UPDATE repo_reconcile_state
+         SET desired_generation = ?1,
+             dirty_since_ns = COALESCE(dirty_since_ns, ?2)
+         WHERE repo_hash = ?3",
+        params![next, now_ns, repo_hash],
+    )?;
+    Ok(next)
+}
+
+/// Bump `desired_generation` AND `force_generation` under `tx`.
+/// Used by manual `cairn ctl repo reindex` requests so a
+/// concurrent FS event that also happens to bump desired cannot
+/// "eat" the operator's force signal — the reconcile executor
+/// picks the max desired but honours `force_generation` for the
+/// analyzer-enqueue variant.
+///
+/// # Errors
+/// See [`increment_desired_generation`].
+pub fn increment_force_generation(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    now_ns: i64,
+) -> Result<i64> {
+    let next = increment_desired_generation(tx, repo_hash, now_ns)?;
+    tx.execute(
+        "UPDATE repo_reconcile_state SET force_generation = ?1 WHERE repo_hash = ?2",
+        params![next, repo_hash],
+    )?;
+    Ok(next)
+}
+
+fn invalid_transition(context: &str) -> crate::Error {
+    crate::Error::Internal(format!("reconcile state transition rejected: {context}"))
+}
+
+/// Persist that we are about to attempt `generation`. Called
+/// under the repository op_lock, immediately before running the
+/// actual reindex work — if the daemon crashes between this call
+/// and success/failure, startup recovery observes a non-NULL
+/// `attempt_generation` and treats it as interrupted.
+///
+/// Illegal transitions are rejected fail-closed by the WHERE
+/// clause + affected-rows==1 contract:
+///
+/// - `generation < 0`
+/// - the repository has no reconcile state row (missing repo)
+/// - an attempt is already in flight (`attempt_generation IS NOT NULL`)
+/// - `generation <= applied_generation` (nothing to reconcile
+///   past what we already applied)
+/// - `generation > desired_generation` (attempting a generation
+///   that was never requested)
+///
+/// # Errors
+/// - [`Error::Internal`] when any precondition is violated (the
+///   UPDATE affected 0 rows).
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
+pub fn mark_attempt_start(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    generation: i64,
+    now_ns: i64,
+) -> Result<()> {
+    if generation < 0 {
+        return Err(invalid_transition(&format!(
+            "start: negative generation {generation}"
+        )));
+    }
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET attempt_generation = ?1,
+             last_attempt_ns = ?2
+         WHERE repo_hash = ?3
+           AND attempt_generation IS NULL
+           AND applied_generation < ?1
+           AND ?1 <= desired_generation",
+        params![generation, now_ns, repo_hash],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "start: no valid row for repo_hash={repo_hash} generation={generation} \
+             (missing repo, in-flight attempt, gen<=applied, or gen>desired)"
+        )));
+    }
+    Ok(())
+}
+
+/// Persist a successful attempt: advance `applied_generation` to
+/// `max(applied, generation)`, clear the attempt slot, clear the
+/// last error / retry counters. `dirty_since_ns` is cleared iff
+/// `desired_generation <= applied_generation` after the update
+/// (i.e. no newer events arrived while we were reconciling).
+///
+/// Illegal transitions are rejected fail-closed: the call MUST
+/// match `attempt_generation = generation` under `repo_hash`, so
+/// a stale completion cannot silently clear a newer attempt.
+///
+/// # Errors
+/// - [`Error::Internal`] when no row matches (missing repo, no
+///   in-flight attempt, or generation mismatch).
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
+pub fn mark_attempt_success(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    generation: i64,
+    now_ns: i64,
+) -> Result<()> {
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET applied_generation = MAX(applied_generation, ?1),
+             attempt_generation = NULL,
+             last_success_ns = ?2,
+             consecutive_failures = 0,
+             next_retry_at_ns = NULL,
+             last_error = NULL,
+             dirty_since_ns = CASE
+                 WHEN desired_generation <= MAX(applied_generation, ?1) THEN NULL
+                 ELSE dirty_since_ns
+             END
+         WHERE repo_hash = ?3
+           AND attempt_generation = ?1",
+        params![generation, now_ns, repo_hash],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "success: no active attempt matching repo_hash={repo_hash} generation={generation}"
+        )));
+    }
+    Ok(())
+}
+
+/// Persist a failed attempt: clear the attempt slot but leave
+/// `applied_generation` and `dirty_since_ns` alone (the desired >
+/// applied gap remains durable). Record the error text (truncated
+/// UTF-8-safely to [`MAX_ERROR_STRING_BYTES`]), bump the
+/// consecutive-failure counter (`saturating_add`, so an
+/// astronomical failure streak caps rather than wraps), and stamp
+/// `next_retry_at_ns`.
+///
+/// Illegal transitions are rejected fail-closed: same
+/// `attempt_generation = generation` contract as
+/// [`mark_attempt_success`].
+///
+/// # Errors
+/// - [`Error::Internal`] when no row matches.
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
+pub fn mark_attempt_failure(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    generation: i64,
+    error: &str,
+    next_retry_at_ns: i64,
+) -> Result<()> {
+    let error_trimmed = truncate_utf8(error, MAX_ERROR_STRING_BYTES);
+    let current_failures: Option<i64> = tx
+        .query_row(
+            "SELECT consecutive_failures FROM repo_reconcile_state
+             WHERE repo_hash = ?1 AND attempt_generation = ?2",
+            params![repo_hash, generation],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current_failures) = current_failures else {
+        return Err(invalid_transition(&format!(
+            "failure: no active attempt matching repo_hash={repo_hash} generation={generation}"
+        )));
+    };
+    let next_failures = current_failures.saturating_add(1);
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET attempt_generation = NULL,
+             last_error = ?1,
+             consecutive_failures = ?2,
+             next_retry_at_ns = ?3
+         WHERE repo_hash = ?4 AND attempt_generation = ?5",
+        params![
+            error_trimmed,
+            next_failures,
+            next_retry_at_ns,
+            repo_hash,
+            generation
+        ],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "failure: race lost updating repo_hash={repo_hash} generation={generation}"
+        )));
+    }
+    Ok(())
+}
+
+/// Sweep every repository whose `attempt_generation` is non-NULL:
+/// clear the attempt slot, stamp an interrupted-attempt error
+/// (unless one is already present), and return the affected
+/// repo_hashes so the manager can enqueue an immediate retry.
+///
+/// Called from daemon startup before sockets come up, so
+/// operators never see a `Clean` status for a repository whose
+/// last attempt is unaccounted for.
+///
+/// # Errors
+/// SQLite failures.
+pub fn recover_interrupted_attempts(tx: &Transaction<'_>) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT repo_hash FROM repo_reconcile_state WHERE attempt_generation IS NOT NULL",
+    )?;
+    let hashes: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let msg = truncate_utf8(
+        "reconcile attempt interrupted by daemon restart",
+        MAX_ERROR_STRING_BYTES,
+    );
+    for hash in &hashes {
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET attempt_generation = NULL,
+                 last_error = COALESCE(last_error, ?1)
+             WHERE repo_hash = ?2",
+            params![msg, hash],
+        )?;
+    }
+    Ok(hashes)
+}
+
+/// Persist the watcher lifecycle state for `repo_hash`. `error`
+/// is truncated UTF-8-safely; pass `None` to clear it (e.g. on
+/// transition from `Failed` to `Active`).
+///
+/// Fail-closed on missing repo: a caller that has not registered
+/// the repository (no reconcile_state row) MUST NOT silently
+/// succeed — that would let watcher lifecycle transitions
+/// vanish, which reads as "watcher healthy" on status. The
+/// UPDATE-affected-rows == 1 contract catches this.
+///
+/// # Errors
+/// - [`Error::Internal`] when `repo_hash` has no reconcile row.
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
+pub fn set_watcher_state(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    state: WatcherState,
+    error: Option<&str>,
+) -> Result<()> {
+    let trimmed = error.map(|s| truncate_utf8(s, MAX_ERROR_STRING_BYTES).to_string());
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET watcher_state = ?1,
+             watcher_error = ?2
+         WHERE repo_hash = ?3",
+        params![state.as_db_str(), trimmed, repo_hash],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "watcher_state: no reconcile row for repo_hash={repo_hash}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -312,5 +986,622 @@ mod tests {
         assert!(delete(&tx, "demo").unwrap());
         assert!(!delete(&tx, "demo").unwrap());
         tx.commit().unwrap();
+    }
+
+    // ─── Migration v4: repository / reconcile state APIs ────────
+
+    #[test]
+    fn upsert_creates_one_repository_row_for_two_aliases_same_hash() {
+        // Two aliases sharing the same (repo_hash, root_path)
+        // must collapse to a single canonical repositories row —
+        // the identity invariant the reconcile state machine
+        // depends on (one canonical row per watcher / reindex
+        // owner).
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert(&tx, "main", "/p", "h", 1).unwrap();
+        upsert(&tx, "worker", "/p", "h", 2).unwrap();
+        tx.commit().unwrap();
+        let repos = list_repositories(&c).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].repo_hash, "h");
+        assert_eq!(repos[0].root_path, "/p");
+        assert_eq!(
+            repos[0].registered_at_ns, 1,
+            "first-write registration_ns is kept"
+        );
+        let aliases = aliases_for_repo(&c, "h").unwrap();
+        assert_eq!(aliases, vec!["main".to_string(), "worker".to_string()]);
+    }
+
+    #[test]
+    fn upsert_repository_same_hash_different_root_fails_without_alias_insert() {
+        // Canonical bijection: (repo_hash, root_path) is 1:1.
+        // A second `upsert` under an existing repo_hash with a
+        // different root MUST fail with a caller-visible
+        // Internal error, and MUST NOT leave a partial alias /
+        // state / repository mutation behind — the check runs
+        // before any INSERT so a rolled-back tx observes only the
+        // first successful upsert.
+        let (_t, mut c) = fresh();
+        {
+            let tx = c.transaction().unwrap();
+            upsert(&tx, "a", "/p", "h", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        // Second tx: attempt the illegal mapping.
+        {
+            let tx = c.transaction().unwrap();
+            let err = upsert(&tx, "b", "/q", "h", 2).unwrap_err();
+            match err {
+                crate::Error::Internal(msg) => {
+                    assert!(
+                        msg.contains("canonical root_path mismatch"),
+                        "expected canonical bijection error, got {msg}"
+                    );
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+            // Roll back the failed tx — the failed insert must
+            // not leak.
+            tx.rollback().unwrap();
+        }
+        // State after rollback: only the first alias survives,
+        // repositories keeps original root, state row untouched.
+        assert_eq!(lookup_repository(&c, "h").unwrap().unwrap().root_path, "/p");
+        assert_eq!(aliases_for_repo(&c, "h").unwrap(), vec!["a"]);
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.desired_generation, 0);
+    }
+
+    #[test]
+    fn upsert_repository_conflicting_root_under_new_hash_fails_on_unique() {
+        // Different repo_hash, same root_path → violates the
+        // UNIQUE constraint on repositories.root_path.
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert(&tx, "a", "/p", "h1", 1).unwrap();
+        let result = upsert(&tx, "b", "/p", "h2", 2);
+        assert!(result.is_err(), "conflicting root under new hash must fail");
+    }
+
+    #[test]
+    fn alias_entry_join_preserves_root_path_api() {
+        // Public AliasEntry keeps `root_path` even though the
+        // storage moved to `repositories`. Lookup / list JOIN.
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert(&tx, "demo", "/root", "h", 42).unwrap();
+        tx.commit().unwrap();
+        let e = lookup_by_alias(&c, "demo").unwrap().unwrap();
+        assert_eq!(e.root_path, "/root");
+        assert_eq!(e.repo_hash, "h");
+        assert_eq!(e.registered_at_ns, 42);
+        assert_eq!(list_all(&c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_repository_cascades_aliases_and_state() {
+        // Removing the canonical row wipes the labels AND the
+        // reconcile state row atomically via FK ON DELETE
+        // CASCADE.
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert(&tx, "a", "/p", "h", 1).unwrap();
+        upsert(&tx, "b", "/p", "h", 2).unwrap();
+        tx.commit().unwrap();
+        assert!(get_reconcile_state(&c, "h").unwrap().is_some());
+        assert_eq!(aliases_for_repo(&c, "h").unwrap().len(), 2);
+        let tx = c.transaction().unwrap();
+        assert!(delete_repository(&tx, "h").unwrap());
+        tx.commit().unwrap();
+        assert!(get_reconcile_state(&c, "h").unwrap().is_none());
+        assert_eq!(aliases_for_repo(&c, "h").unwrap().len(), 0);
+        assert!(list_repositories(&c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_one_of_two_aliases_leaves_repository_and_state() {
+        // Only `delete_repository` cascades — a single-alias
+        // delete leaves the canonical row and the reconcile
+        // state intact.
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert(&tx, "a", "/p", "h", 1).unwrap();
+        upsert(&tx, "b", "/p", "h", 2).unwrap();
+        delete(&tx, "a").unwrap();
+        tx.commit().unwrap();
+        assert!(get_reconcile_state(&c, "h").unwrap().is_some());
+        assert_eq!(aliases_for_repo(&c, "h").unwrap(), vec!["b"]);
+    }
+
+    #[test]
+    fn increment_desired_generation_bumps_and_stamps_dirty_since() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        assert_eq!(increment_desired_generation(&tx, "h", 100).unwrap(), 1);
+        assert_eq!(increment_desired_generation(&tx, "h", 200).unwrap(), 2);
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.desired_generation, 2);
+        // dirty_since_ns is set on FIRST increment and preserved.
+        assert_eq!(s.dirty_since_ns, Some(100));
+    }
+
+    #[test]
+    fn attempt_success_advances_applied_and_clears_dirty_when_desired_matches() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        mark_attempt_success(&tx, "h", 1, 30).unwrap();
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.applied_generation, 1);
+        assert!(s.attempt_generation.is_none());
+        assert_eq!(s.dirty_since_ns, None, "cleared: desired == applied");
+        assert!(s.last_error.is_none());
+        assert_eq!(s.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn attempt_success_preserves_dirty_when_new_event_bumped_desired() {
+        // Event during attempt: desired bumped again while we
+        // were running. On success, applied catches up to the
+        // attempt generation but dirty_since must be preserved
+        // so the executor loops immediately.
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        increment_desired_generation(&tx, "h", 25).unwrap(); // event during attempt
+        mark_attempt_success(&tx, "h", 1, 30).unwrap();
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.applied_generation, 1);
+        assert_eq!(s.desired_generation, 2);
+        assert_eq!(s.dirty_since_ns, Some(10), "still dirty: desired > applied");
+    }
+
+    #[test]
+    fn attempt_failure_persists_error_and_leaves_gap() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        mark_attempt_failure(&tx, "h", 1, "git failed: EMFILE", 5000).unwrap();
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.applied_generation, 0, "applied MUST NOT advance");
+        assert_eq!(s.desired_generation, 1);
+        assert_eq!(s.dirty_since_ns, Some(10));
+        assert!(s.attempt_generation.is_none());
+        assert_eq!(s.last_error.as_deref(), Some("git failed: EMFILE"));
+        assert_eq!(s.consecutive_failures, 1);
+        assert_eq!(s.next_retry_at_ns, Some(5000));
+    }
+
+    #[test]
+    fn attempt_failure_truncates_long_error_utf8_safely() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 5).unwrap();
+        mark_attempt_start(&tx, "h", 1, 10).unwrap();
+        // Use a multi-byte character so an off-by-one cut would
+        // produce invalid UTF-8.
+        let long = "あ".repeat(3000); // 9000 bytes
+        mark_attempt_failure(&tx, "h", 1, &long, 0).unwrap();
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        let stored = s.last_error.unwrap();
+        assert!(stored.len() <= MAX_ERROR_STRING_BYTES);
+        assert!(stored.chars().all(|c| c == 'あ'), "must remain valid UTF-8");
+    }
+
+    #[test]
+    fn recover_interrupted_attempts_clears_and_annotates() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h1", "/p1", 0).unwrap();
+        upsert_repository(&tx, "h2", "/p2", 0).unwrap();
+        increment_desired_generation(&tx, "h1", 10).unwrap();
+        mark_attempt_start(&tx, "h1", 1, 20).unwrap();
+        // h2 has no in-flight attempt.
+        let hashes = recover_interrupted_attempts(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(hashes, vec!["h1"]);
+        let s1 = get_reconcile_state(&c, "h1").unwrap().unwrap();
+        assert!(s1.attempt_generation.is_none());
+        assert!(s1.last_error.unwrap().contains("interrupted"));
+        let s2 = get_reconcile_state(&c, "h2").unwrap().unwrap();
+        assert!(s2.last_error.is_none());
+    }
+
+    #[test]
+    fn set_watcher_state_persists_and_can_clear_error() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        set_watcher_state(&tx, "h", WatcherState::Failed, Some("git open failed")).unwrap();
+        set_watcher_state(&tx, "h", WatcherState::Active, None).unwrap();
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.watcher_state, WatcherState::Active);
+        assert_eq!(s.watcher_error, None);
+    }
+
+    #[test]
+    fn set_watcher_state_truncates_long_error_utf8_safely() {
+        // Same MAX_ERROR_STRING_BYTES contract as
+        // `mark_attempt_failure`: watcher_error must survive
+        // truncation as valid UTF-8 even when the raw text
+        // straddles a multi-byte boundary at the byte cap.
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        let long = "あ".repeat(3000); // 9000 bytes
+        set_watcher_state(&tx, "h", WatcherState::Failed, Some(&long)).unwrap();
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        let stored = s.watcher_error.unwrap();
+        assert!(stored.len() <= MAX_ERROR_STRING_BYTES);
+        assert!(stored.chars().all(|ch| ch == 'あ'), "must remain UTF-8");
+    }
+
+    #[test]
+    fn increment_force_generation_bumps_both_desired_and_force() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        assert_eq!(increment_force_generation(&tx, "h", 10).unwrap(), 1);
+        tx.commit().unwrap();
+        let s = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(s.desired_generation, 1);
+        assert_eq!(s.force_generation, 1);
+    }
+
+    // ─── MF-3: direct v3 → v4 migration path ────────────────────
+
+    /// Open a fresh temp DB and apply migrations v1..v3 ONLY,
+    /// then hand back the tempdir + connection so the test can
+    /// seed v3-shaped data before running the v4 step in
+    /// isolation. Mirrors the on-disk shape a real 0.7.x daemon
+    /// leaves behind before upgrading to a v4-carrying release.
+    fn open_at_v3() -> (tempfile::TempDir, Connection) {
+        use crate::migration::{apply, apply_standard_pragmas};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index.db");
+        let mut conn = Connection::open(&path).unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        let up_to_v3: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 3)
+            .cloned()
+            .collect();
+        apply(&mut conn, &up_to_v3).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3, "harness must leave DB at v3 before v4 step");
+        (tmp, conn)
+    }
+
+    fn apply_v4_only(conn: &mut Connection) -> Result<()> {
+        use crate::migration::apply;
+        let only_v4: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|m| m.version == 4)
+            .cloned()
+            .collect();
+        apply(conn, &only_v4)
+    }
+
+    #[test]
+    fn v3_to_v4_migration_empty_db_yields_empty_v4_tables() {
+        let (_t, mut c) = open_at_v3();
+        apply_v4_only(&mut c).unwrap();
+        let v: u32 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+        assert!(list_repositories(&c).unwrap().is_empty());
+        // aliases table exists and is empty; the index the v2/v4
+        // migration created must still resolve.
+        let n_aliases: i64 = c
+            .query_row("SELECT COUNT(*) FROM aliases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_aliases, 0);
+        let n_state: i64 = c
+            .query_row("SELECT COUNT(*) FROM repo_reconcile_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n_state, 0);
+    }
+
+    #[test]
+    fn v3_to_v4_migration_collapses_two_aliases_sharing_hash_and_root() {
+        // Two aliases labelling the same on-disk repo must
+        // collapse to ONE repositories row + ONE reconcile state
+        // row after v4. Both aliases must survive as FK'd labels.
+        let (_t, mut c) = open_at_v3();
+        c.execute(
+            "INSERT INTO aliases (alias, root_path, repo_hash, registered_at_ns) VALUES
+                ('main',   '/repos/a', 'h_a', 100),
+                ('worker', '/repos/a', 'h_a', 200)",
+            [],
+        )
+        .unwrap();
+        apply_v4_only(&mut c).unwrap();
+
+        let repos = list_repositories(&c).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].repo_hash, "h_a");
+        assert_eq!(repos[0].root_path, "/repos/a");
+        assert_eq!(
+            repos[0].registered_at_ns, 100,
+            "MIN(registered_at_ns) wins on collapse"
+        );
+
+        let mut labels = aliases_for_repo(&c, "h_a").unwrap();
+        labels.sort();
+        assert_eq!(labels, vec!["main".to_string(), "worker".to_string()]);
+
+        // Reconcile state row is seeded exactly once, at
+        // generation 0 with defaults intact.
+        let s = get_reconcile_state(&c, "h_a").unwrap().unwrap();
+        assert_eq!(s.desired_generation, 0);
+        assert_eq!(s.applied_generation, 0);
+        assert_eq!(s.force_generation, 0);
+        assert!(s.attempt_generation.is_none());
+        assert_eq!(s.consecutive_failures, 0);
+        assert_eq!(s.watcher_state, WatcherState::Starting);
+    }
+
+    #[test]
+    fn v3_to_v4_migration_fails_when_two_aliases_share_hash_but_disagree_on_root() {
+        // On a v3 DB where two aliases point to the same
+        // repo_hash but different root_path, the v4 data
+        // migration's `SELECT DISTINCT repo_hash, root_path`
+        // yields two rows sharing a PK — the INSERT must fail
+        // rather than silently pick a winner. Fail-closed here
+        // keeps the canonical bijection intact even on a dirty
+        // pre-v4 DB; operators recover by inspecting the aliases
+        // and deleting the wrong mapping before retrying.
+        let (_t, mut c) = open_at_v3();
+        c.execute(
+            "INSERT INTO aliases (alias, root_path, repo_hash, registered_at_ns) VALUES
+                ('a', '/repos/x', 'h_dup', 100),
+                ('b', '/repos/y', 'h_dup', 200)",
+            [],
+        )
+        .unwrap();
+        let err = apply_v4_only(&mut c).unwrap_err();
+        // Message shape is SQLite's, we don't care about exact
+        // wording — just that the step aborted.
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unique") || msg.contains("primary") || msg.contains("constraint"),
+            "expected PK/UNIQUE violation, got {msg:?}"
+        );
+        // Migration ran in a transaction — user_version stays 3.
+        let v: u32 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3, "failed migration must not bump user_version");
+    }
+
+    #[test]
+    fn v3_to_v4_migration_fails_when_two_aliases_share_root_but_disagree_on_hash() {
+        // Same shape, opposite axis: shared root_path with
+        // different repo_hash. `repositories.root_path` is
+        // UNIQUE so the second INSERT must fail.
+        let (_t, mut c) = open_at_v3();
+        c.execute(
+            "INSERT INTO aliases (alias, root_path, repo_hash, registered_at_ns) VALUES
+                ('a', '/repos/z', 'h1', 100),
+                ('b', '/repos/z', 'h2', 200)",
+            [],
+        )
+        .unwrap();
+        let err = apply_v4_only(&mut c).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unique") || msg.contains("constraint"),
+            "expected UNIQUE(root_path) violation, got {msg:?}"
+        );
+        let v: u32 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+    }
+
+    #[test]
+    fn v3_to_v4_migration_preserves_public_alias_entry_shape() {
+        // After a real v3→v4 upgrade, `lookup_by_alias` and
+        // `list_all` must keep serving `AliasEntry { alias,
+        // root_path, repo_hash, registered_at_ns }` — the
+        // storage moved to `repositories` but the public API
+        // JOIN must hide that from consumers.
+        let (_t, mut c) = open_at_v3();
+        c.execute(
+            "INSERT INTO aliases (alias, root_path, repo_hash, registered_at_ns) VALUES
+                ('demo', '/root', 'h', 42)",
+            [],
+        )
+        .unwrap();
+        apply_v4_only(&mut c).unwrap();
+
+        let e = lookup_by_alias(&c, "demo").unwrap().unwrap();
+        assert_eq!(e.alias, "demo");
+        assert_eq!(e.root_path, "/root");
+        assert_eq!(e.repo_hash, "h");
+        assert_eq!(e.registered_at_ns, 42);
+        assert_eq!(list_all(&c).unwrap().len(), 1);
+    }
+
+    // ─── MF-2: attempt transition identity checks ──────────────
+
+    fn assert_invalid_transition(err: crate::Error, needle: &str) {
+        match err {
+            crate::Error::Internal(msg) => assert!(
+                msg.contains(needle),
+                "expected invalid-transition error containing {needle:?}, got {msg}"
+            ),
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_attempt_start_rejects_negative_generation() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        let err = mark_attempt_start(&tx, "h", -1, 10).unwrap_err();
+        assert_invalid_transition(err, "negative generation");
+    }
+
+    #[test]
+    fn mark_attempt_start_rejects_generation_above_desired() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap(); // desired=1
+        let err = mark_attempt_start(&tx, "h", 2, 20).unwrap_err();
+        assert_invalid_transition(err, "start:");
+    }
+
+    #[test]
+    fn mark_attempt_start_rejects_generation_at_or_below_applied() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap(); // desired=1
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        mark_attempt_success(&tx, "h", 1, 30).unwrap(); // applied=1
+        // Re-starting at the already-applied generation must be
+        // rejected — no work to do.
+        let err = mark_attempt_start(&tx, "h", 1, 40).unwrap_err();
+        assert_invalid_transition(err, "start:");
+    }
+
+    #[test]
+    fn mark_attempt_start_rejects_second_start_over_in_flight_attempt() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        increment_desired_generation(&tx, "h", 20).unwrap(); // desired=2
+        mark_attempt_start(&tx, "h", 1, 30).unwrap();
+        // Second start while attempt_generation is non-NULL must
+        // fail even if the new generation is otherwise valid.
+        let err = mark_attempt_start(&tx, "h", 2, 40).unwrap_err();
+        assert_invalid_transition(err, "start:");
+    }
+
+    #[test]
+    fn mark_attempt_start_rejects_missing_repo() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let err = mark_attempt_start(&tx, "ghost", 1, 10).unwrap_err();
+        assert_invalid_transition(err, "start:");
+    }
+
+    #[test]
+    fn mark_attempt_success_rejects_generation_mismatch() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap(); // desired=1
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        // Stale completion of a different generation must fail;
+        // must NOT clear the in-flight attempt slot.
+        let err = mark_attempt_success(&tx, "h", 2, 30).unwrap_err();
+        assert_invalid_transition(err, "success:");
+        let s = get_reconcile_state(&tx, "h").unwrap().unwrap();
+        assert_eq!(
+            s.attempt_generation,
+            Some(1),
+            "in-flight attempt must not be cleared by stale success"
+        );
+        assert_eq!(s.applied_generation, 0);
+    }
+
+    #[test]
+    fn mark_attempt_success_rejects_without_active_attempt() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        // No mark_attempt_start — attempt_generation IS NULL.
+        let err = mark_attempt_success(&tx, "h", 1, 20).unwrap_err();
+        assert_invalid_transition(err, "success:");
+    }
+
+    #[test]
+    fn mark_attempt_success_rejects_missing_repo() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let err = mark_attempt_success(&tx, "ghost", 1, 10).unwrap_err();
+        assert_invalid_transition(err, "success:");
+    }
+
+    #[test]
+    fn mark_attempt_failure_rejects_generation_mismatch() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        let err = mark_attempt_failure(&tx, "h", 2, "stale", 100).unwrap_err();
+        assert_invalid_transition(err, "failure:");
+        let s = get_reconcile_state(&tx, "h").unwrap().unwrap();
+        assert_eq!(
+            s.attempt_generation,
+            Some(1),
+            "stale failure must not clear the in-flight attempt"
+        );
+        assert!(s.last_error.is_none());
+        assert_eq!(s.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn mark_attempt_failure_rejects_without_active_attempt() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        let err = mark_attempt_failure(&tx, "h", 1, "orphan", 100).unwrap_err();
+        assert_invalid_transition(err, "failure:");
+    }
+
+    #[test]
+    fn mark_attempt_failure_rejects_missing_repo() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let err = mark_attempt_failure(&tx, "ghost", 1, "gone", 100).unwrap_err();
+        assert_invalid_transition(err, "failure:");
+    }
+
+    #[test]
+    fn set_watcher_state_rejects_missing_repo() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let err = set_watcher_state(&tx, "ghost", WatcherState::Active, None).unwrap_err();
+        assert_invalid_transition(err, "watcher_state:");
+    }
+
+    #[test]
+    fn truncate_utf8_never_splits_a_char() {
+        assert_eq!(truncate_utf8("abcdef", 3), "abc");
+        // "あ" is 3 bytes; asking for 2 must trim to 0.
+        assert_eq!(truncate_utf8("あ", 2), "");
+        // "aあb" is 5 bytes; asking for 4 must trim to "a" (1 byte).
+        assert_eq!(truncate_utf8("aあb", 4), "aあ");
     }
 }
