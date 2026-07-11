@@ -270,7 +270,11 @@ pub enum WatcherState {
 }
 
 impl WatcherState {
-    fn as_db_str(self) -> &'static str {
+    /// The stable wire / SQL string form of this state. Exposed
+    /// so higher layers (status proto mapping, doctor) don't
+    /// need to match on the enum verbatim.
+    #[must_use]
+    pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
             Self::Active => "active",

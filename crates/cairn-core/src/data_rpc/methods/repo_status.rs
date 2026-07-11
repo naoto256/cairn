@@ -1,6 +1,7 @@
 //! `repo_status` — detailed status for one registered repository.
 
 use cairn_lang_api::all_backends;
+use cairn_proto::RepoReconcileStatus;
 use cairn_proto::common::{
     AnalyzerState, Diagnostic, Hint, HintAction, HintCode, TierRepoStatus, TierStatusBody,
 };
@@ -57,6 +58,26 @@ impl DataMethod for RepoStatus {
                     repo_wide: args.tier3.verbose_tier3.then_some(TierStatusBody::ready()),
                 },
             };
+            // PR3 Phase 4: durable reconcile state. If the
+            // `repositories` row exists (v4 always seeds a
+            // reconcile_state row alongside it), we lift the row
+            // into `RepoReconcileStatus`. If the row is somehow
+            // missing (should be impossible under Phase 1's FK
+            // cascade + seed), we fail-closed rather than
+            // synthesising a clean state — the caller asked for
+            // exactly one repo and missing state is DB corruption.
+            let reconcile = match cas_registry::get_reconcile_state(&index, &entry.repo_hash)? {
+                Some(state) => {
+                    let aliases = cas_registry::aliases_for_repo(&index, &entry.repo_hash)?;
+                    Some(reconcile_state_to_wire(&entry.repo_hash, aliases, &state))
+                }
+                None => {
+                    return Err(Error::Internal(format!(
+                        "repo_reconcile_state row missing for repo_hash={}",
+                        entry.repo_hash
+                    )));
+                }
+            };
             Ok(RepoStatusEntry {
                 alias: entry.alias,
                 root: entry.root_path,
@@ -69,6 +90,7 @@ impl DataMethod for RepoStatus {
                 } else {
                     Vec::new()
                 },
+                reconcile,
             })
         })
         .await
@@ -124,7 +146,101 @@ fn repo_status_hints(repo: &RepoStatusEntry) -> Vec<Hint> {
             target: Some("tier3".into()),
         });
     }
+
+    // PR3 Phase 4 hints from durable reconcile state.
+    if let Some(r) = &repo.reconcile {
+        if r.watcher_state == "failed" {
+            hints.push(Hint {
+                code: HintCode::ReconcileWatcherFailed,
+                message: format!(
+                    "Filesystem watcher for `{}` is in failed state: {}. Future file events for this repo will NOT be observed until the daemon restarts.",
+                    repo.alias,
+                    r.watcher_error.as_deref().unwrap_or("no error text"),
+                ),
+                action: None,
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: Some(repo.alias.clone()),
+            });
+        }
+        if r.attempt_generation.is_some() {
+            hints.push(Hint {
+                code: HintCode::ReconcileAttemptInProgress,
+                message: format!(
+                    "Reconcile worker is running attempt for generation {} on `{}`.",
+                    r.attempt_generation.unwrap_or_default(),
+                    repo.alias
+                ),
+                action: Some(HintAction::WaitForIndex),
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: Some(repo.alias.clone()),
+            });
+        } else if r.pending {
+            hints.push(Hint {
+                code: HintCode::ReconcilePending,
+                message: format!(
+                    "Repository `{}` has a dirty gap (desired={} > applied={}) — the reconcile manager will pick it up on the next wake or startup.",
+                    repo.alias, r.desired_generation, r.applied_generation
+                ),
+                action: Some(HintAction::WaitForIndex),
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: Some(repo.alias.clone()),
+            });
+        }
+        if r.retry_scheduled && r.consecutive_failures > 0 {
+            hints.push(Hint {
+                code: HintCode::ReconcileRetryWait,
+                message: format!(
+                    "Last {} reconcile attempts failed on `{}`: {}. Next retry is scheduled.",
+                    r.consecutive_failures,
+                    repo.alias,
+                    r.last_error.as_deref().unwrap_or("no error text"),
+                ),
+                action: Some(HintAction::WaitForIndex),
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: Some(repo.alias.clone()),
+            });
+        }
+    }
     hints
+}
+
+/// Map a Phase 1 `RepoReconcileState` row into the wire type.
+/// Shared by data-RPC and control status paths so both surfaces
+/// produce identical objects for the same underlying row.
+pub(crate) fn reconcile_state_to_wire(
+    repo_hash: &str,
+    aliases: Vec<String>,
+    state: &cas_registry::RepoReconcileState,
+) -> RepoReconcileStatus {
+    let pending =
+        state.desired_generation > state.applied_generation || state.attempt_generation.is_some();
+    let retry_scheduled = state.next_retry_at_ns.is_some();
+    RepoReconcileStatus {
+        repo_hash: repo_hash.to_string(),
+        aliases,
+        desired_generation: state.desired_generation,
+        applied_generation: state.applied_generation,
+        force_generation: state.force_generation,
+        attempt_generation: state.attempt_generation,
+        dirty_since_ns: state.dirty_since_ns,
+        last_attempt_ns: state.last_attempt_ns,
+        last_success_ns: state.last_success_ns,
+        consecutive_failures: state.consecutive_failures,
+        next_retry_at_ns: state.next_retry_at_ns,
+        last_error: state.last_error.clone(),
+        watcher_state: state.watcher_state.as_db_str().to_string(),
+        watcher_error: state.watcher_error.clone(),
+        pending,
+        retry_scheduled,
+    }
 }
 
 fn validate_repo_status_args(args: &RepoStatusArgs) -> Result<()> {
@@ -255,6 +371,119 @@ mod tests {
                 repo_wide: None,
             },
             snapshots: Vec::new(),
+            reconcile: None,
         }
+    }
+
+    // ─── PR3 Phase 4 wire/data MF suite ───────────────────────────
+
+    fn reconcile_entry_with_state(state: RepoReconcileStatus) -> RepoStatusEntry {
+        let mut e = repo_status_entry("ready", TierStatusBody::ready());
+        e.reconcile = Some(state);
+        e
+    }
+
+    fn baseline_reconcile() -> RepoReconcileStatus {
+        RepoReconcileStatus {
+            repo_hash: "h".into(),
+            aliases: vec!["demo".into()],
+            desired_generation: 0,
+            applied_generation: 0,
+            force_generation: 0,
+            attempt_generation: None,
+            dirty_since_ns: None,
+            last_attempt_ns: None,
+            last_success_ns: None,
+            consecutive_failures: 0,
+            next_retry_at_ns: None,
+            last_error: None,
+            watcher_state: "active".into(),
+            watcher_error: None,
+            pending: false,
+            retry_scheduled: false,
+        }
+    }
+
+    /// MF-5a: pending reconcile state emits `reconcile_pending`
+    /// hint.
+    #[test]
+    fn mf5_repo_status_emits_reconcile_pending_hint() {
+        let repo = reconcile_entry_with_state(RepoReconcileStatus {
+            desired_generation: 3,
+            applied_generation: 1,
+            pending: true,
+            ..baseline_reconcile()
+        });
+        let hints = repo_status_hints(&repo);
+        let hint = hints
+            .iter()
+            .find(|h| h.code == HintCode::ReconcilePending)
+            .expect("pending hint must fire");
+        assert!(hint.message.contains("desired=3"));
+        assert!(hint.message.contains("applied=1"));
+    }
+
+    /// MF-5b: watcher_state == failed emits
+    /// `reconcile_watcher_failed` hint with watcher_error.
+    #[test]
+    fn mf5_repo_status_emits_watcher_failed_hint() {
+        let repo = reconcile_entry_with_state(RepoReconcileStatus {
+            watcher_state: "failed".into(),
+            watcher_error: Some("git open failed".into()),
+            ..baseline_reconcile()
+        });
+        let hints = repo_status_hints(&repo);
+        let hint = hints
+            .iter()
+            .find(|h| h.code == HintCode::ReconcileWatcherFailed)
+            .expect("watcher failed hint must fire");
+        assert!(hint.message.contains("git open failed"));
+    }
+
+    /// MF-5c: retry backoff emits `reconcile_retry_wait` with the
+    /// error text.
+    #[test]
+    fn mf5_repo_status_emits_retry_wait_hint() {
+        let repo = reconcile_entry_with_state(RepoReconcileStatus {
+            desired_generation: 2,
+            applied_generation: 1,
+            pending: true,
+            consecutive_failures: 3,
+            next_retry_at_ns: Some(99_999),
+            last_error: Some("EMFILE".into()),
+            retry_scheduled: true,
+            ..baseline_reconcile()
+        });
+        let hints = repo_status_hints(&repo);
+        let hint = hints
+            .iter()
+            .find(|h| h.code == HintCode::ReconcileRetryWait)
+            .expect("retry wait hint must fire");
+        assert!(hint.message.contains("EMFILE"));
+    }
+
+    /// MF-5d: attempt in flight emits
+    /// `reconcile_attempt_in_progress` (informational) and NOT
+    /// the pending hint — the attempt is what pending would
+    /// tell the user to wait for.
+    #[test]
+    fn mf5_repo_status_attempt_in_progress_hides_pending_hint() {
+        let repo = reconcile_entry_with_state(RepoReconcileStatus {
+            desired_generation: 5,
+            applied_generation: 2,
+            attempt_generation: Some(5),
+            pending: true,
+            ..baseline_reconcile()
+        });
+        let hints = repo_status_hints(&repo);
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.code == HintCode::ReconcileAttemptInProgress)
+        );
+        assert!(
+            hints.iter().all(|h| h.code != HintCode::ReconcilePending),
+            "attempt in flight makes the pending hint redundant"
+        );
     }
 }

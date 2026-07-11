@@ -213,6 +213,11 @@ pub struct RepoStatus {
     /// dumping job history inline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobSnapshot>,
+    /// PR3 Phase 4: durable reconcile state for the canonical
+    /// repo. Additive; two alias rows sharing the same
+    /// `reconcile.repo_hash` carry the same object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile: Option<crate::RepoReconcileStatus>,
 }
 
 impl RepoStatus {
@@ -354,6 +359,7 @@ mod status_tests {
             }],
             job_summary: JobSummary::default(),
             jobs: Vec::new(),
+            reconcile: None,
         };
         assert_eq!(
             repo.languages().into_iter().collect::<Vec<_>>(),

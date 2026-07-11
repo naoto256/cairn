@@ -27,7 +27,10 @@ pub mod common;
 pub mod control;
 pub mod jsonrpc;
 pub mod methods;
+pub mod reconcile_status;
 pub mod version;
+
+pub use reconcile_status::RepoReconcileStatus;
 
 pub use common::{
     AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,

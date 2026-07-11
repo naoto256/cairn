@@ -41,12 +41,39 @@ impl ControlMethod for Status {
                 let conn = cas_store::open(&store_path)?;
                 let snapshots = collect_anchor_snapshots(&conn, store_bytes, &backends)?;
                 let job_summary = collect_job_summary(&conn)?;
+                // PR3 Phase 4: durable reconcile state per repo.
+                // Two aliases with the same repo_hash both carry
+                // the same object. Fail-closed on missing state
+                // row when the repository exists — that shape
+                // would indicate DB corruption (v4 seeds a
+                // reconcile_state row alongside every repositories
+                // row and FK ON DELETE CASCADE tears them down
+                // together).
+                let reconcile = match cas_registry::get_reconcile_state(&index, &entry.repo_hash)? {
+                    Some(state) => {
+                        let aliases = cas_registry::aliases_for_repo(&index, &entry.repo_hash)?;
+                        Some(
+                            crate::data_rpc::methods::repo_status::reconcile_state_to_wire(
+                                &entry.repo_hash,
+                                aliases,
+                                &state,
+                            ),
+                        )
+                    }
+                    None => {
+                        return Err(Error::Internal(format!(
+                            "repo_reconcile_state row missing for repo_hash={} (alias={})",
+                            entry.repo_hash, entry.alias
+                        )));
+                    }
+                };
                 out.push(RepoStatus {
                     alias: entry.alias,
                     root: entry.root_path,
                     snapshots,
                     job_summary,
                     jobs: Vec::new(),
+                    reconcile,
                 });
             }
             Ok(out)

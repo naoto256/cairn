@@ -263,6 +263,19 @@ pub enum HintCode {
     DaemonNotReady,
     RepoNotRegistered,
     SnapshotStale,
+    /// Repository has a durable dirty gap (`desired > applied`)
+    /// with no in-flight attempt — the reconcile manager will
+    /// pick it up on the next wake or startup.
+    ReconcilePending,
+    /// A failed reconcile attempt scheduled a retry via
+    /// `next_retry_at_ns`.
+    ReconcileRetryWait,
+    /// Watcher lifecycle has entered the `failed` state — future
+    /// filesystem events for this repo are NOT observed until
+    /// the daemon restarts or the watcher recovers.
+    ReconcileWatcherFailed,
+    /// A worker attempt is currently in flight (informational).
+    ReconcileAttemptInProgress,
 }
 
 /// Optional action category for a hint.
