@@ -68,6 +68,21 @@ pub fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
 /// and writers concurrency; foreign keys default to off in SQLite for
 /// backwards compatibility, so we enable them explicitly.
 pub fn apply_standard_pragmas(conn: &Connection) -> Result<()> {
+    // Set `busy_timeout` FIRST so every pragma that can fail
+    // with SQLITE_BUSY (journal_mode = WAL is famously one
+    // such: switching journal modes acquires an exclusive
+    // lock, and a concurrent opener can race it) retries
+    // instead of surfacing to the caller. Without this the
+    // very first thread to bootstrap the WAL journal wins and
+    // any other opener within a few ms racing it hits
+    // `DatabaseBusy` even though nobody has done any real
+    // work yet.
+    //
+    // 30s buys enough headroom for CPU-starved parallel test
+    // runs and real production writer contention across
+    // independent spawn_blocking tasks; production writes are
+    // small and finish long before the timeout.
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
