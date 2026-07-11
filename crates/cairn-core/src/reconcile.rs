@@ -165,6 +165,15 @@ impl RepoRuntime {
     }
 }
 
+/// Injectable register-executor for tests. When set, the worker
+/// calls the hook instead of running the real
+/// `register_repo_*_enqueue` path. Tests use this to inject
+/// success/failure, block for in-flight assertions, and count
+/// invocations without needing a real git worktree.
+#[cfg(test)]
+pub type TestRegisterHookFn =
+    std::sync::Arc<dyn Fn(&str, &str, i64, bool) -> Result<()> + Send + Sync + 'static>;
+
 /// Central reindex state-machine driver — one instance per
 /// daemon. See the module-level docs for the concurrency
 /// contract.
@@ -183,6 +192,13 @@ pub struct RepoReconcileManager {
     /// synchronise with tokio task scheduling in MF tests.
     #[cfg(test)]
     test_attempts_started: AtomicI64,
+    /// Test-only register injector. When `Some`, the worker
+    /// invokes it in place of the real `register_repo_*_enqueue`
+    /// call — the injector receives
+    /// `(repo_hash, alias, generation, forced)` and returns
+    /// `Result<()>`. Left `None` in production.
+    #[cfg(test)]
+    test_register_hook: std::sync::Mutex<Option<TestRegisterHookFn>>,
 }
 
 impl RepoReconcileManager {
@@ -223,7 +239,22 @@ impl RepoReconcileManager {
             workers_idle: Arc::new(Notify::new()),
             #[cfg(test)]
             test_attempts_started: AtomicI64::new(0),
+            #[cfg(test)]
+            test_register_hook: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install a test-only register injector. Returns the
+    /// previously installed hook, if any.
+    #[cfg(test)]
+    pub fn set_test_register_hook(&self, hook: TestRegisterHookFn) -> Option<TestRegisterHookFn> {
+        let mut guard = self.test_register_hook.lock().unwrap();
+        guard.replace(hook)
+    }
+
+    #[cfg(test)]
+    fn take_test_register_hook_snapshot(&self) -> Option<TestRegisterHookFn> {
+        self.test_register_hook.lock().unwrap().clone()
     }
 
     /// Record durable dirty intent for `repo_hash` and wake the
@@ -710,15 +741,44 @@ async fn run_attempt(
     }
 
     // Phase B: pick alias + run the register/enqueue work.
-    let register_result = run_register_work(
-        cas_data_dir.clone(),
-        hash.clone(),
-        preferred_alias,
-        forced,
-        job_manager,
-        now_ns,
-    )
-    .await;
+    #[cfg(test)]
+    let test_hook = mgr.take_test_register_hook_snapshot();
+    #[cfg(not(test))]
+    let test_hook: Option<()> = None;
+    let register_result = if let Some(_h) = &test_hook {
+        #[cfg(test)]
+        {
+            let cas_data_dir_hook = cas_data_dir.clone();
+            let hash_hook = hash.clone();
+            let alias_hook = preferred_alias.clone();
+            let hook = test_hook.clone().unwrap();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let index = cas_registry::open(&cas_data_dir_hook.index_db_path())?;
+                let aliases = cas_registry::aliases_for_repo(&index, &hash_hook)?;
+                let alias =
+                    pick_alias(&alias_hook, &aliases).ok_or_else(|| Error::RepoNotFound {
+                        alias: format!("no aliases for repo_hash={hash_hook}"),
+                    })?;
+                (hook)(&hash_hook, &alias, generation, forced)
+            })
+            .await
+            .map_err(|e| Error::internal_task_panic("reconcile test hook", e))?
+        }
+        #[cfg(not(test))]
+        {
+            unreachable!()
+        }
+    } else {
+        run_register_work(
+            cas_data_dir.clone(),
+            hash.clone(),
+            preferred_alias,
+            forced,
+            job_manager,
+            now_ns,
+        )
+        .await
+    };
 
     // Phase C: commit success or failure to index.db.
     let policy = mgr.retry;
