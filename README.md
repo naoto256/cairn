@@ -266,6 +266,20 @@ remediation (failed-at-current, queued, missing-row, or a
 chain-broken Fail if drift persists despite a successful
 analyzer pass) and a concrete next-step.
 
+Repo-level reindex intent (watcher events, `cairn ctl repo
+reindex`, parser-revision drift recovery) is driven by a durable
+per-`repo_hash` state machine — desired / applied / force
+generation counters, in-flight attempt, retry backoff, watcher
+lifecycle — visible via `repo_status.reconcile` (data-RPC) and
+`status.repos[].reconcile` (control), and grouped in
+`cairn ctl daemon doctor` as `reconcile dirty gap` / `reconcile
+retry` / `reconcile attempt` / `watcher lifecycle` /
+`reconcile invariants` checks. The wire object is repeated per
+alias for a canonical repo but carries `aliases: [...]` so a
+client can dedup by `repo_hash`. Older clients that ignore the
+field see no wire-shape change — every new field is additive with
+`serde(default, skip_serializing_if = "Option::is_none")`.
+
 ## Languages
 
 | Language | Tier-1 (syntax) | Tier-2 (semantic) | Tier-2.5 (in-process) | Tier-3 (cross-file) |

@@ -162,6 +162,13 @@ pub struct RepoStatusEntry {
     pub tier3_status: TierRepoStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshots: Vec<RepoSnapshotEntry>,
+    /// PR3 Phase 4: durable reconcile state for the underlying
+    /// canonical repo. Additive — older daemons omit it and older
+    /// consumers deserialize existing payloads unchanged. Two
+    /// alias entries in the same response with equal
+    /// `reconcile.repo_hash` carry the same object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile: Option<crate::RepoReconcileStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +317,7 @@ mod list_repos_tests {
                     repo_wide: None,
                 },
                 snapshots: Vec::new(),
+                reconcile: None,
             },
             diagnostics: vec![Diagnostic {
                 code: crate::DiagnosticCode::AnalyzerStale,
@@ -361,6 +369,7 @@ mod list_repos_tests {
                     repo_wide: None,
                 },
                 snapshots: Vec::new(),
+                reconcile: None,
             },
             diagnostics: Vec::new(),
             hints: Vec::new(),
