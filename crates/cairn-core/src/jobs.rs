@@ -1074,28 +1074,33 @@ impl JobManager {
         Ok(jobs)
     }
 
-    /// High-level "reindex this whole repo right now" entry point.
+    /// **Compat helper — not a production entry point.** Since
+    /// PR3 Phase 3, repo-level reindex intent (watcher events,
+    /// manual reindex, parser-revision drift) records durable
+    /// state through [`crate::reconcile::RepoReconcileManager`]
+    /// and the worker executes the register hot path
+    /// asynchronously. This method still exists so
+    /// [`crate::workspace_analyzer::staleness::check_revision_staleness_and_enqueue`]
+    /// can fall back inline when it is called without a reconcile
+    /// driver (test / degraded startup only). Production wiring
+    /// always passes `Some(reconcile)`, so this method's only
+    /// live caller path is the `reconcile.is_none()` gate.
     ///
-    /// Looks the alias up in the registry, opens its CAS store,
-    /// walks the register hot path with the dedup gate **off** (=
-    /// analyzers are always re-queued), and returns a structured
-    /// outcome.
-    ///
-    /// # Why the surface is intentionally narrow
-    ///
-    /// Callers (operator-driven reindex, parser-revision drift
-    /// recovery, future watcher heuristics) supply only `alias` and
-    /// `reason`. All the routing identity (`repo_hash`, `repo_root`,
-    /// `manifest_id`, `entries`, `now_ns`) is derived inside this
-    /// method from the registry + clock. A buggy caller cannot
-    /// hand-stamp the wrong store path or a stale timestamp.
+    /// Original behaviour: look the alias up in the registry,
+    /// open its CAS store, walk the register hot path with the
+    /// dedup gate **off** (= analyzers always re-queued), return
+    /// a structured outcome. All routing identity (`repo_hash`,
+    /// `repo_root`, `manifest_id`, `entries`, `now_ns`) is derived
+    /// inside this method from the registry + clock; a buggy
+    /// caller cannot hand-stamp the wrong store path or a stale
+    /// timestamp.
     ///
     /// # Errors
     /// * [`Error::RepoNotFound`] if `alias` is not registered.
     /// * SQLite / IO errors from the registry, store open, git
     ///   invocation, or the analyzer enqueue path bubble up
     ///   unchanged.
-    pub fn enqueue_full_repo_reindex(
+    pub(crate) fn enqueue_full_repo_reindex(
         &self,
         alias: &str,
         reason: ReindexReason,

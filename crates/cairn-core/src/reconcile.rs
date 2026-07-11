@@ -61,6 +61,14 @@ pub enum ReconcileTrigger {
     StartupRecovery,
     /// Internal retry after a prior failed attempt.
     Retry,
+    /// Daemon-startup revision-staleness scanner detected
+    /// `parser_revision` drift on a registered repo — the
+    /// tentative manifest's persisted parser revision is
+    /// behind (or missing against) what the linked-in backend
+    /// reports. Triggers a `force_generation` bump so the
+    /// worker performs a full reparse rather than a
+    /// dedupe-eligible refresh.
+    ParserRevisionDrift,
 }
 
 /// Return value from a request into the manager — mostly for

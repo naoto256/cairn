@@ -50,6 +50,12 @@ pub struct Daemon {
     /// not cut off, stop analyzer jobs before the shared LSP pool so workers
     /// cannot race pool teardown, and finally reap LSP child processes.
     pub job_manager: Option<Arc<JobManager>>,
+    /// Reconcile driver — required in production so the startup
+    /// revision-staleness scan can route parser-revision drift
+    /// through the durable state machine rather than the
+    /// synchronous full-reindex helper. Tests that don't exercise
+    /// the drift path may pass `None`.
+    pub reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
 }
 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -81,6 +87,7 @@ impl Daemon {
         // failure (e.g. alias-index unreadable) is logged here.
         if let Some(job_manager) = self.job_manager.clone() {
             let cas_data_dir_for_staleness = job_manager.cas_data_dir().clone();
+            let reconcile_for_staleness = self.reconcile.clone();
             // The scan is sync SQLite I/O, so we hand it to the blocking
             // pool. We then `spawn` an awaiter so a panic inside the
             // blocking thread surfaces as a `JoinError` and gets
@@ -91,6 +98,7 @@ impl Daemon {
                 crate::workspace_analyzer::check_revision_staleness_and_enqueue(
                     &cas_data_dir_for_staleness,
                     &job_manager,
+                    reconcile_for_staleness.as_ref(),
                 )
             });
             tokio::spawn(async move {
@@ -364,6 +372,7 @@ mod tests {
                     control_handler: Arc::new(EchoHandler),
                     shutdown,
                     job_manager: None,
+                    reconcile: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -405,6 +414,7 @@ mod tests {
                     control_handler: Arc::new(EchoHandler),
                     shutdown,
                     job_manager: None,
+                    reconcile: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -475,6 +485,7 @@ mod tests {
                     control_handler: Arc::new(EchoHandler),
                     shutdown,
                     job_manager: Some(job_manager),
+                    reconcile: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -568,6 +579,7 @@ mod tests {
                     )),
                     shutdown,
                     job_manager: None,
+                    reconcile: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -681,6 +693,7 @@ mod tests {
                     )),
                     shutdown,
                     job_manager: None,
+                    reconcile: None,
                 };
                 daemon.run().await.unwrap();
             }

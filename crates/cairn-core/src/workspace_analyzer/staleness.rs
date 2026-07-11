@@ -54,11 +54,14 @@ use cairn_lang_api::all_backends;
 use rusqlite::params;
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
+
 use crate::Result;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::jobs::{EnqueueAnalyzerRun, JobManager, ReindexReason};
 use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
+use crate::reconcile::{ReconcileTrigger, RepoReconcileManager};
 use crate::workspace_analyzer::{expected_analyzers_for_manifest, expected_parse_units};
 
 use super::all_workspace_analyzers;
@@ -109,11 +112,14 @@ pub struct StalenessSummary {
     /// a `parser_revision` different from what the current backend
     /// reports).
     pub parser_drift_aliases: usize,
-    /// Number of full-repo reindex requests dispatched as a result
-    /// of parser-revision drift. Counts *requests*, not the analyzer
-    /// jobs each request fans out into — those are visible on each
-    /// `FullReindexEnqueueOutcome`.
-    pub full_reindex_requests: usize,
+    /// Number of `request_force_by_alias(ParserRevisionDrift)`
+    /// requests dispatched to the reconcile manager as a result
+    /// of parser-revision drift. Counts *requests* (durable
+    /// intent records); the worker executes the register /
+    /// analyzer enqueue work asynchronously and its outcome is
+    /// visible on `repo_reconcile_state` rather than in this
+    /// summary.
+    pub parser_drift_reconcile_requests: usize,
 }
 
 /// Read each registered alias's tentative manifest, compute which
@@ -128,6 +134,7 @@ pub struct StalenessSummary {
 pub fn check_revision_staleness_and_enqueue(
     cas_data_dir: &CasDataDir,
     job_manager: &JobManager,
+    reconcile: Option<&Arc<RepoReconcileManager>>,
 ) -> Result<StalenessSummary> {
     let index = cas_registry::open(&cas_data_dir.index_db_path())?;
     let entries = cas_registry::list_all(&index)?;
@@ -147,7 +154,13 @@ pub fn check_revision_staleness_and_enqueue(
     };
 
     for entry in &entries {
-        match scan_one_alias(cas_data_dir, job_manager, entry, &expected_revision_for) {
+        match scan_one_alias(
+            cas_data_dir,
+            job_manager,
+            reconcile,
+            entry,
+            &expected_revision_for,
+        ) {
             Ok(per_alias) => {
                 summary.jobs_enqueued += per_alias.jobs_enqueued;
                 summary.active_stale += per_alias.active_stale;
@@ -155,7 +168,7 @@ pub fn check_revision_staleness_and_enqueue(
                     per_alias.terminal_failed_current_revision;
                 if per_alias.parser_drift {
                     summary.parser_drift_aliases += 1;
-                    summary.full_reindex_requests += 1;
+                    summary.parser_drift_reconcile_requests += 1;
                 }
             }
             Err(err) => {
@@ -176,7 +189,7 @@ pub fn check_revision_staleness_and_enqueue(
         active_stale = summary.active_stale,
         terminal_failed_current_revision = summary.terminal_failed_current_revision,
         parser_drift_aliases = summary.parser_drift_aliases,
-        full_reindex_requests = summary.full_reindex_requests,
+        parser_drift_reconcile_requests = summary.parser_drift_reconcile_requests,
         "revision staleness scan complete"
     );
     Ok(summary)
@@ -187,17 +200,22 @@ struct PerAliasSummary {
     jobs_enqueued: usize,
     active_stale: usize,
     terminal_failed_current_revision: usize,
-    /// `true` iff the parser-revision drift pre-check fired and a
-    /// `enqueue_full_repo_reindex` request was dispatched. When set,
-    /// the analyzer-revision drift loop is skipped — the upcoming
-    /// reindex will re-stamp everything, so re-queueing here would
-    /// only cause coalesce noise.
+    /// `true` iff the parser-revision drift pre-check fired and
+    /// a durable reconcile force request was recorded (through
+    /// [`RepoReconcileManager::request_force_by_alias`] with
+    /// [`ReconcileTrigger::ParserRevisionDrift`], or through the
+    /// compat helper [`JobManager::enqueue_full_repo_reindex`]
+    /// when reconcile is unavailable — test-only). When set, the
+    /// analyzer-revision drift loop is skipped — the upcoming
+    /// reindex will re-stamp everything, so re-queueing here
+    /// would only cause coalesce noise.
     parser_drift: bool,
 }
 
 fn scan_one_alias(
     cas_data_dir: &CasDataDir,
     job_manager: &JobManager,
+    reconcile: Option<&Arc<RepoReconcileManager>>,
     entry: &cas_registry::AliasEntry,
     expected_revision_for: &HashMap<&'static str, u32>,
 ) -> Result<PerAliasSummary> {
@@ -233,25 +251,58 @@ fn scan_one_alias(
     // an infinite reindex loop (the row stays in place across reindex,
     // and `expected_parse_units` ignores it).
     if detect_parser_revision_drift(&conn, manifest_id, repo_root)? {
-        match job_manager
-            .enqueue_full_repo_reindex(&entry.alias, ReindexReason::ParserRevisionDrift)
-        {
-            Ok(outcome) => {
-                info!(
+        if let Some(reconcile) = reconcile {
+            // Production path: record durable force intent via the
+            // reconcile manager. The register / analyzer enqueue
+            // work runs asynchronously in the worker; scan doesn't
+            // wait for it. `Handle::current().block_on` is safe
+            // here because the scanner runs inside a tokio
+            // `spawn_blocking` task — the runtime handle is
+            // present and reserved.
+            let handle = tokio::runtime::Handle::current();
+            let reconcile = reconcile.clone();
+            let alias = entry.alias.clone();
+            let dispatch = handle.block_on(async move {
+                reconcile
+                    .request_force_by_alias(alias, ReconcileTrigger::ParserRevisionDrift)
+                    .await
+            });
+            match dispatch {
+                Ok(outcome) => info!(
+                    alias = %entry.alias,
+                    repo_hash = %outcome.repo_hash,
+                    generation = outcome.generation,
+                    scheduled = outcome.scheduled,
+                    "parser-revision drift: recorded reconcile force request"
+                ),
+                Err(err) => warn!(
+                    alias = %entry.alias,
+                    error = %err,
+                    "parser-revision drift: reconcile force request failed; continuing"
+                ),
+            }
+        } else {
+            // Compat path (test / degraded startup only). The
+            // production daemon always passes `Some(reconcile)`;
+            // this branch is intentionally the sole surviving
+            // production-adjacent caller of
+            // `JobManager::enqueue_full_repo_reindex`, kept
+            // behind the `reconcile.is_none()` gate so it never
+            // runs when a reconcile driver exists.
+            match job_manager
+                .enqueue_full_repo_reindex(&entry.alias, ReindexReason::ParserRevisionDrift)
+            {
+                Ok(outcome) => info!(
                     alias = %entry.alias,
                     blobs_parsed = outcome.blobs_parsed,
                     jobs_enqueued = outcome.jobs_enqueued,
-                    skip_analyzers_for_unchanged_manifest =
-                        outcome.skip_analyzers_for_unchanged_manifest,
-                    "parser-revision drift: enqueued full repo reindex"
-                );
-            }
-            Err(err) => {
-                warn!(
+                    "parser-revision drift: fallback full reindex enqueued (no reconcile driver)"
+                ),
+                Err(err) => warn!(
                     alias = %entry.alias,
                     error = %err,
-                    "parser-revision drift: full reindex enqueue failed; continuing"
-                );
+                    "parser-revision drift: fallback full reindex enqueue failed; continuing"
+                ),
             }
         }
         return Ok(PerAliasSummary {
@@ -824,7 +875,7 @@ mod e2e {
         insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, "succeeded");
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         assert_eq!(summary.aliases_scanned, 1);
         assert_eq!(summary.aliases_failed, 0);
@@ -850,7 +901,7 @@ mod e2e {
         // No pre-seeded run row.
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         assert_eq!(summary.jobs_enqueued, 1);
         assert_eq!(summary.aliases_failed, 0);
@@ -869,8 +920,9 @@ mod e2e {
             let f = setup_alias();
             insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, status);
 
-            let summary = check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager)
-                .unwrap_or_else(|e| panic!("scan failed for status `{status}`: {e}"));
+            let summary =
+                check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None)
+                    .unwrap_or_else(|e| panic!("scan failed for status `{status}`: {e}"));
 
             assert_eq!(
                 summary.jobs_enqueued, 1,
@@ -889,8 +941,9 @@ mod e2e {
             let f = setup_alias();
             insert_run(&f, ANALYZER_ID, EXPECTED_REV, status);
 
-            let summary = check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager)
-                .unwrap_or_else(|e| panic!("scan failed for status `{status}`: {e}"));
+            let summary =
+                check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None)
+                    .unwrap_or_else(|e| panic!("scan failed for status `{status}`: {e}"));
 
             assert_eq!(
                 summary.jobs_enqueued, 0,
@@ -916,8 +969,9 @@ mod e2e {
             let f = setup_alias();
             insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, status);
 
-            let summary = check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager)
-                .unwrap_or_else(|e| panic!("scan failed for status `{status}`: {e}"));
+            let summary =
+                check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None)
+                    .unwrap_or_else(|e| panic!("scan failed for status `{status}`: {e}"));
 
             assert_eq!(
                 summary.jobs_enqueued, 0,
@@ -965,7 +1019,7 @@ mod e2e {
         .unwrap();
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         // One enqueue for the tentative manifest (missing row), and
         // zero enqueues for the definitive manifest's old row.
@@ -1018,7 +1072,7 @@ mod e2e {
         std::fs::write(&store_path, b"this is not a sqlite file").unwrap();
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         assert_eq!(summary.aliases_scanned, 2);
         assert_eq!(
@@ -1170,7 +1224,7 @@ mod e2e {
 
     /// Test #7 — end-to-end happy path: no drift, scanner proceeds to
     /// analyzer drift loop and enqueues an analyzer run as before. The
-    /// `parser_drift_aliases` and `full_reindex_requests` counters
+    /// `parser_drift_aliases` and `parser_drift_reconcile_requests` counters
     /// stay at zero.
     #[test]
     fn e2e_no_parser_drift_proceeds_to_analyzer_drift() {
@@ -1178,10 +1232,10 @@ mod e2e {
         insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, "succeeded");
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         assert_eq!(summary.parser_drift_aliases, 0);
-        assert_eq!(summary.full_reindex_requests, 0);
+        assert_eq!(summary.parser_drift_reconcile_requests, 0);
         assert_eq!(summary.jobs_enqueued, 1, "analyzer drift still enqueues");
     }
 
@@ -1203,14 +1257,14 @@ mod e2e {
         drop(conn);
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         assert_eq!(
             summary.parser_drift_aliases, 1,
             "drift must be counted; summary = {summary:?}"
         );
         assert_eq!(
-            summary.full_reindex_requests, 1,
+            summary.parser_drift_reconcile_requests, 1,
             "exactly one full reindex request per drifted alias"
         );
     }
@@ -1234,7 +1288,7 @@ mod e2e {
         insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, "succeeded"); // analyzer also stale
 
         let summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         assert_eq!(summary.parser_drift_aliases, 1);
         assert_eq!(
@@ -1318,7 +1372,7 @@ mod e2e {
         drop(conn);
 
         let summary =
-            check_revision_staleness_and_enqueue(&drifted.cas_data_dir, &drifted.job_manager)
+            check_revision_staleness_and_enqueue(&drifted.cas_data_dir, &drifted.job_manager, None)
                 .unwrap();
 
         assert_eq!(summary.aliases_scanned, 2);
@@ -1326,7 +1380,7 @@ mod e2e {
             summary.parser_drift_aliases, 1,
             "only the drifted alias counts; summary = {summary:?}"
         );
-        assert_eq!(summary.full_reindex_requests, 1);
+        assert_eq!(summary.parser_drift_reconcile_requests, 1);
     }
 
     /// Test #11 — `FullReindexEnqueueOutcome` shape pin: the
@@ -1390,7 +1444,7 @@ mod e2e {
         insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, "succeeded"); // would-be analyzer-drift bait
 
         let _summary =
-            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager).unwrap();
+            check_revision_staleness_and_enqueue(&f.cas_data_dir, &f.job_manager, None).unwrap();
 
         // If the parser-drift path had fallen through to
         // `enqueue_analyzer_run`, a row at EXPECTED_REV would now be
@@ -1402,5 +1456,146 @@ mod e2e {
         );
         // The pre-existing analyzer row stays untouched.
         assert_eq!(count_runs(&f, ANALYZER_ID), 1);
+    }
+
+    // ─── Phase 3 MF suite ─────────────────────────────────────────
+
+    fn build_reconcile(f: &AliasFixture) -> Arc<crate::reconcile::RepoReconcileManager> {
+        use crate::reconcile::RepoReconcileManager;
+        let mgr = RepoReconcileManager::new(f.cas_data_dir.clone(), None);
+        // Skip real register/enqueue work in the worker — MF tests
+        // only care about durable intent recording and lack of
+        // analyzer_run stamping via the parser-drift path.
+        mgr.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        mgr
+    }
+
+    fn trigger_parser_drift(f: &AliasFixture) {
+        let conn = cas_store::open(&f.cas_data_dir.store_db_path(&f.repo_hash)).unwrap();
+        conn.execute(
+            "UPDATE blobs SET parser_revision = 0 WHERE blob_sha = 'fake-sha'",
+            [],
+        )
+        .unwrap();
+    }
+
+    async fn run_scan(
+        f: &AliasFixture,
+        reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+    ) -> StalenessSummary {
+        let cas = f.cas_data_dir.clone();
+        let job_manager = f.job_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            check_revision_staleness_and_enqueue(&cas, &job_manager, reconcile.as_ref())
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    /// MF-1: parser drift records durable reconcile intent through
+    /// the manager (desired_generation + force_generation both
+    /// bump), NOT through the compat full-reindex helper.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mf1_parser_drift_records_reconcile_intent() {
+        let f = setup_alias();
+        trigger_parser_drift(&f);
+        let reconcile = build_reconcile(&f);
+        let summary = run_scan(&f, Some(reconcile.clone())).await;
+
+        assert_eq!(summary.parser_drift_aliases, 1);
+        assert_eq!(summary.parser_drift_reconcile_requests, 1);
+
+        let index = cas_registry::open(&f.cas_data_dir.index_db_path()).unwrap();
+        let state = cas_registry::get_reconcile_state(&index, &f.repo_hash)
+            .unwrap()
+            .expect("reconcile state row must exist");
+        assert!(
+            state.desired_generation >= 1,
+            "desired must bump; state = {state:?}"
+        );
+        assert!(
+            state.force_generation >= 1,
+            "force must bump (drift → forced reindex path); state = {state:?}"
+        );
+
+        reconcile.shutdown(std::time::Duration::from_secs(2)).await;
+    }
+
+    /// MF-2: parser drift with reconcile MUST NOT queue any
+    /// analyzer-only rows via `enqueue_analyzer_run` — the worker
+    /// re-stamps everything under the forced register path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mf2_parser_drift_skips_analyzer_loop_with_reconcile() {
+        let f = setup_alias();
+        trigger_parser_drift(&f);
+        // Also seed analyzer drift so both paths could fire.
+        insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, "succeeded");
+        let reconcile = build_reconcile(&f);
+        let _summary = run_scan(&f, Some(reconcile.clone())).await;
+
+        // Only the pre-existing (old-revision) row exists; no new
+        // row was stamped at the expected revision by the scanner.
+        assert_eq!(
+            fetch_run_status(&f, ANALYZER_ID, EXPECTED_REV).as_deref(),
+            None,
+            "parser drift must not queue an analyzer run via the reconcile path"
+        );
+        assert_eq!(count_runs(&f, ANALYZER_ID), 1);
+        reconcile.shutdown(std::time::Duration::from_secs(2)).await;
+    }
+
+    /// MF-4: analyzer-only drift with reconcile wired still uses
+    /// the targeted `enqueue_analyzer_run` primitive, and does NOT
+    /// touch reconcile state. Analyzer-only rerun is not a
+    /// repo-level intent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mf4_analyzer_drift_still_uses_analyzer_enqueue_with_reconcile() {
+        let f = setup_alias();
+        // Analyzer drift only, no parser drift.
+        insert_run(&f, ANALYZER_ID, EXPECTED_REV - 1, "succeeded");
+        let reconcile = build_reconcile(&f);
+        let summary = run_scan(&f, Some(reconcile.clone())).await;
+
+        assert_eq!(summary.parser_drift_aliases, 0);
+        assert_eq!(summary.parser_drift_reconcile_requests, 0);
+        assert!(summary.jobs_enqueued >= 1);
+        // Fresh analyzer run row stamped at the expected revision.
+        assert_eq!(
+            fetch_run_status(&f, ANALYZER_ID, EXPECTED_REV).as_deref(),
+            Some("queued")
+        );
+        // Reconcile state untouched.
+        let index = cas_registry::open(&f.cas_data_dir.index_db_path()).unwrap();
+        let state = cas_registry::get_reconcile_state(&index, &f.repo_hash)
+            .unwrap()
+            .expect("reconcile state row exists from v4 migration");
+        assert_eq!(state.desired_generation, 0);
+        assert_eq!(state.force_generation, 0);
+        reconcile.shutdown(std::time::Duration::from_secs(2)).await;
+    }
+
+    /// MF-6: when the scanner is invoked without a reconcile
+    /// driver (test / degraded startup), parser drift falls back
+    /// to the compat `JobManager::enqueue_full_repo_reindex`
+    /// helper. Production daemon wiring always passes reconcile,
+    /// so this branch is not a production caller; it exists so
+    /// the historical test surface keeps working while the
+    /// helper is retired to `pub(crate)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mf6_reconcile_none_falls_back_to_full_reindex_helper() {
+        let f = setup_alias();
+        trigger_parser_drift(&f);
+        let summary = run_scan(&f, None).await;
+
+        assert_eq!(summary.parser_drift_aliases, 1);
+        assert_eq!(summary.parser_drift_reconcile_requests, 1);
+        // Fallback path does not touch reconcile state.
+        let index = cas_registry::open(&f.cas_data_dir.index_db_path()).unwrap();
+        let state = cas_registry::get_reconcile_state(&index, &f.repo_hash)
+            .unwrap()
+            .expect("reconcile state row seeded by v4 migration");
+        assert_eq!(state.desired_generation, 0);
+        assert_eq!(state.force_generation, 0);
     }
 }
