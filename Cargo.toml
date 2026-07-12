@@ -45,7 +45,7 @@ members = [
 [workspace.package]
 version = "0.7.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Naoto Morishima"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/naoto256/cairn"
@@ -70,6 +70,15 @@ unused_must_use = "deny"
 # `doc_markdown`, `useless_format`) at a frequency that makes
 # `-D warnings` unworkable mid-development. Crates may opt in
 # individually if they want stricter enforcement.
+#
+# `collapsible_if` is opted out because bumping MSRV to 1.88 (which
+# is where let-chains stabilised) activates clippy's suggestion to
+# fold every nested `if let Some(_) = _ { if _ {} }` into a
+# let-chain. The suggestions are legitimate but hit 20+ pre-
+# existing sites across language backends and the watcher. Folding
+# is worthwhile but does not belong in the 0.7.1 release cut;
+# revisit as its own cleanup PR.
+collapsible_if = "allow"
 
 [workspace.dependencies]
 # Async runtime

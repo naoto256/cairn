@@ -114,7 +114,10 @@ impl RetryPolicy {
     /// Uses `saturating_add` so a huge failure streak caps at
     /// `i64::MAX` rather than wrapping.
     fn next_retry_at_ns(&self, now_ns: i64, consecutive_failures: i64) -> i64 {
-        let shift = consecutive_failures.clamp(0, 20) as u32;
+        // First retry (`consecutive_failures == 1`) uses shift 0
+        // = one `base_delay`. Documented formula:
+        // `base * 2^min(consecutive_failures - 1, 20)`.
+        let shift = consecutive_failures.saturating_sub(1).clamp(0, 20) as u32;
         let scaled = self.base_delay.saturating_mul(1u32 << shift);
         let capped = scaled.min(self.max_delay);
         let delay_ns = i64::try_from(capped.as_nanos()).unwrap_or(i64::MAX);
@@ -510,7 +513,28 @@ impl RepoReconcileManager {
             runtime.worker_running = true;
             let notify = runtime.notify.clone();
             drop(runtimes);
+            // Increment BEFORE re-checking the shutdown flag so a
+            // concurrent `shutdown()` cannot observe
+            // `live_workers == 0` after flipping `shutting_down`
+            // between our earlier check and this bump. If the flag
+            // was flipped in the window, undo the bump and clear
+            // the worker_running flag so a later request can
+            // respawn cleanly under a new manager. This closes the
+            // "shutdown returns drained while a worker is still
+            // about to spawn" race.
             self.live_workers.fetch_add(1, Ordering::SeqCst);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                self.live_workers.fetch_sub(1, Ordering::SeqCst);
+                let mut runtimes = self.lock_runtimes();
+                if let Some(rt) = runtimes.get_mut(repo_hash) {
+                    rt.worker_running = false;
+                }
+                debug!(
+                    repo_hash = %repo_hash,
+                    "reconcile shutting down mid-spawn; aborting new worker"
+                );
+                return false;
+            }
             let mgr = self.clone();
             let hash = repo_hash.to_string();
             tokio::spawn(async move {

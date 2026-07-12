@@ -277,8 +277,13 @@ retry` / `reconcile attempt` / `watcher lifecycle` /
 `reconcile invariants` checks. The wire object is repeated per
 alias for a canonical repo but carries `aliases: [...]` so a
 client can dedup by `repo_hash`. Older clients that ignore the
-field see no wire-shape change — every new field is additive with
-`serde(default, skip_serializing_if = "Option::is_none")`.
+field see no wire-shape change: the new `reconcile` object itself
+is an `Option` with `serde(default, skip_serializing_if =
+"Option::is_none")` so absent-in / absent-out round-trips
+cleanly, and inside `RepoReconcileStatus` every nullable durable
+column is likewise `Option<T>` with skip-when-`None` — required
+scalar fields (`repo_hash`, generation counters,
+`consecutive_failures`, `watcher_state`) always serialize.
 
 ## Languages
 

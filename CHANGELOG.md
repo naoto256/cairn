@@ -42,8 +42,6 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
-### Fixed
-
 - **Cross-store `JobKey` / `JobId` collisions no longer coalesce or
   misroute analyzer reruns.** Two independent stores that happened to
   share a `(manifest_id, analyzer_id)` pair (a routine consequence of
