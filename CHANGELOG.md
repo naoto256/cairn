@@ -5,7 +5,42 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [Unreleased] — 0.7.1
+## [0.7.1] — 2026-07-12
+
+### Added
+
+- **Durable repo-level reconcile state machine.** `index.db`
+  migration v4 introduces a canonical `repositories` table
+  (`repo_hash` PK, `root_path` UNIQUE) that owns each on-disk repo
+  1:1 with its filesystem watcher and reconcile-state row.
+  `aliases` becomes an FK-cascade index into `repositories`, and a
+  new `repo_reconcile_state` table tracks per-repo generation
+  counters (desired / applied / force / in-flight attempt),
+  watcher lifecycle, retry backoff, and last error.
+- **`RepoReconcileManager` — one instance per daemon.** Watcher
+  events, `cairn ctl repo reindex`, parser-revision drift
+  recovery, and startup dirty-gap wake all now bump durable
+  intent BEFORE any register / analyzer enqueue work; the worker
+  executes the register hot path asynchronously with retry /
+  backoff / watcher-lifecycle accounting. A crash between the
+  intent bump and the attempt leaves `desired > applied`
+  durable, and startup recovery resumes automatically.
+- **Truthful status + doctor.** `repo_status.reconcile` (data
+  RPC) and `status.repos[].reconcile` (control) additively expose
+  the durable state — `desired_generation` / `applied_generation`
+  / `force_generation` / `attempt_generation` / `dirty_since_ns`
+  / `last_attempt_ns` / `last_success_ns` /
+  `consecutive_failures` / `next_retry_at_ns` / `last_error` /
+  `watcher_state` / `watcher_error`, plus derived `pending` and
+  `retry_scheduled` booleans and an `aliases: [...]` list so
+  clients can dedup two per-alias entries by `repo_hash`. New
+  hints: `reconcile_pending`, `reconcile_retry_wait`,
+  `reconcile_watcher_failed`, `reconcile_attempt_in_progress`.
+  `cairn ctl daemon doctor` grows a `reconcile_state_checks`
+  group (dirty gap / retry / stuck attempt / watcher failed /
+  invariant fail) deduped by `repo_hash`.
+
+### Fixed
 
 ### Fixed
 
