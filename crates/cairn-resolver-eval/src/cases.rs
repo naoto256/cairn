@@ -123,9 +123,9 @@ pub fn python_cases() -> Vec<GoldenCase> {
             },
             // tree-sitter-python emits bare qualified names — no
             // module prefix.
-            tier2_expected: vec![h("dog.py", 4, "Dog")],
+            tier2_expected: vec![h("dog.py", 5, "Dog")],
             tier25_expected: vec![],
-            tier3_expected: vec![h("dog.py", 4, "Dog")],
+            tier3_expected: vec![h("dog.py", 5, "Dog")],
         },
         GoldenCase {
             name: "python_find_subtypes_class",
@@ -136,9 +136,9 @@ pub fn python_cases() -> Vec<GoldenCase> {
                 kind: None,
                 limit: Some(50),
             },
-            tier2_expected: vec![h("dog.py", 4, "Dog"), h("cat.py", 4, "Cat")],
-            tier25_expected: vec![],
-            tier3_expected: vec![h("dog.py", 4, "Dog"), h("cat.py", 4, "Cat")],
+            tier2_expected: vec![h("dog.py", 5, "Dog"), h("cat.py", 4, "Cat")],
+            tier25_expected: vec![h("dog.py", 5, "Dog"), h("cat.py", 4, "Cat")],
+            tier3_expected: vec![h("dog.py", 5, "Dog"), h("cat.py", 4, "Cat")],
         },
         GoldenCase {
             name: "python_find_supertypes_class",
@@ -149,9 +149,61 @@ pub fn python_cases() -> Vec<GoldenCase> {
                 kind: None,
                 limit: Some(50),
             },
-            tier2_expected: vec![h("dog.py", 4, "Animal")],
-            tier25_expected: vec![],
-            tier3_expected: vec![h("dog.py", 4, "Animal")],
+            tier2_expected: vec![h("dog.py", 5, "Animal")],
+            tier25_expected: vec![h("dog.py", 5, "Animal")],
+            tier3_expected: vec![h("dog.py", 5, "Animal")],
+        },
+        GoldenCase {
+            name: "python_find_callers_super_method",
+            language: "python",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("speak".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("dog.py", 10, "speak"), h("dog.py", 11, "speak")],
+            tier25_expected: vec![h("dog.py", 10, "speak"), h("dog.py", 11, "speak")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "python_find_callers_class_receiver",
+            language: "python",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("build".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("dog.py", 12, "build")],
+            tier25_expected: vec![h("dog.py", 12, "build")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "python_find_callers_import_alias",
+            language: "python",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("aliased_helper".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("dog.py", 13, "aliased_helper")],
+            tier25_expected: vec![h("dog.py", 13, "aliased_helper")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "python_find_imports_cross_file",
+            language: "python",
+            tool: Tool::FindImports,
+            query: Query {
+                symbol: Some("dog.py".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("dog.py", 1, "animal.py"), h("dog.py", 2, "util.py")],
+            tier25_expected: vec![h("dog.py", 1, "animal.py"), h("dog.py", 2, "util.py")],
+            tier3_expected: vec![],
         },
     ]
 }
@@ -226,6 +278,472 @@ pub fn java_cases() -> Vec<GoldenCase> {
     ]
 }
 
+pub fn php_cases() -> Vec<GoldenCase> {
+    vec![
+        GoldenCase {
+            name: "php_find_supertypes_service",
+            language: "php",
+            tool: Tool::FindSupertypes,
+            query: Query {
+                symbol: Some("App\\Service".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/Service.php", 7, "IntermediateService"),
+                h("src/Service.php", 7, "Greeter"),
+                h("src/Service.php", 8, "Logging"),
+            ],
+            tier25_expected: vec![
+                h("src/Service.php", 7, "IntermediateService"),
+                h("src/Service.php", 7, "Greeter"),
+                h("src/Service.php", 8, "Logging"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "php_find_subtypes_interface",
+            language: "php",
+            tool: Tool::FindSubtypes,
+            query: Query {
+                symbol: Some("Greeter".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/Service.php", 7, "App\\Service")],
+            tier25_expected: vec![h("src/Service.php", 7, "App\\Service")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "php_find_callers_static_alias",
+            language: "php",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("build".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/Service.php", 13, "App\\Service::build"),
+                h("src/main.php", 6, "App\\Service::build"),
+            ],
+            tier25_expected: vec![
+                h("src/Service.php", 13, "App\\Service::build"),
+                h("src/main.php", 6, "App\\Service::build"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "php_find_callers_parent",
+            language: "php",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("step".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/Service.php", 14, "App\\BaseService::step")],
+            tier25_expected: vec![h("src/Service.php", 14, "App\\BaseService::step")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "php_find_imports_alias",
+            language: "php",
+            tool: Tool::FindImports,
+            query: Query {
+                symbol: Some("src/main.php".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/main.php", 4, "src/Service.php")],
+            tier25_expected: vec![h("src/main.php", 4, "src/Service.php")],
+            tier3_expected: vec![],
+        },
+    ]
+}
+
+pub fn kotlin_cases() -> Vec<GoldenCase> {
+    vec![
+        GoldenCase {
+            name: "kotlin_find_supertypes_service",
+            language: "kotlin",
+            tool: Tool::FindSupertypes,
+            query: Query {
+                symbol: Some("Service".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/app/Service.kt", 7, "IntermediateService"),
+                h("src/app/Service.kt", 7, "Greeter"),
+            ],
+            tier25_expected: vec![
+                h("src/app/Service.kt", 7, "IntermediateService"),
+                h("src/app/Service.kt", 7, "Greeter"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "kotlin_find_subtypes_interface",
+            language: "kotlin",
+            tool: Tool::FindSubtypes,
+            query: Query {
+                symbol: Some("Greeter".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/app/Service.kt", 7, "Service")],
+            tier25_expected: vec![h("src/app/Service.kt", 7, "Service")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "kotlin_find_callers_dispatch",
+            language: "kotlin",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("build".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/app/Service.kt", 15, "app.Service.Companion.build")],
+            tier25_expected: vec![h("src/app/Service.kt", 15, "app.Service.Companion.build")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "kotlin_find_callers_super",
+            language: "kotlin",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("step".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/app/Service.kt", 14, "base.BaseService.step")],
+            tier25_expected: vec![h("src/app/Service.kt", 14, "base.BaseService.step")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "kotlin_find_callers_import_alias",
+            language: "kotlin",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("aliasedHelper".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/app/Service.kt", 16, "util.helper")],
+            tier25_expected: vec![h("src/app/Service.kt", 16, "util.helper")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "kotlin_find_imports_cross_file",
+            language: "kotlin",
+            tool: Tool::FindImports,
+            query: Query {
+                symbol: Some("src/app/Service.kt".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/app/Service.kt", 3, "src/api/Greeter.kt"),
+                h("src/app/Service.kt", 4, "src/base/IntermediateService.kt"),
+                h("src/app/Service.kt", 5, "src/util/Helpers.kt"),
+            ],
+            tier25_expected: vec![
+                h("src/app/Service.kt", 3, "src/api/Greeter.kt"),
+                h("src/app/Service.kt", 4, "src/base/IntermediateService.kt"),
+                h("src/app/Service.kt", 5, "src/util/Helpers.kt"),
+            ],
+            tier3_expected: vec![],
+        },
+    ]
+}
+
+pub fn swift_cases() -> Vec<GoldenCase> {
+    vec![
+        GoldenCase {
+            name: "swift_find_supertypes_service",
+            language: "swift",
+            tool: Tool::FindSupertypes,
+            query: Query {
+                symbol: Some("Service".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("Service.swift", 1, "IntermediateService"),
+                h("Service.swift", 1, "Greeter"),
+            ],
+            tier25_expected: vec![
+                h("Service.swift", 1, "IntermediateService"),
+                h("Service.swift", 1, "Greeter"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "swift_find_subtypes_protocol",
+            language: "swift",
+            tool: Tool::FindSubtypes,
+            query: Query {
+                symbol: Some("Greeter".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("Service.swift", 1, "Service")],
+            tier25_expected: vec![h("Service.swift", 1, "Service")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "swift_find_callers_super",
+            language: "swift",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("step".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("Service.swift", 6, "BaseService.step")],
+            tier25_expected: vec![h("Service.swift", 6, "BaseService.step")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "swift_find_callers_static",
+            language: "swift",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("build".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("Service.swift", 11, "Service.build")],
+            tier25_expected: vec![h("Service.swift", 11, "Service.build")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "swift_find_callers_top_level",
+            language: "swift",
+            tool: Tool::FindCallees,
+            query: Query {
+                symbol: Some("runHelper".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("Main.swift", 4, "helper")],
+            tier25_expected: vec![h("Main.swift", 4, "helper")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "swift_find_imports_framework",
+            language: "swift",
+            tool: Tool::FindImports,
+            query: Query {
+                symbol: Some("Main.swift".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("Main.swift", 1, "Foundation")],
+            tier25_expected: vec![h("Main.swift", 1, "Foundation")],
+            tier3_expected: vec![],
+        },
+    ]
+}
+
+pub fn csharp_cases() -> Vec<GoldenCase> {
+    vec![
+        GoldenCase {
+            name: "csharp_find_supertypes_service",
+            language: "csharp",
+            tool: Tool::FindSupertypes,
+            query: Query {
+                symbol: Some("App.Service".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/Service.cs", 7, "IntermediateService"),
+                h("src/Service.cs", 7, "IGreeter"),
+            ],
+            tier25_expected: vec![
+                h("src/Service.cs", 7, "IntermediateService"),
+                h("src/Service.cs", 7, "IGreeter"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "csharp_find_subtypes_interface",
+            language: "csharp",
+            tool: Tool::FindSubtypes,
+            query: Query {
+                symbol: Some("IGreeter".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/Service.cs", 7, "App.Service")],
+            tier25_expected: vec![h("src/Service.cs", 7, "App.Service")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "csharp_find_callers_static_alias",
+            language: "csharp",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("Build".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/Service.cs", 14, "App.Service.Build"),
+                h("src/Main.cs", 7, "App.Service.Build"),
+            ],
+            tier25_expected: vec![
+                h("src/Service.cs", 14, "App.Service.Build"),
+                h("src/Main.cs", 7, "App.Service.Build"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "csharp_find_callers_base",
+            language: "csharp",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("Step".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/Service.cs", 13, "Lib.BaseService.Step")],
+            tier25_expected: vec![h("src/Service.cs", 13, "Lib.BaseService.Step")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "csharp_find_callers_using_static",
+            language: "csharp",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("RunHelper".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/Service.cs", 15, "Lib.Helpers.RunHelper")],
+            tier25_expected: vec![h("src/Service.cs", 15, "Lib.Helpers.RunHelper")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "csharp_find_imports_alias",
+            language: "csharp",
+            tool: Tool::FindImports,
+            query: Query {
+                symbol: Some("src/Main.cs".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/Main.cs", 1, "src/Service.cs")],
+            tier25_expected: vec![h("src/Main.cs", 1, "src/Service.cs")],
+            tier3_expected: vec![],
+        },
+    ]
+}
+
+pub fn javascript_cases() -> Vec<GoldenCase> {
+    vec![
+        GoldenCase {
+            name: "javascript_find_supertypes_service",
+            language: "javascript",
+            tool: Tool::FindSupertypes,
+            query: Query {
+                symbol: Some("Service".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/service.js", 3, "IntermediateService")],
+            tier25_expected: vec![h("src/service.js", 3, "IntermediateService")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "javascript_find_subtypes_base",
+            language: "javascript",
+            tool: Tool::FindSubtypes,
+            query: Query {
+                symbol: Some("BaseService".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/intermediate.js", 3, "IntermediateService")],
+            tier25_expected: vec![h("src/intermediate.js", 3, "IntermediateService")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "javascript_find_callers_super_and_self",
+            language: "javascript",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("step".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/service.js", 7, "BaseService.step"),
+                h("src/service.js", 12, "Service.step"),
+            ],
+            tier25_expected: vec![
+                h("src/service.js", 7, "BaseService.step"),
+                h("src/service.js", 12, "Service.step"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "javascript_find_callers_static_alias",
+            language: "javascript",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("build".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/service.js", 11, "Service.build"),
+                h("src/main.js", 4, "Service.build"),
+            ],
+            tier25_expected: vec![
+                h("src/service.js", 11, "Service.build"),
+                h("src/main.js", 4, "Service.build"),
+            ],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "javascript_find_callers_import_alias",
+            language: "javascript",
+            tool: Tool::FindCallers,
+            query: Query {
+                symbol: Some("runHelper".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![h("src/main.js", 5, "helper")],
+            tier25_expected: vec![h("src/main.js", 5, "helper")],
+            tier3_expected: vec![],
+        },
+        GoldenCase {
+            name: "javascript_find_imports_cross_file",
+            language: "javascript",
+            tool: Tool::FindImports,
+            query: Query {
+                symbol: Some("src/main.js".into()),
+                kind: None,
+                limit: Some(50),
+            },
+            tier2_expected: vec![
+                h("src/main.js", 1, "src/service.js"),
+                h("src/main.js", 2, "src/helpers.js"),
+            ],
+            tier25_expected: vec![
+                h("src/main.js", 1, "src/service.js"),
+                h("src/main.js", 2, "src/helpers.js"),
+            ],
+            tier3_expected: vec![],
+        },
+    ]
+}
+
 /// Ruby golden cases — exercise the Tier-2.5 cross-file resolver spec.
 ///
 /// Each case ships two expectation tracks:
@@ -233,8 +751,8 @@ pub fn java_cases() -> Vec<GoldenCase> {
 /// - `tier2_expected`: what the Tier-2 (single-file syntactic) Ruby
 ///   backend should surface today — typically the lexical hit with
 ///   `target_symbol_id = NULL` (name-only).
-/// - `tier25_expected`: what the upcoming `cairn-lang-ruby-tier25`
-///   resolver is expected to add — same site, but with the qualified
+/// - `tier25_expected`: what `cairn-lang-ruby-tier25` must resolve —
+///   the same site, but with the qualified
 ///   target resolved across files via `require` / `require_relative`
 ///   chains and MRO. Empty for queries the spec deliberately leaves
 ///   un-resolved (dynamic dispatch / `define_method` / `send`).
@@ -258,9 +776,18 @@ pub fn ruby_cases() -> Vec<GoldenCase> {
                 kind: None,
                 limit: Some(50),
             },
-            tier2_expected: vec![h("lib/loud_dog.rb", 3, "Dog")],
-            tier25_expected: vec![h("lib/loud_dog.rb", 3, "Dog")],
-            tier3_expected: vec![h("lib/loud_dog.rb", 3, "Dog")],
+            tier2_expected: vec![
+                h("lib/loud_dog.rb", 3, "Dog"),
+                h("lib/loud_dog.rb", 4, "Logging"),
+            ],
+            tier25_expected: vec![
+                h("lib/loud_dog.rb", 3, "Dog"),
+                h("lib/loud_dog.rb", 4, "Logging"),
+            ],
+            tier3_expected: vec![
+                h("lib/loud_dog.rb", 3, "Dog"),
+                h("lib/loud_dog.rb", 4, "Logging"),
+            ],
         },
         // 2) Subtypes of `Animal` — Dog and Cat are direct, LoudDog is
         //    transitive (Tier-2.5 may surface it once MRO is wired).
@@ -343,10 +870,10 @@ pub fn ruby_cases() -> Vec<GoldenCase> {
             tier25_expected: vec![h("lib/loud_dog.rb", 6, "Logging#log")],
             tier3_expected: vec![h("lib/loud_dog.rb", 6, "Logging#log")],
         },
-        // 6) Qualified call site: `Utils::String.shout("hi")` from
+        // 6) Qualified call site: `Utils.shout("hi")` from
         //    app/usage.rb. Tier-2 surfaces the call name `shout`
         //    only; Tier-2.5 resolves the qualified constant path
-        //    `Utils::String` and pins the call to the module's static
+        //    `Utils` and pins the call to the module's static
         //    method.
         GoldenCase {
             name: "ruby_find_callers_qualified_static",
@@ -357,43 +884,37 @@ pub fn ruby_cases() -> Vec<GoldenCase> {
                 kind: None,
                 limit: Some(50),
             },
-            tier2_expected: vec![h("app/usage.rb", 7, "shout")],
-            tier25_expected: vec![h("app/usage.rb", 7, "shout")],
-            tier3_expected: vec![h("app/usage.rb", 7, "shout")],
+            tier2_expected: vec![h("app/usage.rb", 7, "Utils.shout")],
+            tier25_expected: vec![h("app/usage.rb", 7, "Utils.shout")],
+            tier3_expected: vec![h("app/usage.rb", 7, "Utils.shout")],
         },
         // 7) Imports: app/usage.rb pulls in lib/loud_dog.rb and
         //    lib/utils.rb via `require_relative`. Tier-2 records the
         //    require sites lexically; Tier-2.5 ties the require
         //    targets to the actual files they expose.
-        //    `find_callers` is the closest existing query for "who
-        //    references this file's symbols"; we pin the require call
-        //    sites by name.
+        //    `find_imports` exposes the import-site target path and
+        //    provenance directly, so the Tier-2.5 track cannot pass on
+        //    the lexical `require_relative` call alone.
         GoldenCase {
-            name: "ruby_find_callers_require_relative",
+            name: "ruby_find_imports_require_relative",
             language: "ruby",
-            tool: Tool::FindCallers,
+            tool: Tool::FindImports,
             query: Query {
-                symbol: Some("require_relative".into()),
+                symbol: Some("app/usage.rb".into()),
                 kind: None,
                 limit: Some(50),
             },
             tier2_expected: vec![
-                h("app/usage.rb", 1, "require_relative"),
-                h("app/usage.rb", 2, "require_relative"),
-                h("lib/loud_dog.rb", 1, "require_relative"),
-                h("lib/loud_dog.rb", 2, "require_relative"),
+                h("app/usage.rb", 1, "lib/loud_dog.rb"),
+                h("app/usage.rb", 2, "lib/utils.rb"),
             ],
             tier25_expected: vec![
-                h("app/usage.rb", 1, "require_relative"),
-                h("app/usage.rb", 2, "require_relative"),
-                h("lib/loud_dog.rb", 1, "require_relative"),
-                h("lib/loud_dog.rb", 2, "require_relative"),
+                h("app/usage.rb", 1, "lib/loud_dog.rb"),
+                h("app/usage.rb", 2, "lib/utils.rb"),
             ],
             tier3_expected: vec![
-                h("app/usage.rb", 1, "require_relative"),
-                h("app/usage.rb", 2, "require_relative"),
-                h("lib/loud_dog.rb", 1, "require_relative"),
-                h("lib/loud_dog.rb", 2, "require_relative"),
+                h("app/usage.rb", 1, "lib/loud_dog.rb"),
+                h("app/usage.rb", 2, "lib/utils.rb"),
             ],
         },
         // 8) Out-of-scope confirmation (retreat line): the dynamic
@@ -429,6 +950,11 @@ pub fn all_cases() -> Vec<GoldenCase> {
     v.extend(python_cases());
     v.extend(typescript_cases());
     v.extend(java_cases());
+    v.extend(php_cases());
+    v.extend(kotlin_cases());
+    v.extend(swift_cases());
+    v.extend(csharp_cases());
+    v.extend(javascript_cases());
     v.extend(ruby_cases());
     v
 }

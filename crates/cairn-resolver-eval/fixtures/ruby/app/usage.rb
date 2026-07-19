@@ -4,7 +4,7 @@ class Usage
   def run
     ld = LoudDog.new
     ld.bark
-    Utils::String.shout("hi")
+    Utils.shout("hi")
   end
   def dynamic_call(obj)
     obj.method_that_might_not_exist

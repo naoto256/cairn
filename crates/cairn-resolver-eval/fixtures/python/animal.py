@@ -1,4 +1,8 @@
 class Animal:
+    @classmethod
+    def build(cls):
+        return cls()
+
     def speak(self) -> str:
         return "..."
 
