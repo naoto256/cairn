@@ -13,9 +13,9 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
+    build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
+    parser_id_filter, query_one_or_all_snapshots,
 };
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
 use crate::{Error, Result};
@@ -46,24 +46,26 @@ impl DataMethod for FindSymbols {
         let requested_repo = args.scope.repo.clone();
         let signature_only = args.signature_only;
 
-        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
+        let execution = query_one_or_all_snapshots(
             ctx,
-            requested_repo,
-            "find_symbols",
-            effective_limit,
-            move |entry, conn| {
-                let anchor = crate::anchor::resolve_explicit_or_default(
-                    conn,
-                    anchor_arg.as_deref(),
-                    branch_arg.as_deref(),
-                )?;
-                let anchor_label = anchor.as_str().to_string();
-                let hits = query::find_symbols(conn, &anchor, &q)?;
+            SnapshotQueryRequest {
+                requested_repo,
+                anchor: anchor_arg,
+                branch: branch_arg,
+                method_name: "find_symbols",
+                effective_limit,
+                verbose_tier3: args.tier3.verbose_tier3,
+                exact_file: None,
+            },
+            move |entry, conn, snapshot| {
+                let anchor_label = snapshot.anchor.as_str().to_string();
+                let hits = query::find_symbols(conn, &snapshot.anchor, &q)?;
                 Ok(hits
                     .into_iter()
                     .map(|hit| (entry.alias.clone(), anchor_label.clone(), hit))
                     .collect())
             },
+            |hits| parser_id_filter(hits.iter().map(|(_, _, hit)| hit.parser_id.clone())),
             |out: &mut Vec<(String, String, SymbolHit)>| {
                 out.sort_by(|(repo_a, _, a), (repo_b, _, b)| {
                     language_sort_key(a.language.as_deref())
@@ -76,22 +78,18 @@ impl DataMethod for FindSymbols {
             },
         )
         .await?;
-        let parser_ids = parser_id_filter(hits.iter().map(|(_, _, h)| h.parser_id.clone()));
-        let items: Vec<_> = hits
+        let items: Vec<_> = execution
+            .items
             .into_iter()
             .map(|(repo, anchor_label, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
             .collect();
-        let tier3_status = tier_status_for_query(
-            ctx,
-            args.scope.repo.clone(),
-            args.scope.anchor.clone(),
-            args.scope.branch.clone(),
-            parser_ids,
-            args.tier3.verbose_tier3,
-            "find_symbols",
-        )
-        .await?;
-        let completeness = completeness_for_scan(capped, skipped_unavailable);
+        let tier3_status = execution.tier3_status;
+        let freshness_issues = execution.freshness_issues;
+        let completeness = completeness_for_snapshot_scan(
+            execution.capped,
+            execution.skipped_unavailable,
+            &freshness_issues,
+        );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindSymbols,
             items_empty: items.is_empty(),
@@ -106,8 +104,8 @@ impl DataMethod for FindSymbols {
                 ..QueryArgsView::default()
             },
         };
-        let diagnostics = build_diagnostics(&emission_ctx);
-        let hints = build_hints(&emission_ctx);
+        let (diagnostics, hints) =
+            build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
 
         Ok(serde_json::to_value(FindSymbolResult {
             items,

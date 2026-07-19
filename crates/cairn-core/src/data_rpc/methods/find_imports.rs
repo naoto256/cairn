@@ -9,9 +9,9 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::Result;
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
+    build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
+    parser_id_filter, query_one_or_all_snapshots,
 };
 use crate::query::{self, FindImportsArgs as QueryArgs};
 
@@ -34,20 +34,22 @@ impl DataMethod for FindImports {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
+        let exact_file = args.file.clone();
 
-        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
+        let execution = query_one_or_all_snapshots(
             ctx,
-            requested_repo,
-            "find_imports",
-            effective_limit,
-            move |entry, conn| {
-                let anchor = crate::anchor::resolve_explicit_or_default(
-                    conn,
-                    anchor_arg.as_deref(),
-                    branch_arg.as_deref(),
-                )?;
-                let anchor_label = anchor.as_str().to_string();
-                let hits = query::find_imports(conn, &anchor, &q)?;
+            SnapshotQueryRequest {
+                requested_repo,
+                anchor: anchor_arg,
+                branch: branch_arg,
+                method_name: "find_imports",
+                effective_limit,
+                verbose_tier3: args.tier3.verbose_tier3,
+                exact_file,
+            },
+            move |entry, conn, snapshot| {
+                let anchor_label = snapshot.anchor.as_str().to_string();
+                let hits = query::find_imports(conn, &snapshot.anchor, &q)?;
                 Ok(hits
                     .into_iter()
                     .map(|h| {
@@ -72,22 +74,18 @@ impl DataMethod for FindImports {
                     })
                     .collect())
             },
+            |hits| parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone())),
             |_out: &mut Vec<(ImportHit, String)>| {},
         )
         .await?;
-        let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
-        let items: Vec<_> = hits.into_iter().map(|(item, _)| item).collect();
-        let tier3_status = tier_status_for_query(
-            ctx,
-            args.scope.repo.clone(),
-            args.scope.anchor.clone(),
-            args.scope.branch.clone(),
-            parser_ids,
-            args.tier3.verbose_tier3,
-            "find_imports",
-        )
-        .await?;
-        let completeness = completeness_for_scan(capped, skipped_unavailable);
+        let items: Vec<_> = execution.items.into_iter().map(|(item, _)| item).collect();
+        let tier3_status = execution.tier3_status;
+        let freshness_issues = execution.freshness_issues;
+        let completeness = completeness_for_snapshot_scan(
+            execution.capped,
+            execution.skipped_unavailable,
+            &freshness_issues,
+        );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindImports,
             items_empty: items.is_empty(),
@@ -102,8 +100,8 @@ impl DataMethod for FindImports {
                 ..QueryArgsView::default()
             },
         };
-        let diagnostics = build_diagnostics(&emission_ctx);
-        let hints = build_hints(&emission_ctx);
+        let (diagnostics, hints) =
+            build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
 
         Ok(serde_json::to_value(ImportsResult {
             items,
