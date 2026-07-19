@@ -20,7 +20,7 @@ use crate::data_rpc::helpers::{
     query_one_or_all_snapshots,
 };
 use crate::query::{self, SymbolSourceRow};
-use crate::register::load_blob_or_worktree;
+use crate::register::load_blob_or_verified_worktree;
 use crate::{Error, Result};
 
 pub struct GetSymbolSource;
@@ -181,7 +181,7 @@ impl DataMethod for GetSymbolSource {
         let source = if args.signature_only {
             String::new()
         } else {
-            materialise(&hit.worktree_root, &row)?
+            materialise(&hit.repo, &hit.worktree_root, &row)?
         };
         let result = GetSymbolSourceResult {
             qualified: row.qualified,
@@ -249,16 +249,21 @@ fn finalize_source_hits(hits: &mut Vec<SourceHit>) {
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(GetSymbolSource);
 
 /// Slice `row.byte_start..row.byte_end` out of the blob's content,
-/// loaded via the shared `register::load_blob_or_worktree` helper (git
-/// cat-file first, worktree fallback for tentative-anchor blobs).
-fn materialise(worktree_root: &std::path::Path, row: &SymbolSourceRow) -> Result<String> {
-    let bytes = load_blob_or_worktree(worktree_root, &row.blob_sha, &row.path).map_err(|e| {
-        Error::InvalidArgument(format!(
-            "get_symbol_source: blob {} not in git and {} unreadable: {e}",
-            row.blob_sha,
-            worktree_root.join(&row.path).display()
-        ))
-    })?;
+/// loaded via the shared verified fallback helper (git object first, then one
+/// immutable worktree read whose SHA must match the indexed blob).
+fn materialise(
+    repo: &str,
+    worktree_root: &std::path::Path,
+    row: &SymbolSourceRow,
+) -> Result<String> {
+    let bytes = load_blob_or_verified_worktree(worktree_root, &row.blob_sha, &row.path).map_err(
+        |_| {
+            Error::InvalidArgument(format!(
+                "get_symbol_source: indexed bytes unavailable or changed for {repo}:{}; reindex needed",
+                row.path
+            ))
+        },
+    )?;
     if row.byte_end > bytes.len() || row.byte_start > row.byte_end {
         return Err(Error::InvalidArgument(format!(
             "get_symbol_source: blob {} shorter than indexed byte range ({}..{} vs {} bytes); reindex needed",
@@ -300,6 +305,36 @@ mod tests {
             ("src/a.rs", "pub fn duplicate() { println!(\"a\"); }\n"),
             ("src/b.rs", "pub fn duplicate() { println!(\"b\"); }\n"),
         ])
+    }
+
+    #[test]
+    fn source_materialisation_rejects_changed_fallback_without_exposing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("source.rs"), b"changed\n").unwrap();
+        let row = SymbolSourceRow {
+            symbol_id: 1,
+            qualified: "crate::source".into(),
+            name: "source".into(),
+            kind: cairn_proto::common::SymbolKind::Function,
+            signature: None,
+            doc: None,
+            path: "source.rs".into(),
+            blob_sha: crate::cas::hash::git_blob_sha(b"indexed\n"),
+            byte_start: 0,
+            byte_end: 7,
+            line_start: 1,
+            line_end: 1,
+            parser_id: "rust".into(),
+        };
+
+        let err = materialise("demo", tmp.path(), &row).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::InvalidArgument(message)
+                if message.contains("demo:source.rs")
+                    && !message.contains(&tmp.path().display().to_string())
+        ));
     }
 
     #[tokio::test]

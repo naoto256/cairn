@@ -706,12 +706,13 @@ pub(crate) fn git_cat_file(repo_root: &Path, blob_sha: &str) -> Result<Vec<u8>> 
 /// Tries `git cat-file <blob_sha>` first (= the authoritative blob the
 /// index was built from). If that fails — typically because the blob
 /// only exists in the worktree under a tentative anchor — falls back
-/// to reading `worktree_root.join(path)` straight off disk.
+/// to one immutable read of `worktree_root.join(path)` and verifies that
+/// payload against `blob_sha` before returning it.
 ///
 /// Wire methods that need source-line context (`get_symbol_source`,
 /// `find_references` snippets) share this lookup; keeping it in one
 /// place avoids the two callers' fallbacks drifting apart.
-pub(crate) fn load_blob_or_worktree(
+pub(crate) fn load_blob_or_verified_worktree(
     worktree_root: &Path,
     blob_sha: &str,
     path: &str,
@@ -722,9 +723,18 @@ pub(crate) fn load_blob_or_worktree(
             "invalid git blob sha: expected 40 hex characters",
         ));
     }
-    git_cat_file(worktree_root, blob_sha)
-        .map_err(|e| std::io::Error::other(e.to_string()))
-        .or_else(|_| std::fs::read(worktree_root.join(path)))
+    if let Ok(bytes) = git_cat_file(worktree_root, blob_sha) {
+        return Ok(bytes);
+    }
+
+    let bytes = std::fs::read(worktree_root.join(path))?;
+    if crate::cas::hash::git_blob_sha(&bytes) != blob_sha {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "worktree content does not match indexed blob sha",
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -747,6 +757,44 @@ mod tests {
     fn init_rust_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
         let (tmp, _sha) = init_repo(files);
         tmp
+    }
+
+    #[test]
+    fn verified_worktree_fallback_accepts_matching_immutable_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = b"pub fn tentative() {}\n";
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), bytes).unwrap();
+        let blob_sha = crate::cas::hash::git_blob_sha(bytes);
+
+        let loaded = load_blob_or_verified_worktree(tmp.path(), &blob_sha, "src/lib.rs").unwrap();
+
+        assert_eq!(loaded, bytes);
+    }
+
+    #[test]
+    fn verified_worktree_fallback_rejects_bytes_changed_after_indexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), b"pub fn changed() {}\n").unwrap();
+        let indexed_sha = crate::cas::hash::git_blob_sha(b"pub fn indexed() {}\n");
+
+        let err =
+            load_blob_or_verified_worktree(tmp.path(), &indexed_sha, "src/lib.rs").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn committed_blob_wins_over_changed_worktree_bytes() {
+        let original = b"pub fn committed() {}\n";
+        let repo = init_rust_repo(&[("src/lib.rs", std::str::from_utf8(original).unwrap())]);
+        fs::write(repo.path().join("src/lib.rs"), b"pub fn changed() {}\n").unwrap();
+        let blob_sha = crate::cas::hash::git_blob_sha(original);
+
+        let loaded = load_blob_or_verified_worktree(repo.path(), &blob_sha, "src/lib.rs").unwrap();
+
+        assert_eq!(loaded, original);
     }
 
     fn parser_ids_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Vec<String> {
