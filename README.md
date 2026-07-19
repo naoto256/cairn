@@ -236,6 +236,12 @@ both clamped to mode 0700.
   lands as `Failed` (retry after a lease is released, the current
   eviction completes, or via `cairn ctl repo reindex <alias>`).
 
+`cairn ctl daemon shutdown` acknowledges the shutdown request immediately;
+process teardown continues asynchronously. Cairn stops accepting requests,
+cancels active analyzer work, reaps LSP children, and drains workers under a
+10-second daemon deadline, followed by a 2-second runtime backstop for residual
+blocking filesystem work.
+
 ### Register a repo
 
 ```sh
