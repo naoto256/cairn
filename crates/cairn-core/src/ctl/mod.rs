@@ -28,6 +28,7 @@ use crate::Result;
 use crate::daemon::LineHandler;
 use crate::jobs::JobManager;
 use crate::jsonrpc_dispatch::{self, RpcMethod};
+use crate::lifecycle::RepoLifecycleManager;
 use crate::paths::CasDataDir;
 use crate::watcher::WatchManager;
 
@@ -65,6 +66,7 @@ pub struct CtlCtx {
     pub watch_manager: Option<Arc<WatchManager>>,
     pub job_manager: Option<Arc<JobManager>>,
     pub reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+    pub lifecycle: Option<Arc<RepoLifecycleManager>>,
     pub version: &'static str,
     pub started_at: Instant,
 }
@@ -125,6 +127,7 @@ impl CtlHandler {
             watch_manager,
             job_manager,
             None,
+            None,
         )
     }
 
@@ -138,6 +141,7 @@ impl CtlHandler {
         watch_manager: Option<Arc<WatchManager>>,
         job_manager: Option<Arc<JobManager>>,
         reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+        lifecycle: Option<Arc<RepoLifecycleManager>>,
     ) -> Self {
         let methods = jsonrpc_dispatch::method_table(&CONTROL_METHODS);
         Self {
@@ -147,6 +151,7 @@ impl CtlHandler {
                 watch_manager,
                 job_manager,
                 reconcile,
+                lifecycle,
                 version,
                 started_at: Instant::now(),
             },

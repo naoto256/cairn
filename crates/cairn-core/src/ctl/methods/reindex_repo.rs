@@ -87,7 +87,7 @@ impl ControlMethod for ReindexRepo {
                 }
             })?;
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let mut conn = cas_store::open(&store_path)?;
+            let mut conn = cas_store::open_existing(&store_path)?;
             match job_manager.as_deref() {
                 Some(manager) => register_repo_force_analyzers_enqueue(
                     &mut conn,

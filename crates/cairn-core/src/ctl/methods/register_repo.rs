@@ -57,8 +57,15 @@ impl ControlMethod for RegisterRepo {
         let repo_hash_for_index = repo_hash.clone();
         let index_path = cas_data_dir.index_db_path();
         let job_manager = ctx.job_manager.clone();
+        let lifecycle = ctx.lifecycle.clone();
+        let permit = match &lifecycle {
+            Some(lifecycle) => {
+                Some(lifecycle.begin_registration(repo_hash.clone(), canonical.clone(), now_ns)?)
+            }
+            None => None,
+        };
 
-        let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
+        let work_result = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut conn = cas_store::open(&store_path)?;
             let outcome = match job_manager.as_deref() {
                 Some(manager) => register_repo_enqueue_analyzers(
@@ -72,16 +79,33 @@ impl ControlMethod for RegisterRepo {
                 None => cas_register(&mut conn, &worktree, now_ns)?,
             };
 
-            // Update the top-level alias → repo index so queries can
-            // resolve `repo=<alias>`.
-            let mut idx = cas_registry::open(&index_path)?;
-            let tx = idx.transaction()?;
-            cas_registry::upsert(&tx, &alias, &canonical_str, &repo_hash_for_index, now_ns)?;
-            tx.commit()?;
+            if lifecycle.is_none() {
+                // Legacy constructor used by focused tests. Production
+                // publishes aliases through RepoLifecycleManager.
+                let mut idx = cas_registry::open(&index_path)?;
+                let tx = idx.transaction()?;
+                cas_registry::upsert(&tx, &alias, &canonical_str, &repo_hash_for_index, now_ns)?;
+                tx.commit()?;
+            }
             Ok(outcome)
         })
         .await
-        .map_err(|e| Error::internal_task_panic("register_repo", e))??;
+        .map_err(|e| Error::internal_task_panic("register_repo", e))?;
+
+        let outcome = match work_result {
+            Ok(outcome) => {
+                if let (Some(lifecycle), Some(permit)) = (&ctx.lifecycle, permit) {
+                    lifecycle.publish_registration(permit, &args.alias, args.persistent, now_ns)?;
+                }
+                outcome
+            }
+            Err(err) => {
+                if let (Some(lifecycle), Some(permit)) = (&ctx.lifecycle, permit) {
+                    lifecycle.abort_registration(permit).await?;
+                }
+                return Err(err);
+            }
+        };
 
         info!(
             alias = %args.alias,

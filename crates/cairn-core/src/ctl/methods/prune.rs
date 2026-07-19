@@ -23,6 +23,7 @@ impl ControlMethod for Prune {
     async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
         let args: PruneArgs = parse_params(params)?;
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let lifecycle = ctx.lifecycle.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<PruneResult> {
             let backends = all_backends();
@@ -30,6 +31,7 @@ impl ControlMethod for Prune {
                 backends.iter().map(|b| b.parser_id().to_string()).collect();
 
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let enumerate_all = args.repo.is_none();
             let entries = match args.repo {
                 Some(alias) => {
                     let entry = cas_registry::lookup_by_alias(&index, &alias)?
@@ -42,8 +44,19 @@ impl ControlMethod for Prune {
             let mut repos = Vec::with_capacity(entries.len());
             let mut total_deleted = 0_u64;
             for entry in entries {
+                let _lease = match &lifecycle {
+                    Some(lifecycle) if enumerate_all => {
+                        let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)?
+                        else {
+                            continue;
+                        };
+                        Some(lease)
+                    }
+                    Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
+                    None => None,
+                };
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                let mut conn = cas_store::open(&store_path)?;
+                let mut conn = cas_store::open_existing(&store_path)?;
                 let deleted = prune_store(&mut conn, &current_parser_ids)?;
                 total_deleted += deleted;
                 repos.push(PruneRepoEntry {

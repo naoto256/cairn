@@ -20,6 +20,14 @@ impl ControlMethod for RemoveRepo {
 
     async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
         let args: RemoveRepoArgs = parse_params(params)?;
+        if let Some(lifecycle) = &ctx.lifecycle {
+            if !lifecycle.remove_alias(&args.alias).await? {
+                return Err(Error::RepoNotFound {
+                    alias: args.alias.clone(),
+                });
+            }
+            return Ok(serde_json::to_value(Ack::with_alias(args.alias)).unwrap());
+        }
         let cas_data_dir = ctx.cas_data_dir.clone();
         let alias = args.alias.clone();
 
