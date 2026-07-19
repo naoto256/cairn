@@ -307,7 +307,7 @@ scalar fields (`repo_hash`, generation counters,
 
 Tier-1 is the tree-sitter syntax floor: symbols, outlines, imports,
 and other facts extractable from one file. Fourteen first-class
-language backends ship with 0.7.1 (plus Markdown for outlines),
+language backends ship with 0.8.0 (plus Markdown for outlines),
 and a generic tree-sitter fallback covers additional grammars.
 
 Tier-2 adds language-specific semantic facts from one file —
@@ -318,16 +318,24 @@ across every backend so `find_subtypes` / `find_supertypes` compare
 cleanly across languages.
 
 Tier-2.5 is the in-process workspace analyzer layer for cross-file
-resolution without an external LSP. Seven languages ship Tier-2.5
-backends today — Python, PHP, Ruby, C#, JavaScript, Kotlin, and
-Swift. These analyzers build manifest-scoped resolutions and
+resolution without an external LSP. The 0.8.0 scope is complete with
+seven Tier-2.5 backends — Ruby, PHP, Python, Kotlin, Swift, C#, and
+JavaScript. These analyzers build manifest-scoped resolutions and
 attach `target_path` to imports, subtype / supertype edges,
 references, callers, and callees, so a `find_subtypes` query
 against an interface returns the workspace file each implementation
 lives in directly, even when no Tier-3 LSP runs. Languages without
 a Tier-2.5 backend (Rust, Go, TypeScript, Java, C, C++,
 Objective-C) skip the layer and rely on Tier-3 for cross-file
-resolution.
+resolution. Java and TypeScript remain supported at Tier-1, Tier-2,
+and Tier-3, but neither is part of the 0.8.0 Tier-2.5 scope.
+
+TypeScript currently relies on `typescript-language-server` / tsserver
+for cross-file semantics. Without a usable local server, its Tier-1 and
+Tier-2 facts remain available, but Cairn is not self-contained for
+TypeScript cross-file queries. This is a known gap, not a permanent
+endorsement of external-LSP quality as an architectural dependency;
+the Tier-2.5 position will be reconsidered on the path to 1.0.
 
 The runner reads each Tier-2.5 file's bytes once per pass and
 hands them to the analyzer through the `WorkspaceFile::source_bytes`
