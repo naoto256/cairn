@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Accuracy eval harness: golden Tier-2/Tier-3 expectations over mini-repo fixtures."
+description = "Accuracy eval harness: golden Tier-2/Tier-2.5/Tier-3 expectations over mini-repo fixtures."
 publish = false
 
 [dependencies]
@@ -16,20 +16,28 @@ cairn-core.workspace = true
 cairn-proto.workspace = true
 cairn-lang-api.workspace = true
 # Tier-2 (syntactic) backends — force-linked so their distributed-slice
-# entries reach this crate's binary. Tier-3 (LSP) backends are NOT
-# linked here: their analyzers require external LSP servers which are
-# not guaranteed in CI, so the harness fixes the Tier-2 baseline only
-# and leaves the `Tier3` track as a structural placeholder.
+# entries reach this crate's binary. Tier-3 (LSP) backends are not
+# linked here because CI does not guarantee their external servers.
 cairn-lang-rust.workspace = true
 cairn-lang-python.workspace = true
 cairn-lang-typescript.workspace = true
 cairn-lang-java.workspace = true
 cairn-lang-ruby.workspace = true
-# Tier-2.5 (cross-file syntactic) Ruby backend. Force-linked so its
-# `WORKSPACE_ANALYZERS` distributed-slice entry reaches this crate's
-# binary; `register_repo` then invokes it automatically through
-# `run_registered_workspace_analyzers` and persists its resolutions.
+cairn-lang-php.workspace = true
+cairn-lang-kotlin.workspace = true
+cairn-lang-swift.workspace = true
+cairn-lang-csharp.workspace = true
+# Tier-2.5 (cross-file syntactic) backends. Force-linked so their
+# `WORKSPACE_ANALYZERS` distributed-slice entries reach this crate's
+# binary; `register_repo` then invokes them automatically and persists
+# their resolutions.
 cairn-lang-ruby-tier25.workspace = true
+cairn-lang-php-tier25.workspace = true
+cairn-lang-python-tier25.workspace = true
+cairn-lang-kotlin-tier25.workspace = true
+cairn-lang-swift-tier25.workspace = true
+cairn-lang-csharp-tier25.workspace = true
+cairn-lang-javascript-tier25.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow = "1"

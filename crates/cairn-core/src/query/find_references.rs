@@ -109,7 +109,7 @@ fn run_find_references(
     // byte_end, kind)` tuple (ranked by `source_rank_case_sql` so
     // tier3 wins over tier25 wins over tier2-direct), the main query
     // LEFT JOINs it, and the projected `target_qualified` is
-    // `COALESCE(refs.target_qualified, symbols.qualified)` where
+    // `COALESCE(symbols.qualified, refs.target_qualified)` where
     // `symbols.qualified` is pulled through `resolutions.target_symbol_id`.
     // `kind_source` carries the provenance: the resolution-layer
     // `source` string when a resolution covered the site, the
@@ -150,7 +150,7 @@ fn run_find_references(
                     target_path
                FROM (
                  SELECT r.target_name,
-                        COALESCE(r.target_qualified, sym.qualified)
+                        COALESCE(sym.qualified, r.target_qualified)
                             AS target_qualified,
                         r.kind,
                         enc.qualified AS enclosing,
@@ -273,7 +273,7 @@ fn run_find_references(
             // index.
             //
             // The strict path matches against
-            // `COALESCE(r.target_qualified, sym.qualified)` rather than
+            // `COALESCE(sym.qualified, r.target_qualified)` rather than
             // `r.target_qualified` alone so that cross-parser-id
             // resolutions — where the Tier-2.5 persist layer adopted a
             // sibling-parser symbol id and the surface `target_qualified`
@@ -305,34 +305,31 @@ fn run_find_references(
 /// shape (PR-γ #8).
 ///
 /// Pre-fix, this case ran through `run()` with
-/// `WHERE COALESCE(r.target_qualified, sym.qualified) = ?`. The
+/// `WHERE COALESCE(sym.qualified, r.target_qualified) = ?`. The
 /// COALESCE referenced a column from a LEFT JOIN (`symbols.qualified`
 /// via `resolutions.target_symbol_id`), so SQLite could not push it
 /// through `idx_refs_target_qualified` and fell back to `SCAN refs
 /// USING idx_refs_blob`, an O(N) scan per query (measured ~135× the
 /// index-driven path on a 1K-ref fixture).
 ///
-/// The rewrite is a strict equivalence: `COALESCE(a, b) = ?` becomes
-/// `a = ? OR (a IS NULL AND b = ?)`, but expressed as a `UNION ALL`
-/// over two disjoint `strict_refs` branches so SQLite can pick an
-/// index for each:
+/// The rewrite is expressed as a `UNION ALL` over two disjoint
+/// `strict_refs` branches so SQLite can pick an index for each:
 ///
 ///   * **Branch A** — `refs.target_qualified = ?` hits the partial
 ///     index `idx_refs_target_qualified (target_qualified IS NOT NULL)`.
-///   * **Branch B** — `refs.target_qualified IS NULL` + the join to
-///     `best_resolution` + `symbols.qualified = ?` lets SQLite probe
+///   * **Branch B** — the join to `best_resolution` plus
+///     `symbols.qualified = ?` lets SQLite probe
 ///     `idx_symbols_qualified` first and ride the resolution-row
-///     uniqueness back to the ref.
+///     uniqueness back to the ref. It excludes rows already selected
+///     by Branch A.
 ///
-/// The two branches are mutually exclusive by construction
-/// (`target_qualified IS NULL` is a single-table predicate on `refs`),
-/// so `UNION ALL` is the right combinator: no dedup needed across
-/// branches.
+/// The outer projected-name predicate removes Branch A rows when a
+/// higher-tier resolution supersedes their syntactic qualified value.
 ///
 /// Critical invariants (see `pr_gamma_*` tests):
 ///   * Empty-string is NOT NULL — Branch A still selects
 ///     `target_qualified = ''` rows when that happens to match the
-///     query value, matching the COALESCE semantics exactly.
+///     query value when no higher-tier symbol supersedes it.
 ///   * The downstream `dedup_rank` / noise filter / projection
 ///     COALESCE are unchanged — Branch B rows continue to carry
 ///     `target_qualified=NULL` and inherit `sym.qualified` through
@@ -381,8 +378,8 @@ fn run_strict_incoming(
              UNION ALL
              -- Branch B: cross-parser fallback. The Tier-2.5 persist
              -- layer adopted a sibling-parser symbol id (so
-             -- `target_qualified` on the ref is NULL); the strict
-             -- query reaches it via the resolution row + symbol
+             -- `target_qualified` on the ref may be absent or merely
+             -- syntactic); the strict query reaches it via the resolution row + symbol
              -- table. Probes idx_symbols_qualified first.
              SELECT r.*
                FROM refs r
@@ -394,15 +391,15 @@ fn run_strict_incoming(
                 AND res.kind = r.kind
                 AND res.rn = 1
                JOIN symbols sym ON sym.id = res.target_symbol_id
-              WHERE r.target_qualified IS NULL
-                AND sym.qualified = ?2
+              WHERE sym.qualified = ?2
+                AND (r.target_qualified IS NULL OR r.target_qualified <> ?2)
          )
          SELECT target_name, target_qualified, kind, enclosing,
                 path, line, blob_sha, parser_id, kind_source,
                 target_path
            FROM (
              SELECT r.target_name,
-                    COALESCE(r.target_qualified, sym.qualified)
+                    COALESCE(sym.qualified, r.target_qualified)
                         AS target_qualified,
                     r.kind,
                     enc.qualified AS enclosing,
@@ -468,6 +465,11 @@ fn run_strict_incoming(
             )",
         );
     }
+    sql.push_str(if include_noise {
+        " WHERE target_qualified = ?2"
+    } else {
+        " AND target_qualified = ?2"
+    });
     sql.push_str(" ORDER BY path, line, byte_start, source_rank");
     sql.push_str(&format!(" LIMIT {limit}"));
 

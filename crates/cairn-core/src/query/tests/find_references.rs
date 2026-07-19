@@ -401,7 +401,7 @@ fn references_empty_symbol_errors() {
 // sibling-parser symbol. find_references' SQL does not change in Phase 1
 // (its target_path surface is Phase 2), but the data it reads does: rows
 // it joins to `resolutions` may now have a non-NULL target_symbol_id, and
-// `COALESCE(refs.target_qualified, sym.qualified)` therefore promotes the
+// `COALESCE(sym.qualified, refs.target_qualified)` therefore promotes the
 // surfaced `target_qualified` for cross-parser calls that used to bottom
 // out at None.
 //
@@ -565,6 +565,47 @@ fn find_references_outgoing_picks_up_cross_parser_resolution_post_p1() {
         "cross-parser fallback should surface sibling-parser qualified via COALESCE"
     );
     assert_eq!(hit.kind_source, "tier25-kotlin-resolver");
+}
+
+#[test]
+fn higher_tier_resolution_supersedes_bare_tier2_qualified_name() {
+    let (_db, conn, java_id, _) = cross_parser_call_fixture(false);
+    let java_id = java_id.unwrap();
+    conn.execute(
+        "UPDATE refs SET target_qualified = 'fromJson'
+         WHERE blob_sha = 'sha-kt' AND byte_start = 42",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO resolutions
+               (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                kind, semantic_kind, target_symbol_id, target_path, source)
+         VALUES ('sha-kt', 'tree-sitter-kotlin-ng', 42, 50, 'call', NULL, ?1,
+                 'src/JsonAdapter.java', 'tier25-kotlin-resolver')",
+        rusqlite::params![java_id],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "fromJson".into(),
+            direction: ReferenceDirection::Incoming,
+            kind: Some(RefKind::Call),
+            include_noise: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].target_qualified.as_deref(),
+        Some("com.x.JsonAdapter.fromJson")
+    );
+    assert_eq!(hits[0].kind_source, "tier25-kotlin-resolver");
 }
 
 #[test]
