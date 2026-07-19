@@ -291,6 +291,88 @@ fn duplicate_enqueue_does_not_overwrite_current_job_row() {
 }
 
 #[test]
+fn manual_cancel_of_running_job_cancels_active_handle() {
+    let data = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+    let manager = JobManager::new(Arc::clone(&cas_data_dir));
+    let repo_hash = "repo-hash";
+    let manifest_id = ManifestId(1);
+    {
+        let mut index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(&tx, "repo", repo.path().to_str().unwrap(), repo_hash, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    let mut conn = cas_store::open(&cas_data_dir.store_db_path(repo_hash)).unwrap();
+    insert_manifest(&conn, manifest_id.0);
+    let job = manager
+        .queue_analyzer_run(test_queue_request(
+            &mut conn,
+            repo.path(),
+            repo_hash,
+            manifest_id,
+            1,
+        ))
+        .unwrap()
+        .expect("job should queue");
+    conn.execute(
+        "UPDATE workspace_analysis_runs SET status = 'running' WHERE job_id = ?1",
+        [job.job_id],
+    )
+    .unwrap();
+    let progress = crate::workspace_analyzer::AnalyzerProgress::default();
+    manager.register_active_progress(job.job_id, progress.clone());
+
+    let cancelled = manager.cancel(job.job_id).unwrap();
+
+    assert!(!cancelled.cancelled);
+    assert!(progress.is_cancelled());
+    let cancel_requested: i64 = conn
+        .query_row(
+            "SELECT cancel_requested FROM workspace_analysis_runs WHERE job_id = ?1",
+            [job.job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancel_requested, 1);
+}
+
+#[test]
+fn begin_shutdown_cancels_active_progress_and_rejects_new_admission() {
+    let data = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+    let manager = JobManager::new(cas_data_dir);
+    let progress = crate::workspace_analyzer::AnalyzerProgress::default();
+    manager.register_active_progress(41, progress.clone());
+
+    manager.begin_shutdown();
+
+    assert!(progress.is_cancelled());
+    let late_progress = crate::workspace_analyzer::AnalyzerProgress::default();
+    manager.register_active_progress(42, late_progress.clone());
+    assert!(
+        late_progress.is_cancelled(),
+        "a run racing after the shutdown linearization point must start cancelled"
+    );
+
+    let mut conn = cas_store::open(&manager.cas_data_dir.store_db_path("repo-hash")).unwrap();
+    insert_manifest(&conn, 1);
+    let err = manager
+        .queue_analyzer_run(test_queue_request(
+            &mut conn,
+            repo.path(),
+            "repo-hash",
+            ManifestId(1),
+            1,
+        ))
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::JobManagerShuttingDown));
+    assert_eq!(count_runs(&conn, 1, "pyright-lsp"), 0);
+}
+
+#[test]
 fn enqueue_reindex_queues_only_expected_manifest_analyzers() {
     let data = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

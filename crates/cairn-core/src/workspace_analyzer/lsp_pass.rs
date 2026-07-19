@@ -235,6 +235,7 @@ async fn collect_resolved_refs(
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
     for file in files {
+        ensure_analyzer_active(&progress)?;
         let Some(path) = &file.worktree_path else {
             continue;
         };
@@ -263,6 +264,7 @@ async fn collect_resolved_refs(
             progress.clone(),
         )
         .await;
+        ensure_analyzer_active(&progress)?;
         let definition_elapsed = definition_started.elapsed();
         debug!(
             analyzer_id,
@@ -313,6 +315,7 @@ async fn collect_multi_kind_resolved_refs(
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
     for file in files {
+        ensure_analyzer_active(&progress)?;
         let Some(path) = &file.worktree_path else {
             continue;
         };
@@ -354,6 +357,7 @@ async fn collect_multi_kind_resolved_refs(
             progress.clone(),
         )
         .await;
+        ensure_analyzer_active(&progress)?;
         let definition_elapsed = definition_started.elapsed();
         debug!(
             analyzer_id,
@@ -452,6 +456,7 @@ where
                     analyzer_id,
                     uri,
                     site.position,
+                    Some(&progress),
                 )
                 .await;
                 progress.tick();
@@ -526,6 +531,7 @@ where
                     analyzer_id,
                     uri,
                     request.site.position,
+                    Some(&progress),
                 )
                 .await;
                 progress.tick();
@@ -612,6 +618,7 @@ async fn definition_with_retry_from<F, Fut>(
     analyzer_id: &str,
     uri: &Url,
     position: Position,
+    progress: Option<&AnalyzerProgress>,
 ) -> Result<Vec<Location>>
 where
     F: FnMut() -> Fut,
@@ -621,6 +628,9 @@ where
     let mut retried_empty_definition = false;
     let mut retried_content_modified = false;
     for _attempt in 0..MAX_DEFINITION_ATTEMPTS {
+        if progress.is_some_and(AnalyzerProgress::is_cancelled) {
+            return Err(analyzer_cancelled_error());
+        }
         match definition().await {
             Ok(locations) if !locations.is_empty() => return Ok(locations),
             Ok(locations) => {
@@ -650,6 +660,18 @@ where
         }
     }
     Ok(Vec::new())
+}
+
+fn ensure_analyzer_active(progress: &AnalyzerProgress) -> Result<()> {
+    if progress.is_cancelled() {
+        Err(analyzer_cancelled_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn analyzer_cancelled_error() -> Error {
+    Error::Internal("workspace analyzer cancelled".into())
 }
 
 fn is_file_not_found(err: &crate::lsp::Error) -> bool {
@@ -797,6 +819,7 @@ mod tests {
             "test-lsp",
             &test_uri(),
             test_position(),
+            None,
         )
         .await
     }
@@ -963,6 +986,36 @@ mod tests {
             "definition pipeline took {:?}",
             start.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_definition_stream_starts_no_new_requests() {
+        let sites = (0..100).map(test_site).collect::<Vec<_>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let progress = AnalyzerProgress::default();
+        progress.cancel();
+        let resolved = collect_definition_site_locations(
+            sites,
+            {
+                let calls = Arc::clone(&calls);
+                move |_site| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, crate::lsp::Error>(Vec::new())
+                    }
+                }
+            },
+            DefinitionRetryPolicy::default(),
+            "test-lsp",
+            &test_uri(),
+            false,
+            progress,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resolved.resolved.len(), 0);
     }
 
     #[tokio::test]

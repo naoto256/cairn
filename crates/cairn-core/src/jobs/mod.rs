@@ -22,8 +22,8 @@ use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::manifest::{self, ManifestEntry, ManifestId};
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::{
-    ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, all_workspace_analyzers,
-    config_hash, expected_analyzers_for_manifest, mark_run,
+    ANALYZER_STALL_TIMEOUT, AnalyzerProgress, AnalyzerRunRequest, RunRecord, RunStatus,
+    all_workspace_analyzers, config_hash, expected_analyzers_for_manifest, mark_run,
     run_one_workspace_analyzer_with_timeout,
 };
 use crate::{Error, Result};
@@ -148,6 +148,20 @@ struct JobKey {
     analyzer_id: String,
 }
 
+struct JobAdmissionState {
+    accepting: bool,
+    active_progress: HashMap<JobId, AnalyzerProgress>,
+}
+
+impl Default for JobAdmissionState {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            active_progress: HashMap::new(),
+        }
+    }
+}
+
 impl JobKey {
     fn from_job(job: &Job) -> Self {
         Self {
@@ -169,6 +183,11 @@ pub struct JobManager {
     runtime_metrics: JobRuntimeMetricsStore,
     job_index: JobIndex,
     tracked_keys: TrackedJobKeys,
+    /// Admission and active cancellation handles share one lock so
+    /// `begin_shutdown` is a linearization point: after it returns, no
+    /// enqueue can commit a durable row and every run that registered before
+    /// it has observed cancellation.
+    admission: Mutex<JobAdmissionState>,
     // Daemon-global monotonic `JobId` allocator. `restore_from_db`
     // seeds this above the whole-store historical max and any
     // tombstoned id, so post-restart enqueues cannot collide with
@@ -277,6 +296,7 @@ impl JobManager {
             runtime_metrics: JobRuntimeMetricsStore::default(),
             job_index: JobIndex::default(),
             tracked_keys: TrackedJobKeys::default(),
+            admission: Mutex::new(JobAdmissionState::default()),
             // Fresh manager starts at 1 so tests that assert
             // `first.job_id == 1` after a bare `JobManager::new` keep
             // working; in production `restore_from_db()` is called
@@ -619,6 +639,10 @@ impl JobManager {
         &self,
         request: QueueAnalyzerRun<'_>,
     ) -> Result<Option<QueuedAnalyzerJob>> {
+        let admission = self.admission.lock().expect("job admission lock poisoned");
+        if !admission.accepting {
+            return Err(Error::JobManagerShuttingDown);
+        }
         let QueueAnalyzerRun {
             conn,
             alias,
@@ -684,6 +708,7 @@ impl JobManager {
         if !enqueued {
             self.tracked_keys.release(&key);
         }
+        drop(admission);
         Ok(enqueued.then(|| QueuedAnalyzerJob {
             job_id,
             analyzer_id: analyzer_id.to_string(),
@@ -763,6 +788,15 @@ impl JobManager {
                      WHERE manifest_id = ?1 AND analyzer_id = ?2",
                     params![manifest_id, analyzer_id],
                 )?;
+                if let Some(progress) = self
+                    .admission
+                    .lock()
+                    .expect("job admission lock poisoned")
+                    .active_progress
+                    .get(&job_id)
+                {
+                    progress.cancel();
+                }
                 CancelResult {
                     cancelled: false,
                     reason:
@@ -782,41 +816,77 @@ impl JobManager {
     }
 
     pub async fn shutdown(&self, drain_timeout: Duration) {
-        test_observe_job_manager_shutdown();
-        {
-            let mut sender = self
-                .scheduler_sender
-                .lock()
-                .expect("job scheduler sender lock poisoned");
-            if let Some(sender) = sender.take() {
-                let _ = sender.send(SchedulerMsg::Shutdown);
+        self.begin_shutdown();
+        test_observe_job_manager_drain();
+        if tokio::time::timeout(drain_timeout, async {
+            {
+                let mut sender = self
+                    .scheduler_sender
+                    .lock()
+                    .expect("job scheduler sender lock poisoned");
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(SchedulerMsg::Shutdown);
+                }
             }
-        }
-        let scheduler = self
-            .scheduler
-            .lock()
-            .expect("job scheduler lock poisoned")
-            .take();
-        if let Some(handle) = scheduler {
-            let _ = tokio::time::timeout(drain_timeout, handle).await;
-        }
-        {
-            let mut sender = self
-                .worker_sender
+            let scheduler = self
+                .scheduler
                 .lock()
-                .expect("job worker sender lock poisoned");
-            sender.take();
-        }
-        let handles = {
-            let mut workers = self.workers.lock().expect("job worker lock poisoned");
-            std::mem::take(&mut *workers)
-        };
-        let _ = tokio::time::timeout(drain_timeout, async {
+                .expect("job scheduler lock poisoned")
+                .take();
+            if let Some(handle) = scheduler {
+                let _ = handle.await;
+            }
+            self.worker_sender
+                .lock()
+                .expect("job worker sender lock poisoned")
+                .take();
+            let handles = {
+                let mut workers = self.workers.lock().expect("job worker lock poisoned");
+                std::mem::take(&mut *workers)
+            };
             for handle in handles {
                 let _ = handle.await;
             }
         })
-        .await;
+        .await
+        .is_err()
+        {
+            warn!(
+                timeout_ms = drain_timeout.as_millis(),
+                "job manager shutdown drain timed out"
+            );
+        }
+    }
+
+    /// Close analyzer-job admission and request cancellation of every active
+    /// run. This is idempotent and is the shutdown linearization point.
+    pub fn begin_shutdown(&self) {
+        let mut admission = self.admission.lock().expect("job admission lock poisoned");
+        let first_transition = admission.accepting;
+        admission.accepting = false;
+        for progress in admission.active_progress.values() {
+            progress.cancel();
+        }
+        drop(admission);
+        if first_transition {
+            test_observe_job_manager_shutdown();
+        }
+    }
+
+    fn register_active_progress(&self, job_id: JobId, progress: AnalyzerProgress) {
+        let mut admission = self.admission.lock().expect("job admission lock poisoned");
+        if !admission.accepting {
+            progress.cancel();
+        }
+        admission.active_progress.insert(job_id, progress);
+    }
+
+    fn unregister_active_progress(&self, job_id: JobId) {
+        self.admission
+            .lock()
+            .expect("job admission lock poisoned")
+            .active_progress
+            .remove(&job_id);
     }
 
     fn enqueue_memory(&self, job: Job) -> bool {
@@ -860,7 +930,25 @@ fn test_observe_job_manager_shutdown() {
 fn test_observe_job_manager_shutdown() {}
 
 #[cfg(test)]
+fn test_observe_job_manager_drain() {
+    if let Some(observer) = JOB_MANAGER_DRAIN_OBSERVER
+        .lock()
+        .expect("job manager drain observer poisoned")
+        .as_ref()
+    {
+        observer();
+    }
+}
+
+#[cfg(not(test))]
+fn test_observe_job_manager_drain() {}
+
+#[cfg(test)]
 pub(crate) static JOB_MANAGER_SHUTDOWN_OBSERVER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static JOB_MANAGER_DRAIN_OBSERVER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     Mutex::new(None);
 
 fn pool_group_for_analyzer_id(analyzer_id: &str) -> Result<Option<&'static str>> {
