@@ -5,10 +5,11 @@
 //! using the blob_sha the symbol was indexed against; the byte range
 //! recorded at parse time always matches that blob.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use cairn_proto::common::SourceTier;
-use cairn_proto::methods::{GetSymbolSourceArgs, GetSymbolSourceResult};
+use cairn_proto::methods::{GetSymbolSourceArgs, GetSymbolSourceResult, SymbolSourceCandidate};
 use linkme::distributed_slice;
 use serde_json::Value;
 
@@ -24,11 +25,30 @@ use crate::{Error, Result};
 
 pub struct GetSymbolSource;
 
+const AMBIGUITY_CANDIDATE_LIMIT: usize = 20;
+const EXECUTION_CANDIDATE_LIMIT: u32 = (AMBIGUITY_CANDIDATE_LIMIT + 1) as u32;
+const STORE_CANDIDATE_PROBE_LIMIT: usize = AMBIGUITY_CANDIDATE_LIMIT + 2;
+
 struct SourceHit {
     repo: String,
+    repo_hash: String,
+    manifest_id: i64,
     anchor: String,
+    worktree_root: PathBuf,
     row: SymbolSourceRow,
-    source: String,
+}
+
+impl SourceHit {
+    fn to_wire_candidate(&self) -> SymbolSourceCandidate {
+        SymbolSourceCandidate {
+            repo: self.repo.clone(),
+            branch: self.anchor.clone(),
+            file: self.row.path.clone(),
+            line_start: self.row.line_start,
+            line_end: self.row.line_end,
+            kind: self.row.kind.clone(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -44,11 +64,21 @@ impl DataMethod for GetSymbolSource {
                 "get_symbol_source: `qualified` must be non-empty".into(),
             ));
         }
+        if matches!(args.line, Some(0)) {
+            return Err(Error::InvalidParams(
+                "get_symbol_source: `line` must be a 1-indexed value >= 1".into(),
+            ));
+        }
+        if args.line.is_some() && args.file.is_none() {
+            return Err(Error::InvalidParams(
+                "get_symbol_source: `line` requires `file`".into(),
+            ));
+        }
 
         let qualified = args.qualified.clone();
         let file_filter = args.file.clone();
+        let line_filter = args.line;
         let exact_file = file_filter.clone();
-        let signature_only = args.signature_only;
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
@@ -60,40 +90,48 @@ impl DataMethod for GetSymbolSource {
                 anchor: anchor_arg,
                 branch: branch_arg,
                 method_name: "get_symbol_source",
-                effective_limit: 1,
+                effective_limit: EXECUTION_CANDIDATE_LIMIT,
                 verbose_tier3,
                 exact_file,
             },
             move |entry, conn, snapshot| {
-                let row = match query::get_symbol_source_row(
+                let rows = query::get_symbol_source_rows(
                     conn,
                     &snapshot.anchor,
                     &qualified,
                     file_filter.as_deref(),
-                )? {
-                    Some(row) => row,
-                    None => return Ok(Vec::new()),
-                };
-                let worktree_root = PathBuf::from(&entry.root_path);
-                let source = if signature_only {
-                    String::new()
-                } else {
-                    materialise(&worktree_root, &row)?
-                };
-                Ok(vec![SourceHit {
-                    repo: entry.alias.clone(),
-                    anchor: snapshot.anchor.as_str().to_string(),
-                    row,
-                    source,
-                }])
+                    line_filter,
+                    STORE_CANDIDATE_PROBE_LIMIT,
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| SourceHit {
+                        repo: entry.alias.clone(),
+                        repo_hash: entry.repo_hash.clone(),
+                        manifest_id: snapshot.manifest_id.0,
+                        anchor: snapshot.anchor.as_str().to_string(),
+                        worktree_root: PathBuf::from(&entry.root_path),
+                        row,
+                    })
+                    .collect())
             },
             |hits| parser_id_filter(hits.iter().map(|hit| hit.row.parser_id.clone())),
-            |_hits: &mut Vec<SourceHit>| {},
+            finalize_source_hits,
         )
         .await?;
 
         let freshness_issues = execution.freshness_issues;
-        let Some(hit) = execution.items.into_iter().next() else {
+        let mut hits = execution.items;
+        if hits.len() > 1 {
+            let candidates_truncated = execution.capped || hits.len() > AMBIGUITY_CANDIDATE_LIMIT;
+            hits.truncate(AMBIGUITY_CANDIDATE_LIMIT);
+            return Err(Error::AmbiguousSource {
+                qualified: args.qualified,
+                candidates: hits.iter().map(SourceHit::to_wire_candidate).collect(),
+                candidates_truncated,
+            });
+        }
+        let Some(hit) = hits.pop() else {
             if let Some(issue) = freshness_issues.first() {
                 let repo = (issue.repo != "*").then(|| issue.repo.clone());
                 return match args.file.clone() {
@@ -140,6 +178,11 @@ impl DataMethod for GetSymbolSource {
         let (diagnostics, hints) =
             build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
         let row = hit.row;
+        let source = if args.signature_only {
+            String::new()
+        } else {
+            materialise(&hit.worktree_root, &row)?
+        };
         let result = GetSymbolSourceResult {
             qualified: row.qualified,
             name: row.name,
@@ -151,7 +194,7 @@ impl DataMethod for GetSymbolSource {
             ),
             line_start: row.line_start,
             line_end: row.line_end,
-            source: hit.source,
+            source,
             signature: row.signature,
             doc: row.doc,
             // Source bytes come from the manifest blob, not one analyzer row.
@@ -165,6 +208,40 @@ impl DataMethod for GetSymbolSource {
 
         Ok(serde_json::to_value(result).unwrap())
     }
+}
+
+fn finalize_source_hits(hits: &mut Vec<SourceHit>) {
+    hits.sort_by(|left, right| {
+        (
+            &left.repo,
+            &left.anchor,
+            &left.row.path,
+            left.row.line_start,
+            left.row.byte_start,
+            left.row.byte_end,
+            &left.row.blob_sha,
+        )
+            .cmp(&(
+                &right.repo,
+                &right.anchor,
+                &right.row.path,
+                right.row.line_start,
+                right.row.byte_start,
+                right.row.byte_end,
+                &right.row.blob_sha,
+            ))
+    });
+    let mut seen = BTreeSet::new();
+    hits.retain(|hit| {
+        seen.insert((
+            hit.repo_hash.clone(),
+            hit.manifest_id,
+            hit.row.path.clone(),
+            hit.row.blob_sha.clone(),
+            hit.row.byte_start,
+            hit.row.byte_end,
+        ))
+    });
 }
 
 #[allow(unsafe_code)]
@@ -216,6 +293,174 @@ mod tests {
                 params![entry.repo_hash],
             )
             .unwrap();
+    }
+
+    fn ambiguous_fixture() -> test_support::DataRpcFixture {
+        test_support::registered_fixture_with_files(&[
+            ("src/a.rs", "pub fn duplicate() { println!(\"a\"); }\n"),
+            ("src/b.rs", "pub fn duplicate() { println!(\"b\"); }\n"),
+        ])
+    }
+
+    #[tokio::test]
+    async fn duplicate_qualified_declarations_return_typed_ambiguity_before_source_io() {
+        let fixture = ambiguous_fixture();
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "duplicate"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::AmbiguousSource {
+                qualified,
+                candidates,
+                candidates_truncated: false,
+            } if qualified == "duplicate"
+                && candidates.len() == 2
+                && candidates[0].file == "src/a.rs"
+                && candidates[1].file == "src/b.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguity_candidates_are_capped_without_weakening_cardinality() {
+        let owned = (0..21)
+            .map(|index| {
+                (
+                    format!("src/{index:02}.rs"),
+                    "pub fn duplicate() {}\n".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let files = owned
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect::<Vec<_>>();
+        let fixture = test_support::registered_fixture_with_files(&files);
+
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "duplicate"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::AmbiguousSource {
+                candidates,
+                candidates_truncated: true,
+                ..
+            } if candidates.len() == AMBIGUITY_CANDIDATE_LIMIT
+                && candidates[0].file == "src/00.rs"
+                && candidates[19].file == "src/19.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn aliases_for_one_repository_do_not_duplicate_physical_declarations() {
+        let fixture = test_support::registered_fixture();
+        let mut index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(
+            &tx,
+            "demo-alt",
+            &entry.root_path,
+            &entry.repo_hash,
+            entry.registered_at_ns,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let value = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "qualified": "target"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value["qualified"], "target");
+    }
+
+    #[tokio::test]
+    async fn file_and_one_indexed_line_select_one_declaration() {
+        let fixture = ambiguous_fixture();
+        let value = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "duplicate",
+                    "file": "src/a.rs",
+                    "line": 1
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value["location"], "demo:tentative/1:src/a.rs:1");
+        assert!(
+            value["source"]
+                .as_str()
+                .unwrap()
+                .contains("println!(\"a\")")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_line_is_rejected_as_invalid_params() {
+        let fixture = ambiguous_fixture();
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "duplicate",
+                    "file": "src/a.rs",
+                    "line": 0
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidParams(message) if message.contains("1-indexed")));
+    }
+
+    #[tokio::test]
+    async fn line_without_file_is_rejected_as_invalid_params() {
+        let fixture = ambiguous_fixture();
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "duplicate",
+                    "line": 1
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidParams(message) if message.contains("requires `file`"))
+        );
     }
 
     #[tokio::test]

@@ -1282,6 +1282,11 @@ pub struct GetSymbolSourceArgs {
     /// files (rare; useful for cross-module test fixtures).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Optional 1-indexed source line used to disambiguate declarations in
+    /// [`Self::file`]. The value is compared directly with a candidate's
+    /// `line_start`; callers must also provide `file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
     /// Return only the signature + doc string, not the body. Cheap
     /// way to "peek" at an API surface (parameters / return type /
     /// docstring) without paying for the full implementation text.
@@ -1291,6 +1296,24 @@ pub struct GetSymbolSourceArgs {
     /// Tier-3 status verbosity.
     #[serde(flatten)]
     pub tier3: Tier3Args,
+}
+
+/// One physical declaration offered to disambiguate a
+/// `get_symbol_source` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolSourceCandidate {
+    /// Repository alias containing the declaration.
+    pub repo: String,
+    /// Anchor label selected for the query.
+    pub branch: String,
+    /// Repo-root-relative file path.
+    pub file: String,
+    /// 1-based first line of the declaration.
+    pub line_start: u32,
+    /// 1-based last line of the declaration.
+    pub line_end: u32,
+    /// Symbol kind recorded for the canonical parser row.
+    pub kind: SymbolKind,
 }
 
 /// Result of `get_symbol_source`.
@@ -1527,6 +1550,44 @@ mod tests {
         assert_eq!(serialized["limit"], 50);
         assert!(serialized.get("scope").is_none());
         assert!(serialized.get("pagination").is_none());
+    }
+
+    #[test]
+    fn get_symbol_source_args_keep_one_indexed_line_flat_on_wire() {
+        let value = json!({
+            "repo": "demo",
+            "anchor": "HEAD",
+            "qualified": "crate::same",
+            "file": "src/lib.rs",
+            "line": 1,
+            "signature_only": false
+        });
+        let args: GetSymbolSourceArgs = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(args.scope.repo.as_deref(), Some("demo"));
+        assert_eq!(args.file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(args.line, Some(1));
+        assert_eq!(serde_json::to_value(args).unwrap(), value);
+    }
+
+    #[test]
+    fn symbol_source_candidate_round_trips_disambiguation_fields() {
+        let candidate = SymbolSourceCandidate {
+            repo: "demo".into(),
+            branch: "tentative/1".into(),
+            file: "src/lib.rs".into(),
+            line_start: 4,
+            line_end: 8,
+            kind: SymbolKind::Function,
+        };
+        let value = serde_json::to_value(&candidate).unwrap();
+
+        assert_eq!(value["file"], "src/lib.rs");
+        assert_eq!(value["line_start"], 4);
+        assert_eq!(
+            serde_json::from_value::<SymbolSourceCandidate>(value).unwrap(),
+            candidate
+        );
     }
 
     #[test]
