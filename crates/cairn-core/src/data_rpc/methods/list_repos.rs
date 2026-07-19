@@ -17,6 +17,7 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::enrichment::collect_enrichment;
+use crate::freshness::{self, EvaluatedSnapshot, SnapshotFreshness, SnapshotStaleReason};
 use crate::manifest::ManifestId;
 use crate::{Error, Result};
 
@@ -63,9 +64,25 @@ impl DataMethod for ListRepos {
                         }
                         None => None,
                     };
-                    let conn =
+                    let mut conn =
                         cas_store::open_existing(&cas_data_dir.store_db_path(&entry.repo_hash))?;
-                    let snapshot_summary = collect_repo_snapshot_summary(&conn, &backends)?;
+                    let tx = conn.transaction()?;
+                    let selected = select_status_snapshot(
+                        &index,
+                        &tx,
+                        &entry.repo_hash,
+                        crate::data_rpc::helpers::system_now_ns(),
+                    )?;
+                    let mut snapshot_summary = collect_repo_snapshot_summary(&tx, &backends)?;
+                    tx.commit()?;
+                    let current_freshness = revalidate_status_snapshot(
+                        &index,
+                        &conn,
+                        &entry.repo_hash,
+                        selected.as_ref(),
+                        crate::data_rpc::helpers::system_now_ns(),
+                    )?;
+                    apply_current_freshness(&mut snapshot_summary, current_freshness);
                     let owner = cas_registry::lookup_repository(&index, &entry.repo_hash)?
                         .ok_or_else(|| Error::RepoNotFound {
                             alias: entry.alias.clone(),
@@ -162,7 +179,7 @@ pub(super) fn collect_repo_snapshot_summary(
         .count() as u32;
     let stale_snapshot_count = snapshots
         .iter()
-        .filter(|snapshot| snapshot.status == "stale")
+        .filter(|snapshot| matches!(snapshot.status.as_str(), "stale" | "reconciling"))
         .count() as u32;
     let active_jobs = count_active_jobs(conn)?;
     let aggregate_status = derive_aggregate_status(&snapshots, active_jobs);
@@ -349,7 +366,11 @@ fn derive_aggregate_status(
             .any(|snapshot| snapshot.status == "missing")
     {
         RepoAggregateStatus::Error
-    } else if active_jobs > 0 {
+    } else if active_jobs > 0
+        || snapshots
+            .iter()
+            .any(|snapshot| snapshot.status == "reconciling")
+    {
         RepoAggregateStatus::Indexing
     } else if snapshots
         .iter()
@@ -359,6 +380,68 @@ fn derive_aggregate_status(
     } else {
         RepoAggregateStatus::Ready
     }
+}
+
+pub(super) fn select_status_snapshot(
+    index: &rusqlite::Connection,
+    store: &rusqlite::Connection,
+    repo_hash: &str,
+    now_ns: i64,
+) -> Result<Option<EvaluatedSnapshot>> {
+    match freshness::evaluate_snapshot(index, store, repo_hash, None, None, now_ns) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(Error::AnchorNotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn revalidate_status_snapshot(
+    index: &rusqlite::Connection,
+    store: &rusqlite::Connection,
+    repo_hash: &str,
+    selected: Option<&EvaluatedSnapshot>,
+    now_ns: i64,
+) -> Result<SnapshotFreshness> {
+    match selected {
+        Some(selected) => freshness::revalidate_snapshot(index, store, repo_hash, selected, now_ns),
+        None => Ok(SnapshotFreshness::Stale(
+            SnapshotStaleReason::MissingTentative,
+        )),
+    }
+}
+
+pub(super) fn apply_current_freshness(
+    summary: &mut RepoSnapshotSummary,
+    freshness: SnapshotFreshness,
+) {
+    let SnapshotFreshness::Stale(reason) = freshness else {
+        return;
+    };
+    let status = reason.status_label();
+    summary.current.status = status.into();
+    if let Some(snapshot) = summary.snapshots.iter_mut().find(|snapshot| {
+        snapshot
+            .branches
+            .iter()
+            .any(|branch| branch == &summary.current.anchor)
+    }) {
+        snapshot.status = status.into();
+    }
+    summary.summary.ready_snapshot_count = summary
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == "ready")
+        .count() as u32;
+    summary.summary.stale_snapshot_count = summary
+        .snapshots
+        .iter()
+        .filter(|snapshot| matches!(snapshot.status.as_str(), "stale" | "reconciling"))
+        .count() as u32;
+    summary.aggregate_status = match (status, summary.aggregate_status) {
+        ("reconciling", _) => RepoAggregateStatus::Indexing,
+        ("stale", RepoAggregateStatus::Ready) => RepoAggregateStatus::Partial,
+        (_, existing) => existing,
+    };
 }
 
 fn derive_status(file_count: i64, symbol_count: i64, enrichment: &[LanguageEnrichment]) -> String {
@@ -435,6 +518,31 @@ mod tests {
             .unwrap();
         assert!(rust.has_analyzer);
         assert_eq!(rust.tier, SourceTier::Semantic);
+    }
+
+    #[tokio::test]
+    async fn list_repos_generation_gap_is_indexing_not_ready() {
+        let fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = applied_generation + 1
+                 WHERE repo_hash = ?1",
+                params![entry.repo_hash],
+            )
+            .unwrap();
+
+        let value = ListRepos
+            .dispatch(&fixture.ctx, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let result: ListReposResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(result.repos[0].status, RepoAggregateStatus::Indexing);
     }
 
     #[tokio::test]

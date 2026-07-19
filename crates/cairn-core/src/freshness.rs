@@ -51,6 +51,14 @@ impl SnapshotStaleReason {
             Self::ChangedDuringQuery => "snapshot_changed_during_query",
         }
     }
+
+    #[must_use]
+    pub(crate) fn status_label(self) -> &'static str {
+        match self {
+            Self::AttemptInProgress | Self::GenerationGap => "reconciling",
+            _ => "stale",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
