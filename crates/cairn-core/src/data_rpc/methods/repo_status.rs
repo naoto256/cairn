@@ -9,7 +9,10 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use super::list_repos::{collect_repo_snapshot_summary, resolve_repo_by_path};
+use super::list_repos::{
+    apply_current_freshness, collect_repo_snapshot_summary, resolve_repo_by_path,
+    revalidate_status_snapshot, select_status_snapshot,
+};
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::data_rpc::helpers::compute_tier_status;
 use crate::{Error, Result};
@@ -28,11 +31,11 @@ impl DataMethod for RepoStatus {
         let cas_data_dir = ctx.cas_data_dir.clone();
         let lifecycle = ctx.lifecycle.clone();
 
-        let repo =
-            tokio::task::spawn_blocking(move || -> Result<RepoStatusEntry> {
-                let backends = all_backends();
-                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-                let entry = match (args.scope.repo.as_deref(), args.path.as_deref()) {
+        let repo = tokio::task::spawn_blocking(move || -> Result<RepoStatusEntry> {
+            let backends = all_backends();
+            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let entry =
+                match (args.scope.repo.as_deref(), args.path.as_deref()) {
                     (Some(alias), None) => cas_registry::lookup_by_alias(&index, alias)?
                         .ok_or_else(|| Error::RepoNotFound {
                             alias: alias.to_string(),
@@ -43,67 +46,96 @@ impl DataMethod for RepoStatus {
                         })?,
                     _ => unreachable!("validated above"),
                 };
-                let _lease = match &lifecycle {
-                    Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
-                    None => None,
-                };
-                let conn = cas_store::open_existing(&cas_data_dir.store_db_path(&entry.repo_hash))?;
-                let owner = cas_registry::lookup_repository(&index, &entry.repo_hash)?.ok_or_else(
-                    || Error::RepoNotFound {
+            let _lease = match &lifecycle {
+                Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
+                None => None,
+            };
+            let mut conn = cas_store::open_existing(&cas_data_dir.store_db_path(&entry.repo_hash))?;
+            let owner =
+                cas_registry::lookup_repository(&index, &entry.repo_hash)?.ok_or_else(|| {
+                    Error::RepoNotFound {
                         alias: entry.alias.clone(),
-                    },
-                )?;
-                let summary = collect_repo_snapshot_summary(&conn, &backends)?;
-                let tier3_status = match summary.current_manifest_id {
-                    Some(manifest_id) => {
-                        let status = compute_tier_status(&conn, manifest_id)?;
-                        TierRepoStatus {
-                            this_repo: status.this_query.clone(),
-                            repo_wide: args.tier3.verbose_tier3.then_some(status.this_query),
-                        }
                     }
-                    None => TierRepoStatus {
-                        this_repo: TierStatusBody::ready(),
-                        repo_wide: args.tier3.verbose_tier3.then_some(TierStatusBody::ready()),
-                    },
-                };
-                // Map the repository's durable reconcile state into
-                // `RepoReconcileStatus`. Registration seeds a reconcile-state
-                // row for every repository, and the FK cascade keeps their
-                // lifecycles aligned. If that state is somehow missing, fail
-                // closed rather than synthesising a clean state because the
-                // caller requested exactly one repository and the missing row
-                // indicates database corruption.
-                let reconcile = match cas_registry::get_reconcile_state(&index, &entry.repo_hash)? {
-                    Some(state) => {
-                        let aliases = cas_registry::aliases_for_repo(&index, &entry.repo_hash)?;
-                        Some(state.to_wire(&entry.repo_hash, aliases))
+                })?;
+            let tx = conn.transaction()?;
+            let selected = select_status_snapshot(
+                &index,
+                &tx,
+                &entry.repo_hash,
+                crate::data_rpc::helpers::system_now_ns(),
+            )?;
+            let mut summary = collect_repo_snapshot_summary(&tx, &backends)?;
+            let mut tier3_status = match summary.current_manifest_id {
+                Some(manifest_id) => {
+                    let status = compute_tier_status(&tx, manifest_id)?;
+                    TierRepoStatus {
+                        this_repo: status.this_query.clone(),
+                        repo_wide: args.tier3.verbose_tier3.then_some(status.this_query),
                     }
-                    None => {
-                        return Err(Error::Internal(format!(
-                            "repo_reconcile_state row missing for repo_hash={}",
-                            entry.repo_hash
-                        )));
-                    }
-                };
-                Ok(RepoStatusEntry {
-                    alias: entry.alias,
-                    root: entry.root_path,
-                    persistent: owner.persistent,
-                    languages: summary.languages,
-                    summary: summary.summary,
-                    current: summary.current,
-                    tier3_status,
-                    snapshots: if args.include_snapshots {
-                        summary.snapshots
-                    } else {
-                        Vec::new()
+                }
+                None => TierRepoStatus {
+                    this_repo: TierStatusBody {
+                        ready: false,
+                        analyzers: Vec::new(),
                     },
-                    reconcile,
-                })
+                    repo_wide: args.tier3.verbose_tier3.then_some(TierStatusBody {
+                        ready: false,
+                        analyzers: Vec::new(),
+                    }),
+                },
+            };
+            tx.commit()?;
+            let current_freshness = revalidate_status_snapshot(
+                &index,
+                &conn,
+                &entry.repo_hash,
+                selected.as_ref(),
+                crate::data_rpc::helpers::system_now_ns(),
+            )?;
+            apply_current_freshness(&mut summary, current_freshness);
+            if current_freshness.is_stale() {
+                tier3_status.this_repo.ready = false;
+                if let Some(repo_wide) = &mut tier3_status.repo_wide {
+                    repo_wide.ready = false;
+                }
+            }
+            // Map the repository's durable reconcile state into
+            // `RepoReconcileStatus`. Registration seeds a reconcile-state
+            // row for every repository, and the FK cascade keeps their
+            // lifecycles aligned. If that state is somehow missing, fail
+            // closed rather than synthesising a clean state because the
+            // caller requested exactly one repository and the missing row
+            // indicates database corruption.
+            let reconcile = match cas_registry::get_reconcile_state(&index, &entry.repo_hash)? {
+                Some(state) => {
+                    let aliases = cas_registry::aliases_for_repo(&index, &entry.repo_hash)?;
+                    Some(state.to_wire(&entry.repo_hash, aliases))
+                }
+                None => {
+                    return Err(Error::Internal(format!(
+                        "repo_reconcile_state row missing for repo_hash={}",
+                        entry.repo_hash
+                    )));
+                }
+            };
+            Ok(RepoStatusEntry {
+                alias: entry.alias,
+                root: entry.root_path,
+                persistent: owner.persistent,
+                languages: summary.languages,
+                summary: summary.summary,
+                current: summary.current,
+                tier3_status,
+                snapshots: if args.include_snapshots {
+                    summary.snapshots
+                } else {
+                    Vec::new()
+                },
+                reconcile,
             })
-            .await
-            .map_err(|e| Error::internal_task_panic("repo_status", e))??;
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("repo_status", e))??;
 
         let hints = repo_status_hints(&repo);
         Ok(serde_json::to_value(RepoStatusResult {
@@ -282,6 +314,32 @@ mod tests {
             .unwrap();
         let result: RepoStatusResult = serde_json::from_value(result).unwrap();
         assert_eq!(result.repo.alias, "demo");
+    }
+
+    #[tokio::test]
+    async fn repo_status_generation_gap_is_reconciling_and_not_tier_ready() {
+        let fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = applied_generation + 1
+                 WHERE repo_hash = ?1",
+                rusqlite::params![entry.repo_hash],
+            )
+            .unwrap();
+
+        let result = RepoStatus
+            .dispatch(&fixture.ctx, serde_json::json!({"repo": "demo"}))
+            .await
+            .unwrap();
+        let result: RepoStatusResult = serde_json::from_value(result).unwrap();
+
+        assert_eq!(result.repo.current.status, "reconciling");
+        assert!(!result.repo.tier3_status.this_repo.ready);
     }
 
     #[test]

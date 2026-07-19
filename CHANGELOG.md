@@ -24,6 +24,28 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Current-snapshot readiness now includes durable freshness.** Query methods
+  pin one manifest per repository for the full response, then revalidate the
+  tentative anchor and reconcile publication receipt before claiming a
+  complete result. A watcher failure, generation gap, in-flight reconcile,
+  expired scan watermark, missing receipt, or concurrent anchor move keeps
+  returned rows usable but marks the response partial with the machine-readable
+  `file_not_indexed_or_snapshot_stale` diagnostic and retry hint. Empty results
+  from an unverified snapshot no longer suggest fuzzy or broader queries, while
+  independent cap and analyzer diagnostics remain visible. `list_repos`,
+  `repo_status`, and Tier readiness use the same evaluator, so a stale current
+  snapshot cannot report `ready` merely because analyzer status is empty.
+
+  File-targeted `get_outline`, `find_imports`, and `get_symbol_source` now check
+  exact manifest membership before querying. A stale or unindexed source-file
+  miss from `get_symbol_source` returns JSON-RPC `-32002` (`FileNotIndexed`) with
+  structured `error.data` containing completeness, diagnostics, hints, repo,
+  file, and reason. A fresh qualified-name miss in an indexed file preserves
+  the existing not-found behavior. Store migration v13 adds a nullable
+  reconcile-generation receipt to tentative anchor publication; ordinary
+  non-reconcile anchor writes clear that receipt rather than carrying stale
+  freshness forward.
+
 - **Full scans now fail closed without publishing partial snapshots.** Git
   metadata, ignore discovery, directory walking, metadata lookup, file reads,
   and Tier-1 parsing must all succeed before a tentative manifest or anchor is
