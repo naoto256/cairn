@@ -24,7 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use matcher::{GitMetadataPaths, RepoIgnoreMatcher, resolve_git_metadata};
+use matcher::{
+    GitMetadataPaths, RepoIgnoreMatcher, is_nested_git_marker_path, resolve_git_metadata,
+};
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
@@ -255,6 +257,16 @@ impl EventClassifier {
             if event.paths.iter().any(|path| self.is_ignore_control(path)) {
                 return Some(RescanReason::IgnoreRulesChanged);
             }
+            if matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(ModifyKind::Name(_))
+            ) && event.paths.iter().any(|path| {
+                self.is_working_tree_path(path) && is_nested_git_marker_path(&self.repo_root, path)
+            }) {
+                return Some(RescanReason::DirectoryTopologyChanged);
+            }
             (is_directory_topology_change(event.kind)
                 && event
                     .paths
@@ -378,8 +390,13 @@ impl EventClassifier {
                 return classify_git(path, kind, &git_root);
             }
         }
-        if self.is_in_pruned_subtree(path) {
-            debug!(?path, "skip (always-pruned subtree)");
+        if self
+            .ignore
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_pruned_path(path)
+        {
+            debug!(?path, "skip (pruned subtree)");
             return None;
         }
         if self.is_gitignored(path, kind) {
@@ -397,21 +414,6 @@ impl EventClassifier {
             }),
             _ => None,
         }
-    }
-
-    /// True if any path component falls under an
-    /// [`scan::ALWAYS_PRUNED_DIR_NAMES`] entry. Sharing the list with
-    /// the scan walker keeps the two surfaces consistent: an event
-    /// the scanner would skip should never reach the indexer either.
-    fn is_in_pruned_subtree(&self, path: &Path) -> bool {
-        let Ok(rel) = path.strip_prefix(self.repo_root.as_path()) else {
-            return false;
-        };
-        rel.components().any(|c| {
-            c.as_os_str()
-                .to_str()
-                .is_some_and(|n| crate::scan::ALWAYS_PRUNED_DIR_NAMES.contains(&n))
-        })
     }
 
     fn is_gitignored(&self, path: &Path, kind: EventKind) -> bool {
@@ -657,6 +659,35 @@ mod tests {
     }
 
     #[test]
+    fn classifier_prunes_nested_git_boundaries_but_not_codex_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git_dir_checkout = root.join("vendor/dir-checkout");
+        std::fs::create_dir_all(git_dir_checkout.join(".git")).unwrap();
+        let git_file_checkout = root.join(".codex/worktrees/w1/file-checkout");
+        std::fs::create_dir_all(&git_file_checkout).unwrap();
+        std::fs::write(git_file_checkout.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let classifier = classifier_for(root);
+        for source in [
+            git_dir_checkout.join("src/lib.rs"),
+            git_file_checkout.join("src/lib.rs"),
+        ] {
+            assert_eq!(
+                classifier.classify(&source, EventKind::Modify(ModifyKind::Any)),
+                None
+            );
+        }
+        assert!(matches!(
+            classifier.classify(
+                &root.join(".codex/settings.json"),
+                EventKind::Modify(ModifyKind::Any)
+            ),
+            Some(WatchEvent::File { .. })
+        ));
+    }
+
+    #[test]
     fn gitignored_file_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
@@ -745,6 +776,89 @@ mod tests {
             Some(WatchEvent::Rescan {
                 reason: RescanReason::DirectoryTopologyChanged
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_git_marker_create_and_remove_force_topology_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let nested = root.join("tools/checkout");
+        std::fs::create_dir_all(&nested).unwrap();
+        let marker = nested.join(".git");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+
+        std::fs::write(&marker, "gitdir: elsewhere\n").unwrap();
+        let create =
+            notify::Event::new(EventKind::Create(CreateKind::File)).add_path(marker.clone());
+        classifier.handle_batch(&[debounced(create)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        let remove =
+            notify::Event::new(EventKind::Remove(RemoveKind::File)).add_path(marker.clone());
+        classifier.handle_batch(&[debounced(remove)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+
+        std::fs::create_dir(&marker).unwrap();
+        let create_directory =
+            notify::Event::new(EventKind::Create(CreateKind::Folder)).add_path(marker.clone());
+        classifier.handle_batch(&[debounced(create_directory)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+
+        std::fs::remove_dir(&marker).unwrap();
+        let remove_directory =
+            notify::Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(marker);
+        classifier.handle_batch(&[debounced(remove_directory)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_checkout_directory_rename_reloads_boundary_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old = root.join("old-checkout");
+        let new = root.join("new-checkout");
+        std::fs::create_dir_all(old.join(".git")).unwrap();
+        std::fs::write(old.join("lib.rs"), "").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+
+        std::fs::rename(&old, &new).unwrap();
+        let rename = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old)
+            .add_path(new.clone());
+        classifier.handle_batch(&[debounced(rename)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+        assert_eq!(
+            classifier.classify(&new.join("lib.rs"), EventKind::Modify(ModifyKind::Any)),
+            None
         );
     }
 

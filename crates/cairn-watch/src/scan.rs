@@ -67,19 +67,12 @@ pub fn walk_repo(repo_root: &Path) -> impl Iterator<Item = ScannedFile> {
         .git_global(false)
         .require_git(false)
         .filter_entry(move |e| {
-            !is_always_pruned(e)
+            !matcher.is_pruned_path(e.path())
                 && !matcher.is_ignored(e.path(), e.file_type().is_some_and(|kind| kind.is_dir()))
         })
         .build();
 
     walker.filter_map(Result::ok).filter_map(scanned_from_entry)
-}
-
-fn is_always_pruned(entry: &DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .is_some_and(|n| ALWAYS_PRUNED_DIR_NAMES.contains(&n))
 }
 
 fn scanned_from_entry(entry: DirEntry) -> Option<ScannedFile> {
@@ -120,6 +113,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::fs;
+    use std::process::Command;
 
     #[test]
     fn walks_simple_tree() {
@@ -220,5 +214,99 @@ mod tests {
                 "{dir} should be pruned but appeared in: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn prunes_nested_git_boundaries_without_pruning_harness_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex/worktrees/w1/repo")).unwrap();
+        fs::write(
+            root.join(".codex/worktrees/w1/repo/.git"),
+            "gitdir: elsewhere\n",
+        )
+        .unwrap();
+        fs::write(root.join(".codex/worktrees/w1/repo/lib.rs"), "").unwrap();
+        fs::write(root.join(".codex/settings.json"), "{}").unwrap();
+
+        fs::create_dir_all(root.join("vendor/nested/.git")).unwrap();
+        fs::write(root.join("vendor/nested/lib.rs"), "").unwrap();
+        fs::write(root.join("vendor/keep.rs"), "").unwrap();
+
+        let paths = walk_repo(root).map(|file| file.path).collect::<Vec<_>>();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with(".codex/settings.json"))
+        );
+        assert!(paths.iter().any(|path| path.ends_with("vendor/keep.rs")));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.ends_with(".codex/worktrees/w1/repo/lib.rs"))
+        );
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.ends_with("vendor/nested/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn tracked_gitlink_submodule_is_pruned_from_parent_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "cairn@example.invalid"]);
+        run_git(root, &["config", "user.name", "Cairn Test"]);
+        fs::write(root.join("keep.rs"), "").unwrap();
+        run_git(root, &["add", "keep.rs"]);
+        run_git(root, &["commit", "-qm", "fixture"]);
+        let head = run_git(root, &["rev-parse", "HEAD"]);
+
+        fs::create_dir_all(root.join("vendor/submodule")).unwrap();
+        fs::write(
+            root.join("vendor/submodule/.git"),
+            "gitdir: ../../.git/modules/vendor/submodule\n",
+        )
+        .unwrap();
+        fs::write(root.join("vendor/submodule/lib.rs"), "").unwrap();
+        run_git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                head.trim(),
+                "vendor/submodule",
+            ],
+        );
+        let index = run_git(root, &["ls-files", "--stage", "vendor/submodule"]);
+        assert!(index.starts_with("160000 "), "expected gitlink: {index}");
+
+        let paths = walk_repo(root).map(|file| file.path).collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path.ends_with("keep.rs")));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.ends_with("vendor/submodule/lib.rs"))
+        );
+    }
+
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 }

@@ -24,6 +24,14 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Nested Git checkouts no longer contaminate their parent snapshot.**
+  Startup scans, ignore discovery, and live watcher classification now prune
+  any directory below the registered root that contains its own `.git` file
+  or directory. This applies equally to agent-created worktrees, standalone
+  nested clones, and tracked submodules. Submodule contents are therefore no
+  longer queryable through the parent alias; register the submodule root under
+  a separate alias when its symbols should be indexed.
+
 - **Daemon shutdown is bounded and cancellation-safe.** Shutdown now closes
   analyzer-job admission, cancels active analyzer progress handles, force-reaps
   pooled LSP children through a process-control handle that does not wait for

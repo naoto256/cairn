@@ -112,6 +112,36 @@ impl RepoIgnoreMatcher {
         }
     }
 
+    /// Return whether `path` belongs to a subtree that the parent
+    /// repository never owns.
+    ///
+    /// In addition to the fixed always-pruned directory names, any
+    /// directory below the registered root that contains a `.git`
+    /// file or directory is a nested repository boundary. Metadata
+    /// lookup errors intentionally fail open here; the scanner's
+    /// fallible-I/O contract is handled separately.
+    pub(crate) fn is_pruned_path(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.repo_root) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() {
+            return false;
+        }
+        if relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| ALWAYS_PRUNED_DIR_NAMES.contains(&name))
+        }) {
+            return true;
+        }
+
+        path.ancestors()
+            .take_while(|directory| *directory != self.repo_root)
+            .take_while(|directory| directory.starts_with(&self.repo_root))
+            .any(has_git_marker)
+    }
+
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         let Ok(relative) = path.strip_prefix(&self.repo_root) else {
             return false;
@@ -162,7 +192,7 @@ impl RepoIgnoreMatcher {
                 continue;
             }
             let path = entry.path();
-            if is_always_pruned(&path) || self.is_ignored(&path, true) {
+            if self.is_pruned_path(&path) || self.is_ignored(&path, true) {
                 continue;
             }
             self.discover_directory(&path)?;
@@ -199,10 +229,16 @@ fn load_matcher(root: &Path, source: &Path) -> io::Result<Gitignore> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-fn is_always_pruned(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| ALWAYS_PRUNED_DIR_NAMES.contains(&name))
+fn has_git_marker(directory: &Path) -> bool {
+    let marker = directory.join(".git");
+    marker.is_file() || marker.is_dir()
+}
+
+pub(crate) fn is_nested_git_marker_path(repo_root: &Path, path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".git")
+        && path
+            .parent()
+            .is_some_and(|parent| parent != repo_root && parent.starts_with(repo_root))
 }
 
 #[cfg(test)]
@@ -234,6 +270,72 @@ mod tests {
         assert!(!matcher.is_ignored(&root.join("sub/keep.log"), false));
         assert!(matcher.is_ignored(&root.join("sub/drop.log"), false));
         assert!(matcher.is_ignored(&root.join("blocked/keep.log"), false));
+    }
+
+    #[test]
+    fn nested_git_file_and_directory_boundaries_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("nested-dir/.git")).unwrap();
+        fs::write(root.join("nested-dir/lib.rs"), "").unwrap();
+        fs::create_dir_all(root.join("nested-file")).unwrap();
+        fs::write(root.join("nested-file/.git"), "gitdir: elsewhere\n").unwrap();
+        fs::write(root.join("nested-file/lib.rs"), "").unwrap();
+
+        let matcher = RepoIgnoreMatcher::build(root, &root.join(".git/info/exclude")).unwrap();
+        assert!(matcher.is_pruned_path(&root.join("nested-dir/lib.rs")));
+        assert!(matcher.is_pruned_path(&root.join("nested-file/lib.rs")));
+        assert!(!matcher.is_pruned_path(root));
+        assert!(!matcher.is_pruned_path(&root.join("src/lib.rs")));
+    }
+
+    #[test]
+    fn ordinary_codex_directory_is_not_pruned_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".codex/settings.json"), "{}").unwrap();
+
+        let matcher = RepoIgnoreMatcher::build(root, &root.join(".git/info/exclude")).unwrap();
+        assert!(!matcher.is_pruned_path(&root.join(".codex/settings.json")));
+    }
+
+    #[test]
+    fn matcher_discovery_stops_at_nested_repository_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let nested = root.join("vendor/nested");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::write(nested.join(".gitignore"), "*.rs\n").unwrap();
+
+        let matcher = RepoIgnoreMatcher::build(root, &root.join(".git/info/exclude")).unwrap();
+        assert!(matcher.is_pruned_path(&nested.join("lib.rs")));
+        assert!(matcher.layers.iter().all(|layer| layer.directory != nested));
+    }
+
+    #[test]
+    fn fail_open_matcher_still_prunes_nested_repository_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("nested/.git")).unwrap();
+
+        let matcher = RepoIgnoreMatcher::fail_open(root);
+        assert!(matcher.is_pruned_path(&root.join("nested/src/lib.rs")));
+    }
+
+    #[test]
+    fn nested_git_marker_control_excludes_registered_root_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(!is_nested_git_marker_path(root, &root.join(".git")));
+        assert!(is_nested_git_marker_path(
+            root,
+            &root.join("vendor/lib/.git")
+        ));
+        assert!(!is_nested_git_marker_path(
+            root,
+            &root.join("vendor/lib/.git/config")
+        ));
     }
 
     #[test]
