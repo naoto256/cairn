@@ -46,11 +46,68 @@ pub struct LspClient {
     restarts: AtomicUsize,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
     pub(super) pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     progress: Arc<ProgressState>,
     stderr_tail: Arc<Mutex<StderrTail>>,
+}
+
+/// Cloneable control-plane handle for one LSP child process.
+///
+/// This deliberately contains no document or request-operation state. A pool
+/// shutdown must be able to stop and reap the child while a normal analyzer
+/// pass holds the entry's data-plane mutex for the duration of its work.
+#[derive(Clone)]
+pub(crate) struct LspProcessControl {
+    alive: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+    writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
+    child: Arc<Mutex<Option<Child>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+}
+
+impl LspProcessControl {
+    /// Permanently prevent this client from spawning a replacement child, then
+    /// terminate and reap the current child without taking the pool entry's
+    /// data-plane mutex.
+    pub(crate) async fn stop_and_terminate(&self) -> Result<()> {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.force_terminate().await
+    }
+
+    async fn force_terminate(&self) -> Result<()> {
+        self.alive.store(false, Ordering::SeqCst);
+        // Kill first. A wedged server can backpressure a pipe write while the
+        // writer mutex is held; waiting for that mutex before kill would make
+        // the process-control plane depend on the data plane it must unblock.
+        let mut child_slot = self.child.lock().await;
+        let termination_err = if let Some(child) = child_slot.as_mut() {
+            let _ = child.kill().await;
+            child
+                .wait()
+                .await
+                .err()
+                .map(|err| Error::ChildTerminationFailed(format!("wait() after kill: {err}")))
+        } else {
+            None
+        };
+        *child_slot = None;
+        drop(child_slot);
+        {
+            let mut writer = self.writer.lock().await;
+            *writer = None;
+        }
+        {
+            let mut pending = self.pending.lock().await;
+            pending.clear();
+        }
+        match termination_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
 }
 
 impl LspClient {
@@ -104,7 +161,27 @@ impl LspClient {
         initialization_options: Value,
         request_timeout: Duration,
     ) -> Result<Self> {
-        let client = Self::new(
+        let client = Self::configured(
+            binary_path,
+            args,
+            env,
+            workspace_root,
+            initialization_options,
+            request_timeout,
+        );
+        client.start_process().await?;
+        Ok(client)
+    }
+
+    pub(super) fn configured(
+        binary_path: &Path,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        workspace_root: &Path,
+        initialization_options: Value,
+        request_timeout: Duration,
+    ) -> Self {
+        Self::new(
             Some(binary_path.to_path_buf()),
             args,
             env,
@@ -112,9 +189,11 @@ impl LspClient {
             initialization_options,
             request_timeout,
             MAX_RESTARTS,
-        );
-        client.spawn_process().await?;
-        Ok(client)
+        )
+    }
+
+    pub(super) async fn start_process(&self) -> Result<()> {
+        self.spawn_process().await
     }
 
     fn new(
@@ -137,8 +216,9 @@ impl LspClient {
             restarts: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
             alive: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
             writer: Arc::new(Mutex::new(None)),
-            child: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             progress: Arc::new(ProgressState::default()),
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
@@ -172,6 +252,9 @@ impl LspClient {
     }
 
     async fn spawn_process(&self) -> Result<()> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::PoolStopped);
+        }
         let Some(binary_path) = &self.binary_path else {
             return Err(Error::ServerExited(None.into()));
         };
@@ -216,8 +299,24 @@ impl LspClient {
             tokio::spawn(capture_stderr(stderr, Arc::clone(&self.stderr_tail)));
         }
 
+        {
+            let mut child_slot = self.child.lock().await;
+            if self.stopping.load(Ordering::SeqCst) {
+                drop(child_slot);
+                return Err(reap_local_child(&mut child, "client is stopping").await);
+            }
+            *child_slot = Some(child);
+        }
         self.install_transport(stdout, stdin).await;
-        *self.child.lock().await = Some(child);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(match self.force_terminate().await {
+                Ok(()) => Error::PoolStopped,
+                Err(cleanup) => Error::OperationWithCleanupFailure {
+                    original: Box::new(Error::PoolStopped),
+                    cleanup: Box::new(cleanup),
+                },
+            });
+        }
         if let Err(err) = self.initialize().await {
             let contextual = self.with_stderr_context(err).await;
             return Err(match self.force_terminate().await {
@@ -258,38 +357,16 @@ impl LspClient {
     /// bounded graceful wait fails or the child slot needs kill +
     /// reap. Those variants are documented at their call sites.
     pub(crate) async fn force_terminate(&self) -> Result<()> {
-        self.alive.store(false, Ordering::SeqCst);
-        // Drop the writer first so the reader task observes EOF
-        // and exits cleanly.
-        {
-            let mut writer = self.writer.lock().await;
-            *writer = None;
-        }
-        // Fail any in-flight requests: the writer is gone and the
-        // child is going away, so their oneshot senders will never
-        // fire otherwise.
-        {
-            let mut pending = self.pending.lock().await;
-            pending.clear();
-        }
-        let mut child_slot = self.child.lock().await;
-        let termination_err: Option<Error> = if let Some(child) = child_slot.as_mut() {
-            let _ = child.kill().await;
-            match child.wait().await {
-                Ok(_) => None,
-                Err(e) => Some(Error::ChildTerminationFailed(format!(
-                    "wait() after kill: {e}"
-                ))),
-            }
-        } else {
-            None
-        };
-        // Drop the child handle regardless — `kill_on_drop(true)`
-        // is the final backstop for the child process itself.
-        *child_slot = None;
-        match termination_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        self.process_control().force_terminate().await
+    }
+
+    pub(crate) fn process_control(&self) -> LspProcessControl {
+        LspProcessControl {
+            alive: Arc::clone(&self.alive),
+            stopping: Arc::clone(&self.stopping),
+            writer: Arc::clone(&self.writer),
+            child: Arc::clone(&self.child),
+            pending: Arc::clone(&self.pending),
         }
     }
 
@@ -476,6 +553,7 @@ impl LspClient {
     /// # Errors
     /// See the mapping above.
     pub async fn shutdown(self) -> Result<()> {
+        self.stopping.store(true, Ordering::SeqCst);
         let mut protocol_err: Option<Error> = None;
         if self.alive.load(Ordering::SeqCst) {
             match self.request::<Value>("shutdown", Value::Null).await {
@@ -540,6 +618,9 @@ impl LspClient {
     }
 
     async fn ensure_running(&self) -> Result<()> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::PoolStopped);
+        }
         if self.alive.load(Ordering::SeqCst) {
             return Ok(());
         }
