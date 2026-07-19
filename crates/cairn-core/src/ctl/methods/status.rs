@@ -52,13 +52,7 @@ impl ControlMethod for Status {
                 let reconcile = match cas_registry::get_reconcile_state(&index, &entry.repo_hash)? {
                     Some(state) => {
                         let aliases = cas_registry::aliases_for_repo(&index, &entry.repo_hash)?;
-                        Some(
-                            crate::data_rpc::methods::repo_status::reconcile_state_to_wire(
-                                &entry.repo_hash,
-                                aliases,
-                                &state,
-                            ),
-                        )
+                        Some(state.to_wire(&entry.repo_hash, aliases))
                     }
                     None => {
                         return Err(Error::Internal(format!(
