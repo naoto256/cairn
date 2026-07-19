@@ -202,6 +202,9 @@ pub struct RepoStatus {
     pub alias: String,
     /// Repository root path as registered with the daemon.
     pub root: String,
+    /// Whether a missing root is retained instead of auto-pruned.
+    #[serde(default)]
+    pub persistent: bool,
     /// Snapshot manifests reachable through this repo's anchors.
     pub snapshots: Vec<SnapshotStatus>,
     /// Compact analyzer-job state counts for manifests reachable through
@@ -345,6 +348,7 @@ mod status_tests {
         let repo = RepoStatus {
             alias: "cairn".into(),
             root: "/tmp/cairn".into(),
+            persistent: false,
             snapshots: vec![SnapshotStatus {
                 branches: vec!["HEAD".into()],
                 status: "ready".into(),

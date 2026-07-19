@@ -128,6 +128,7 @@ mod tests {
         RepoStatusEntry {
             alias: "demo".into(),
             root: "/p".into(),
+            persistent: false,
             languages: vec!["rust".into()],
             summary: RepoStatusSummary {
                 snapshot_count: 1,
@@ -153,6 +154,7 @@ mod tests {
         RepoStatus {
             alias: "demo".into(),
             root: "/p".into(),
+            persistent: false,
             snapshots: Vec::new(),
             job_summary: JobSummary::default(),
             jobs: Vec::new(),

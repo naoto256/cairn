@@ -9,7 +9,7 @@ use tracing::debug;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier_status_for_query,
+    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
     with_one_or_all_stores,
 };
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
@@ -41,7 +41,7 @@ impl DataMethod for GetOutline {
             max_depth: args.max_depth,
         };
 
-        let (hits, capped) = with_one_or_all_stores(
+        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
             ctx,
             repo_alias,
             "outline",
@@ -109,7 +109,7 @@ impl DataMethod for GetOutline {
             "get_outline",
         )
         .await?;
-        let completeness = completeness_for_cap(capped);
+        let completeness = completeness_for_scan(capped, skipped_unavailable);
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::GetOutline,
             items_empty: items.is_empty(),
@@ -292,6 +292,7 @@ mod tests {
             _data: data,
             ctx: DataCtx {
                 cas_data_dir: Arc::new(cas),
+                lifecycle: None,
             },
         }
     }
@@ -351,6 +352,7 @@ mod tests {
             _data: data,
             ctx: DataCtx {
                 cas_data_dir: Arc::new(cas),
+                lifecycle: None,
             },
         }
     }

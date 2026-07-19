@@ -64,6 +64,12 @@ enum RepoCommand {
         path: PathBuf,
         #[arg(long)]
         alias: String,
+        /// Retain the registration when its root is temporarily missing.
+        #[arg(long, conflicts_with = "ephemeral")]
+        persistent: bool,
+        /// Explicitly restore the default missing-root auto-prune policy.
+        #[arg(long, conflicts_with = "persistent")]
+        ephemeral: bool,
     },
     /// Drop a repository alias from the registry.
     Remove { alias: String },
@@ -237,13 +243,26 @@ fn route_ctl_command(command: CtlCommand) -> Result<CtlInvocation> {
 
 fn route_repo_command(command: RepoCommand) -> Result<CtlInvocation> {
     match command {
-        RepoCommand::Register { path, alias } => {
+        RepoCommand::Register {
+            path,
+            alias,
+            persistent,
+            ephemeral,
+        } => {
             let canon = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize {}", path.display()))?;
             Ok(control_invocation(
                 "register_repo",
-                json!({"path": canon.to_string_lossy(), "alias": alias}),
+                json!({
+                    "path": canon.to_string_lossy(),
+                    "alias": alias,
+                    "persistent": match (persistent, ephemeral) {
+                        (true, false) => Some(true),
+                        (false, true) => Some(false),
+                        _ => None,
+                    },
+                }),
             ))
         }
         RepoCommand::Remove { alias } => {
@@ -711,6 +730,7 @@ mod tests {
             repos: vec![cairn_proto::methods::RepoListEntry {
                 alias: "demo".into(),
                 root: "/repo/demo".into(),
+                persistent: false,
                 languages: vec!["rust".into()],
                 status: cairn_proto::methods::RepoAggregateStatus::Ready,
                 snapshot_count: 1,
@@ -785,6 +805,7 @@ mod tests {
         let repo = cairn_proto::control::RepoStatus {
             alias: "demo".into(),
             root: "/repo/demo".into(),
+            persistent: false,
             snapshots: vec![
                 cairn_proto::control::SnapshotStatus {
                     branches: vec!["HEAD".into()],
