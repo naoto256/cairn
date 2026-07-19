@@ -602,6 +602,15 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        let canonical = std::fs::canonicalize(repo.path()).unwrap();
+        let repo_hash = path_hash(&canonical);
+        let store_path = cas_data_dir.store_db_path(&repo_hash);
+        let index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+        let baseline_state = cas_registry::get_reconcile_state(&index, &repo_hash)
+            .unwrap()
+            .expect("reconcile state row must exist for watched repo");
+        let baseline_desired = baseline_state.desired_generation;
+
         let symbol_name = "daemon_watcher_probe_symbol";
         std::fs::write(
             repo.path().join("src/lib.rs"),
@@ -609,35 +618,36 @@ mod tests {
         )
         .unwrap();
 
-        let canonical = std::fs::canonicalize(repo.path()).unwrap();
-        let repo_hash = path_hash(&canonical);
-        let store_path = cas_data_dir.store_db_path(&repo_hash);
-
         // Poll: durable generation must advance (watcher event →
         // reconcile manager → desired++) AND the symbol must
         // land in the store (worker executed the reindex).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut saw_symbol = false;
+        let mut last_state = Some(baseline_state);
         while tokio::time::Instant::now() < deadline {
-            if symbol_exists(&store_path, &canonical, symbol_name) {
-                saw_symbol = true;
+            saw_symbol = symbol_exists(&store_path, &canonical, symbol_name);
+            last_state = cas_registry::get_reconcile_state(&index, &repo_hash).unwrap();
+            let reconcile_applied = last_state.as_ref().is_some_and(|state| {
+                state.desired_generation > baseline_desired
+                    && state.applied_generation >= state.desired_generation
+            });
+            if saw_symbol && reconcile_applied {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(saw_symbol, "watcher did not reindex symbol {symbol_name}");
-        // Durable state check.
-        let index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
-        let state = cas_registry::get_reconcile_state(&index, &repo_hash)
-            .unwrap()
-            .expect("reconcile state row must exist for watched repo");
+        let state = last_state.expect("reconcile state row must exist for watched repo");
         assert!(
-            state.desired_generation > 0,
-            "watcher event must have bumped desired_generation, got {state:?}"
+            saw_symbol,
+            "watcher did not reindex symbol {symbol_name}; last reconcile state: {state:?}"
         );
         assert!(
-            state.applied_generation > 0,
-            "reconcile worker must have advanced applied_generation, got {state:?}"
+            state.desired_generation > baseline_desired,
+            "watcher event must bump desired_generation above baseline {baseline_desired}, got {state:?}"
+        );
+        assert!(
+            state.applied_generation >= state.desired_generation,
+            "reconcile worker must apply the watcher generation, got {state:?}"
         );
 
         shutdown.notify_waiters();
