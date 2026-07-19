@@ -3,7 +3,9 @@
 use cairn_proto::jsonrpc::{
     RequestId, Response, error_code, error_response as jsonrpc_error_response,
 };
-use cairn_proto::{Hint, HintCode};
+use cairn_proto::{
+    Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction, HintCode,
+};
 use serde_json::json;
 
 use crate::Error;
@@ -18,6 +20,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             error_code::INVALID_PARAMS
         }
         Error::RepoNotFound { .. } => error_code::REPO_NOT_FOUND,
+        Error::FileNotIndexed { .. } => error_code::FILE_NOT_INDEXED,
         Error::Internal(_) => error_code::INTERNAL_ERROR,
         _ => error_code::INTERNAL_ERROR,
     };
@@ -35,6 +38,37 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
                 drop_params: Vec::new(),
                 target: Some(alias.clone()),
             }]
+        }));
+    }
+    if let Error::FileNotIndexed { repo, file, reason } = err
+        && let Some(error) = response.error.as_mut()
+    {
+        error.data = Some(json!({
+            "completeness": Completeness::partial_truncated(
+                "file_not_indexed_or_snapshot_stale"
+            ),
+            "diagnostics": [Diagnostic {
+                code: DiagnosticCode::FileNotIndexedOrSnapshotStale,
+                severity: DiagnosticSeverity::Warning,
+                message: "The requested file is absent from, or the current snapshot could not prove freshness for, this result.".into(),
+                language: None,
+                analyzer_id: None,
+                repo: repo.clone(),
+                file: Some(file.clone()),
+                details: Some(json!({ "reason": reason })),
+            }],
+            "hints": [Hint {
+                code: HintCode::FileNotIndexedOrSnapshotStale,
+                message: "Wait for reconciliation or run `cairn ctl repo reindex <alias>` before retrying the file query.".into(),
+                action: Some(HintAction::WaitForIndex),
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: repo.clone().or_else(|| Some(file.clone())),
+            }],
+            "repo": repo,
+            "file": file,
+            "reason": reason,
         }));
     }
     response
@@ -115,5 +149,33 @@ mod tests {
         let hints = error.data.unwrap()["hints"].as_array().unwrap().clone();
         assert_eq!(hints[0]["code"], "repo_not_registered");
         assert!(hints[0]["action"].is_null() || hints[0].get("action").is_none());
+    }
+
+    #[test]
+    fn file_not_indexed_error_has_typed_code_and_structured_recovery_data() {
+        let response = error_from(
+            RequestId::Number(1),
+            &Error::FileNotIndexed {
+                repo: Some("demo".into()),
+                file: "src/new.rs".into(),
+                reason: "file_not_indexed".into(),
+            },
+        );
+        let error = response.error.unwrap();
+
+        assert_eq!(error.code, error_code::FILE_NOT_INDEXED);
+        let data = error.data.unwrap();
+        assert_eq!(
+            data["completeness"]["reason"],
+            "file_not_indexed_or_snapshot_stale"
+        );
+        assert_eq!(
+            data["diagnostics"][0]["code"],
+            "file_not_indexed_or_snapshot_stale"
+        );
+        assert_eq!(
+            data["hints"][0]["code"],
+            "file_not_indexed_or_snapshot_stale"
+        );
     }
 }
