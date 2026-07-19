@@ -32,6 +32,8 @@ impl DataMethod for GetOutline {
         }
 
         let repo_alias = args.scope.repo.clone();
+        let anchor_arg = args.scope.anchor.clone();
+        let branch_arg = args.scope.branch.clone();
         let file = args.file.clone();
         let exact_file = file.clone();
         let path = args.path.clone();
@@ -46,8 +48,8 @@ impl DataMethod for GetOutline {
             ctx,
             SnapshotQueryRequest {
                 requested_repo: repo_alias,
-                anchor: None,
-                branch: None,
+                anchor: anchor_arg,
+                branch: branch_arg,
                 method_name: "outline",
                 effective_limit,
                 verbose_tier3: args.tier3.verbose_tier3,
@@ -100,6 +102,8 @@ impl DataMethod for GetOutline {
 
         debug!(
             repo = ?args.scope.repo,
+            branch = ?args.scope.branch,
+            anchor = ?args.scope.anchor,
             file = ?args.file,
             path = ?args.path,
             count = items.len(),
@@ -198,6 +202,34 @@ mod tests {
         );
         assert_eq!(result["hints"][0]["code"], "capped_narrow_filter");
         assert_eq!(result["hints"][1]["code"], "capped_increase_limit");
+    }
+
+    #[tokio::test]
+    async fn outline_snapshot_scope_selects_head_branch_or_current_tentative() {
+        let (fixture, branch) = snapshot_scope_fixture();
+
+        let current = GetOutline
+            .dispatch(&fixture.ctx, json!({"repo": "demo", "file": "src/lib.rs"}))
+            .await
+            .unwrap();
+        let head = GetOutline
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "file": "src/lib.rs", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        let branch_result = GetOutline
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "file": "src/lib.rs", "branch": branch}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(current["items"][0]["name"], "tentative");
+        assert_eq!(head["items"][0]["name"], "committed");
+        assert_eq!(branch_result["items"][0]["name"], "committed");
     }
 
     #[tokio::test]
@@ -339,6 +371,52 @@ mod tests {
                 lifecycle: None,
             },
         }
+    }
+
+    fn snapshot_scope_fixture() -> (OutlineFixture, String) {
+        let (repo, _sha) = init_repo(&[("src/lib.rs", "pub fn committed() {}\n")]);
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn tentative() {}\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = CasDataDir::with_root(data.path().to_path_buf());
+        cas.ensure().unwrap();
+        let canonical = std::fs::canonicalize(repo.path()).unwrap();
+        let repo_hash = path_hash(&canonical);
+        let store_path = cas.store_db_path(&repo_hash);
+        let mut store = cas_store::open(&store_path).unwrap();
+        let now_ns = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        let registration = register_repo(&mut store, &canonical, now_ns).unwrap();
+        let branch = registration.branch.clone().unwrap();
+
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(
+            &tx,
+            "demo",
+            &canonical.to_string_lossy(),
+            &repo_hash,
+            now_ns,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        mark_fresh(&mut store, &index, &repo_hash, now_ns, &registration);
+
+        (
+            OutlineFixture {
+                _repo: repo,
+                _data: data,
+                ctx: DataCtx {
+                    cas_data_dir: Arc::new(cas),
+                    lifecycle: None,
+                },
+            },
+            branch,
+        )
     }
 
     #[tokio::test]
