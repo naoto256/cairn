@@ -31,17 +31,85 @@ use cairn_core::query::{
 use cairn_core::register::register_repo;
 use cairn_core::workspace_analyzer::all_workspace_analyzers;
 use cairn_proto::methods::ReferenceDirection;
+use std::time::{Duration, Instant};
 
 use crate::fixture;
 use crate::report::{EvalReport, TierReport};
 use crate::types::{ActualHit, GoldenCase, Tool};
 
+/// One registered fixture whose store can serve several eval queries.
+///
+/// Golden tests normally register a fresh fixture per case. Record-only
+/// performance tests instead need to time several queries against one store,
+/// then delete Tier-2.5 resolutions from that same store to obtain a Tier-2
+/// baseline without changing any other input.
+pub struct RegisteredFixture {
+    _live: fixture::LiveFixture,
+    _db_tmp: tempfile::TempDir,
+    conn: rusqlite::Connection,
+    anchor: AnchorName,
+    register_elapsed: Duration,
+}
+
+impl RegisteredFixture {
+    /// Wall time spent inside [`register_repo`]. Fixture copying and git setup
+    /// are intentionally excluded.
+    #[must_use]
+    pub fn register_elapsed(&self) -> Duration {
+        self.register_elapsed
+    }
+
+    /// Execute one golden query against the registered store.
+    pub fn run_query(&self, case: &GoldenCase) -> Result<Vec<ActualHit>> {
+        run_tool(&self.conn, &self.anchor, case)
+    }
+
+    /// Remove only Tier-2.5 resolution rows, leaving the manifest, Tier-1/2
+    /// facts, and every other store input unchanged.
+    pub fn delete_tier25_resolutions(&self) -> Result<usize> {
+        self.conn
+            .execute("DELETE FROM resolutions WHERE source LIKE 'tier25-%'", [])
+            .context("delete Tier-2.5 resolutions")
+    }
+}
+
+/// Build and register one language fixture for reuse by eval consumers.
+pub fn register_fixture(language: &str) -> Result<RegisteredFixture> {
+    crate::force_link_tier25_analyzers();
+
+    let live = fixture::build(language).context("build fixture")?;
+    let db_tmp = tempfile::tempdir().context("db tempdir")?;
+    let mut conn = store::open(&db_tmp.path().join("store.db")).context("open CAS store")?;
+
+    let started = Instant::now();
+    let outcome = register_repo(&mut conn, &live.repo_root, 0).context("register fixture repo")?;
+    let register_elapsed = started.elapsed();
+    if outcome.blobs_parsed == 0 {
+        bail!("register_repo parsed zero blobs for {language} — backend not linked?");
+    }
+
+    if let Some(analyzer_id) = all_workspace_analyzers()
+        .into_iter()
+        .find(|analyzer| analyzer.language() == language)
+        .map(|analyzer| analyzer.id())
+    {
+        assert_tier25_run_succeeded(&conn, outcome.tentative_manifest.0, language, analyzer_id)?;
+    }
+
+    Ok(RegisteredFixture {
+        _live: live,
+        _db_tmp: db_tmp,
+        conn,
+        anchor: AnchorName::tentative(outcome.worktree_id),
+        register_elapsed,
+    })
+}
+
 /// Run one case and produce a full `EvalReport`. Errors bubble up
 /// (build / register / sqlite); the caller decides whether a low
 /// recall is a hard failure.
 pub fn run_case(case: &GoldenCase) -> Result<EvalReport> {
-    crate::force_link_tier25_analyzers();
-
+    let fixture = register_fixture(case.language)?;
     let tier25_analyzer_id = all_workspace_analyzers()
         .into_iter()
         .find(|analyzer| analyzer.language() == case.language)
@@ -53,38 +121,10 @@ pub fn run_case(case: &GoldenCase) -> Result<EvalReport> {
         );
     }
 
-    let live = fixture::build(case.language).context("build fixture")?;
-    let db_tmp = tempfile::tempdir().context("db tempdir")?;
-    let mut conn = store::open(&db_tmp.path().join("store.db")).context("open CAS store")?;
-
-    let outcome = register_repo(&mut conn, &live.repo_root, 0).context("register fixture repo")?;
-    if outcome.blobs_parsed == 0 {
-        bail!(
-            "register_repo parsed zero blobs for {} — backend not linked?",
-            case.language
-        );
-    }
-
     if let Some(analyzer_id) = tier25_analyzer_id {
-        let (status, error): (String, Option<String>) = conn
-            .query_row(
-                "SELECT status, error FROM workspace_analysis_runs
-                 WHERE manifest_id = ?1 AND analyzer_id = ?2",
-                rusqlite::params![outcome.tentative_manifest.0, analyzer_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .with_context(|| format!("read {analyzer_id} run status"))?;
-        if status != "succeeded" {
-            bail!(
-                "Tier-2.5 analyzer {analyzer_id} for {} finished as {status}: {}",
-                case.language,
-                error.as_deref().unwrap_or("no error recorded")
-            );
-        }
-
         if !case.tier25_expected.is_empty() {
             let source = format!("tier25-{analyzer_id}");
-            let resolution_count: i64 = conn.query_row(
+            let resolution_count: i64 = fixture.conn.query_row(
                 "SELECT COUNT(*) FROM resolutions WHERE source = ?1",
                 [&source],
                 |row| row.get(0),
@@ -98,7 +138,7 @@ pub fn run_case(case: &GoldenCase) -> Result<EvalReport> {
         }
     }
 
-    let actual = run_tool(&conn, &AnchorName::tentative(outcome.worktree_id), case)?;
+    let actual = fixture.run_query(case)?;
     let tier2 = TierReport::score(&case.tier2_expected, &actual);
     let tier25 = TierReport::score_tier25(&case.tier25_expected, &actual);
     // Tier-3 placeholder: no LSP-driven path yet, so score against an
@@ -113,6 +153,29 @@ pub fn run_case(case: &GoldenCase) -> Result<EvalReport> {
         tier25,
         tier3,
     })
+}
+
+fn assert_tier25_run_succeeded(
+    conn: &rusqlite::Connection,
+    manifest_id: i64,
+    language: &str,
+    analyzer_id: &str,
+) -> Result<()> {
+    let (status, error): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, error FROM workspace_analysis_runs
+             WHERE manifest_id = ?1 AND analyzer_id = ?2",
+            rusqlite::params![manifest_id, analyzer_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .with_context(|| format!("read {analyzer_id} run status"))?;
+    if status != "succeeded" {
+        bail!(
+            "Tier-2.5 analyzer {analyzer_id} for {language} finished as {status}: {}",
+            error.as_deref().unwrap_or("no error recorded")
+        );
+    }
+    Ok(())
 }
 
 fn run_tool(
