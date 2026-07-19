@@ -12,9 +12,11 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use crate::cas::registry as cas_registry;
+use crate::lifecycle::{RegistrationReconcilePolicy, RepoLifecycleManager};
 use crate::paths::CasDataDir;
 use crate::reconcile::{
-    Clock, ReconcileTrigger, RepoReconcileManager, RetryPolicy, TestRegisterHookFn,
+    Clock, PeriodicReconcilePolicy, ReconcileTrigger, RepoReconcileManager, RetryPolicy,
+    TestRegisterHookFn,
 };
 
 // ─── Test-only clock / hook / helpers ─────────────────────────
@@ -448,10 +450,10 @@ async fn mf5_failure_preserves_gap_and_bumps_failure_counter() {
 // ─── MF-6: interrupted attempt recovery ───────────────────────
 
 #[tokio::test]
-async fn mf6_recover_interrupted_attempts_clears_and_wakes() {
+async fn mf6_recover_interrupted_attempts_waits_for_startup_prime_before_wake() {
     // Seed a state row with attempt_generation set (simulating a
-    // crash mid-attempt). recover_interrupted_attempts must
-    // clear it and wake the worker so the retry runs.
+    // crash mid-attempt). Recovery clears it but must not wake a worker until
+    // the caller completes the watcher-arm barrier and startup priming.
     let (_t, cas) = fresh_cas();
     seed_repo(&cas, "demo", "/p", "h");
     // Simulate crashed state.
@@ -468,13 +470,26 @@ async fn mf6_recover_interrupted_attempts_clears_and_wakes() {
     let register = FakeRegister::new();
     mgr.set_test_register_hook(register.as_hook());
 
-    let hashes = mgr.recover_interrupted_attempts().await.unwrap();
+    let hashes = mgr
+        .recover_interrupted_attempts_without_wake()
+        .await
+        .unwrap();
     assert_eq!(hashes, vec!["h".to_string()]);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        register.call_count(),
+        0,
+        "recovery must not wake before arm"
+    );
+
+    let outcome = mgr.prime_startup_reconcile(hashes).await.unwrap();
+    assert_eq!(outcome.recovered, vec!["h".to_string()]);
+    assert_eq!(outcome.primed, vec![("h".to_string(), 2)]);
 
     wait_for(
         || {
             let state = read_state(&cas, "h");
-            state.applied_generation >= 1
+            state.applied_generation >= 2
         },
         2000,
         "recovery-driven attempt to complete",
@@ -491,6 +506,139 @@ async fn mf6_recover_interrupted_attempts_clears_and_wakes() {
         .unwrap();
     // Success cleared the annotated error.
     assert!(s.last_error.is_none() || s.last_error.as_deref() == Some(""));
+}
+
+#[tokio::test]
+async fn periodic_scheduler_delays_first_tick_and_stops_on_shutdown() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "demo", "/p", "h");
+    {
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::increment_desired_generation(&tx, "h", 1).unwrap();
+        cas_registry::mark_attempt_start(&tx, "h", 1, 2).unwrap();
+        cas_registry::mark_attempt_success(&tx, "h", 1, 100).unwrap();
+        tx.commit().unwrap();
+    }
+    let clock = ManualClock::new(1_000);
+    let mgr = build_manager(cas.clone(), clock.clone());
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    mgr.start_periodic_reconcile(PeriodicReconcilePolicy {
+        poll_interval: Duration::from_millis(100),
+        max_clean_age: Duration::from_nanos(1),
+    })
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(register.call_count(), 0, "the first tick must be delayed");
+    wait_for(|| register.call_count() == 1, 1_000, "periodic reconcile").await;
+    wait_for(
+        || read_state(&cas, "h").applied_generation == 2,
+        1_000,
+        "periodic generation apply",
+    )
+    .await;
+
+    mgr.shutdown(Duration::from_secs(1)).await;
+    let generation = read_state(&cas, "h").desired_generation;
+    clock.advance(10_000);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(read_state(&cas, "h").desired_generation, generation);
+}
+
+#[tokio::test]
+async fn periodic_scheduler_shutdown_is_observed_before_first_poll() {
+    let (_t, cas) = fresh_cas();
+    let mgr = build_manager(cas, ManualClock::new(1_000));
+    mgr.start_periodic_reconcile(PeriodicReconcilePolicy {
+        poll_interval: Duration::from_secs(60),
+        max_clean_age: Duration::from_secs(60),
+    })
+    .unwrap();
+
+    timeout(
+        Duration::from_millis(250),
+        mgr.shutdown(Duration::from_secs(1)),
+    )
+    .await
+    .expect("periodic shutdown permit must wake a task before its first poll");
+}
+
+#[tokio::test]
+async fn periodic_cycle_does_not_stack_on_a_dirty_repository() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "demo", "/p", "h");
+    {
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::increment_desired_generation(&tx, "h", 1).unwrap();
+        tx.commit().unwrap();
+    }
+    let clock = ManualClock::new(1_000);
+    let mgr = build_manager(cas.clone(), clock);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+
+    mgr.run_periodic_cycle(Duration::from_nanos(1)).await;
+
+    assert_eq!(read_state(&cas, "h").desired_generation, 1);
+    assert_eq!(register.call_count(), 0);
+    mgr.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn periodic_cycle_skips_registering_owner_until_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let (_t, cas) = fresh_cas();
+    let lifecycle = RepoLifecycleManager::new(cas.clone());
+    let permit = lifecycle
+        .begin_registration("h".into(), root.path().to_path_buf(), 1)
+        .unwrap();
+    let mgr = RepoReconcileManager::new_with_lifecycle(cas.clone(), None, lifecycle.clone());
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+
+    mgr.run_periodic_cycle(Duration::from_nanos(1)).await;
+    assert_eq!(read_state(&cas, "h").desired_generation, 0);
+    assert_eq!(register.call_count(), 0);
+
+    lifecycle
+        .publish_registration(permit, "demo", None, 2, RegistrationReconcilePolicy::None)
+        .unwrap();
+    mgr.run_periodic_cycle(Duration::from_nanos(1)).await;
+    wait_for(
+        || register.call_count() == 1,
+        1_000,
+        "active periodic attempt",
+    )
+    .await;
+
+    mgr.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn periodic_cycle_continues_after_one_repository_attempt_fails() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "a", "/a", "a");
+    seed_repo(&cas, "b", "/b", "b");
+    let clock = ManualClock::new(1_000);
+    let mgr = build_manager(cas.clone(), clock);
+    let register = FakeRegister::new();
+    register.set_fail_next("first repo failed");
+    mgr.set_test_register_hook(register.as_hook());
+
+    mgr.run_periodic_cycle(Duration::from_nanos(1)).await;
+    wait_for(
+        || register.call_count() >= 2,
+        1_000,
+        "both periodic repository attempts",
+    )
+    .await;
+
+    assert_eq!(read_state(&cas, "a").desired_generation, 1);
+    assert_eq!(read_state(&cas, "b").desired_generation, 1);
+    mgr.shutdown(Duration::from_secs(1)).await;
 }
 
 // ─── MF-7: watcher lifecycle persistence ──────────────────────
