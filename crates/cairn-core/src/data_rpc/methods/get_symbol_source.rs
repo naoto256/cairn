@@ -365,6 +365,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguity_survives_data_jsonrpc_with_structured_candidates() {
+        let fixture = ambiguous_fixture();
+        let rpc = crate::data_rpc::DataRpc::new(fixture.ctx.cas_data_dir.clone());
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "get_symbol_source",
+            "params": {
+                "repo": "demo",
+                "qualified": "duplicate"
+            }
+        })
+        .to_string();
+
+        let response = crate::daemon::LineHandler::handle(&rpc, &request)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(
+            value["error"]["code"],
+            cairn_proto::jsonrpc::error_code::AMBIGUOUS_SOURCE
+        );
+        assert_eq!(value["error"]["data"]["qualified"], "duplicate");
+        assert_eq!(
+            value["error"]["data"]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(value["error"]["data"]["candidates"][0]["file"], "src/a.rs");
+        assert_eq!(value["error"]["data"]["candidates_truncated"], false);
+    }
+
+    #[tokio::test]
     async fn ambiguity_candidates_are_capped_without_weakening_cardinality() {
         let owned = (0..21)
             .map(|index| {
