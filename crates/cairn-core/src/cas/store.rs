@@ -1,10 +1,10 @@
 //! Per-repo store open ceremony.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
-use crate::Result;
 use crate::cas::schema::MIGRATIONS;
-use crate::migration::open_with_migrations;
+use crate::migration::{apply, apply_standard_pragmas, open_with_migrations};
+use crate::{Error, Result};
 
 /// Open (creating if necessary) the per-repo store at `path`. Applies
 /// standard pragmas and runs any pending CAS-schema migrations.
@@ -13,6 +13,32 @@ use crate::migration::open_with_migrations;
 /// Filesystem or SQLite failures.
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     open_with_migrations(path, MIGRATIONS)
+}
+
+/// Open an existing per-repo store without permitting SQLite to create the
+/// database file. This is the required opener for read, reconcile, job, and
+/// diagnostic paths: a repository being removed must not be resurrected by a
+/// late store access.
+///
+/// # Errors
+/// [`Error::StoreNotFound`] when the database is absent, or the underlying
+/// filesystem / SQLite / migration error.
+pub fn open_existing(path: &std::path::Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut conn = match Connection::open_with_flags(path, flags) {
+        Ok(conn) => conn,
+        Err(open_err) => match std::fs::metadata(path) {
+            Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::StoreNotFound {
+                    path: path.display().to_string(),
+                });
+            }
+            _ => return Err(open_err.into()),
+        },
+    };
+    apply_standard_pragmas(&conn)?;
+    apply(&mut conn, MIGRATIONS)?;
+    Ok(conn)
 }
 
 #[cfg(test)]
@@ -33,6 +59,31 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 12);
+    }
+
+    #[test]
+    fn open_existing_never_creates_a_missing_store_or_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing").join("store.db");
+
+        let err = open_existing(&path).unwrap_err();
+
+        assert!(matches!(err, Error::StoreNotFound { .. }));
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn open_existing_applies_migrations_to_an_existing_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store.db");
+        drop(open(&path).unwrap());
+
+        let conn = open_existing(&path).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
     }
 
     fn table_exists(c: &Connection, name: &str) -> bool {
