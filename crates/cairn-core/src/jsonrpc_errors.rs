@@ -21,6 +21,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
         }
         Error::RepoNotFound { .. } => error_code::REPO_NOT_FOUND,
         Error::FileNotIndexed { .. } => error_code::FILE_NOT_INDEXED,
+        Error::AmbiguousSource { .. } => error_code::AMBIGUOUS_SOURCE,
         Error::SnapshotStale { .. } => error_code::SNAPSHOT_STALE,
         Error::Internal(_) => error_code::INTERNAL_ERROR,
         _ => error_code::INTERNAL_ERROR,
@@ -100,12 +101,27 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             "reason": reason,
         }));
     }
+    if let Error::AmbiguousSource {
+        qualified,
+        candidates,
+        candidates_truncated,
+    } = err
+        && let Some(error) = response.error.as_mut()
+    {
+        error.data = Some(json!({
+            "qualified": qualified,
+            "candidates": candidates,
+            "candidates_truncated": candidates_truncated,
+        }));
+    }
     response
 }
 
 #[cfg(test)]
 mod tests {
+    use cairn_proto::SymbolKind;
     use cairn_proto::jsonrpc::{RequestId, error_code};
+    use cairn_proto::methods::SymbolSourceCandidate;
 
     use super::error_from;
     use crate::Error;
@@ -226,5 +242,33 @@ mod tests {
         assert_eq!(data["hints"][0]["code"], "snapshot_stale");
         assert!(data.get("file").is_none());
         assert!(!data.to_string().contains("<unspecified>"));
+    }
+
+    #[test]
+    fn ambiguous_source_error_has_typed_code_and_bounded_candidates() {
+        let response = error_from(
+            RequestId::Number(1),
+            &Error::AmbiguousSource {
+                qualified: "crate::same".into(),
+                candidates: vec![SymbolSourceCandidate {
+                    repo: "demo".into(),
+                    branch: "tentative/1".into(),
+                    file: "src/lib.rs".into(),
+                    line_start: 7,
+                    line_end: 9,
+                    kind: SymbolKind::Function,
+                }],
+                candidates_truncated: true,
+            },
+        );
+        let error = response.error.unwrap();
+
+        assert_eq!(error.code, error_code::AMBIGUOUS_SOURCE);
+        let data = error.data.unwrap();
+        assert_eq!(data["qualified"], "crate::same");
+        assert_eq!(data["candidates"][0]["file"], "src/lib.rs");
+        assert_eq!(data["candidates"][0]["line_start"], 7);
+        assert_eq!(data["candidates_truncated"], true);
+        assert!(!data.to_string().contains("blob_sha"));
     }
 }
