@@ -72,7 +72,9 @@ impl LanguageBackend for RubyBackend {
         // `require` / `require_relative`, so the Tier-2.5 require-graph
         // resolver can pin them too. Pre-v4 rows lack these imports
         // entirely; bumping the revision forces a re-parse.
-        4
+        // v5: invalidate rows produced before worktree hashing and parsing
+        // shared one immutable, single-read payload.
+        5
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {

@@ -66,7 +66,10 @@ impl LanguageBackend for KotlinBackend {
         // to tier2-fact. Existing blob caches are invalidated; the
         // PR #220 staleness scanner auto-enqueues reindex at daemon
         // startup, no manual `cairn ctl repo reindex` required.
-        4
+        //
+        // rev 5: invalidate rows produced before worktree hashing and parsing
+        // shared one immutable, single-read payload.
+        5
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
