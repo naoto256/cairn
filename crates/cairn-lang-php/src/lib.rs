@@ -65,7 +65,9 @@ impl LanguageBackend for PhpBackend {
         // range as a covering span), so the Tier-2.5 require-graph
         // resolver can pin its `resolutions` row at the exact site and
         // `find_imports` can LEFT JOIN it.
-        2
+        // v3: invalidate rows produced before worktree hashing and parsing
+        // shared one immutable, single-read payload.
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {

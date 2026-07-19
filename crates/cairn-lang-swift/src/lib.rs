@@ -51,7 +51,9 @@ impl LanguageBackend for SwiftBackend {
         // consumption. The Swift Tier-2.5 resolver pins its
         // `resolutions` row at the same dotted-path span Tier-2
         // records here, so `find_imports` can LEFT JOIN them.
-        2
+        // rev 3: invalidate rows produced before worktree hashing and parsing
+        // shared one immutable, single-read payload.
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
