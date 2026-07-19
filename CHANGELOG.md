@@ -24,6 +24,23 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Source lookup now fails closed on physical ambiguity and verifies fallback
+  bytes.** `get_symbol_source` no longer returns an arbitrary first row when a
+  qualified name identifies multiple physical declarations. It returns
+  JSON-RPC `-32003` (`AmbiguousSource`) with up to 20 deterministic candidates;
+  callers can disambiguate with `file` and an optional 1-indexed `line`. Rows
+  emitted by multiple parsers or aliases collapse by physical source identity,
+  while genuinely distinct declarations remain ambiguous. Git objects remain
+  authoritative, and tentative worktree fallback bytes are returned only when
+  their Git blob SHA matches the indexed snapshot, preventing changed bytes
+  from being rendered under an older identity. Reference snippets use the same
+  verification and omit only the stale snippet when verification fails.
+
+  `get_outline` now accepts the shared `branch` / `anchor` snapshot selectors
+  end to end across JSON-RPC, CLI, and MCP. Existing CLI flags no longer get
+  silently dropped; explicit historical selection is distinct from the default
+  current tentative snapshot.
+
 - **Current-snapshot readiness now includes durable freshness.** Query methods
   pin one manifest per repository for the full response, then revalidate the
   tentative anchor and reconcile publication receipt before claiming a

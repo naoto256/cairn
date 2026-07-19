@@ -176,8 +176,8 @@ optional flag (omit it to search every registered repo).
 
 ```sh
 cairn query symbols <name>           [--repo <alias>]   # symbol by name (was: find)
-cairn query outline <file-or-dir/>   [--repo <alias>]   # file or directory outline
-cairn query source  <qualified-name> [--repo <alias>]   # source body for a symbol
+cairn query outline <file-or-dir/>   [--repo <alias>] [--branch <name> | --anchor <name>]
+cairn query source  <qualified-name> [--repo <alias>] [--file <path> [--line <1-based>]]
 cairn query subtypes   <name>        [--repo <alias>]   # who implements / extends / mixes in <name>
 cairn query supertypes <name>        [--repo <alias>]   # what <name> extends / implements / mixes in
 cairn query callers <name>           [--repo <alias>]   # who calls <name>
@@ -199,11 +199,12 @@ cairn query refs Widget --kind type
 ```
 
 Omitting `--repo` searches every registered repo; each hit carries its
-origin in a `repo:branch:file:line` location prefix. `source` returns
-the first matching qualified name across the registry, which is usually
-unambiguous; pass `--repo` to pin it. `outline` interprets a trailing
-`/` on the positional path as the directory-mode signal — without it
-the argument is treated as a single file.
+origin in a `repo:branch:file:line` location prefix. `source` requires one
+physical declaration: multiple matches return `-32003 AmbiguousSource` with
+bounded candidates instead of choosing an arbitrary row. Use `--repo` and
+`--file`, then the optional 1-indexed `--line`, to disambiguate. `outline`
+interprets a trailing `/` on the positional path as the directory-mode signal
+— without it the argument is treated as a single file.
 
 `--anchor <name>` selects a specific snapshot: `HEAD` (committed
 only), `branch/<n>`, `tag/<n>`, or `tentative/<id>`. The plain
@@ -311,6 +312,10 @@ file belongs to the selected manifest. Explicit `--anchor` / `--branch`
 queries are historical reads and are not judged against current-worktree
 freshness. A stale or unindexed file passed to `get_symbol_source` is surfaced
 as JSON-RPC `-32002` with structured recovery data instead of a silent miss.
+A qualified miss without `file` returns `-32004 SnapshotStale` when current
+freshness cannot be proven. Tentative source and reference-snippet fallbacks
+also verify the worktree bytes against the indexed blob SHA; changed bytes are
+never presented as belonging to the selected snapshot.
 
 ## Languages
 
