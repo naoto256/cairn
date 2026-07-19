@@ -62,7 +62,7 @@ impl DataMethod for FindCallees {
                 let anchor_label = snapshot.anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
                 let hits = query::find_references(conn, &snapshot.anchor, &q)?;
-                let mut snippets = SnippetCache::new(worktree_root);
+                let mut snippets = SnippetCache::new(entry.alias.clone(), worktree_root);
                 Ok(hits
                     .into_iter()
                     .map(|h| {
