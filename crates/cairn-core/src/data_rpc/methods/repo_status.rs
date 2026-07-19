@@ -1,7 +1,6 @@
 //! `repo_status` — detailed status for one registered repository.
 
 use cairn_lang_api::all_backends;
-use cairn_proto::RepoReconcileStatus;
 use cairn_proto::common::{
     AnalyzerState, Diagnostic, Hint, HintAction, HintCode, TierRepoStatus, TierStatusBody,
 };
@@ -69,7 +68,7 @@ impl DataMethod for RepoStatus {
             let reconcile = match cas_registry::get_reconcile_state(&index, &entry.repo_hash)? {
                 Some(state) => {
                     let aliases = cas_registry::aliases_for_repo(&index, &entry.repo_hash)?;
-                    Some(reconcile_state_to_wire(&entry.repo_hash, aliases, &state))
+                    Some(state.to_wire(&entry.repo_hash, aliases))
                 }
                 None => {
                     return Err(Error::Internal(format!(
@@ -212,37 +211,6 @@ fn repo_status_hints(repo: &RepoStatusEntry) -> Vec<Hint> {
     hints
 }
 
-/// Map a Phase 1 `RepoReconcileState` row into the wire type.
-/// Shared by data-RPC and control status paths so both surfaces
-/// produce identical objects for the same underlying row.
-pub(crate) fn reconcile_state_to_wire(
-    repo_hash: &str,
-    aliases: Vec<String>,
-    state: &cas_registry::RepoReconcileState,
-) -> RepoReconcileStatus {
-    let pending =
-        state.desired_generation > state.applied_generation || state.attempt_generation.is_some();
-    let retry_scheduled = state.next_retry_at_ns.is_some();
-    RepoReconcileStatus {
-        repo_hash: repo_hash.to_string(),
-        aliases,
-        desired_generation: state.desired_generation,
-        applied_generation: state.applied_generation,
-        force_generation: state.force_generation,
-        attempt_generation: state.attempt_generation,
-        dirty_since_ns: state.dirty_since_ns,
-        last_attempt_ns: state.last_attempt_ns,
-        last_success_ns: state.last_success_ns,
-        consecutive_failures: state.consecutive_failures,
-        next_retry_at_ns: state.next_retry_at_ns,
-        last_error: state.last_error.clone(),
-        watcher_state: state.watcher_state.as_db_str().to_string(),
-        watcher_error: state.watcher_error.clone(),
-        pending,
-        retry_scheduled,
-    }
-}
-
 fn validate_repo_status_args(args: &RepoStatusArgs) -> Result<()> {
     match (args.scope.repo.as_ref(), args.path.as_ref()) {
         (Some(_), None) | (None, Some(_)) => Ok(()),
@@ -263,6 +231,7 @@ static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(RepoStatus);
 mod tests {
     use super::*;
     use crate::data_rpc::helpers::test_support;
+    use cairn_proto::RepoReconcileStatus;
     use cairn_proto::common::{TierAnalyzerStatus, default_tier};
     use cairn_proto::methods::RepoScope;
 

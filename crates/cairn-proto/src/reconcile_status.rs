@@ -15,6 +15,11 @@
 //!   are populated by the producer and treated as convenience —
 //!   consumers that need the exact rule read the raw fields.
 //!
+//! The in-tree mapping and relational column predicates are owned
+//! by `RepoReconcileState` in `cairn_core::cas::registry`; this
+//! module is the protocol-side contract for that storage-owned
+//! interpretation.
+//!
 //! Wire policy for PR3 Phase 4: strictly additive. This field is
 //! `Option<RepoReconcileStatus>` on `RepoStatusEntry` / `RepoStatus`
 //! with `#[serde(default, skip_serializing_if = "Option::is_none")]`,

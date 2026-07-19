@@ -1556,40 +1556,11 @@ fn classify_reconcile_state(
     // Phase 1's helper WHERE + affected-rows contract should
     // make these unreachable, but doctor is the operator's
     // safety net).
-    if state.applied_generation > state.desired_generation {
+    if let Some(violation) = state.invariant_violations().into_iter().next() {
         out.push(doctor_check(
             format!("reconcile invariants: {label}"),
             DoctorStatus::Fail,
-            Some(format!(
-                "applied_generation={} > desired_generation={}",
-                state.applied_generation, state.desired_generation
-            )),
-            Some("State machine invariant break. File a bug and restart the daemon.".into()),
-        ));
-        return out;
-    }
-    if state.force_generation > state.desired_generation {
-        out.push(doctor_check(
-            format!("reconcile invariants: {label}"),
-            DoctorStatus::Fail,
-            Some(format!(
-                "force_generation={} > desired_generation={}",
-                state.force_generation, state.desired_generation
-            )),
-            Some("State machine invariant break. File a bug and restart the daemon.".into()),
-        ));
-        return out;
-    }
-    if let Some(attempt) = state.attempt_generation
-        && attempt > state.desired_generation
-    {
-        out.push(doctor_check(
-            format!("reconcile invariants: {label}"),
-            DoctorStatus::Fail,
-            Some(format!(
-                "attempt_generation={attempt} > desired_generation={}",
-                state.desired_generation
-            )),
+            Some(violation.to_string()),
             Some("State machine invariant break. File a bug and restart the daemon.".into()),
         ));
         return out;
@@ -1598,7 +1569,7 @@ fn classify_reconcile_state(
     // Watcher failure (informational Warn — the reindex path can
     // still recover via manual reindex or startup wake, but
     // future file events are blind until restart).
-    if state.watcher_state == cas_registry::WatcherState::Failed {
+    if state.watcher_failed() {
         out.push(doctor_check(
             format!("watcher lifecycle: {label}"),
             DoctorStatus::Warn,
@@ -1615,11 +1586,7 @@ fn classify_reconcile_state(
     }
 
     // Stuck attempt (worker held mark_attempt_start for too long).
-    if let Some(_attempt) = state.attempt_generation {
-        let attempt_age = state
-            .last_attempt_ns
-            .map(|last| now_ns.saturating_sub(last))
-            .unwrap_or(0);
+    if let Some(attempt_age) = state.attempt_age_ns(now_ns) {
         if attempt_age > RECONCILE_STUCK_ATTEMPT_WARN_NS {
             out.push(doctor_check(
                 format!("reconcile attempt: {label}"),
@@ -1636,7 +1603,7 @@ fn classify_reconcile_state(
     }
 
     // Retry / backoff still in progress.
-    if state.consecutive_failures > 0
+    if state.retry_backoff_scheduled()
         && let Some(next) = state.next_retry_at_ns
     {
         out.push(doctor_check(
@@ -1655,14 +1622,7 @@ fn classify_reconcile_state(
     // Dirty gap without attempt and without scheduled retry —
     // the manager didn't pick it up. This is the "stuck backlog"
     // case; MF-6.
-    if state.desired_generation > state.applied_generation
-        && state.attempt_generation.is_none()
-        && state.next_retry_at_ns.is_none()
-    {
-        let dirty_age = state
-            .dirty_since_ns
-            .map(|since| now_ns.saturating_sub(since))
-            .unwrap_or(0);
+    if let Some(dirty_age) = state.dirty_gap_ns(now_ns) {
         if dirty_age > RECONCILE_DIRTY_GAP_WARN_NS {
             out.push(doctor_check(
                 format!("reconcile dirty gap: {label}"),
