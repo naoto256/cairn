@@ -24,6 +24,16 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Snapshot reconciliation now closes watcher-arm and silent-loss gaps.**
+  Initial registration arms the canonical repository watcher before the first
+  scan, then atomically publishes the alias with an immediate catch-up
+  generation so edits during that scan cannot be lost. Daemon startup waits
+  until every active repository has attempted to arm its watcher before
+  recording one durable full-reconcile generation for each repository.
+  During long-running sessions, a fixed five-minute scheduler also requests a
+  full reconcile for clean repositories whose last successful scan is at
+  least 30 minutes old, recovering events silently lost by the OS watcher.
+
 - **Nested Git checkouts no longer contaminate their parent snapshot.**
   Startup scans, ignore discovery, and live watcher classification now prune
   any directory below the registered root that contains its own `.git` file
