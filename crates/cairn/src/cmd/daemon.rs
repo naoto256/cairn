@@ -11,6 +11,7 @@ use cairn_core::ctl::CtlHandler;
 use cairn_core::daemon::Daemon;
 use cairn_core::data_rpc::DataRpc;
 use cairn_core::jobs::JobManager;
+use cairn_core::lifecycle::RepoLifecycleManager;
 use cairn_core::paths::CasDataDir;
 use cairn_core::reconcile::RepoReconcileManager;
 use cairn_core::sockets::SocketPaths;
@@ -43,9 +44,22 @@ pub async fn run(args: Args) -> Result<()> {
     });
     cas_data_dir.ensure()?;
     info!(root = %cas_data_dir.root().display(), "storage open");
-    let job_manager = init_job_manager(cas_data_dir.clone())?;
+    let lifecycle = RepoLifecycleManager::new(cas_data_dir.clone());
+    let sweep = lifecycle.startup_sweep().await?;
+    info!(
+        removed = sweep.repositories_removed.len(),
+        active = sweep.repositories_active.len(),
+        degraded = sweep.repositories_degraded.len(),
+        cleanup_retried = sweep.cleanup_retried.len(),
+        "repository lifecycle startup sweep complete"
+    );
+    let job_manager = init_job_manager(cas_data_dir.clone(), lifecycle.clone())?;
     job_manager.start_workers();
-    let reconcile = RepoReconcileManager::new(cas_data_dir.clone(), Some(job_manager.clone()));
+    let reconcile = RepoReconcileManager::new_with_lifecycle(
+        cas_data_dir.clone(),
+        Some(job_manager.clone()),
+        lifecycle.clone(),
+    );
     // Clear any `attempt_generation` left set by a prior crash
     // BEFORE spawning workers or starting watchers — a stale
     // in-flight marker would otherwise block the first real
@@ -57,6 +71,11 @@ pub async fn run(args: Args) -> Result<()> {
         cas_data_dir.clone(),
         reconcile.clone(),
     ));
+    lifecycle.bind_runtime(
+        Arc::downgrade(&job_manager),
+        Arc::downgrade(&watch_manager),
+        Arc::downgrade(&reconcile),
+    )?;
     start_registered_watchers(watch_manager.clone()).await;
     // Kick workers for repos whose dirty gap survived the last
     // shutdown so `desired > applied` catches up without waiting
@@ -70,7 +89,10 @@ pub async fn run(args: Args) -> Result<()> {
 
     let daemon = Daemon {
         paths,
-        data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
+        data_handler: Arc::new(DataRpc::with_lifecycle(
+            cas_data_dir.clone(),
+            Some(lifecycle.clone()),
+        )),
         control_handler: Arc::new(CtlHandler::with_full_context(
             cas_data_dir,
             shutdown.clone(),
@@ -78,10 +100,12 @@ pub async fn run(args: Args) -> Result<()> {
             Some(watch_manager),
             Some(job_manager.clone()),
             Some(reconcile.clone()),
+            Some(lifecycle.clone()),
         )),
         shutdown,
         job_manager: Some(job_manager),
         reconcile: Some(reconcile.clone()),
+        lifecycle: Some(lifecycle.clone()),
     };
     // Retain the reconcile driver until daemon.run returns so
     // watcher requests keep landing on a live manager.
@@ -127,8 +151,11 @@ fn spawn_signal_handler(shutdown: Arc<Notify>) {
 /// misroute onto a still-live sibling. Fail closed so the
 /// supervisor (systemd / launchd / operator) surfaces the failure
 /// and the DB state can be repaired before the daemon comes up.
-fn init_job_manager(cas_data_dir: Arc<CasDataDir>) -> Result<Arc<JobManager>> {
-    let job_manager = JobManager::new(cas_data_dir);
+fn init_job_manager(
+    cas_data_dir: Arc<CasDataDir>,
+    lifecycle: Arc<RepoLifecycleManager>,
+) -> Result<Arc<JobManager>> {
+    let job_manager = JobManager::with_lifecycle(cas_data_dir, lifecycle);
     job_manager
         .restore_from_db()
         .map_err(|e| anyhow::anyhow!("failed to restore queued analyzer jobs: {e}"))?;
@@ -172,7 +199,10 @@ mod tests {
             cas_registry::insert_ambiguous_ids(&tx, &[i64::MAX], 1).unwrap();
             tx.commit().unwrap();
         }
-        let err = init_job_manager(cas).err().expect("restore must fail");
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let err = init_job_manager(cas, lifecycle)
+            .err()
+            .expect("restore must fail");
         assert!(
             format!("{err:#}").contains("failed to restore queued analyzer jobs"),
             "restore failure must be surfaced as a startup error, got {err:#}"
@@ -186,7 +216,8 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
         cas.ensure().unwrap();
-        assert!(init_job_manager(cas).is_ok());
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        assert!(init_job_manager(cas, lifecycle).is_ok());
     }
 
     #[tokio::test]

@@ -325,7 +325,7 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             store_path.display()
         )));
     }
-    let conn = cas_store::open(store_path)?;
+    let conn = cas_store::open_existing(store_path)?;
     let worktree_id = conn
         .query_row(
             "SELECT worktree_id FROM worktrees WHERE path = ?1",
@@ -1530,6 +1530,35 @@ pub(crate) fn reconcile_state_checks(cas_data_dir: &CasDataDir) -> Result<Vec<Do
             }
         }
     }
+    let incomplete = cas_registry::list_incomplete_removals(&index)?;
+    for event in incomplete {
+        checks.push(doctor_check(
+            format!("repository cleanup: {}", event.repo_hash),
+            DoctorStatus::Warn,
+            Some(format!(
+                "{} cleanup is {:?}: {}",
+                event.reason.as_db_str(),
+                event.store_cleanup_state,
+                event.cleanup_error.as_deref().unwrap_or("retry pending")
+            )),
+            Some("Restart the daemon to retry cleanup, then inspect the daemon log if it remains pending.".into()),
+        ));
+    }
+    let completed = cas_registry::list_recent_completed_removals(&index, 10)?;
+    if !completed.is_empty() {
+        checks.push(doctor_check(
+            "recent repository auto-prune",
+            DoctorStatus::Pass,
+            Some(
+                completed
+                    .iter()
+                    .map(|event| format!("{} ({})", event.root_path, event.reason.as_db_str()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None,
+        ));
+    }
     Ok(checks)
 }
 
@@ -2330,6 +2359,7 @@ mod tests {
                 watch_manager: Some(self.watch_manager.clone()),
                 job_manager: None,
                 reconcile: None,
+                lifecycle: None,
                 version: "test",
                 started_at: Instant::now(),
             };

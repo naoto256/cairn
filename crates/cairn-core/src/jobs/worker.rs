@@ -21,6 +21,11 @@ impl JobManager {
     }
 
     async fn run_job(&self, dispatch: DispatchJob) -> Result<()> {
+        let lease = self
+            .lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.acquire_by_repo_hash(&dispatch.job.repo_hash))
+            .transpose()?;
         let runtime_metrics = self.runtime_metrics.clone();
         let job_id = dispatch.job.id;
         let progress_metrics = runtime_metrics.clone();
@@ -30,7 +35,7 @@ impl JobManager {
             }));
         self.register_active_progress(job_id, progress.clone());
         let joined = tokio::task::spawn_blocking(move || {
-            run_job_blocking(dispatch.job, runtime_metrics, progress)
+            run_job_blocking(dispatch.job, runtime_metrics, progress, lease)
         })
         .await;
         self.unregister_active_progress(job_id);
@@ -66,8 +71,9 @@ fn run_job_blocking(
     job: Job,
     runtime_metrics: JobRuntimeMetricsStore,
     progress: crate::workspace_analyzer::AnalyzerProgress,
+    _lease: Option<crate::lifecycle::RepoLease>,
 ) -> Result<()> {
-    let mut conn = cas_store::open(&job.store_path)?;
+    let mut conn = cas_store::open_existing(&job.store_path)?;
     let row: Option<(String, i64)> = conn
         .query_row(
             "SELECT status, cancel_requested

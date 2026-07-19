@@ -8,7 +8,7 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_subtypes::into_wire_hit;
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier_status_for_query,
+    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
     with_one_or_all_stores,
 };
 use crate::query::{self, FindSupertypesArgs as QueryArgs};
@@ -39,7 +39,7 @@ impl DataMethod for FindSupertypes {
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
 
-        let (hits, capped) = with_one_or_all_stores(
+        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
             ctx,
             requested_repo,
             "find_supertypes",
@@ -75,7 +75,7 @@ impl DataMethod for FindSupertypes {
             "find_supertypes",
         )
         .await?;
-        let completeness = completeness_for_cap(capped);
+        let completeness = completeness_for_scan(capped, skipped_unavailable);
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindSupertypes,
             items_empty: items.is_empty(),
@@ -195,6 +195,7 @@ mod tests {
             _data: data,
             ctx: DataCtx {
                 cas_data_dir: Arc::new(cas),
+                lifecycle: None,
             },
         }
     }

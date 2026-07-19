@@ -339,6 +339,53 @@ fn manual_cancel_of_running_job_cancels_active_handle() {
 }
 
 #[test]
+fn repository_removal_cancels_running_job_active_handle() {
+    let data = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+    let manager = JobManager::new(Arc::clone(&cas_data_dir));
+    let repo_hash = "repo-hash";
+    let manifest_id = ManifestId(1);
+    {
+        let mut index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(&tx, "repo", repo.path().to_str().unwrap(), repo_hash, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    let mut conn = cas_store::open(&cas_data_dir.store_db_path(repo_hash)).unwrap();
+    insert_manifest(&conn, manifest_id.0);
+    let job = manager
+        .queue_analyzer_run(test_queue_request(
+            &mut conn,
+            repo.path(),
+            repo_hash,
+            manifest_id,
+            1,
+        ))
+        .unwrap()
+        .expect("job should queue");
+    conn.execute(
+        "UPDATE workspace_analysis_runs SET status = 'running' WHERE job_id = ?1",
+        [job.job_id],
+    )
+    .unwrap();
+    let progress = crate::workspace_analyzer::AnalyzerProgress::default();
+    manager.register_active_progress(job.job_id, progress.clone());
+
+    assert_eq!(manager.cancel_repository(repo_hash).unwrap(), 1);
+
+    assert!(progress.is_cancelled());
+    let cancel_requested: i64 = conn
+        .query_row(
+            "SELECT cancel_requested FROM workspace_analysis_runs WHERE job_id = ?1",
+            [job.job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancel_requested, 1);
+}
+
+#[test]
 fn begin_shutdown_cancels_active_progress_and_rejects_new_admission() {
     let data = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

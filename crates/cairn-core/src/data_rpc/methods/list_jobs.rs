@@ -24,50 +24,71 @@ impl DataMethod for ListJobs {
             parse_params(params)?
         };
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let lifecycle = ctx.lifecycle.clone();
 
-        let (jobs, capped) = tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool)> {
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entries = match args.scope.repo.as_deref() {
-                Some(alias) => {
-                    let entry = cas_registry::lookup_by_alias(&index, alias)?.ok_or_else(|| {
-                        Error::RepoNotFound {
-                            alias: alias.to_string(),
+        let (jobs, capped, skipped_unavailable) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool, bool)> {
+                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+                let enumerate_all = args.scope.repo.is_none();
+                let entries = match args.scope.repo.as_deref() {
+                    Some(alias) => {
+                        let entry =
+                            cas_registry::lookup_by_alias(&index, alias)?.ok_or_else(|| {
+                                Error::RepoNotFound {
+                                    alias: alias.to_string(),
+                                }
+                            })?;
+                        vec![entry]
+                    }
+                    None => cas_registry::list_all(&index)?,
+                };
+                let mut out = Vec::new();
+                let mut skipped_unavailable = false;
+                for entry in entries {
+                    let _lease = match &lifecycle {
+                        Some(lifecycle) if enumerate_all => {
+                            let Some(lease) =
+                                lifecycle.acquire_for_enumeration(&entry.repo_hash)?
+                            else {
+                                skipped_unavailable = true;
+                                continue;
+                            };
+                            Some(lease)
                         }
-                    })?;
-                    vec![entry]
+                        Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
+                        None => None,
+                    };
+                    let conn =
+                        cas_store::open_existing(&cas_data_dir.store_db_path(&entry.repo_hash))?;
+                    out.extend(collect_jobs(
+                        &conn,
+                        &entry.alias,
+                        args.state.as_deref(),
+                        args.include_terminal,
+                    )?);
                 }
-                None => cas_registry::list_all(&index)?,
-            };
-            let mut out = Vec::new();
-            for entry in entries {
-                let conn = cas_store::open(&cas_data_dir.store_db_path(&entry.repo_hash))?;
-                out.extend(collect_jobs(
-                    &conn,
-                    &entry.alias,
-                    args.state.as_deref(),
-                    args.include_terminal,
-                )?);
-            }
-            out.sort_by_key(|job| std::cmp::Reverse(job.job_id));
-            let capped = if let Some(limit) = args.pagination.limit {
-                let limit = limit as usize;
-                if out.len() > limit {
-                    out.truncate(limit);
-                    true
+                out.sort_by_key(|job| std::cmp::Reverse(job.job_id));
+                let capped = if let Some(limit) = args.pagination.limit {
+                    let limit = limit as usize;
+                    if out.len() > limit {
+                        out.truncate(limit);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
-            Ok((out, capped))
-        })
-        .await
-        .map_err(|e| Error::internal_task_panic("list_jobs", e))??;
+                };
+                Ok((out, capped, skipped_unavailable))
+            })
+            .await
+            .map_err(|e| Error::internal_task_panic("list_jobs", e))??;
 
         Ok(serde_json::to_value(ListJobsResult {
             jobs,
-            completeness: if capped {
+            completeness: if skipped_unavailable {
+                cairn_proto::Completeness::partial_truncated("repo_unavailable")
+            } else if capped {
                 cairn_proto::Completeness::partial_truncated("cap")
             } else {
                 cairn_proto::Completeness::complete()

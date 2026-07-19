@@ -99,6 +99,9 @@ pub struct RepoListEntry {
     pub alias: String,
     /// Registered repository root path.
     pub root: String,
+    /// Whether a missing root is retained instead of auto-pruned.
+    #[serde(default)]
+    pub persistent: bool,
     /// Distinct language tags present in current snapshots.
     pub languages: Vec<String>,
     /// Aggregate repository readiness.
@@ -156,6 +159,9 @@ pub struct RepoStatusResult {
 pub struct RepoStatusEntry {
     pub alias: String,
     pub root: String,
+    /// Whether a missing root is retained instead of auto-pruned.
+    #[serde(default)]
+    pub persistent: bool,
     pub languages: Vec<String>,
     pub summary: RepoStatusSummary,
     pub current: RepoStatusCurrent,
@@ -266,6 +272,7 @@ mod list_repos_tests {
             repos: vec![RepoListEntry {
                 alias: "cairn".into(),
                 root: "/tmp/cairn".into(),
+                persistent: false,
                 languages: vec!["markdown".into(), "rust".into()],
                 status: RepoAggregateStatus::Ready,
                 snapshot_count: 1,
@@ -297,11 +304,49 @@ mod list_repos_tests {
     }
 
     #[test]
+    fn register_repo_persistent_is_additive_and_tri_state() {
+        let omitted: RegisterRepoArgs = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/demo",
+            "alias": "demo"
+        }))
+        .unwrap();
+        assert_eq!(omitted.persistent, None);
+
+        let explicit: RegisterRepoArgs = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/demo",
+            "alias": "demo",
+            "persistent": false
+        }))
+        .unwrap();
+        assert_eq!(explicit.persistent, Some(false));
+        assert_eq!(
+            serde_json::to_value(explicit).unwrap()["persistent"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn legacy_repo_inventory_payload_defaults_persistent_to_false() {
+        let entry: RepoListEntry = serde_json::from_value(serde_json::json!({
+            "alias": "demo",
+            "root": "/tmp/demo",
+            "languages": [],
+            "status": "ready",
+            "snapshot_count": 0,
+            "current_file_count": 0,
+            "current_symbol_count": 0
+        }))
+        .unwrap();
+        assert!(!entry.persistent);
+    }
+
+    #[test]
     fn repo_status_result_serializes_diagnostics_and_hints_when_present() {
         let result = RepoStatusResult {
             repo: RepoStatusEntry {
                 alias: "demo".into(),
                 root: "/tmp/demo".into(),
+                persistent: false,
                 languages: vec!["rust".into()],
                 summary: RepoStatusSummary {
                     snapshot_count: 1,
@@ -354,6 +399,7 @@ mod list_repos_tests {
             repo: RepoStatusEntry {
                 alias: "demo".into(),
                 root: "/tmp/demo".into(),
+                persistent: false,
                 languages: vec!["rust".into()],
                 summary: RepoStatusSummary {
                     snapshot_count: 1,
@@ -1306,6 +1352,10 @@ pub struct RegisterRepoArgs {
     pub path: String,
     /// Short name the agent will use in subsequent queries.
     pub alias: String,
+    /// Override lifecycle policy. Omitted preserves an existing owner's
+    /// policy and defaults a newly registered owner to ephemeral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent: Option<bool>,
 }
 
 /// Arguments to `reindex`.

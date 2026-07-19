@@ -14,7 +14,7 @@ use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::cas::kind_conv::symbol_kind_to_str;
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_cap, limit_with_probe, parser_id_filter, tier_status_for_query,
+    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
     with_one_or_all_stores,
 };
 use crate::query::{self, FindSymbolsArgs, SymbolHit};
@@ -46,7 +46,7 @@ impl DataMethod for FindSymbols {
         let requested_repo = args.scope.repo.clone();
         let signature_only = args.signature_only;
 
-        let (hits, capped) = with_one_or_all_stores(
+        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
             ctx,
             requested_repo,
             "find_symbols",
@@ -91,7 +91,7 @@ impl DataMethod for FindSymbols {
             "find_symbols",
         )
         .await?;
-        let completeness = completeness_for_cap(capped);
+        let completeness = completeness_for_scan(capped, skipped_unavailable);
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindSymbols,
             items_empty: items.is_empty(),

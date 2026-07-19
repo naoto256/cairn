@@ -35,50 +35,73 @@ impl DataMethod for ListRepos {
             parse_params(params)?
         };
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let lifecycle = ctx.lifecycle.clone();
 
-        let (repos, capped) = tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool)> {
-            let backends = all_backends();
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entries = cas_registry::list_all(&index)?;
-            let mut out = Vec::with_capacity(entries.len());
-            for entry in entries {
-                if let Some(query) = args.query.as_deref()
-                    && !entry.alias.contains(query)
-                    && !entry.root_path.contains(query)
-                {
-                    continue;
+        let (repos, capped, skipped_unavailable) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool, bool)> {
+                let backends = all_backends();
+                let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+                let entries = cas_registry::list_all(&index)?;
+                let mut out = Vec::with_capacity(entries.len());
+                let mut skipped_unavailable = false;
+                for entry in entries {
+                    if let Some(query) = args.query.as_deref()
+                        && !entry.alias.contains(query)
+                        && !entry.root_path.contains(query)
+                    {
+                        continue;
+                    }
+                    let _lease = match &lifecycle {
+                        Some(lifecycle) => {
+                            let Some(lease) =
+                                lifecycle.acquire_for_enumeration(&entry.repo_hash)?
+                            else {
+                                skipped_unavailable = true;
+                                continue;
+                            };
+                            Some(lease)
+                        }
+                        None => None,
+                    };
+                    let conn =
+                        cas_store::open_existing(&cas_data_dir.store_db_path(&entry.repo_hash))?;
+                    let snapshot_summary = collect_repo_snapshot_summary(&conn, &backends)?;
+                    let owner = cas_registry::lookup_repository(&index, &entry.repo_hash)?
+                        .ok_or_else(|| Error::RepoNotFound {
+                            alias: entry.alias.clone(),
+                        })?;
+                    out.push(RepoListEntry {
+                        alias: entry.alias,
+                        root: entry.root_path,
+                        persistent: owner.persistent,
+                        languages: snapshot_summary.languages,
+                        status: snapshot_summary.aggregate_status,
+                        snapshot_count: snapshot_summary.summary.snapshot_count,
+                        current_file_count: snapshot_summary.summary.current_file_count,
+                        current_symbol_count: snapshot_summary.summary.current_symbol_count,
+                    });
                 }
-                let conn = cas_store::open(&cas_data_dir.store_db_path(&entry.repo_hash))?;
-                let snapshot_summary = collect_repo_snapshot_summary(&conn, &backends)?;
-                out.push(RepoListEntry {
-                    alias: entry.alias,
-                    root: entry.root_path,
-                    languages: snapshot_summary.languages,
-                    status: snapshot_summary.aggregate_status,
-                    snapshot_count: snapshot_summary.summary.snapshot_count,
-                    current_file_count: snapshot_summary.summary.current_file_count,
-                    current_symbol_count: snapshot_summary.summary.current_symbol_count,
-                });
-            }
-            let capped = if let Some(limit) = args.pagination.limit {
-                let limit = limit as usize;
-                if out.len() > limit {
-                    out.truncate(limit);
-                    true
+                let capped = if let Some(limit) = args.pagination.limit {
+                    let limit = limit as usize;
+                    if out.len() > limit {
+                        out.truncate(limit);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
-            Ok((out, capped))
-        })
-        .await
-        .map_err(|e| Error::internal_task_panic("list_repos", e))??;
+                };
+                Ok((out, capped, skipped_unavailable))
+            })
+            .await
+            .map_err(|e| Error::internal_task_panic("list_repos", e))??;
 
         Ok(serde_json::to_value(ListReposResult {
             repos,
-            completeness: if capped {
+            completeness: if skipped_unavailable {
+                cairn_proto::Completeness::partial_truncated("repo_unavailable")
+            } else if capped {
                 cairn_proto::Completeness::partial_truncated("cap")
             } else {
                 cairn_proto::Completeness::complete()
@@ -361,6 +384,8 @@ mod tests {
     use cairn_proto::SourceTier;
 
     use crate::cas::store;
+    use crate::data_rpc::helpers::test_support;
+    use crate::lifecycle::RepoLifecycleManager;
     use crate::register::register_repo;
     use crate::testutil::init_repo;
 
@@ -410,5 +435,33 @@ mod tests {
             .unwrap();
         assert!(rust.has_analyzer);
         assert_eq!(rust.tier, SourceTier::Semantic);
+    }
+
+    #[tokio::test]
+    async fn list_repos_skips_removing_owner_and_marks_inventory_partial() {
+        let mut fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        drop(index);
+        let lifecycle = RepoLifecycleManager::new(fixture.ctx.cas_data_dir.clone());
+        lifecycle.startup_sweep().await.unwrap();
+        lifecycle
+            .begin_removal_and_wait(&entry.repo_hash)
+            .await
+            .unwrap();
+        fixture.ctx.lifecycle = Some(lifecycle);
+
+        let value = ListRepos
+            .dispatch(&fixture.ctx, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let result: ListReposResult = serde_json::from_value(value).unwrap();
+        assert!(result.repos.is_empty());
+        assert_eq!(
+            result.completeness,
+            cairn_proto::Completeness::partial_truncated("repo_unavailable")
+        );
     }
 }

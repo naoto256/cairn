@@ -29,6 +29,7 @@ impl ControlMethod for Status {
         let uptime = ctx.started_at.elapsed().as_secs();
         let version = ctx.version.to_string();
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let lifecycle = ctx.lifecycle.clone();
 
         let repos = tokio::task::spawn_blocking(move || -> Result<Vec<RepoStatus>> {
             let backends = all_backends();
@@ -36,9 +37,19 @@ impl ControlMethod for Status {
             let entries = cas_registry::list_all(&index)?;
             let mut out = Vec::with_capacity(entries.len());
             for entry in entries {
+                let _lease = match &lifecycle {
+                    Some(lifecycle) => {
+                        let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)?
+                        else {
+                            continue;
+                        };
+                        Some(lease)
+                    }
+                    None => None,
+                };
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
                 let store_bytes = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
-                let conn = cas_store::open(&store_path)?;
+                let conn = cas_store::open_existing(&store_path)?;
                 let snapshots = collect_anchor_snapshots(&conn, store_bytes, &backends)?;
                 let job_summary = collect_job_summary(&conn)?;
                 // PR3 Phase 4: durable reconcile state per repo.
@@ -64,6 +75,11 @@ impl ControlMethod for Status {
                 out.push(RepoStatus {
                     alias: entry.alias,
                     root: entry.root_path,
+                    persistent: cas_registry::lookup_repository(&index, &entry.repo_hash)?
+                        .ok_or_else(|| Error::RepoNotFound {
+                            alias: entry.repo_hash.clone(),
+                        })?
+                        .persistent,
                     snapshots,
                     job_summary,
                     jobs: Vec::new(),

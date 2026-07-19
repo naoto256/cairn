@@ -55,6 +55,9 @@ pub struct Daemon {
     /// synchronous full-reindex helper. Tests that don't exercise
     /// the drift path may pass `None`.
     pub reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+    /// Canonical repository lifecycle owner. When present, teardown stops its
+    /// intent task before dropping job/watcher/reconcile runtime bindings.
+    pub lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
 }
 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -152,6 +155,14 @@ impl Daemon {
             // cancels handles registered by already-running analyzers.
             if let Some(job_manager) = &self.job_manager {
                 job_manager.begin_shutdown();
+            }
+            if let Some(lifecycle) = &self.lifecycle {
+                if let Err(err) = lifecycle.shutdown(Duration::from_secs(1)).await {
+                    warn!(
+                        error = %err,
+                        "repository lifecycle shutdown did not drain; durable state will recover on next startup"
+                    );
+                }
             }
             // Kill LSP children before awaiting workers. Pending requests then
             // fail and release the PoolEntry state mutex held by each pass.
@@ -343,6 +354,7 @@ mod tests {
     use crate::cas::store as cas_store;
     use crate::ctl::CtlHandler;
     use crate::data_rpc::DataRpc;
+    use crate::lifecycle::{RemovalIntent, RepoLifecycleManager};
     use crate::paths::{CasDataDir, path_hash};
     use crate::query::{FindSymbolsArgs, find_symbols};
     use crate::reconcile::RepoReconcileManager;
@@ -399,6 +411,7 @@ mod tests {
                     shutdown,
                     job_manager: None,
                     reconcile: None,
+                    lifecycle: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -441,6 +454,7 @@ mod tests {
                     shutdown,
                     job_manager: None,
                     reconcile: None,
+                    lifecycle: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -520,6 +534,7 @@ mod tests {
                     shutdown,
                     job_manager: Some(job_manager),
                     reconcile: None,
+                    lifecycle: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -576,6 +591,7 @@ mod tests {
                     shutdown,
                     job_manager: None,
                     reconcile: None,
+                    lifecycle: None,
                 }
                 .run_with_shutdown_timeout(Duration::from_millis(100))
                 .await
@@ -648,6 +664,7 @@ mod tests {
                     shutdown,
                     job_manager: None,
                     reconcile: Some(reconcile),
+                    lifecycle: None,
                 }
                 .run()
                 .await
@@ -720,6 +737,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removal_in_progress_does_not_make_clean_daemon_shutdown_fail() {
+        let runtime_tmp = runtime_tempdir();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
+        let cas = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let repo_hash = path_hash(&root);
+        {
+            let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(&tx, "demo", &root.to_string_lossy(), &repo_hash, 1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        lifecycle.startup_sweep().await.unwrap();
+        let jobs = crate::jobs::JobManager::with_lifecycle(cas.clone(), lifecycle.clone());
+        let reconcile = RepoReconcileManager::new_with_lifecycle(
+            cas.clone(),
+            Some(jobs.clone()),
+            lifecycle.clone(),
+        );
+        let watchers = Arc::new(WatchManager::with_reconcile(cas, reconcile.clone()));
+        lifecycle
+            .bind_runtime(
+                Arc::downgrade(&jobs),
+                Arc::downgrade(&watchers),
+                Arc::downgrade(&reconcile),
+            )
+            .unwrap();
+
+        // Keep one admitted read alive so the removal owner remains blocked
+        // in its lease drain beyond the daemon's lifecycle join budget.
+        let lease = lifecycle.acquire_by_repo_hash(&repo_hash).unwrap();
+        lifecycle
+            .request_removal(RemovalIntent::LastAliasRemoved {
+                repo_hash: repo_hash.clone(),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    lifecycle.acquire_by_repo_hash(&repo_hash),
+                    Err(crate::Error::RepositoryUnavailable { .. })
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("removal owner did not close repository admission");
+
+        let shutdown = Arc::new(Notify::new());
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            let lifecycle = lifecycle.clone();
+            let jobs = jobs.clone();
+            let reconcile = reconcile.clone();
+            async move {
+                Daemon {
+                    paths,
+                    data_handler: Arc::new(EchoHandler),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: Some(jobs),
+                    reconcile: Some(reconcile),
+                    lifecycle: Some(lifecycle),
+                }
+                .run()
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(3), daemon_task)
+            .await
+            .expect("daemon teardown exceeded the test bound")
+            .expect("daemon task panicked");
+        assert!(
+            result.is_ok(),
+            "a lifecycle join timeout must not fail clean daemon teardown: {result:?}"
+        );
+
+        // The timed-out owner task is detached, not aborted. Once the lease
+        // drains it must finish the already-durable removal.
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let removed = {
+                    let index = cas_registry::open(&data_tmp.path().join("index.db")).unwrap();
+                    cas_registry::lookup_repository(&index, &repo_hash)
+                        .unwrap()
+                        .is_none()
+                };
+                if removed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("durable removal did not finish after the lease drained");
+        reconcile.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn read_line_capped_rejects_oversized_line() {
         // Stream a payload that exceeds the cap with no newline. The
         // helper must return InvalidData rather than buffer unboundedly.
@@ -785,10 +912,12 @@ mod tests {
                         Some(watch_manager),
                         None,
                         Some(reconcile),
+                        None,
                     )),
                     shutdown,
                     job_manager: None,
                     reconcile: None,
+                    lifecycle: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -909,10 +1038,12 @@ mod tests {
                         Some(watch_manager),
                         None,
                         Some(reconcile),
+                        None,
                     )),
                     shutdown,
                     job_manager: None,
                     reconcile: None,
+                    lifecycle: None,
                 };
                 daemon.run().await.unwrap();
             }
@@ -984,7 +1115,7 @@ mod tests {
     }
 
     fn symbol_exists(store_path: &Path, repo_root: &Path, symbol_name: &str) -> bool {
-        let Ok(conn) = cas_store::open(store_path) else {
+        let Ok(conn) = cas_store::open_existing(store_path) else {
             return false;
         };
         let Ok(worktree_id) = conn.query_row(
