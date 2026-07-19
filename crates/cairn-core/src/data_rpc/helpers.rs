@@ -29,15 +29,17 @@ pub(crate) async fn with_one_or_all_stores<T, F, S>(
     effective_limit: u32,
     mut query_store: F,
     mut finalize: S,
-) -> Result<(Vec<T>, bool)>
+) -> Result<(Vec<T>, bool, bool)>
 where
     T: Send + 'static,
     F: FnMut(&cas_registry::AliasEntry, &rusqlite::Connection) -> Result<Vec<T>> + Send + 'static,
     S: FnMut(&mut Vec<T>) + Send + 'static,
 {
     let cas_data_dir = ctx.cas_data_dir.clone();
-    tokio::task::spawn_blocking(move || -> Result<(Vec<T>, bool)> {
+    let lifecycle = ctx.lifecycle.clone();
+    tokio::task::spawn_blocking(move || -> Result<(Vec<T>, bool, bool)> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+        let enumerate_all = requested_repo.is_none();
         let aliases = match requested_repo.as_deref() {
             Some(name) => {
                 let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
@@ -52,9 +54,21 @@ where
 
         let mut out = Vec::new();
         let mut capped = false;
+        let mut skipped_unavailable = false;
         for entry in aliases {
+            let _lease = match &lifecycle {
+                Some(lifecycle) if enumerate_all => {
+                    let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)? else {
+                        skipped_unavailable = true;
+                        continue;
+                    };
+                    Some(lease)
+                }
+                Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
+                None => None,
+            };
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             let mut hits = match query_store(&entry, &conn) {
                 Ok(h) => h,
                 Err(Error::AnchorNotFound { .. }) => continue,
@@ -66,7 +80,7 @@ where
 
         finalize(&mut out);
         capped |= trim_to_requested_limit(&mut out, effective_limit);
-        Ok((out, capped))
+        Ok((out, capped, skipped_unavailable))
     })
     .await
     .map_err(|e| Error::internal_task_panic(method_name, e))?
@@ -86,8 +100,10 @@ pub(crate) fn trim_to_requested_limit<T>(rows: &mut Vec<T>, effective_limit: u32
     }
 }
 
-pub(crate) fn completeness_for_cap(capped: bool) -> Completeness {
-    if capped {
+pub(crate) fn completeness_for_scan(capped: bool, skipped_unavailable: bool) -> Completeness {
+    if skipped_unavailable {
+        Completeness::partial_truncated(PartialReason::from("repo_unavailable"))
+    } else if capped {
         Completeness::partial_truncated(PartialReason::Cap)
     } else {
         Completeness::complete()
@@ -452,6 +468,7 @@ pub(crate) async fn tier_status_for_query(
     method_name: &'static str,
 ) -> Result<TierStatus> {
     let cas_data_dir = ctx.cas_data_dir.clone();
+    let lifecycle = ctx.lifecycle.clone();
     tokio::task::spawn_blocking(move || -> Result<TierStatus> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
         let aliases = match requested_repo.as_deref() {
@@ -468,9 +485,20 @@ pub(crate) async fn tier_status_for_query(
 
         let mut analyzers = Vec::new();
         let mut repo_wide_analyzers = Vec::new();
+        let enumerate_all = requested_repo.is_none();
         for entry in aliases {
+            let _lease = match &lifecycle {
+                Some(lifecycle) if enumerate_all => {
+                    let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)? else {
+                        continue;
+                    };
+                    Some(lease)
+                }
+                Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
+                None => None,
+            };
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             let anchor = anchor::resolve_explicit_or_default(
                 &conn,
                 anchor_arg.as_deref(),
@@ -775,6 +803,7 @@ pub(crate) mod test_support {
             _data: data,
             ctx: DataCtx {
                 cas_data_dir: Arc::new(cas),
+                lifecycle: None,
             },
         }
     }
@@ -863,15 +892,63 @@ mod tests {
     }
 
     #[test]
-    fn completeness_for_cap_marks_partial_with_cap_reason() {
-        assert_eq!(completeness_for_cap(false), Completeness::Complete);
+    fn completeness_for_scan_reports_cap_and_unavailable_repo() {
+        assert_eq!(completeness_for_scan(false, false), Completeness::Complete);
         assert_eq!(
-            completeness_for_cap(true),
+            completeness_for_scan(true, false),
             Completeness::Partial {
                 missing_tiers: Vec::new(),
                 reason: Some(PartialReason::Cap),
             }
         );
+        assert_eq!(
+            completeness_for_scan(false, true),
+            Completeness::partial_truncated("repo_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_store_scan_skips_removing_repo_but_explicit_scope_errors() {
+        let mut fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        drop(index);
+        let lifecycle =
+            crate::lifecycle::RepoLifecycleManager::new(fixture.ctx.cas_data_dir.clone());
+        lifecycle.startup_sweep().await.unwrap();
+        lifecycle
+            .begin_removal_and_wait(&entry.repo_hash)
+            .await
+            .unwrap();
+        fixture.ctx.lifecycle = Some(lifecycle);
+
+        let (rows, capped, skipped) = with_one_or_all_stores(
+            &fixture.ctx,
+            None,
+            "enumeration skip test",
+            10,
+            |_entry, _conn| Ok(vec![1_u8]),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+        assert!(!capped);
+        assert!(skipped);
+
+        let err = with_one_or_all_stores(
+            &fixture.ctx,
+            Some("demo".into()),
+            "explicit removing test",
+            10,
+            |_entry, _conn| Ok(vec![1_u8]),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::RepositoryUnavailable { .. }));
     }
 
     #[test]

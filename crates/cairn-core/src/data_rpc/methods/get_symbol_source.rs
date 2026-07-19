@@ -46,6 +46,7 @@ impl DataMethod for GetSymbolSource {
         let requested_repo = args.scope.repo.clone();
         let verbose_tier3 = args.tier3.verbose_tier3;
         let cas_data_dir = ctx.cas_data_dir.clone();
+        let lifecycle = ctx.lifecycle.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
@@ -60,10 +61,24 @@ impl DataMethod for GetSymbolSource {
                 }
                 None => cas_registry::list_all(&index)?,
             };
+            let enumerate_all = requested_repo.is_none();
+            let mut skipped_unavailable = 0_usize;
 
             for entry in &aliases {
+                let _lease = match &lifecycle {
+                    Some(lifecycle) if enumerate_all => {
+                        let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)?
+                        else {
+                            skipped_unavailable = skipped_unavailable.saturating_add(1);
+                            continue;
+                        };
+                        Some(lease)
+                    }
+                    Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
+                    None => None,
+                };
                 let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                let conn = cas_store::open(&store_path)?;
+                let conn = cas_store::open_existing(&store_path)?;
                 let anchor = crate::anchor::resolve_explicit_or_default(
                     &conn,
                     anchor_arg.as_deref(),
@@ -146,7 +161,11 @@ impl DataMethod for GetSymbolSource {
 
             let scope = match requested_repo.as_deref() {
                 Some(name) => format!("repo=`{name}`"),
-                None => format!("any of {} registered repos", aliases.len()),
+                None => format!(
+                    "any of {} registered repos ({} unavailable skipped)",
+                    aliases.len(),
+                    skipped_unavailable
+                ),
             };
             Err(Error::InvalidArgument(format!(
                 "no symbol matches qualified=`{qualified}` in {scope}"

@@ -35,6 +35,7 @@ use serde_json::Value;
 use crate::Result;
 use crate::daemon::LineHandler;
 use crate::jsonrpc_dispatch::{self, RpcMethod};
+use crate::lifecycle::RepoLifecycleManager;
 use crate::paths::CasDataDir;
 
 pub mod methods;
@@ -75,6 +76,7 @@ pub static DATA_METHODS: [fn() -> Box<dyn DataMethod>] = [..];
 #[derive(Clone)]
 pub struct DataCtx {
     pub cas_data_dir: Arc<CasDataDir>,
+    pub lifecycle: Option<Arc<RepoLifecycleManager>>,
 }
 
 #[async_trait::async_trait]
@@ -101,9 +103,20 @@ pub struct DataRpc {
 impl DataRpc {
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Self {
+        Self::with_lifecycle(cas_data_dir, None)
+    }
+
+    #[must_use]
+    pub fn with_lifecycle(
+        cas_data_dir: Arc<CasDataDir>,
+        lifecycle: Option<Arc<RepoLifecycleManager>>,
+    ) -> Self {
         let methods = jsonrpc_dispatch::method_table(&DATA_METHODS);
         Self {
-            ctx: DataCtx { cas_data_dir },
+            ctx: DataCtx {
+                cas_data_dir,
+                lifecycle,
+            },
             methods,
         }
     }

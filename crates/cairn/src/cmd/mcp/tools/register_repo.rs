@@ -16,6 +16,7 @@ fn spec() -> ToolSpec {
             "properties": {
                 "path":  {"type": "string", "description": "Absolute path to the repo root."},
                 "alias": {"type": "string", "description": "Short identifier used in subsequent queries (e.g. the repo name)."},
+                "persistent": {"type": "boolean", "description": "Retain the registration if its root is temporarily missing. Omit to preserve an existing policy; new registrations default to false."},
             },
             "required": ["path", "alias"],
             "additionalProperties": false,

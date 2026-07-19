@@ -246,11 +246,21 @@ blocking filesystem work.
 
 ```sh
 cairn ctl repo register --alias my-proj /path/to/repo
+cairn ctl repo register --alias mounted --persistent /Volumes/team/repo
 cairn ctl daemon status
 ```
 
 A repo can carry more than one alias; removing one keeps the on-disk
 store alive while any other label still references it.
+
+Registrations are ephemeral by default: when a repository root is
+definitively missing, the daemon removes its canonical registration and CAS
+store. Use `--persistent` for roots that may be temporarily unavailable, such
+as removable or network-mounted storage; use `--ephemeral` when re-registering
+to restore the default policy. Persistence protects only against missing-root
+auto-prune. Aliases are routing labels, so a repository with no aliases is
+unreachable and is removed even when persistent. Retargeting the last alias
+away from a persistent repository has the same result.
 
 Workspace analyzers (Tier-2.5 and Tier-3) run in daemon background
 jobs. Use `cairn ctl jobs list --alias my-proj` to inspect

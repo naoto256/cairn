@@ -7,6 +7,21 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased] — 0.8.0
 
+### Added
+
+- **Explicit repository lifecycle policy and automatic orphan cleanup.** New
+  registrations are ephemeral by default and are automatically deregistered,
+  with their CAS store removed, when the root is definitively missing.
+  `cairn ctl repo register --persistent` retains temporarily unavailable roots;
+  `--ephemeral` restores the default. Registration inventory and status expose
+  the effective policy. A durable removal audit records pending, failed, and
+  recently completed cleanup, and daemon startup resumes interrupted cleanup
+  before restoring jobs or starting watchers.
+
+  Persistence protects missing roots only. A canonical repository with no
+  aliases is unreachable and is removed regardless of policy, including when
+  its final alias is retargeted.
+
 ### Fixed
 
 - **Daemon shutdown is bounded and cancellation-safe.** Shutdown now closes
@@ -33,6 +48,16 @@ versions follow [SemVer](https://semver.org/).
   This deliberately narrows scanning to Git ignore semantics: `.ignore`
   files and `.gitignore` files above the registered repository root are no
   longer inherited. Cairn's fixed always-pruned directories remain unchanged.
+
+- **Repository removal is now a single, race-safe lifecycle transition.**
+  Register, query, reconcile, analyzer jobs, watcher ownership, alias removal,
+  and startup recovery coordinate through a canonical `repo_hash` activity
+  gate. Removal rejects new leases, drains existing work, cancels pending jobs,
+  unregisters the watcher, atomically deletes registry state while recording
+  cleanup intent, and only then removes the store. Read paths use no-create
+  store opens, preventing a query racing removal from recreating a deleted CAS
+  directory. The prior final-alias removal path could leave canonical and
+  reconcile rows orphaned; it now routes through the same lifecycle owner.
 
 ## [0.7.1] — 2026-07-12
 
