@@ -24,6 +24,19 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Full scans now fail closed without publishing partial snapshots.** Git
+  metadata, ignore discovery, directory walking, metadata lookup, file reads,
+  and Tier-1 parsing must all succeed before a tentative manifest or anchor is
+  published. Failures retain bounded diagnostics, leave the prior snapshot in
+  place, and preserve the durable reconcile generation gap for retry. Each
+  included worktree file is read once into an immutable per-file payload; the
+  same bytes drive its blob hash, fallback backend selection, and Tier-1 parse,
+  eliminating hash/parse time-of-check-to-time-of-use drift. All Tier-1 parser
+  revisions are bumped for this input-capture contract change, so the first
+  daemon startup after upgrading schedules one automatic reindex of every
+  registered repository. That one-time re-parse invalidates any legacy cache
+  row whose facts may have come from different bytes than its blob hash.
+
 - **Snapshot reconciliation now closes watcher-arm and silent-loss gaps.**
   Initial registration arms the canonical repository watcher before the first
   scan, then atomically publishes the alias with an immediate catch-up

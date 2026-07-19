@@ -52,7 +52,9 @@ impl LanguageBackend for CsharpBackend {
         // rev 2: emit byte_range on ImportFact (using directives) so
         // Tier-2.5's csharp-resolver can pin its resolution rows at the
         // same dotted-path span; find_imports LEFT JOINs them.
-        2
+        // rev 3: invalidate rows produced before worktree hashing and parsing
+        // shared one immutable, single-read payload.
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {

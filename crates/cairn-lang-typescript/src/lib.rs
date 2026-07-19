@@ -77,7 +77,9 @@ impl LanguageBackend for TypescriptBackend {
     /// that revision 2 introduced. Same input yields more `ImportFact`
     /// rows, so the CAS-cached syntactic snapshot must be invalidated.
     fn parser_revision(&self) -> u32 {
-        4
+        // Revision 5 invalidates rows produced before worktree hashing and
+        // parsing shared one immutable, single-read payload.
+        5
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -116,7 +118,7 @@ impl LanguageBackend for TsxBackend {
 
     /// See [`TypescriptBackend::parser_revision`].
     fn parser_revision(&self) -> u32 {
-        4
+        5
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -157,7 +159,7 @@ impl LanguageBackend for JavascriptBackend {
 
     /// See [`TypescriptBackend::parser_revision`].
     fn parser_revision(&self) -> u32 {
-        4
+        5
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -1304,15 +1306,17 @@ const { join } = require('path');
     }
 
     #[test]
-    fn parser_revision_bumped_for_expanded_require_emit() {
+    fn parser_revision_covers_fact_and_input_capture_invalidation() {
         // Revision 3 (PR-β): statement-position, expression-position,
         // and `module.exports = require(...)` re-export require calls
         // now also emit `ImportFact` rows. Bump signals the CAS-cached
         // syntactic snapshot to invalidate so the same input yields the
-        // wider fact set without a manual reindex.
-        assert_eq!(TypescriptBackend.parser_revision(), 4);
-        assert_eq!(TsxBackend.parser_revision(), 4);
-        assert_eq!(JavascriptBackend.parser_revision(), 4);
+        // wider fact set without a manual reindex. Revision 4 added nested
+        // scope facts; revision 5 invalidates rows from the former two-read
+        // worktree hash/parse path.
+        assert_eq!(TypescriptBackend.parser_revision(), 5);
+        assert_eq!(TsxBackend.parser_revision(), 5);
+        assert_eq!(JavascriptBackend.parser_revision(), 5);
     }
 
     // ─── PR-β: expanded require() ImportFact emit ────────────────

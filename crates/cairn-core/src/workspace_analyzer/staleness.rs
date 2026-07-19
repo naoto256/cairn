@@ -1131,7 +1131,7 @@ mod e2e {
     }
 
     /// Test #3 — R2 must-fix #1 (core): a missing `blobs(blob_sha,
-    /// parser_id)` row is drift. The `parse_pending_blobs` recovery
+    /// parser_id)` row is drift. The pre-publication parse recovery
     /// path will re-parse and write the row on the next register pass.
     #[test]
     fn parser_drift_when_blob_row_missing() {
@@ -1152,7 +1152,7 @@ mod e2e {
     /// obsolete row simply falls outside the set.
     ///
     /// Without this guarantee, the scanner would enqueue a full
-    /// reindex; `parse_pending_blobs` wouldn't touch the obsolete row
+    /// reindex; the pre-publication parse wouldn't touch the obsolete row
     /// (the new backend doesn't claim it); next startup would see the
     /// same row and enqueue again — an infinite reindex loop.
     #[test]

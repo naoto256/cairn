@@ -20,7 +20,7 @@
 //!    `LanguageBackend`). Stored on `blobs(parser_id, parser_revision)`.
 //!    Bumped whenever a Tier-1 backend changes the syntactic facts it
 //!    emits. Recovery has two paths: (a) on the next `register_repo`
-//!    pass over a blob with a stale revision, `parse_pending_blobs`
+//!    pass over a blob with a stale revision, the pre-publication parse pass
 //!    transparently re-parses via `cas::blob::reuse_or_compute`;
 //!    (b) the daemon-startup [`staleness::check_revision_staleness_and_enqueue`]
 //!    runs a [`staleness::detect_parser_revision_drift`] pre-check

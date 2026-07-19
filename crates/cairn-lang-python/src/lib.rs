@@ -63,7 +63,9 @@ impl LanguageBackend for PythonBackend {
         // the leading-dot prefix of `relative_import` nodes). Tier-2.5
         // require-graph pins its `resolutions` row on the same site so
         // `find_imports` can LEFT JOIN them.
-        2
+        // rev 3: invalidate rows produced before worktree hashing and parsing
+        // shared one immutable, single-read payload.
+        3
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {

@@ -104,8 +104,8 @@ pub(crate) fn manifest_parser_ids(
     Ok(parser_ids)
 }
 
-/// Shared backend-selection chain used by both the register hot path
-/// (`parse_pending_blobs`) and the daemon-startup parser-revision
+/// Shared backend-selection chain used by both the register hot path's
+/// pre-publication parse and the daemon-startup parser-revision
 /// staleness scanner.
 ///
 /// Selection priority is: extension match → C-family header
@@ -168,8 +168,9 @@ pub(crate) struct ExpectedParseUnit {
 ///
 /// Missing worktree files (entry referenced a file that has since
 /// been deleted) and read errors during fallback are silently
-/// skipped — they would also be skipped by `parse_pending_blobs`, and
-/// the scanner has no recovery for them either.
+/// skipped here because this startup diagnostic is best-effort. Registration's
+/// full scan is stricter: any required read error rejects the attempt and
+/// preserves the durable reconcile gap.
 ///
 /// Caller is responsible for stopping at the first manifest that
 /// matters; this function does not scan every manifest in the store.
