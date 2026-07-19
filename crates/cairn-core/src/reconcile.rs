@@ -7,7 +7,7 @@
 //! in-process worker to execute the attempt. A crash between the
 //! bump and the attempt leaves the gap `desired > applied` durable,
 //! so the next startup can resume via
-//! [`cas::registry::recover_interrupted_attempts`] + immediate wake.
+//! `cas::registry::recover_interrupted_attempts` + immediate wake.
 //!
 //! # Concurrency contract
 //!
@@ -60,6 +60,15 @@ pub enum ReconcileTrigger {
     /// Daemon startup found `desired > applied` (or an
     /// interrupted attempt that recovery cleared).
     StartupRecovery,
+    /// Catch-up generation recorded atomically with registration
+    /// publication after the watcher was armed.
+    RegistrationCatchUp,
+    /// Full reconcile requested for every active repository after daemon
+    /// startup has attempted to arm all watchers.
+    StartupFullReconcile,
+    /// Low-frequency full reconcile used to recover a silently missed
+    /// filesystem event.
+    PeriodicFullReconcile,
     /// Internal retry after a prior failed attempt.
     Retry,
     /// Daemon-startup revision-staleness scanner detected
@@ -87,6 +96,27 @@ pub struct ReconcileRequestOutcome {
     /// existing one. False if the caller intentionally did not
     /// wake (e.g. bulk startup priming will wake separately).
     pub scheduled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPrimeOutcome {
+    pub recovered: Vec<String>,
+    pub primed: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicReconcilePolicy {
+    pub poll_interval: Duration,
+    pub max_clean_age: Duration,
+}
+
+impl Default for PeriodicReconcilePolicy {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(5 * 60),
+            max_clean_age: Duration::from_secs(30 * 60),
+        }
+    }
 }
 
 /// Backoff schedule for failed reconcile attempts.
@@ -200,6 +230,8 @@ pub struct RepoReconcileManager {
     shutting_down: std::sync::atomic::AtomicBool,
     live_workers: AtomicUsize,
     workers_idle: Arc<Notify>,
+    periodic_shutdown: Arc<Notify>,
+    periodic_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Monotonic counter for tests: how many attempts (start OR
     /// failure) have been driven through the manager. Used to
     /// synchronise with tokio task scheduling in MF tests.
@@ -248,7 +280,7 @@ impl RepoReconcileManager {
     }
 
     /// Full constructor exposed for tests. Production uses
-    /// [`new`].
+    /// [`Self::new`].
     #[must_use]
     pub fn with_config(
         cas_data_dir: Arc<CasDataDir>,
@@ -278,6 +310,8 @@ impl RepoReconcileManager {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             live_workers: AtomicUsize::new(0),
             workers_idle: Arc::new(Notify::new()),
+            periodic_shutdown: Arc::new(Notify::new()),
+            periodic_task: Mutex::new(None),
             #[cfg(test)]
             test_attempts_started: AtomicI64::new(0),
             #[cfg(test)]
@@ -354,7 +388,7 @@ impl RepoReconcileManager {
         trigger: ReconcileTrigger,
     ) -> Result<ReconcileRequestOutcome> {
         let _lease = match &self.lifecycle {
-            Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&repo_hash)?),
+            Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(&repo_hash)?),
             None => None,
         };
         let cas_data_dir = self.cas_data_dir.clone();
@@ -392,7 +426,7 @@ impl RepoReconcileManager {
         trigger: ReconcileTrigger,
     ) -> Result<ReconcileRequestOutcome> {
         let _lease = match &self.lifecycle {
-            Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&repo_hash)?),
+            Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(&repo_hash)?),
             None => None,
         };
         let cas_data_dir = self.cas_data_dir.clone();
@@ -423,10 +457,10 @@ impl RepoReconcileManager {
         })
     }
 
-    /// On startup: clear every non-NULL `attempt_generation` and
-    /// annotate `last_error`, then wake the workers for the
-    /// affected repos so they retry immediately.
-    pub async fn recover_interrupted_attempts(self: &Arc<Self>) -> Result<Vec<String>> {
+    /// Clear every interrupted attempt without waking a worker. Daemon startup
+    /// calls this before arming watchers, then passes the returned hashes to
+    /// [`Self::prime_startup_reconcile`] after the watcher barrier.
+    pub async fn recover_interrupted_attempts_without_wake(&self) -> Result<Vec<String>> {
         let cas_data_dir = self.cas_data_dir.clone();
         let hashes = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
@@ -437,16 +471,177 @@ impl RepoReconcileManager {
         })
         .await
         .map_err(|e| Error::internal_task_panic("reconcile recover_interrupted", e))??;
-        for h in &hashes {
-            self.wake_or_spawn(h, None);
-        }
         Ok(hashes)
     }
 
+    /// Durably request one immediate full reconcile for every active canonical
+    /// repository, then wake workers only after the all-or-nothing transaction
+    /// commits.
+    pub async fn prime_startup_reconcile(
+        self: &Arc<Self>,
+        recovered: Vec<String>,
+    ) -> Result<StartupPrimeOutcome> {
+        let cas_data_dir = self.cas_data_dir.clone();
+        let now_ns = self.clock.now_ns();
+        let primed = tokio::task::spawn_blocking(move || -> Result<Vec<(String, i64)>> {
+            let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let primed = cas_registry::prime_startup_generations(&tx, now_ns)?;
+            tx.commit()?;
+            Ok(primed)
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("reconcile startup prime", e))??;
+        for (repo_hash, generation) in &primed {
+            debug!(
+                repo_hash = %repo_hash,
+                generation,
+                trigger = ?ReconcileTrigger::StartupFullReconcile,
+                "startup reconcile generation recorded"
+            );
+            self.wake_or_spawn(repo_hash, None);
+        }
+        Ok(StartupPrimeOutcome { recovered, primed })
+    }
+
+    /// Wake a generation that another owner recorded in the same transaction
+    /// as its own state publication. No database mutation occurs here.
+    pub fn wake_recorded_generation(
+        self: &Arc<Self>,
+        repo_hash: &str,
+        preferred_alias: Option<String>,
+    ) -> bool {
+        self.wake_or_spawn(repo_hash, preferred_alias)
+    }
+
+    /// Start the low-frequency reconcile scheduler. The first poll is delayed;
+    /// startup priming provides the immediate full reconcile.
+    pub fn start_periodic_reconcile(
+        self: &Arc<Self>,
+        policy: PeriodicReconcilePolicy,
+    ) -> Result<()> {
+        if policy.poll_interval.is_zero() || policy.max_clean_age.is_zero() {
+            return Err(Error::InvalidArgument(
+                "periodic reconcile durations must be non-zero".into(),
+            ));
+        }
+        let mut slot = self
+            .periodic_task
+            .lock()
+            .map_err(|_| Error::Internal("periodic reconcile task mutex poisoned".into()))?;
+        if slot.is_some() {
+            return Err(Error::InvalidArgument(
+                "periodic reconcile scheduler already started".into(),
+            ));
+        }
+        let weak = Arc::downgrade(self);
+        let shutdown = self.periodic_shutdown.clone();
+        *slot = Some(tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + policy.poll_interval;
+            let mut interval = tokio::time::interval_at(start, policy.poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.notified() => return,
+                    _ = interval.tick() => {
+                        let Some(manager) = weak.upgrade() else {
+                            return;
+                        };
+                        manager.run_periodic_cycle(policy.max_clean_age).await;
+                    }
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    async fn run_periodic_cycle(self: &Arc<Self>, max_clean_age: Duration) {
+        let cas_data_dir = self.cas_data_dir.clone();
+        let repos = match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            Ok(cas_registry::list_repositories(&index)?
+                .into_iter()
+                .filter(|repo| repo.removal_request.is_none())
+                .map(|repo| repo.repo_hash)
+                .collect())
+        })
+        .await
+        {
+            Ok(Ok(repos)) => repos,
+            Ok(Err(err)) => {
+                warn!(error = %err, "periodic reconcile failed to list repositories");
+                return;
+            }
+            Err(err) => {
+                warn!(error = %err, "periodic reconcile repository task failed");
+                return;
+            }
+        };
+
+        for repo_hash in repos {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            match self
+                .request_periodic_if_due(repo_hash.clone(), max_clean_age)
+                .await
+            {
+                Ok(Some(generation)) => info!(
+                    repo_hash = %repo_hash,
+                    generation,
+                    trigger = ?ReconcileTrigger::PeriodicFullReconcile,
+                    "periodic reconcile generation recorded"
+                ),
+                Ok(None) => {}
+                Err(Error::RepositoryUnavailable { .. }) => {
+                    debug!(repo_hash = %repo_hash, "periodic reconcile skipped unavailable repository");
+                }
+                Err(err) => warn!(
+                    repo_hash = %repo_hash,
+                    error = %err,
+                    "periodic reconcile request failed"
+                ),
+            }
+        }
+    }
+
+    async fn request_periodic_if_due(
+        self: &Arc<Self>,
+        repo_hash: String,
+        max_clean_age: Duration,
+    ) -> Result<Option<i64>> {
+        let _lease = match &self.lifecycle {
+            Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(&repo_hash)?),
+            None => None,
+        };
+        let max_clean_age_ns = i64::try_from(max_clean_age.as_nanos()).unwrap_or(i64::MAX);
+        let now_ns = self.clock.now_ns();
+        let cas_data_dir = self.cas_data_dir.clone();
+        let repo_hash_task = repo_hash.clone();
+        let generation = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+            let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let generation = cas_registry::increment_periodic_generation_if_due(
+                &tx,
+                &repo_hash_task,
+                now_ns,
+                max_clean_age_ns,
+            )?;
+            tx.commit()?;
+            Ok(generation)
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("reconcile periodic request", e))??;
+        if generation.is_some() {
+            self.wake_or_spawn(&repo_hash, None);
+        }
+        Ok(generation)
+    }
+
     /// Wake workers for every repo the DB says still has
-    /// `desired > applied`. Called from startup after
-    /// [`recover_interrupted_attempts`]; safe to call at any
-    /// time.
+    /// `desired > applied`. Startup uses the stronger all-repository priming
+    /// barrier; this remains a support primitive for callers that only need to
+    /// resume already-recorded work.
     pub async fn wake_dirty_repositories(self: &Arc<Self>) -> Result<Vec<String>> {
         let cas_data_dir = self.cas_data_dir.clone();
         let dirty = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
@@ -470,9 +665,19 @@ impl RepoReconcileManager {
         Ok(dirty)
     }
 
-    /// Persist watcher lifecycle state. Fails-closed if
-    /// `repo_hash` has no reconcile state row (Phase 1
-    /// affected-rows == 1 contract).
+    /// Persist watcher lifecycle state. Fails closed unless exactly one
+    /// reconcile-state row exists for `repo_hash`.
+    pub(crate) fn set_watcher_state_immediate(
+        &self,
+        repo_hash: &str,
+        state: WatcherState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        persist_watcher_state(&self.cas_data_dir, repo_hash, state, error)
+    }
+
+    /// Async wrapper for callers that must not perform SQLite I/O on the
+    /// runtime worker thread.
     pub async fn set_watcher_state_by_repo_hash(
         &self,
         repo_hash: String,
@@ -480,12 +685,8 @@ impl RepoReconcileManager {
         error: Option<String>,
     ) -> Result<()> {
         let cas_data_dir = self.cas_data_dir.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            cas_registry::set_watcher_state(&tx, &repo_hash, state, error.as_deref())?;
-            tx.commit()?;
-            Ok(())
+        tokio::task::spawn_blocking(move || {
+            persist_watcher_state(&cas_data_dir, &repo_hash, state, error.as_deref())
         })
         .await
         .map_err(|e| Error::internal_task_panic("reconcile set_watcher_state", e))??;
@@ -499,7 +700,16 @@ impl RepoReconcileManager {
     pub async fn shutdown(&self, timeout: Duration) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
+        self.periodic_shutdown.notify_one();
         let deadline = tokio::time::Instant::now() + timeout;
+        let periodic = self
+            .periodic_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = periodic {
+            let _ = tokio::time::timeout_at(deadline, task).await;
+        }
         loop {
             if self.live_workers.load(Ordering::SeqCst) == 0 {
                 return;
@@ -618,6 +828,19 @@ impl RepoReconcileManager {
         rt.worker_running = false;
         true
     }
+}
+
+fn persist_watcher_state(
+    cas_data_dir: &CasDataDir,
+    repo_hash: &str,
+    state: WatcherState,
+    error: Option<&str>,
+) -> Result<()> {
+    let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
+    let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    cas_registry::set_watcher_state(&tx, repo_hash, state, error)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The per-repo worker loop. Runs until `desired <= applied`
@@ -804,7 +1027,7 @@ async fn run_attempt(
     forced: bool,
 ) -> Result<AttemptOutcome> {
     let _lease = match &mgr.lifecycle {
-        Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(repo_hash)?),
+        Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(repo_hash)?),
         None => None,
     };
     if let Some(lifecycle) = &mgr.lifecycle {
