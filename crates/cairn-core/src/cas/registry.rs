@@ -29,6 +29,7 @@
 //!   `cancel(retired_id)` returns `unknown job id` even after a
 //!   partial cross-store rewrite crashed midway.
 
+use cairn_proto::RepoReconcileStatus;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::Result;
@@ -294,8 +295,9 @@ impl WatcherState {
 }
 
 /// One row in `repo_reconcile_state`. All fields mirror the SQL
-/// schema exactly; downstream (`RepoReconcileManager`, doctor,
-/// `repo_status`) map to the wire types.
+/// schema exactly. Wire mapping and predicates that depend on
+/// relationships between these columns live on this type so
+/// status and diagnostic consumers share one interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoReconcileState {
     pub repo_hash: String,
@@ -311,6 +313,136 @@ pub struct RepoReconcileState {
     pub last_error: Option<String>,
     pub watcher_state: WatcherState,
     pub watcher_error: Option<String>,
+}
+
+/// A relationship between durable generation columns that the
+/// reconcile state machine must never produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileInvariantViolation {
+    AppliedExceedsDesired { applied: i64, desired: i64 },
+    ForceExceedsDesired { force: i64, desired: i64 },
+    AttemptExceedsDesired { attempt: i64, desired: i64 },
+}
+
+impl std::fmt::Display for ReconcileInvariantViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AppliedExceedsDesired { applied, desired } => {
+                write!(
+                    f,
+                    "applied_generation={applied} > desired_generation={desired}"
+                )
+            }
+            Self::ForceExceedsDesired { force, desired } => {
+                write!(f, "force_generation={force} > desired_generation={desired}")
+            }
+            Self::AttemptExceedsDesired { attempt, desired } => {
+                write!(
+                    f,
+                    "attempt_generation={attempt} > desired_generation={desired}"
+                )
+            }
+        }
+    }
+}
+
+impl RepoReconcileState {
+    /// Map this durable row into the shared data/control wire type.
+    #[must_use]
+    pub fn to_wire(&self, repo_hash: &str, aliases: Vec<String>) -> RepoReconcileStatus {
+        RepoReconcileStatus {
+            repo_hash: repo_hash.to_string(),
+            aliases,
+            desired_generation: self.desired_generation,
+            applied_generation: self.applied_generation,
+            force_generation: self.force_generation,
+            attempt_generation: self.attempt_generation,
+            dirty_since_ns: self.dirty_since_ns,
+            last_attempt_ns: self.last_attempt_ns,
+            last_success_ns: self.last_success_ns,
+            consecutive_failures: self.consecutive_failures,
+            next_retry_at_ns: self.next_retry_at_ns,
+            last_error: self.last_error.clone(),
+            watcher_state: self.watcher_state.as_db_str().to_string(),
+            watcher_error: self.watcher_error.clone(),
+            pending: self.pending(),
+            retry_scheduled: self.retry_scheduled(),
+        }
+    }
+
+    /// Whether work is durably pending or currently in flight.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        self.desired_generation > self.applied_generation || self.attempt_generation.is_some()
+    }
+
+    /// Whether the durable state carries a scheduled retry time.
+    #[must_use]
+    pub fn retry_scheduled(&self) -> bool {
+        self.next_retry_at_ns.is_some()
+    }
+
+    /// Return impossible generation relationships in stable priority order.
+    #[must_use]
+    pub fn invariant_violations(&self) -> Vec<ReconcileInvariantViolation> {
+        let mut violations = Vec::new();
+        if self.applied_generation > self.desired_generation {
+            violations.push(ReconcileInvariantViolation::AppliedExceedsDesired {
+                applied: self.applied_generation,
+                desired: self.desired_generation,
+            });
+        }
+        if self.force_generation > self.desired_generation {
+            violations.push(ReconcileInvariantViolation::ForceExceedsDesired {
+                force: self.force_generation,
+                desired: self.desired_generation,
+            });
+        }
+        if let Some(attempt) = self.attempt_generation
+            && attempt > self.desired_generation
+        {
+            violations.push(ReconcileInvariantViolation::AttemptExceedsDesired {
+                attempt,
+                desired: self.desired_generation,
+            });
+        }
+        violations
+    }
+
+    /// Age of an in-flight attempt, saturating at zero for future timestamps.
+    #[must_use]
+    pub fn attempt_age_ns(&self, now_ns: i64) -> Option<i64> {
+        self.attempt_generation.map(|_| {
+            self.last_attempt_ns
+                .map(|last| now_ns.saturating_sub(last))
+                .unwrap_or(0)
+        })
+    }
+
+    /// Whether failures and a retry timestamp describe active backoff.
+    #[must_use]
+    pub fn retry_backoff_scheduled(&self) -> bool {
+        self.consecutive_failures > 0 && self.next_retry_at_ns.is_some()
+    }
+
+    /// Age of an unclaimed dirty gap, or `None` while work is active/retrying.
+    #[must_use]
+    pub fn dirty_gap_ns(&self, now_ns: i64) -> Option<i64> {
+        (self.desired_generation > self.applied_generation
+            && self.attempt_generation.is_none()
+            && self.next_retry_at_ns.is_none())
+        .then(|| {
+            self.dirty_since_ns
+                .map(|since| now_ns.saturating_sub(since))
+                .unwrap_or(0)
+        })
+    }
+
+    /// Whether the durable watcher lifecycle is failed.
+    #[must_use]
+    pub fn watcher_failed(&self) -> bool {
+        self.watcher_state == WatcherState::Failed
+    }
 }
 
 /// Open (creating if necessary) the alias index DB at `path`.
@@ -911,6 +1043,92 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let conn = open(&tmp.path().join("index.db")).unwrap();
         (tmp, conn)
+    }
+
+    fn reconcile_state() -> RepoReconcileState {
+        RepoReconcileState {
+            repo_hash: "stored-hash".into(),
+            desired_generation: 4,
+            applied_generation: 2,
+            force_generation: 1,
+            attempt_generation: Some(3),
+            dirty_since_ns: Some(100),
+            last_attempt_ns: Some(200),
+            last_success_ns: Some(150),
+            consecutive_failures: 2,
+            next_retry_at_ns: Some(500),
+            last_error: Some("EMFILE".into()),
+            watcher_state: WatcherState::Failed,
+            watcher_error: Some("watch failed".into()),
+        }
+    }
+
+    #[test]
+    fn reconcile_state_to_wire_maps_columns_and_derived_flags() {
+        let wire = reconcile_state().to_wire("wire-hash", vec!["a".into(), "b".into()]);
+        assert_eq!(wire.repo_hash, "wire-hash");
+        assert_eq!(wire.aliases, vec!["a", "b"]);
+        assert_eq!(wire.desired_generation, 4);
+        assert_eq!(wire.applied_generation, 2);
+        assert_eq!(wire.force_generation, 1);
+        assert_eq!(wire.attempt_generation, Some(3));
+        assert_eq!(wire.dirty_since_ns, Some(100));
+        assert_eq!(wire.last_attempt_ns, Some(200));
+        assert_eq!(wire.last_success_ns, Some(150));
+        assert_eq!(wire.consecutive_failures, 2);
+        assert_eq!(wire.next_retry_at_ns, Some(500));
+        assert_eq!(wire.last_error.as_deref(), Some("EMFILE"));
+        assert_eq!(wire.watcher_state, "failed");
+        assert_eq!(wire.watcher_error.as_deref(), Some("watch failed"));
+        assert!(wire.pending);
+        assert!(wire.retry_scheduled);
+    }
+
+    #[test]
+    fn reconcile_invariant_violations_keep_doctor_priority_order() {
+        let mut state = reconcile_state();
+        state.desired_generation = 1;
+        state.applied_generation = 4;
+        state.force_generation = 3;
+        state.attempt_generation = Some(2);
+        assert_eq!(
+            state.invariant_violations(),
+            vec![
+                ReconcileInvariantViolation::AppliedExceedsDesired {
+                    applied: 4,
+                    desired: 1,
+                },
+                ReconcileInvariantViolation::ForceExceedsDesired {
+                    force: 3,
+                    desired: 1,
+                },
+                ReconcileInvariantViolation::AttemptExceedsDesired {
+                    attempt: 2,
+                    desired: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_operational_predicates_preserve_column_semantics() {
+        let state = reconcile_state();
+        assert_eq!(state.attempt_age_ns(1_000), Some(800));
+        assert!(state.retry_backoff_scheduled());
+        assert!(state.watcher_failed());
+        assert_eq!(state.dirty_gap_ns(1_000), None);
+
+        let idle_dirty = RepoReconcileState {
+            attempt_generation: None,
+            next_retry_at_ns: None,
+            consecutive_failures: 0,
+            watcher_state: WatcherState::Active,
+            ..state
+        };
+        assert_eq!(idle_dirty.dirty_gap_ns(1_000), Some(900));
+        assert_eq!(idle_dirty.attempt_age_ns(1_000), None);
+        assert!(!idle_dirty.retry_backoff_scheduled());
+        assert!(!idle_dirty.watcher_failed());
     }
 
     #[test]
