@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::lifecycle::RegistrationReconcilePolicy;
 use crate::paths::path_hash;
 use crate::register::{register_repo as cas_register, register_repo_enqueue_analyzers};
 use crate::{Error, Result};
@@ -64,7 +65,23 @@ impl ControlMethod for RegisterRepo {
             }
             None => None,
         };
+        let mut watcher_error = None;
+        let mut arm_receipt = None;
+        if let Some(watch_manager) = &ctx.watch_manager {
+            match watch_manager.arm_repository_if_absent(repo_hash.clone(), canonical.clone()) {
+                Ok(receipt) => arm_receipt = Some(receipt),
+                Err(err) => {
+                    warn!(
+                        alias = %args.alias,
+                        error = %err,
+                        "register_repo continuing after watcher arm failed"
+                    );
+                    watcher_error = Some(err.to_string());
+                }
+            }
+        }
 
+        let legacy_publish = lifecycle.is_none();
         let work_result = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut conn = cas_store::open(&store_path)?;
             let outcome = match job_manager.as_deref() {
@@ -79,7 +96,7 @@ impl ControlMethod for RegisterRepo {
                 None => cas_register(&mut conn, &worktree, now_ns)?,
             };
 
-            if lifecycle.is_none() {
+            if legacy_publish {
                 // Legacy constructor used by focused tests. Production
                 // publishes aliases through RepoLifecycleManager.
                 let mut idx = cas_registry::open(&index_path)?;
@@ -90,16 +107,61 @@ impl ControlMethod for RegisterRepo {
             Ok(outcome)
         })
         .await
-        .map_err(|e| Error::internal_task_panic("register_repo", e))?;
+        .unwrap_or_else(|error| Err(Error::internal_task_panic("register_repo", error)));
 
         let outcome = match work_result {
             Ok(outcome) => {
                 if let (Some(lifecycle), Some(permit)) = (&ctx.lifecycle, permit) {
-                    lifecycle.publish_registration(permit, &args.alias, args.persistent, now_ns)?;
+                    let reconcile_policy = if ctx.reconcile.is_some() {
+                        RegistrationReconcilePolicy::ImmediateCatchUp
+                    } else {
+                        RegistrationReconcilePolicy::None
+                    };
+                    let publication = match lifecycle.publish_registration(
+                        permit,
+                        &args.alias,
+                        args.persistent,
+                        now_ns,
+                        reconcile_policy,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(error) => {
+                            if let (Some(watch_manager), Some(receipt)) =
+                                (&ctx.watch_manager, arm_receipt.take())
+                            {
+                                watch_manager.rollback_arm(receipt);
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if publication.catch_up_generation.is_some()
+                        && let Some(reconcile) = &ctx.reconcile
+                    {
+                        reconcile.wake_recorded_generation(
+                            &publication.repo_hash,
+                            Some(args.alias.clone()),
+                        );
+                    }
+                }
+                if ctx.watch_manager.is_some()
+                    && let Some(reconcile) = &ctx.reconcile
+                {
+                    let (state, error) = match &watcher_error {
+                        Some(error) => (cas_registry::WatcherState::Failed, Some(error.clone())),
+                        None => (cas_registry::WatcherState::Active, None),
+                    };
+                    reconcile
+                        .set_watcher_state_by_repo_hash(repo_hash.clone(), state, error)
+                        .await?;
                 }
                 outcome
             }
             Err(err) => {
+                if let (Some(watch_manager), Some(receipt)) =
+                    (&ctx.watch_manager, arm_receipt.take())
+                {
+                    watch_manager.rollback_arm(receipt);
+                }
                 if let (Some(lifecycle), Some(permit)) = (&ctx.lifecycle, permit) {
                     lifecycle.abort_registration(permit).await?;
                 }
@@ -114,17 +176,10 @@ impl ControlMethod for RegisterRepo {
             blobs_parsed = outcome.blobs_parsed,
             "register_repo complete"
         );
-        let mut ack = Ack::with_alias(args.alias.clone());
-        if let Some(watch_manager) = &ctx.watch_manager {
-            if let Err(err) = watch_manager.watch_alias(args.alias.clone(), canonical) {
-                warn!(
-                    alias = %args.alias,
-                    error = %err,
-                    "register_repo completed but watcher start failed"
-                );
-                ack = Ack::with_alias_and_watcher_failed(args.alias.clone(), err.to_string());
-            }
-        }
+        let ack = match watcher_error {
+            Some(error) => Ack::with_alias_and_watcher_failed(args.alias.clone(), error),
+            None => Ack::with_alias(args.alias.clone()),
+        };
         let mut value = serde_json::to_value(ack).unwrap();
         if let serde_json::Value::Object(obj) = &mut value {
             obj.insert(
@@ -139,3 +194,69 @@ impl ControlMethod for RegisterRepo {
 #[allow(unsafe_code)]
 #[distributed_slice(CONTROL_METHODS)]
 static REGISTER: fn() -> Box<dyn ControlMethod> = || Box::new(RegisterRepo);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use cairn_watch::WatchBackend;
+    use serde_json::json;
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::ctl::CtlCtx;
+    use crate::lifecycle::RepoLifecycleManager;
+    use crate::paths::CasDataDir;
+    use crate::reconcile::RepoReconcileManager;
+    use crate::watcher::WatchManager;
+
+    #[tokio::test]
+    async fn failed_initial_scan_rolls_back_only_its_watcher_arm() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let reconcile =
+            RepoReconcileManager::new_with_lifecycle(cas.clone(), None, lifecycle.clone());
+        let watchers = Arc::new(WatchManager::with_backend_and_reconcile(
+            cas.clone(),
+            WatchBackend::Poll,
+            reconcile.clone(),
+        ));
+        let ctx = CtlCtx {
+            cas_data_dir: cas.clone(),
+            shutdown: Arc::new(Notify::new()),
+            watch_manager: Some(watchers.clone()),
+            job_manager: None,
+            reconcile: Some(reconcile),
+            lifecycle: Some(lifecycle),
+            version: env!("CARGO_PKG_VERSION"),
+            started_at: Instant::now(),
+        };
+        let canonical = root.path().canonicalize().unwrap();
+        let repo_hash = path_hash(&canonical);
+
+        let error = RegisterRepo
+            .dispatch(
+                &ctx,
+                json!({
+                    "alias": "not-a-git-repository",
+                    "path": canonical,
+                }),
+            )
+            .await
+            .expect_err("a directory without a Git repository must fail registration");
+
+        assert!(error.to_string().contains("git"));
+        assert!(!watchers.is_watching_repository(&repo_hash));
+        let index = cas_registry::open(&cas.index_db_path()).unwrap();
+        assert!(
+            cas_registry::lookup_repository(&index, &repo_hash)
+                .unwrap()
+                .is_none(),
+            "failed new registration must not leave a canonical owner"
+        );
+    }
+}

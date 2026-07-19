@@ -1084,6 +1084,91 @@ pub fn increment_desired_generation(
     Ok(next)
 }
 
+/// Bump `desired_generation` and make the resulting work immediately
+/// eligible to run. Registration catch-up and daemon-startup priming use
+/// this path because an old retry deadline must not delay a newly observed
+/// filesystem state. Failure counters and error text remain intact until a
+/// successful attempt clears them.
+pub fn increment_immediate_desired_generation(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    now_ns: i64,
+) -> Result<i64> {
+    let next = increment_desired_generation(tx, repo_hash, now_ns)?;
+    let changed = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET next_retry_at_ns = NULL
+         WHERE repo_hash = ?1",
+        params![repo_hash],
+    )?;
+    if changed != 1 {
+        return Err(invalid_transition(&format!(
+            "immediate dirty: missing repo_hash={repo_hash}"
+        )));
+    }
+    Ok(next)
+}
+
+/// Prime every canonical repository that is not being removed for one
+/// immediate startup reconcile. Callers wrap this helper in one transaction,
+/// so a counter overflow or any SQLite failure rolls back every bump.
+pub fn prime_startup_generations(tx: &Transaction<'_>, now_ns: i64) -> Result<Vec<(String, i64)>> {
+    let mut stmt = tx.prepare(
+        "SELECT repo_hash FROM repositories
+         WHERE removal_requested_at_ns IS NULL
+         ORDER BY repo_hash",
+    )?;
+    let repo_hashes = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut primed = Vec::with_capacity(repo_hashes.len());
+    for repo_hash in repo_hashes {
+        let generation = increment_immediate_desired_generation(tx, &repo_hash, now_ns)?;
+        primed.push((repo_hash, generation));
+    }
+    Ok(primed)
+}
+
+/// Conditionally record a low-frequency full reconcile.
+///
+/// A periodic generation is added only when the repository is active, clean,
+/// idle, and its last successful scan is at least `max_clean_age_ns` old. The
+/// predicate and bump execute under the caller's transaction, preventing a
+/// watcher request racing this check from losing or duplicating work.
+pub fn increment_periodic_generation_if_due(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    now_ns: i64,
+    max_clean_age_ns: i64,
+) -> Result<Option<i64>> {
+    if max_clean_age_ns < 0 {
+        return Err(crate::Error::InvalidArgument(
+            "periodic reconcile max age must be non-negative".into(),
+        ));
+    }
+    let cutoff = now_ns.saturating_sub(max_clean_age_ns);
+    let due: bool = tx
+        .query_row(
+            "SELECT r.removal_requested_at_ns IS NULL
+                    AND s.desired_generation = s.applied_generation
+                    AND s.attempt_generation IS NULL
+                    AND (s.last_success_ns IS NULL OR s.last_success_ns <= ?1)
+             FROM repositories r
+             JOIN repo_reconcile_state s ON s.repo_hash = r.repo_hash
+             WHERE r.repo_hash = ?2",
+            params![cutoff, repo_hash],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !due {
+        return Ok(None);
+    }
+    Ok(Some(increment_desired_generation(tx, repo_hash, now_ns)?))
+}
+
 /// Bump `desired_generation` AND `force_generation` under `tx`.
 /// Used by manual `cairn ctl repo reindex` requests so a
 /// concurrent FS event that also happens to bump desired cannot
@@ -1715,6 +1800,109 @@ mod tests {
         assert_eq!(s.last_error.as_deref(), Some("git failed: EMFILE"));
         assert_eq!(s.consecutive_failures, 1);
         assert_eq!(s.next_retry_at_ns, Some(5000));
+    }
+
+    #[test]
+    fn immediate_generation_clears_retry_deadline_but_preserves_failure_evidence() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        mark_attempt_failure(&tx, "h", 1, "transient failure", 5_000).unwrap();
+        assert_eq!(
+            increment_immediate_desired_generation(&tx, "h", 30).unwrap(),
+            2
+        );
+        tx.commit().unwrap();
+
+        let state = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(state.desired_generation, 2);
+        assert_eq!(state.next_retry_at_ns, None);
+        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(state.last_error.as_deref(), Some("transient failure"));
+    }
+
+    #[test]
+    fn startup_prime_bumps_active_repositories_and_skips_removing() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "active", "/active", 0).unwrap();
+        upsert_repository(&tx, "removing", "/removing", 0).unwrap();
+        mark_removal_requested(&tx, "removing", RepositoryRemovalReason::MissingRoot, 1).unwrap();
+        let primed = prime_startup_generations(&tx, 10).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(primed, vec![("active".to_string(), 1)]);
+        assert_eq!(
+            get_reconcile_state(&c, "active")
+                .unwrap()
+                .unwrap()
+                .desired_generation,
+            1
+        );
+        assert_eq!(
+            get_reconcile_state(&c, "removing")
+                .unwrap()
+                .unwrap()
+                .desired_generation,
+            0
+        );
+    }
+
+    #[test]
+    fn startup_prime_overflow_rolls_back_every_repository() {
+        let (_t, mut c) = fresh();
+        {
+            let tx = c.transaction().unwrap();
+            upsert_repository(&tx, "a", "/a", 0).unwrap();
+            upsert_repository(&tx, "z", "/z", 0).unwrap();
+            tx.execute(
+                "UPDATE repo_reconcile_state SET desired_generation = ?1 WHERE repo_hash = 'z'",
+                params![i64::MAX],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let tx = c.transaction().unwrap();
+        let err = prime_startup_generations(&tx, 10).unwrap_err();
+        assert!(format!("{err}").contains("overflow"));
+        tx.rollback().unwrap();
+        assert_eq!(
+            get_reconcile_state(&c, "a")
+                .unwrap()
+                .unwrap()
+                .desired_generation,
+            0,
+            "the earlier bump must roll back with the overflowing row"
+        );
+    }
+
+    #[test]
+    fn periodic_generation_requires_clean_idle_and_aged_state() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 1).unwrap();
+        mark_attempt_start(&tx, "h", 1, 2).unwrap();
+        mark_attempt_success(&tx, "h", 1, 100).unwrap();
+
+        assert_eq!(
+            increment_periodic_generation_if_due(&tx, "h", 120, 30).unwrap(),
+            None,
+            "a scan younger than the max age is not due"
+        );
+        assert_eq!(
+            increment_periodic_generation_if_due(&tx, "h", 130, 30).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            increment_periodic_generation_if_due(&tx, "h", 200, 30).unwrap(),
+            None,
+            "a durable dirty gap prevents periodic generation stacking"
+        );
+        tx.commit().unwrap();
     }
 
     #[test]
