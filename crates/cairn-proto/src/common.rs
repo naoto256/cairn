@@ -217,6 +217,9 @@ pub enum DiagnosticCode {
     AnalyzerBinaryMissing,
     WorkspaceUnsuitable,
     QueryFailedPartial,
+    /// A lookup without an exact file target could not prove that its empty
+    /// result came from the current fully reconciled snapshot.
+    SnapshotStale,
     /// The selected current snapshot could not prove that the requested file
     /// and rows came from a fresh, fully reconciled publication.
     FileNotIndexedOrSnapshotStale,

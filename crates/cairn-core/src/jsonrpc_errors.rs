@@ -21,6 +21,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
         }
         Error::RepoNotFound { .. } => error_code::REPO_NOT_FOUND,
         Error::FileNotIndexed { .. } => error_code::FILE_NOT_INDEXED,
+        Error::SnapshotStale { .. } => error_code::SNAPSHOT_STALE,
         Error::Internal(_) => error_code::INTERNAL_ERROR,
         _ => error_code::INTERNAL_ERROR,
     };
@@ -68,6 +69,34 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             }],
             "repo": repo,
             "file": file,
+            "reason": reason,
+        }));
+    }
+    if let Error::SnapshotStale { repo, reason } = err
+        && let Some(error) = response.error.as_mut()
+    {
+        error.data = Some(json!({
+            "completeness": Completeness::partial_truncated("snapshot_stale"),
+            "diagnostics": [Diagnostic {
+                code: DiagnosticCode::SnapshotStale,
+                severity: DiagnosticSeverity::Warning,
+                message: "The current snapshot could not prove freshness, so this empty lookup is not a confirmed miss.".into(),
+                language: None,
+                analyzer_id: None,
+                repo: repo.clone(),
+                file: None,
+                details: Some(json!({ "reason": reason })),
+            }],
+            "hints": [Hint {
+                code: HintCode::SnapshotStale,
+                message: "Wait for reconciliation or run `cairn ctl repo reindex <alias>` before retrying the lookup.".into(),
+                action: Some(HintAction::WaitForIndex),
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: repo.clone(),
+            }],
+            "repo": repo,
             "reason": reason,
         }));
     }
@@ -177,5 +206,25 @@ mod tests {
             data["hints"][0]["code"],
             "file_not_indexed_or_snapshot_stale"
         );
+    }
+
+    #[test]
+    fn snapshot_stale_error_has_no_synthetic_file_target() {
+        let response = error_from(
+            RequestId::Number(1),
+            &Error::SnapshotStale {
+                repo: Some("demo".into()),
+                reason: "reconcile_generation_gap".into(),
+            },
+        );
+        let error = response.error.unwrap();
+
+        assert_eq!(error.code, error_code::SNAPSHOT_STALE);
+        let data = error.data.unwrap();
+        assert_eq!(data["completeness"]["reason"], "snapshot_stale");
+        assert_eq!(data["diagnostics"][0]["code"], "snapshot_stale");
+        assert_eq!(data["hints"][0]["code"], "snapshot_stale");
+        assert!(data.get("file").is_none());
+        assert!(!data.to_string().contains("<unspecified>"));
     }
 }

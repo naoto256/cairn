@@ -101,6 +101,8 @@ pub mod error_code {
     pub const REPO_NOT_FOUND: i32 = -32001;
     /// Requested file is not present in the selected snapshot's index.
     pub const FILE_NOT_INDEXED: i32 = -32002;
+    /// A non-file-targeted lookup could not prove current-snapshot freshness.
+    pub const SNAPSHOT_STALE: i32 = -32004;
 }
 
 /// Construct a successful JSON-RPC response.
