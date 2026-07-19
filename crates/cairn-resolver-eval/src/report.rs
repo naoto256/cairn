@@ -93,6 +93,23 @@ impl TierReport {
             extra,
         }
     }
+
+    /// Score only hits whose winning resolution came from Tier-2.5
+    /// or Tier-3. Tier-3 is accepted because a higher-ranked resolver
+    /// producing the correct answer must not reduce the Tier-2.5
+    /// score. Tier-2 facts and provenance-free symbol hits are omitted.
+    pub fn score_tier25(expected: &[ExpectedHit], actual: &[ActualHit]) -> Self {
+        let resolved: Vec<ActualHit> = actual
+            .iter()
+            .filter(|hit| {
+                hit.kind_source.as_deref().is_some_and(|source| {
+                    source.starts_with("tier25-") || source.starts_with("tier3-")
+                })
+            })
+            .cloned()
+            .collect();
+        Self::score(expected, &resolved)
+    }
 }
 
 /// Full case report — both tiers side by side. Tier-3 may carry an
@@ -104,10 +121,8 @@ pub struct EvalReport {
     pub case: &'static str,
     pub language: &'static str,
     pub tier2: TierReport,
-    /// Score for the Tier-2.5 (cross-file syntactic) resolver. Until
-    /// the per-language Tier-2.5 backend is wired into the runner the
-    /// actual set is empty and recall reflects nothing more than the
-    /// case author's promise.
+    /// Score for the Tier-2.5 (cross-file syntactic) resolver, filtered
+    /// to hits whose winning provenance is `tier25-*` or `tier3-*`.
     pub tier25: TierReport,
     pub tier3: TierReport,
 }
@@ -150,7 +165,14 @@ mod tests {
             line,
             target_qualified: q.to_string(),
             parser_id: "test".to_string(),
+            kind_source: None,
         }
+    }
+
+    fn act_from(path: &str, line: u32, q: &str, source: Option<&str>) -> ActualHit {
+        let mut hit = act(path, line, q);
+        hit.kind_source = source.map(str::to_string);
+        hit
     }
 
     #[test]
@@ -180,5 +202,30 @@ mod tests {
         assert_eq!(r.extra.len(), 1);
         assert!((r.precision - 0.5).abs() < 1e-9);
         assert!((r.recall - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tier25_scoring_excludes_tier2_and_provenance_free_hits() {
+        let expected = vec![exp("a.rb", 1, "Target")];
+        let actual = vec![
+            act_from("a.rb", 1, "Target", Some("tier2-fact")),
+            act_from("b.rb", 2, "Other", None),
+        ];
+        let report = TierReport::score_tier25(&expected, &actual);
+        assert_eq!(report.recall, 0.0);
+        assert_eq!(report.precision, 0.0);
+        assert!(report.extra.is_empty());
+    }
+
+    #[test]
+    fn tier25_scoring_accepts_tier25_and_higher_rank_tier3() {
+        let expected = vec![exp("a.rb", 1, "A"), exp("b.rb", 2, "B")];
+        let actual = vec![
+            act_from("a.rb", 1, "A", Some("tier25-ruby-resolver")),
+            act_from("b.rb", 2, "B", Some("tier3-ruby-lsp")),
+        ];
+        let report = TierReport::score_tier25(&expected, &actual);
+        assert_eq!(report.recall, 1.0);
+        assert_eq!(report.precision, 1.0);
     }
 }

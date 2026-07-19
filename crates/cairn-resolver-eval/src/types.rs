@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum Tool {
     FindCallers,
     FindCallees,
+    FindImports,
     FindSubtypes,
     FindSupertypes,
     FindSymbols,
@@ -24,7 +25,8 @@ pub enum Tool {
 pub struct Query {
     /// Symbol name or qualified name (callers / callees / subtypes /
     /// supertypes use this; `find_symbols` uses it as the `query`
-    /// substring).
+    /// substring). `find_imports` interprets it as an optional
+    /// repo-relative source-file filter.
     pub symbol: Option<String>,
     /// Optional `kind` filter for `find_symbols` (e.g. `"class"`).
     pub kind: Option<String>,
@@ -44,14 +46,16 @@ pub struct ExpectedHit {
 }
 
 /// Concrete hit produced by the runner from a resolver result. Carries
-/// the same key as `ExpectedHit` plus an optional parser id for
-/// debugging which backend surfaced a row.
+/// the same key as `ExpectedHit`, a parser id, and optional resolution
+/// provenance. `find_symbols` has no resolution-layer provenance and
+/// therefore records `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActualHit {
     pub path: String,
     pub line: u32,
     pub target_qualified: String,
     pub parser_id: String,
+    pub kind_source: Option<String>,
 }
 
 /// One row in the golden table. Static so cases can live in a `const`

@@ -1,0 +1,3 @@
+protocol Greeter {
+    func greet()
+}
