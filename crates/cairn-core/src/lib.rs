@@ -79,6 +79,13 @@ pub enum Error {
         file: String,
         reason: String,
     },
+    /// A non-file-targeted lookup cannot distinguish a genuine miss from a
+    /// stale current snapshot.
+    #[error("current snapshot freshness could not be proven{repo_suffix}: {reason}", repo_suffix = repo.as_ref().map(|repo| format!(" for repo `{repo}`")).unwrap_or_default())]
+    SnapshotStale {
+        repo: Option<String>,
+        reason: String,
+    },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("internal error: {0}")]

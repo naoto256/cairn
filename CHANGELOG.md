@@ -41,7 +41,10 @@ versions follow [SemVer](https://semver.org/).
   miss from `get_symbol_source` returns JSON-RPC `-32002` (`FileNotIndexed`) with
   structured `error.data` containing completeness, diagnostics, hints, repo,
   file, and reason. A fresh qualified-name miss in an indexed file preserves
-  the existing not-found behavior. Store migration v13 adds a nullable
+  the existing not-found behavior. A qualified-name miss without a file target
+  now returns JSON-RPC `-32004` (`SnapshotStale`) when current-snapshot
+  freshness cannot be proven, rather than fabricating a `FileNotIndexed` error
+  for an `<unspecified>` path. Store migration v13 adds a nullable
   reconcile-generation receipt to tentative anchor publication; ordinary
   non-reconcile anchor writes clear that receipt rather than carrying stale
   freshness forward.
