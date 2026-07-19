@@ -152,17 +152,18 @@ pub fn watch_repo_with_backend(
     backend: WatchBackend,
 ) -> Result<WatcherHandle, WatchError> {
     let repo_root = repo_root.canonicalize()?;
-    let git_metadata = resolve_git_metadata(&repo_root)?;
+    let git_metadata = resolve_git_metadata(&repo_root).unwrap_or_else(|err| {
+        warn!(
+            root = %repo_root.display(),
+            error = %err,
+            "git metadata resolution failed; watcher is fail-open"
+        );
+        GitMetadataPaths::fail_open(&repo_root)
+    });
     let classifier = EventClassifier::new(&repo_root, git_metadata.clone(), tx);
 
-    let event_handler = move |result: DebounceEventResult| match result {
-        Ok(events) => classifier.handle_batch(&events),
-        Err(errs) => {
-            for e in errs {
-                warn!(?e, "notify error");
-                classifier.handle_watch_error();
-            }
-        }
+    let event_handler = move |result: DebounceEventResult| {
+        handle_debounce_result(&classifier, result);
     };
     let mut debouncer = match backend {
         WatchBackend::Recommended => {
@@ -187,6 +188,18 @@ pub fn watch_repo_with_backend(
         }
     }
     Ok(WatcherHandle { debouncer })
+}
+
+fn handle_debounce_result(classifier: &EventClassifier, result: DebounceEventResult) {
+    match result {
+        Ok(events) => classifier.handle_batch(&events),
+        Err(errs) => {
+            for err in &errs {
+                warn!(?err, "notify error");
+            }
+            classifier.handle_watch_error_batch();
+        }
+    }
 }
 
 impl WatcherDebouncer {
@@ -242,8 +255,12 @@ impl EventClassifier {
             if event.paths.iter().any(|path| self.is_ignore_control(path)) {
                 return Some(RescanReason::IgnoreRulesChanged);
             }
-            is_directory_topology_change(event.kind)
-                .then_some(RescanReason::DirectoryTopologyChanged)
+            (is_directory_topology_change(event.kind)
+                && event
+                    .paths
+                    .iter()
+                    .any(|path| self.is_working_tree_path(path)))
+            .then_some(RescanReason::DirectoryTopologyChanged)
         });
         if let Some(reason) = reason {
             self.reload_matcher();
@@ -262,7 +279,7 @@ impl EventClassifier {
         }
     }
 
-    fn handle_watch_error(&self) {
+    fn handle_watch_error_batch(&self) {
         self.reload_matcher();
         self.emit(WatchEvent::Rescan {
             reason: RescanReason::WatchError,
@@ -342,8 +359,17 @@ impl EventClassifier {
 
     fn is_ignore_control(&self, path: &Path) -> bool {
         path == self.git_metadata.info_exclude
-            || (path.starts_with(self.repo_root.as_path())
+            || (self.is_working_tree_path(path)
                 && path.file_name().is_some_and(|name| name == ".gitignore"))
+    }
+
+    fn is_working_tree_path(&self, path: &Path) -> bool {
+        path.starts_with(self.repo_root.as_path())
+            && !self
+                .git_metadata
+                .watch_roots()
+                .iter()
+                .any(|git_root| path.starts_with(git_root))
     }
 
     fn classify(&self, path: &Path, kind: EventKind) -> Option<WatchEvent> {
@@ -720,6 +746,86 @@ mod tests {
                 reason: RescanReason::DirectoryTopologyChanged
             })
         );
+    }
+
+    #[tokio::test]
+    async fn git_internal_topology_change_does_not_force_full_reconcile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+
+        let object_directory = notify::Event::new(EventKind::Create(CreateKind::Folder))
+            .add_path(root.join(".git/objects/ab"));
+        classifier.handle_batch(&[debounced(object_directory)]);
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "git object topology must not trigger a working-tree rescan"
+        );
+
+        let info_exclude = root.join(".git/info/exclude");
+        std::fs::create_dir_all(info_exclude.parent().unwrap()).unwrap();
+        std::fs::write(&info_exclude, "generated.rs\n").unwrap();
+        let exclude_event =
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(info_exclude);
+        classifier.handle_batch(&[debounced(exclude_event)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::IgnoreRulesChanged
+            }),
+            "the watched info/exclude file remains an explicit git-metadata exception"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_error_batch_reloads_and_rescans_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+
+        handle_debounce_result(
+            &classifier,
+            Err(vec![
+                notify::Error::generic("first injected watcher error"),
+                notify::Error::generic("second injected watcher error"),
+            ]),
+        );
+
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::WatchError
+            })
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "one notify error batch must emit exactly one rescan edge"
+        );
+    }
+
+    #[test]
+    fn malformed_git_file_keeps_watcher_fail_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".git"), "not-a-gitdir-file\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        let watcher =
+            watch_repo_with_backend(root, Duration::from_millis(50), tx, WatchBackend::Poll);
+
+        if let Err(err) = watcher {
+            panic!("malformed .git metadata must not leave the repository unwatched: {err}");
+        }
     }
 
     #[tokio::test]
