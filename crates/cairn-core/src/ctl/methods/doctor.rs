@@ -820,7 +820,7 @@ fn parser_revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> 
 ///   succeeded at their expected revision, yet `blobs.parser_revision`
 ///   still mismatches. The reindex chain
 ///   (`scanner` → `enqueue_full_repo_reindex` → `register_repo_inner`
-///   → `parse_pending_blobs`) wrote the new analyzer rows without
+///   → pre-publication Tier-1 parse) wrote the new analyzer rows without
 ///   updating the parser layer, which means a transiently-inaccessible
 ///   worktree (D PR's bug class) leaked through.
 ///
@@ -2740,7 +2740,7 @@ mod tests {
     /// silent data loss class observability safety net: the analyzer
     /// chain is green but the parser layer is still stale, so the
     /// full-reindex chain broke somewhere between
-    /// `enqueue_full_repo_reindex` and `parse_pending_blobs`.
+    /// `enqueue_full_repo_reindex` and the pre-publication Tier-1 parse.
     #[test]
     fn parser_drift_all_analyzers_succeeded_is_fail_chain_bug() {
         let probes = vec![parser_drift_probe(

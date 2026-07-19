@@ -12,12 +12,14 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use crate::cas::registry as cas_registry;
+use crate::cas::store as cas_store;
 use crate::lifecycle::{RegistrationReconcilePolicy, RepoLifecycleManager};
 use crate::paths::CasDataDir;
 use crate::reconcile::{
     Clock, PeriodicReconcilePolicy, ReconcileTrigger, RepoReconcileManager, RetryPolicy,
     TestRegisterHookFn,
 };
+use crate::testutil::init_repo;
 
 // ─── Test-only clock / hook / helpers ─────────────────────────
 
@@ -444,6 +446,40 @@ async fn mf5_failure_preserves_gap_and_bumps_failure_counter() {
             .is_some_and(|s| s.contains("register EMFILE"))
     );
 
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn incomplete_full_scan_preserves_durable_generation_gap() {
+    let (repo, _commit) = init_repo(&[("src/lib.rs", "pub fn indexed() {}\n")]);
+    std::fs::write(repo.path().join(".gitignore"), [0xff]).unwrap();
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "demo", &repo.path().to_string_lossy(), "scan-failure");
+    cas_store::open(&cas.store_db_path("scan-failure")).unwrap();
+    let clock = ManualClock::new(1_000_000);
+    let mgr = build_manager(cas.clone(), clock);
+
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || read_state(&cas, "scan-failure").consecutive_failures >= 1,
+        2000,
+        "incomplete scan failure to be recorded",
+    )
+    .await;
+
+    let state = read_state(&cas, "scan-failure");
+    assert_eq!(state.desired_generation, 1);
+    assert_eq!(state.applied_generation, 0);
+    assert!(state.attempt_generation.is_none());
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("scan:"))
+    );
+    assert!(state.next_retry_at_ns.is_some());
     mgr.shutdown(Duration::from_secs(2)).await;
 }
 
