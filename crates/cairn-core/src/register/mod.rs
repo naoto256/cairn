@@ -57,6 +57,51 @@ pub struct RegisterOutcome {
     /// Number of `(blob, parser)` pairs that were parsed fresh
     /// (= not reused from a prior call).
     pub blobs_parsed: usize,
+    /// Present only when a reconcile attempt atomically stamped the
+    /// tentative anchor with its durable generation proof.
+    pub publication: Option<ReconcilePublicationReceipt>,
+}
+
+/// Durable store-side proof produced by one reconcile publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcilePublicationReceipt {
+    pub anchor: AnchorName,
+    pub manifest_id: ManifestId,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReconcileRegistration<'a> {
+    pub alias: &'a str,
+    pub repo_hash: &'a str,
+    pub worktree_path: &'a Path,
+    pub now_ns: i64,
+    pub generation: i64,
+    pub forced: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RegistrationPublication {
+    Direct { dedupe_unchanged_tentative: bool },
+    Reconcile { generation: i64, forced: bool },
+}
+
+impl RegistrationPublication {
+    fn dedupe_unchanged_tentative(self) -> bool {
+        match self {
+            Self::Direct {
+                dedupe_unchanged_tentative,
+            } => dedupe_unchanged_tentative,
+            Self::Reconcile { forced, .. } => !forced,
+        }
+    }
+
+    fn generation(self) -> Option<i64> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Reconcile { generation, .. } => Some(generation),
+        }
+    }
 }
 
 /// Register a worktree against the open CAS store.
@@ -162,11 +207,85 @@ pub(crate) fn register_repo_force_analyzers_enqueue(
     )
 }
 
+pub(crate) fn register_repo_reconcile_enqueue_analyzers(
+    conn: &mut Connection,
+    request: ReconcileRegistration<'_>,
+    job_manager: &JobManager,
+) -> Result<RegisterOutcome> {
+    register_repo_inner_with_publication(
+        conn,
+        request.worktree_path,
+        request.now_ns,
+        RegistrationPublication::Reconcile {
+            generation: request.generation,
+            forced: request.forced,
+        },
+        |conn, repo_root, manifest_id, entries, now_ns| {
+            job_manager.enqueue_reindex(EnqueueReindex {
+                conn,
+                alias: request.alias,
+                repo_hash: request.repo_hash,
+                repo_root,
+                manifest_id,
+                entries,
+                now_ns,
+            })
+        },
+    )
+}
+
+pub(crate) fn register_repo_reconcile(
+    conn: &mut Connection,
+    worktree_path: &Path,
+    now_ns: i64,
+    generation: i64,
+    forced: bool,
+) -> Result<RegisterOutcome> {
+    register_repo_inner_with_publication(
+        conn,
+        worktree_path,
+        now_ns,
+        RegistrationPublication::Reconcile { generation, forced },
+        |conn, repo_root, manifest_id, entries, now_ns| {
+            let _inserted =
+                run_registered_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns)?;
+            Ok(Vec::new())
+        },
+    )
+}
+
 fn register_repo_inner<F>(
     conn: &mut Connection,
     worktree_path: &Path,
     now_ns: i64,
     dedupe_unchanged_tentative: bool,
+    run_analyzers: F,
+) -> Result<RegisterOutcome>
+where
+    F: FnMut(
+        &mut Connection,
+        &Path,
+        ManifestId,
+        &[ManifestEntry],
+        i64,
+    ) -> Result<Vec<QueuedAnalyzerJob>>,
+{
+    register_repo_inner_with_publication(
+        conn,
+        worktree_path,
+        now_ns,
+        RegistrationPublication::Direct {
+            dedupe_unchanged_tentative,
+        },
+        run_analyzers,
+    )
+}
+
+fn register_repo_inner_with_publication<F>(
+    conn: &mut Connection,
+    worktree_path: &Path,
+    now_ns: i64,
+    publication: RegistrationPublication,
     mut run_analyzers: F,
 ) -> Result<RegisterOutcome>
 where
@@ -178,6 +297,7 @@ where
         i64,
     ) -> Result<Vec<QueuedAnalyzerJob>>,
 {
+    let dedupe_unchanged_tentative = publication.dedupe_unchanged_tentative();
     let backends = all_backends();
     let include = |hint: &PathHint<'_>| {
         if pick_backend_for_path(&backends, hint.path).is_some() {
@@ -281,7 +401,20 @@ where
         &live_ref_names(worktree_path, "refs/heads")?,
     )?;
     prune_stale_ref_anchors(&tx, "tag/", &live_ref_names(worktree_path, "refs/tags")?)?;
-    anchor::set(&tx, &tentative_anchor, tentative, now_ns)?;
+    let publication_receipt = match publication.generation() {
+        Some(generation) => {
+            anchor::set_reconciled(&tx, &tentative_anchor, tentative, now_ns, generation)?;
+            Some(ReconcilePublicationReceipt {
+                anchor: tentative_anchor.clone(),
+                manifest_id: tentative,
+                generation,
+            })
+        }
+        None => {
+            anchor::set(&tx, &tentative_anchor, tentative, now_ns)?;
+            None
+        }
+    };
 
     tx.commit()?;
 
@@ -340,6 +473,7 @@ where
         skip_analyzers_for_unchanged_manifest,
         analyzer_jobs,
         blobs_parsed,
+        publication: publication_receipt,
     })
 }
 
@@ -660,6 +794,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(tent, outcome.tentative_manifest);
+        assert!(outcome.publication.is_none());
+        assert_eq!(
+            anchor::get(&conn, &AnchorName::tentative(outcome.worktree_id))
+                .unwrap()
+                .unwrap()
+                .reconcile_generation,
+            None
+        );
 
         // A symbol named `greet` was indexed against some blob in the
         // committed manifest.
@@ -690,6 +832,67 @@ mod tests {
         );
         // Worktree row should be the same; upsert is idempotent.
         assert_eq!(first.worktree_id, second.worktree_id);
+    }
+
+    #[test]
+    fn reconcile_register_atomically_stamps_tentative_generation() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let outcome = register_repo_reconcile(&mut conn, repo.path(), 10, 7, false).unwrap();
+        let receipt = outcome.publication.unwrap();
+        let durable = anchor::get(&conn, &receipt.anchor).unwrap().unwrap();
+
+        assert_eq!(receipt.manifest_id, outcome.tentative_manifest);
+        assert_eq!(receipt.generation, 7);
+        assert_eq!(durable.manifest_id, receipt.manifest_id);
+        assert_eq!(durable.reconcile_generation, Some(7));
+    }
+
+    #[test]
+    fn unchanged_reconcile_reuses_manifest_but_advances_generation_receipt() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let first = register_repo_reconcile(&mut conn, repo.path(), 10, 3, false).unwrap();
+        let second = register_repo_reconcile(&mut conn, repo.path(), 20, 4, false).unwrap();
+
+        assert_eq!(first.tentative_manifest, second.tentative_manifest);
+        let receipt = second.publication.unwrap();
+        assert_eq!(receipt.generation, 4);
+        assert_eq!(
+            anchor::get(&conn, &receipt.anchor)
+                .unwrap()
+                .unwrap()
+                .reconcile_generation,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn analyzer_failure_after_publication_leaves_durable_receipt() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let err = register_repo_inner_with_publication(
+            &mut conn,
+            repo.path(),
+            10,
+            RegistrationPublication::Reconcile {
+                generation: 8,
+                forced: false,
+            },
+            |_, _, _, _, _| Err(crate::Error::Internal("enqueue failed".into())),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("enqueue failed"));
+        let tentative = anchor::list_prefix(&conn, "tentative/").unwrap();
+        assert_eq!(tentative.len(), 1);
+        assert_eq!(tentative[0].reconcile_generation, Some(8));
     }
 
     #[test]

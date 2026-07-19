@@ -11,14 +11,17 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
+use crate::anchor::{self, AnchorName};
 use crate::cas::registry as cas_registry;
 use crate::cas::store as cas_store;
 use crate::lifecycle::{RegistrationReconcilePolicy, RepoLifecycleManager};
+use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
 use crate::reconcile::{
     Clock, PeriodicReconcilePolicy, ReconcileTrigger, RepoReconcileManager, RetryPolicy,
     TestRegisterHookFn,
 };
+use crate::register::ReconcilePublicationReceipt;
 use crate::testutil::init_repo;
 
 // ─── Test-only clock / hook / helpers ─────────────────────────
@@ -865,4 +868,38 @@ async fn mf10_repository_deleted_before_worker_runs_fails_cleanly() {
     timeout(Duration::from_secs(2), mgr.shutdown(Duration::from_secs(2)))
         .await
         .expect("shutdown must not hang after repository deletion");
+}
+
+#[test]
+fn durable_publication_receipt_must_match_manifest_and_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+         VALUES (1, 'tentative', 0)",
+        [],
+    )
+    .unwrap();
+    let anchor_name = AnchorName::tentative(1);
+    anchor::set_reconciled(&tx, &anchor_name, ManifestId(1), 10, 4).unwrap();
+    tx.commit().unwrap();
+
+    let matching = ReconcilePublicationReceipt {
+        anchor: anchor_name.clone(),
+        manifest_id: ManifestId(1),
+        generation: 4,
+    };
+    super::verify_publication_receipt(&conn, &matching).unwrap();
+
+    let wrong_generation = ReconcilePublicationReceipt {
+        generation: 5,
+        ..matching.clone()
+    };
+    assert!(super::verify_publication_receipt(&conn, &wrong_generation).is_err());
+
+    let tx = conn.transaction().unwrap();
+    anchor::set(&tx, &anchor_name, ManifestId(1), 20).unwrap();
+    tx.commit().unwrap();
+    assert!(super::verify_publication_receipt(&conn, &matching).is_err());
 }
