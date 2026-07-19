@@ -16,18 +16,21 @@
 
 #![forbid(unsafe_code)]
 
+mod matcher;
 pub mod scan;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ignore::gitignore::Gitignore;
+use matcher::{GitMetadataPaths, RepoIgnoreMatcher, resolve_git_metadata};
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
     DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, new_debouncer_opt,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, warn};
 
 /// Errors surfaced by the watcher setup. Runtime classification errors
@@ -48,6 +51,24 @@ pub enum WatchEvent {
     File { path: PathBuf, change: FileChange },
     /// A git ref-shaped path changed.
     Git(GitEvent),
+    /// The watcher cannot safely reduce the change to one path.
+    /// Consumers must reconcile the complete repository snapshot.
+    Rescan { reason: RescanReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanReason {
+    /// A repository-local ignore control file changed.
+    IgnoreRulesChanged,
+    /// A directory was created, removed, or renamed, so nested
+    /// ignore-file discovery must run again.
+    DirectoryTopologyChanged,
+    /// The watcher backend reported that events may have been lost.
+    BackendRequested,
+    /// The watcher backend returned a runtime error.
+    WatchError,
+    /// A previously broken ignore matcher rebuilt successfully.
+    MatcherRecovered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,17 +125,16 @@ pub enum WatchBackend {
 /// `debounce` and pushed on `tx`. The returned handle must be kept
 /// alive; dropping it stops the watcher.
 ///
-/// gitignore filtering is best-effort using the repo's root
-/// `.gitignore`. Per-directory `.gitignore` files are not yet honored
-/// here; the manifest scanner applies the full ignore stack, so the
-/// consumer is expected to filter noisy paths during reconciliation.
+/// Gitignore filtering uses the same hierarchical matcher as the
+/// startup scanner: repository-local `.gitignore` files plus the
+/// repository's `.git/info/exclude`.
 ///
 /// # Errors
 /// Setup-time errors from `notify` or the filesystem.
 pub fn watch_repo(
     repo_root: &Path,
     debounce: Duration,
-    tx: UnboundedSender<WatchEvent>,
+    tx: Sender<WatchEvent>,
 ) -> Result<WatcherHandle, WatchError> {
     watch_repo_with_backend(repo_root, debounce, tx, WatchBackend::Recommended)
 }
@@ -128,25 +148,19 @@ pub fn watch_repo(
 pub fn watch_repo_with_backend(
     repo_root: &Path,
     debounce: Duration,
-    tx: UnboundedSender<WatchEvent>,
+    tx: Sender<WatchEvent>,
     backend: WatchBackend,
 ) -> Result<WatcherHandle, WatchError> {
     let repo_root = repo_root.canonicalize()?;
-    let git_dir = repo_root.join(".git");
-    let ignore = load_root_gitignore(&repo_root);
-
-    let classifier = EventClassifier {
-        repo_root: Arc::new(repo_root.clone()),
-        git_dir: Arc::new(git_dir.clone()),
-        ignore: Arc::new(ignore),
-        tx,
-    };
+    let git_metadata = resolve_git_metadata(&repo_root)?;
+    let classifier = EventClassifier::new(&repo_root, git_metadata.clone(), tx);
 
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => classifier.handle_batch(&events),
         Err(errs) => {
             for e in errs {
                 warn!(?e, "notify error");
+                classifier.handle_watch_error();
             }
         }
     };
@@ -165,11 +179,12 @@ pub fn watch_repo_with_backend(
         }
     };
     debouncer.watch(&repo_root, RecursiveMode::Recursive)?;
-    // Watch .git separately even though it's under repo_root: this
-    // means we still see ref events when the consumer asks us to
-    // ignore the working tree (future flag).
-    if git_dir.is_dir() {
-        let _ = debouncer.watch(&git_dir, RecursiveMode::Recursive);
+    // Linked worktrees keep HEAD in their worktree git dir and refs /
+    // info/exclude in the common git dir. Watch both identities.
+    for git_root in git_metadata.watch_roots() {
+        if git_root.is_dir() {
+            let _ = debouncer.watch(&git_root, RecursiveMode::Recursive);
+        }
     }
     Ok(WatcherHandle { debouncer })
 }
@@ -187,35 +202,59 @@ impl WatcherDebouncer {
     }
 }
 
-fn load_root_gitignore(repo_root: &Path) -> Gitignore {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
-    let candidate = repo_root.join(".gitignore");
-    if candidate.exists() {
-        if let Some(err) = builder.add(&candidate) {
-            warn!(error = %err, path = %candidate.display(), "failed to load .gitignore");
-        }
-    }
-    builder.build().unwrap_or_else(|err| {
-        warn!(error = %err, "gitignore build failed, falling back to empty matcher");
-        Gitignore::empty()
-    })
-}
-
 #[derive(Clone)]
 struct EventClassifier {
     repo_root: Arc<PathBuf>,
-    git_dir: Arc<PathBuf>,
-    ignore: Arc<Gitignore>,
-    tx: UnboundedSender<WatchEvent>,
+    git_metadata: Arc<GitMetadataPaths>,
+    ignore: Arc<RwLock<Arc<RepoIgnoreMatcher>>>,
+    retrying_matcher: Arc<AtomicBool>,
+    tx: Sender<WatchEvent>,
 }
 
 impl EventClassifier {
+    fn new(repo_root: &Path, git_metadata: GitMetadataPaths, tx: Sender<WatchEvent>) -> Self {
+        let (initial, initial_failed) =
+            match RepoIgnoreMatcher::build(repo_root, &git_metadata.info_exclude) {
+                Ok(matcher) => (matcher, false),
+                Err(err) => {
+                    warn!(error = %err, "ignore matcher build failed; watcher is fail-open");
+                    (RepoIgnoreMatcher::fail_open(repo_root), true)
+                }
+            };
+        let classifier = Self {
+            repo_root: Arc::new(repo_root.to_path_buf()),
+            git_metadata: Arc::new(git_metadata),
+            ignore: Arc::new(RwLock::new(Arc::new(initial))),
+            retrying_matcher: Arc::new(AtomicBool::new(false)),
+            tx,
+        };
+        if initial_failed {
+            classifier.start_matcher_retry();
+        }
+        classifier
+    }
+
     fn handle_batch(&self, events: &[notify_debouncer_full::DebouncedEvent]) {
+        let reason = events.iter().find_map(|event| {
+            if event.need_rescan() {
+                return Some(RescanReason::BackendRequested);
+            }
+            if event.paths.iter().any(|path| self.is_ignore_control(path)) {
+                return Some(RescanReason::IgnoreRulesChanged);
+            }
+            is_directory_topology_change(event.kind)
+                .then_some(RescanReason::DirectoryTopologyChanged)
+        });
+        if let Some(reason) = reason {
+            self.reload_matcher();
+            self.emit(WatchEvent::Rescan { reason });
+            return;
+        }
+
         for ev in events {
             for path in &ev.paths {
                 if let Some(out) = self.classify(path, ev.kind) {
-                    if self.tx.send(out).is_err() {
-                        // Receiver dropped — no point continuing.
+                    if !self.emit(out) {
                         return;
                     }
                 }
@@ -223,15 +262,101 @@ impl EventClassifier {
         }
     }
 
+    fn handle_watch_error(&self) {
+        self.reload_matcher();
+        self.emit(WatchEvent::Rescan {
+            reason: RescanReason::WatchError,
+        });
+    }
+
+    fn emit(&self, event: WatchEvent) -> bool {
+        match self.tx.try_send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                debug!("coalesced watcher event into pending edge");
+                true
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn reload_matcher(&self) {
+        match RepoIgnoreMatcher::build(&self.repo_root, &self.git_metadata.info_exclude) {
+            Ok(matcher) => self.replace_matcher(matcher),
+            Err(err) => {
+                warn!(error = %err, "ignore matcher reload failed; watcher is fail-open");
+                self.install_fail_open();
+                self.start_matcher_retry();
+            }
+        }
+    }
+
+    fn install_fail_open(&self) {
+        self.replace_matcher(RepoIgnoreMatcher::fail_open(&self.repo_root));
+    }
+
+    fn replace_matcher(&self, matcher: RepoIgnoreMatcher) {
+        let mut current = self
+            .ignore
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Arc::new(matcher);
+    }
+
+    fn start_matcher_retry(&self) {
+        if self
+            .retrying_matcher
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let classifier = self.clone();
+        std::thread::spawn(move || {
+            let mut delay = Duration::from_millis(100);
+            loop {
+                if classifier.tx.is_closed() {
+                    break;
+                }
+                std::thread::sleep(delay);
+                match RepoIgnoreMatcher::build(
+                    &classifier.repo_root,
+                    &classifier.git_metadata.info_exclude,
+                ) {
+                    Ok(matcher) => {
+                        classifier.replace_matcher(matcher);
+                        classifier.emit(WatchEvent::Rescan {
+                            reason: RescanReason::MatcherRecovered,
+                        });
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "ignore matcher retry failed");
+                        delay = (delay * 2).min(Duration::from_secs(2));
+                    }
+                }
+            }
+            classifier.retrying_matcher.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn is_ignore_control(&self, path: &Path) -> bool {
+        path == self.git_metadata.info_exclude
+            || (path.starts_with(self.repo_root.as_path())
+                && path.file_name().is_some_and(|name| name == ".gitignore"))
+    }
+
     fn classify(&self, path: &Path, kind: EventKind) -> Option<WatchEvent> {
-        if path.starts_with(self.git_dir.as_path()) {
-            return classify_git(path, kind, &self.git_dir);
+        for git_root in self.git_metadata.watch_roots() {
+            if path.starts_with(&git_root) {
+                return classify_git(path, kind, &git_root);
+            }
         }
         if self.is_in_pruned_subtree(path) {
             debug!(?path, "skip (always-pruned subtree)");
             return None;
         }
-        if self.is_gitignored(path) {
+        if self.is_gitignored(path, kind) {
             debug!(?path, "skip (gitignored)");
             return None;
         }
@@ -263,13 +388,24 @@ impl EventClassifier {
         })
     }
 
-    fn is_gitignored(&self, path: &Path) -> bool {
-        // Gitignore::matched expects paths relative to the root.
-        let Ok(rel) = path.strip_prefix(self.repo_root.as_path()) else {
-            return false;
-        };
-        self.ignore.matched(rel, path.is_dir()).is_ignore()
+    fn is_gitignored(&self, path: &Path, kind: EventKind) -> bool {
+        let is_dir = path.is_dir()
+            || matches!(kind, EventKind::Create(CreateKind::Folder))
+            || matches!(kind, EventKind::Remove(RemoveKind::Folder));
+        self.ignore
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_ignored(path, is_dir)
     }
+}
+
+fn is_directory_topology_change(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::Folder)
+            | EventKind::Remove(RemoveKind::Folder)
+            | EventKind::Modify(ModifyKind::Name(_))
+    )
 }
 
 fn classify_git(path: &Path, kind: EventKind, git_dir: &Path) -> Option<WatchEvent> {
@@ -318,8 +454,7 @@ fn classify_git(path: &Path, kind: EventKind, git_dir: &Path) -> Option<WatchEve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
-    use std::ffi::OsStr;
+    use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
 
     fn git(s: &str) -> PathBuf {
         PathBuf::from("/r/.git").join(s)
@@ -401,47 +536,23 @@ mod tests {
     }
 
     fn classifier_for(root: &Path) -> EventClassifier {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        EventClassifier {
-            repo_root: Arc::new(root.to_path_buf()),
-            git_dir: Arc::new(root.join(".git")),
-            ignore: Arc::new(load_root_gitignore(root)),
-            tx,
-        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx)
     }
 
-    async fn wait_for_touched(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
-        file_name: &OsStr,
-    ) -> Option<WatchEvent> {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while let Some(ev) = rx.recv().await {
-                if let WatchEvent::File {
-                    path,
-                    change: FileChange::Touched,
-                } = &ev
-                {
-                    if path.file_name() == Some(file_name) {
-                        return Some(ev);
-                    }
-                }
-            }
-            None
-        })
-        .await
-        .ok()
-        .flatten()
+    fn debounced(event: notify::Event) -> notify_debouncer_full::DebouncedEvent {
+        notify_debouncer_full::DebouncedEvent::new(event, std::time::Instant::now())
     }
 
-    /// Variant of `wait_for_touched` for the *first* event of a session
-    /// where the FSEvents stream may still be settling. The probe file
+    /// Wait for the first touched edge of a session where the FSEvents
+    /// stream may still be settling. The probe file
     /// is re-written on a fixed interval so that even if the very first
     /// few writes land inside the stream's initial dead zone (observed
     /// on /private/tmp under sandboxed runners), a later write still
     /// triggers a delivered event. The total wait budget is `total`;
     /// each retry write happens every `retry_every`.
     async fn wait_for_probe_with_retries(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+        rx: &mut tokio::sync::mpsc::Receiver<WatchEvent>,
         probe: &std::path::Path,
         total: Duration,
         retry_every: Duration,
@@ -523,12 +634,147 @@ mod tests {
     fn gitignored_file_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
-        let ignore = load_root_gitignore(tmp.path());
-        // Note: `matched` needs paths relative to the root.
-        let target = PathBuf::from("ignored.txt");
-        assert!(ignore.matched(&target, false).is_ignore());
-        let other = PathBuf::from("kept.txt");
-        assert!(!ignore.matched(&other, false).is_ignore());
+        let classifier = classifier_for(tmp.path());
+        let target = tmp.path().join("ignored.txt");
+        assert!(classifier.is_gitignored(&target, EventKind::Modify(ModifyKind::Any)));
+        let other = tmp.path().join("kept.txt");
+        assert!(!classifier.is_gitignored(&other, EventKind::Modify(ModifyKind::Any)));
+    }
+
+    #[test]
+    fn ignore_control_is_detected_before_parent_ignore_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), ".gitignore\n").unwrap();
+        let classifier = classifier_for(tmp.path());
+
+        assert!(classifier.is_ignore_control(&tmp.path().join(".gitignore")));
+    }
+
+    #[tokio::test]
+    async fn ignore_change_reloads_matcher_and_emits_one_rescan_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let ignored = root.join("sub/ignored.rs");
+        assert!(
+            classifier
+                .classify(&ignored, EventKind::Modify(ModifyKind::Any))
+                .is_some()
+        );
+
+        std::fs::write(root.join("sub/.gitignore"), "ignored.rs\n").unwrap();
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(root.join("sub/.gitignore"));
+        classifier.handle_batch(&[debounced(event)]);
+
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::IgnoreRulesChanged
+            })
+        );
+        assert!(
+            classifier
+                .classify(&ignored, EventKind::Modify(ModifyKind::Any))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_rescan_and_directory_topology_changes_force_full_reconcile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+
+        let backend_rescan = notify::Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .add_path(root.to_path_buf());
+        classifier.handle_batch(&[debounced(backend_rescan)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::BackendRequested
+            })
+        );
+
+        let directory_create = notify::Event::new(EventKind::Create(CreateKind::Folder))
+            .add_path(root.join("generated"));
+        classifier.handle_batch(&[debounced(directory_create)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+
+        let rename = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(root.join("old"))
+            .add_path(root.join("new"));
+        classifier.handle_batch(&[debounced(rename)]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::DirectoryTopologyChanged
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_ignore_reload_is_fail_open_then_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, "ignored.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let ignored = root.join("ignored.rs");
+        assert!(
+            classifier
+                .classify(&ignored, EventKind::Modify(ModifyKind::Any))
+                .is_none()
+        );
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.handle_batch(&[debounced(
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(ignore_file.clone()),
+        )]);
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::IgnoreRulesChanged
+            })
+        );
+        assert!(
+            classifier
+                .classify(&ignored, EventKind::Modify(ModifyKind::Any))
+                .is_some(),
+            "a broken matcher must fail open"
+        );
+
+        std::fs::write(&ignore_file, "recovered.rs\n").unwrap();
+        let recovered = root.join("recovered.rs");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if classifier
+                    .classify(&recovered, EventKind::Modify(ModifyKind::Any))
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("matcher retry did not recover");
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
     }
 
     #[tokio::test]
@@ -538,7 +784,7 @@ mod tests {
         // Initialize a fake repo so the .git watch path exists.
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let _handle =
             watch_repo_with_backend(&root, Duration::from_millis(150), tx, WatchBackend::Poll)
                 .unwrap();
@@ -558,16 +804,6 @@ mod tests {
         assert!(
             probe_event.is_some(),
             "watcher delivered no Touched event for .probe within 10s of retries"
-        );
-
-        let target = root.join("hello.rs");
-        std::fs::write(&target, "fn main() {}").unwrap();
-
-        let event = wait_for_touched(&mut rx, OsStr::new("hello.rs")).await;
-
-        assert!(
-            event.is_some(),
-            "did not observe a Touched event for hello.rs"
         );
     }
 }
