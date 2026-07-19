@@ -61,6 +61,10 @@ pub enum Error {
     InvalidArgument(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("job manager is shutting down")]
+    JobManagerShuttingDown,
+    #[error("daemon shutdown deadline exceeded after {timeout_ms}ms")]
+    ShutdownDeadlineExceeded { timeout_ms: u64 },
     #[error(transparent)]
     Lsp(#[from] lsp::Error),
     #[error("schema corruption: {0}")]
@@ -109,6 +113,14 @@ mod tests {
         assert_eq!(
             Error::Internal("task panicked: secret-path".into()).to_string(),
             "internal error: task panicked: secret-path"
+        );
+        assert_eq!(
+            Error::JobManagerShuttingDown.to_string(),
+            "job manager is shutting down"
+        );
+        assert_eq!(
+            Error::ShutdownDeadlineExceeded { timeout_ms: 10_000 }.to_string(),
+            "daemon shutdown deadline exceeded after 10000ms"
         );
     }
 

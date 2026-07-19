@@ -10,10 +10,7 @@ use crate::manifest::{ManifestEntry, ManifestId};
 use crate::{Error, Result};
 
 use super::persist::{persist_resolutions, persist_resolved_refs};
-use super::{
-    AnalyzerProgress, AnalyzerProgressObserver, WorkspaceAnalyzer, WorkspaceFile,
-    all_workspace_analyzers,
-};
+use super::{AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFile, all_workspace_analyzers};
 
 // Timeout is a hang detector, not a total work cap. T3 measured nlohmann's
 // C++ pass advancing through 47.4k definition sites with zero request errors
@@ -109,7 +106,7 @@ pub(super) fn run_workspace_analyzers_with_timeout(
                 now_ns,
                 analyzer_stall_timeout,
                 job_id: None,
-                progress_observer: None,
+                progress: None,
             },
         )?;
         inserted += outcome.inserted_refs;
@@ -126,7 +123,7 @@ pub(crate) struct AnalyzerRunRequest<'a> {
     pub(crate) now_ns: i64,
     pub(crate) analyzer_stall_timeout: Duration,
     pub(crate) job_id: Option<i64>,
-    pub(crate) progress_observer: Option<AnalyzerProgressObserver>,
+    pub(crate) progress: Option<AnalyzerProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +145,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         now_ns,
         analyzer_stall_timeout,
         job_id,
-        progress_observer,
+        progress,
     } = request;
     let analyzer_id = analyzer.id();
     let analyzer_revision = analyzer.revision();
@@ -242,14 +239,59 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         },
     )?;
 
+    let progress = progress.unwrap_or_default();
+    if progress.is_cancelled() {
+        let message = "analyzer cancelled";
+        mark_run(
+            conn,
+            RunRecord {
+                manifest_id,
+                analyzer_id,
+                analyzer_revision,
+                config_hash: &config_hash,
+                status: RunStatus::Cancelled,
+                started_at_ns: now_ns,
+                finished_at_ns: now_ns,
+                error: Some(message),
+                job_id,
+            },
+        )?;
+        return Ok(AnalyzerExecution {
+            status: RunStatus::Cancelled,
+            inserted_refs: 0,
+            error: Some(message.into()),
+        });
+    }
     match analyze_workspace_with_timeout(
         analyzer,
         repo_root,
         manifest_id,
         &files,
         analyzer_stall_timeout,
-        progress_observer,
+        progress.clone(),
     ) {
+        AnalyzerRun::Completed(_) if progress.is_cancelled() => {
+            let message = "analyzer cancelled";
+            mark_run(
+                conn,
+                RunRecord {
+                    manifest_id,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash: &config_hash,
+                    status: RunStatus::Cancelled,
+                    started_at_ns: now_ns,
+                    finished_at_ns: now_ns,
+                    error: Some(message),
+                    job_id,
+                },
+            )?;
+            Ok(AnalyzerExecution {
+                status: RunStatus::Cancelled,
+                inserted_refs: 0,
+                error: Some(message.into()),
+            })
+        }
         AnalyzerRun::Completed(Ok(facts)) => {
             let inserted_refs = persist_resolved_refs(
                 conn,
@@ -367,14 +409,11 @@ fn analyze_workspace_with_timeout(
     manifest_id: ManifestId,
     files: &[WorkspaceFile],
     timeout: Duration,
-    progress_observer: Option<AnalyzerProgressObserver>,
+    progress: AnalyzerProgress,
 ) -> AnalyzerRun {
     let repo_root = repo_root.to_path_buf();
     let files = files.to_vec();
     let (tx, rx) = mpsc::channel();
-    let progress = progress_observer
-        .map(AnalyzerProgress::with_observer)
-        .unwrap_or_default();
     let worker_progress = progress.clone();
     let worker = std::thread::spawn(move || {
         let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files, &worker_progress);
@@ -886,7 +925,7 @@ mod tests {
                 source_bytes: None,
             }],
             Duration::from_millis(10),
-            None,
+            AnalyzerProgress::default(),
         );
 
         *STALLED_ANALYZER_CLEANUP_OBSERVER
@@ -1250,6 +1289,42 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn cancellation_before_persist_marks_cancelled_and_preserves_prior_resolutions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        fs::write(repo_root.join("src/Ready.kt"), b"class Ready").unwrap();
+        let (mut conn, entry) = seed_fixture(&tmp.path().join("store.db"), "src/Ready.kt");
+        let progress = AnalyzerProgress::default();
+        progress.cancel();
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer: Box::new(CallCountingAnalyzer {
+                    requires_materialized: true,
+                    call_count: Arc::clone(&call_count),
+                    facts: WorkspaceFacts::default(),
+                }),
+                repo_root: &repo_root,
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 0,
+                analyzer_stall_timeout: Duration::from_secs(30),
+                job_id: Some(7),
+                progress: Some(progress),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Cancelled);
+        assert_eq!(outcome.inserted_refs, 0);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(tier25_resolution_count(&conn), 1);
+        assert_eq!(workspace_analysis_run_row(&conn).0, "cancelled");
+    }
+
     /// **R2 must-fix #1**: a `requires_materialized_files() == true`
     /// analyzer whose workspace files are unreadable at the moment
     /// the runner tries to read them must:
@@ -1294,7 +1369,7 @@ mod tests {
                 now_ns: 0,
                 analyzer_stall_timeout: Duration::from_secs(30),
                 job_id: None,
-                progress_observer: None,
+                progress: None,
             },
         )
         .unwrap();
@@ -1363,7 +1438,7 @@ mod tests {
                 now_ns: 0,
                 analyzer_stall_timeout: Duration::from_secs(30),
                 job_id: None,
-                progress_observer: None,
+                progress: None,
             },
         )
         .unwrap();
@@ -1450,7 +1525,7 @@ mod tests {
                 now_ns: 0,
                 analyzer_stall_timeout: Duration::from_secs(30),
                 job_id: None,
-                progress_observer: None,
+                progress: None,
             },
         )
         .unwrap();

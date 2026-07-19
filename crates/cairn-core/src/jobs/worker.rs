@@ -22,9 +22,19 @@ impl JobManager {
 
     async fn run_job(&self, dispatch: DispatchJob) -> Result<()> {
         let runtime_metrics = self.runtime_metrics.clone();
-        tokio::task::spawn_blocking(move || run_job_blocking(dispatch.job, runtime_metrics))
-            .await
-            .map_err(|e| Error::internal_task_panic("analyzer job", e))?
+        let job_id = dispatch.job.id;
+        let progress_metrics = runtime_metrics.clone();
+        let progress =
+            crate::workspace_analyzer::AnalyzerProgress::with_observer(Arc::new(move |ticks| {
+                progress_metrics.mark_progress(job_id, ticks);
+            }));
+        self.register_active_progress(job_id, progress.clone());
+        let joined = tokio::task::spawn_blocking(move || {
+            run_job_blocking(dispatch.job, runtime_metrics, progress)
+        })
+        .await;
+        self.unregister_active_progress(job_id);
+        joined.map_err(|e| Error::internal_task_panic("analyzer job", e))?
     }
 
     fn notify_worker_finished(&self, job_id: JobId, pool_group: Option<&'static str>, key: JobKey) {
@@ -52,7 +62,11 @@ impl JobManager {
     }
 }
 
-fn run_job_blocking(job: Job, runtime_metrics: JobRuntimeMetricsStore) -> Result<()> {
+fn run_job_blocking(
+    job: Job,
+    runtime_metrics: JobRuntimeMetricsStore,
+    progress: crate::workspace_analyzer::AnalyzerProgress,
+) -> Result<()> {
     let mut conn = cas_store::open(&job.store_path)?;
     let row: Option<(String, i64)> = conn
         .query_row(
@@ -66,7 +80,8 @@ fn run_job_blocking(job: Job, runtime_metrics: JobRuntimeMetricsStore) -> Result
     let Some((state, cancel_requested)) = row else {
         return Ok(());
     };
-    if state == RunStatus::Cancelled.as_str()
+    if progress.is_cancelled()
+        || state == RunStatus::Cancelled.as_str()
         || (state == RunStatus::Queued.as_str() && cancel_requested != 0)
     {
         conn.execute(
@@ -88,12 +103,6 @@ fn run_job_blocking(job: Job, runtime_metrics: JobRuntimeMetricsStore) -> Result
         .ok_or_else(|| Error::InvalidArgument(format!("unknown analyzer: {}", job.analyzer_id)))?;
     let entries = manifest::get_entries(&conn, job.manifest_id)?;
     let now = now_ns();
-    let progress_metrics = runtime_metrics.clone();
-    let job_id = job.id;
-    let progress_observer: crate::workspace_analyzer::AnalyzerProgressObserver =
-        Arc::new(move |ticks| {
-            progress_metrics.mark_progress(job_id, ticks);
-        });
     info!(
         alias = %job.alias,
         analyzer_id = %job.analyzer_id,
@@ -110,7 +119,7 @@ fn run_job_blocking(job: Job, runtime_metrics: JobRuntimeMetricsStore) -> Result
             now_ns: now,
             analyzer_stall_timeout: ANALYZER_STALL_TIMEOUT,
             job_id: Some(job.id),
-            progress_observer: Some(progress_observer),
+            progress: Some(progress),
         },
     )?;
     runtime_metrics.mark_finished(job.id, outcome.status.as_str());
