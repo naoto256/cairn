@@ -19,7 +19,7 @@ use crate::data_rpc::helpers::{
     parser_id_filter, query_one_or_all_snapshots,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
-use crate::register::load_blob_or_worktree;
+use crate::register::load_blob_or_verified_worktree;
 use crate::{Error, Result};
 
 pub struct FindReferences;
@@ -65,7 +65,7 @@ impl DataMethod for FindReferences {
                 let anchor_label = snapshot.anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
                 let hits = query::find_references(conn, &snapshot.anchor, &q)?;
-                let mut snippets = SnippetCache::new(worktree_root);
+                let mut snippets = SnippetCache::new(entry.alias.clone(), worktree_root);
                 Ok(hits
                     .into_iter()
                     .map(|h| {
@@ -149,6 +149,7 @@ fn into_wire_hit(
 /// block, one trait method), so the cache turns N hits into K blob
 /// reads with K ≪ N.
 pub(super) struct SnippetCache {
+    repo: String,
     worktree_root: PathBuf,
     /// `blob_sha → file contents` once materialised. `None` means we
     /// already tried and the blob couldn't be loaded; we won't retry.
@@ -156,8 +157,9 @@ pub(super) struct SnippetCache {
 }
 
 impl SnippetCache {
-    pub(super) fn new(worktree_root: PathBuf) -> Self {
+    pub(super) fn new(repo: String, worktree_root: PathBuf) -> Self {
         Self {
+            repo,
             worktree_root,
             blobs: HashMap::new(),
         }
@@ -172,13 +174,11 @@ impl SnippetCache {
 
     fn load(&mut self, blob_sha: &str, path: &str) -> Option<&[u8]> {
         if !self.blobs.contains_key(blob_sha) {
-            let loaded = load_blob_or_worktree(&self.worktree_root, blob_sha, path)
-                .inspect_err(|e| {
+            let loaded = load_blob_or_verified_worktree(&self.worktree_root, blob_sha, path)
+                .inspect_err(|_| {
                     debug!(
-                        blob_sha,
-                        path,
-                        error = %e,
-                        "snippet: blob not in git and worktree unreadable"
+                        repo = self.repo,
+                        path, "snippet omitted because indexed bytes are unavailable or changed"
                     );
                 })
                 .ok();
@@ -303,6 +303,16 @@ mod tests {
         let src = b"alpha\nbeta\n";
         assert_eq!(extract_line(src, 5), None);
         assert_eq!(extract_line(src, 0), None);
+    }
+
+    #[test]
+    fn snippet_cache_omits_changed_worktree_fallback_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("source.rs"), b"changed\n").unwrap();
+        let indexed_sha = crate::cas::hash::git_blob_sha(b"indexed\n");
+        let mut cache = SnippetCache::new("demo".into(), tmp.path().to_path_buf());
+
+        assert_eq!(cache.line_for(&indexed_sha, "source.rs", 1), None);
     }
 
     struct CrossRepoFixture {
