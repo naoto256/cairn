@@ -6,7 +6,7 @@ use serde_json::json;
 use super::super::types::ToolSpec;
 use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
-use super::{SYMBOL_KIND_DESC, VERBOSE_TIER3_DESC};
+use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, SYMBOL_KIND_DESC, VERBOSE_TIER3_DESC};
 
 fn spec() -> ToolSpec {
     ToolSpec {
@@ -16,6 +16,8 @@ fn spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "Repository alias. Omit to search every registered repo."},
+                "branch": {"type": "string", "description": BRANCH_PARAM_DESC},
+                "anchor": {"type": "string", "description": ANCHOR_PARAM_DESC},
                 "file": {"type": "string", "description": "Path relative to the repo root for single-file outline mode."},
                 "path": {"type": "string", "description": "Repo-root-relative file-path string prefix for directory mode. Include the trailing `/` to scope to a directory."},
                 "kind": {"type": "string", "description": SYMBOL_KIND_DESC},
@@ -32,3 +34,16 @@ fn spec() -> ToolSpec {
 #[distributed_slice(MCP_TOOLS)]
 static REGISTER: fn() -> Box<dyn McpTool> =
     || Box::new(ForwardingTool::data(spec, "get_outline", 20));
+
+#[cfg(test)]
+mod tests {
+    use super::spec;
+
+    #[test]
+    fn schema_exposes_snapshot_scope() {
+        let schema = spec().input_schema;
+
+        assert_eq!(schema["properties"]["branch"]["type"], "string");
+        assert_eq!(schema["properties"]["anchor"]["type"], "string");
+    }
+}

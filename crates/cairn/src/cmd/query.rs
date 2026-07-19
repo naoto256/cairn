@@ -861,6 +861,40 @@ mod tests {
     }
 
     #[test]
+    fn outline_cli_accepts_snapshot_scope_without_transforming_values() {
+        let cli = crate::Cli::try_parse_from([
+            "cairn",
+            "query",
+            "outline",
+            "src/lib.rs",
+            "--repo",
+            "demo",
+            "--branch",
+            "feature/scope",
+            "--anchor",
+            "HEAD",
+        ])
+        .unwrap();
+
+        let crate::Command::Query(Args {
+            command:
+                QueryCommand::Outline {
+                    repo,
+                    branch,
+                    anchor,
+                    ..
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected query outline command");
+        };
+        assert_eq!(repo.as_deref(), Some("demo"));
+        assert_eq!(branch.as_deref(), Some("feature/scope"));
+        assert_eq!(anchor.as_deref(), Some("HEAD"));
+    }
+
+    #[test]
     fn symbols_query_includes_path_and_container_filters() {
         let repo = Some("demo".to_string());
         let branch = None;

@@ -476,12 +476,12 @@ pub struct JobEntry {
 /// Arguments to `get_outline`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineArgs {
-    /// Repository filter. `None` searches every registered repo and
-    /// returns matching outlines from each; identical-named paths
-    /// across repos are distinguished by the `file` field on each
+    /// Repository and snapshot selector. `repo = None` searches every
+    /// registered repo; `anchor` takes priority over `branch`. Identical-named
+    /// paths across repos are distinguished by the `file` field on each
     /// returned item.
     #[serde(flatten)]
-    pub scope: RepoScope,
+    pub scope: SnapshotScope,
     /// Single file to outline, relative to the repo root. Required when
     /// `path` is absent; omitted in directory mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1534,11 +1534,15 @@ mod tests {
     fn outline_args_round_trips_directory_path() {
         let value = json!({
             "repo": "demo",
+            "branch": "feature/scope",
+            "anchor": "HEAD",
             "path": "src/",
             "limit": 50
         });
         let args: OutlineArgs = serde_json::from_value(value).unwrap();
         assert_eq!(args.scope.repo.as_deref(), Some("demo"));
+        assert_eq!(args.scope.branch.as_deref(), Some("feature/scope"));
+        assert_eq!(args.scope.anchor.as_deref(), Some("HEAD"));
         assert_eq!(args.file, None);
         assert_eq!(args.path.as_deref(), Some("src/"));
         assert_eq!(args.pagination.limit, Some(50));
@@ -1546,6 +1550,8 @@ mod tests {
         let serialized = serde_json::to_value(args).unwrap();
         assert!(serialized.get("file").is_none());
         assert_eq!(serialized["repo"], "demo");
+        assert_eq!(serialized["branch"], "feature/scope");
+        assert_eq!(serialized["anchor"], "HEAD");
         assert_eq!(serialized["path"], "src/");
         assert_eq!(serialized["limit"], 50);
         assert!(serialized.get("scope").is_none());
