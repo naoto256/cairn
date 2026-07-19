@@ -22,6 +22,11 @@
 //!   state before any reindex debounce sleeps and recovers
 //!   interrupted attempts on startup — no crash window can leave
 //!   pending work invisible to the operator.
+//! - **Repository lifecycle policy and removal audit.** Canonical owners carry
+//!   the missing-root persistence policy and an optional durable pre-delete
+//!   intent. `repository_removal_events` records the registry-delete / store-
+//!   cleanup boundary so startup can retry incomplete cleanup without
+//!   resurrecting canonical state.
 //! - **Retired ambiguous `JobId` tombstones.** `ambiguous_job_ids`
 //!   records every `JobId` value that was ambiguous across stores
 //!   at some restart. See `JobManager::restore_from_db` for the
@@ -174,6 +179,36 @@ INSERT INTO repo_reconcile_state (repo_hash)
 SELECT repo_hash FROM repositories;
 "#,
     },
+    Migration {
+        // Repository lifecycle policy and crash-safe removal bookkeeping.
+        // Existing repositories intentionally migrate as ephemeral: a
+        // startup sweep removes only roots that are definitively NotFound.
+        version: 5,
+        sql: r#"
+ALTER TABLE repositories ADD COLUMN persistent INTEGER NOT NULL DEFAULT 0
+    CHECK(persistent IN (0, 1));
+ALTER TABLE repositories ADD COLUMN removal_requested_at_ns INTEGER;
+ALTER TABLE repositories ADD COLUMN removal_reason TEXT
+    CHECK(removal_reason IS NULL OR removal_reason IN
+        ('missing_root','last_alias_removed','alias_retargeted',
+         'startup_aliasless','registration_aborted'));
+
+CREATE TABLE repository_removal_events (
+    event_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_hash            TEXT NOT NULL,
+    root_path            TEXT NOT NULL,
+    removed_at_ns        INTEGER NOT NULL,
+    reason               TEXT NOT NULL CHECK(reason IN
+        ('missing_root','last_alias_removed','alias_retargeted',
+         'startup_aliasless','registration_aborted')),
+    store_cleanup_state  TEXT NOT NULL
+        CHECK(store_cleanup_state IN ('pending','complete','error')),
+    cleanup_error        TEXT
+);
+CREATE INDEX idx_repository_removal_events_cleanup
+    ON repository_removal_events(store_cleanup_state, event_id);
+"#,
+    },
 ];
 
 /// Insert every id in `ids` into the `ambiguous_job_ids` tombstone
@@ -259,6 +294,86 @@ pub struct RepositoryEntry {
     pub repo_hash: String,
     pub root_path: String,
     pub registered_at_ns: i64,
+    pub persistent: bool,
+    pub removal_request: Option<RepositoryRemovalRequest>,
+}
+
+/// Durable reason for removing a canonical repository owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryRemovalReason {
+    MissingRoot,
+    LastAliasRemoved,
+    AliasRetargeted,
+    StartupAliasless,
+    RegistrationAborted,
+}
+
+impl RepositoryRemovalReason {
+    #[must_use]
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::MissingRoot => "missing_root",
+            Self::LastAliasRemoved => "last_alias_removed",
+            Self::AliasRetargeted => "alias_retargeted",
+            Self::StartupAliasless => "startup_aliasless",
+            Self::RegistrationAborted => "registration_aborted",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "missing_root" => Self::MissingRoot,
+            "last_alias_removed" => Self::LastAliasRemoved,
+            "alias_retargeted" => Self::AliasRetargeted,
+            "startup_aliasless" => Self::StartupAliasless,
+            "registration_aborted" => Self::RegistrationAborted,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRemovalRequest {
+    pub requested_at_ns: i64,
+    pub reason: RepositoryRemovalReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreCleanupState {
+    Pending,
+    Complete,
+    Error,
+}
+
+impl StoreCleanupState {
+    #[must_use]
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Error => "error",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "pending" => Self::Pending,
+            "complete" => Self::Complete,
+            "error" => Self::Error,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRemovalEvent {
+    pub event_id: i64,
+    pub repo_hash: String,
+    pub root_path: String,
+    pub removed_at_ns: i64,
+    pub reason: RepositoryRemovalReason,
+    pub store_cleanup_state: StoreCleanupState,
+    pub cleanup_error: Option<String>,
 }
 
 /// Watcher lifecycle state — mirrors the `watcher_state` DB column.
@@ -553,7 +668,8 @@ pub fn upsert_repository(
 pub fn lookup_repository(conn: &Connection, repo_hash: &str) -> Result<Option<RepositoryEntry>> {
     Ok(conn
         .query_row(
-            "SELECT repo_hash, root_path, registered_at_ns
+            "SELECT repo_hash, root_path, registered_at_ns, persistent,
+                    removal_requested_at_ns, removal_reason
              FROM repositories WHERE repo_hash = ?1",
             params![repo_hash],
             row_to_repository,
@@ -568,7 +684,8 @@ pub fn lookup_repository(conn: &Connection, repo_hash: &str) -> Result<Option<Re
 /// SQLite failures.
 pub fn list_repositories(conn: &Connection) -> Result<Vec<RepositoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT repo_hash, root_path, registered_at_ns
+        "SELECT repo_hash, root_path, registered_at_ns, persistent,
+                removal_requested_at_ns, removal_reason
          FROM repositories ORDER BY repo_hash",
     )?;
     let rows: rusqlite::Result<Vec<RepositoryEntry>> =
@@ -602,6 +719,146 @@ pub fn delete_repository(tx: &Transaction<'_>, repo_hash: &str) -> Result<bool> 
         params![repo_hash],
     )?;
     Ok(n > 0)
+}
+
+/// Set the canonical lifecycle policy independently from identity upsert.
+pub fn set_repository_persistent(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    persistent: bool,
+) -> Result<bool> {
+    Ok(tx.execute(
+        "UPDATE repositories SET persistent = ?1 WHERE repo_hash = ?2",
+        params![i64::from(persistent), repo_hash],
+    )? == 1)
+}
+
+/// Persist a pre-delete removal request. The first request wins so retries and
+/// duplicate detectors cannot rewrite the operator-visible reason.
+pub fn mark_removal_requested(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    reason: RepositoryRemovalReason,
+    now_ns: i64,
+) -> Result<bool> {
+    Ok(tx.execute(
+        "UPDATE repositories
+         SET removal_requested_at_ns = ?1, removal_reason = ?2
+         WHERE repo_hash = ?3 AND removal_requested_at_ns IS NULL",
+        params![now_ns, reason.as_db_str(), repo_hash],
+    )? == 1)
+}
+
+/// Repositories whose lifecycle owner must resume removal after restart.
+pub fn list_removal_requested(conn: &Connection) -> Result<Vec<RepositoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT repo_hash, root_path, registered_at_ns, persistent,
+                removal_requested_at_ns, removal_reason
+         FROM repositories
+         WHERE removal_requested_at_ns IS NOT NULL
+         ORDER BY repo_hash",
+    )?;
+    let rows: rusqlite::Result<Vec<_>> = stmt.query_map([], row_to_repository)?.collect();
+    Ok(rows?)
+}
+
+/// Atomically create the post-registry cleanup record and delete the
+/// canonical owner. Aliases and reconcile state cascade with the delete.
+pub fn delete_repository_with_event(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    removed_at_ns: i64,
+) -> Result<Option<i64>> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT root_path, removal_reason FROM repositories
+             WHERE repo_hash = ?1 AND removal_requested_at_ns IS NOT NULL",
+            params![repo_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((root_path, reason)) = row else {
+        return Ok(None);
+    };
+    tx.execute(
+        "INSERT INTO repository_removal_events
+         (repo_hash, root_path, removed_at_ns, reason, store_cleanup_state)
+         VALUES (?1, ?2, ?3, ?4, 'pending')",
+        params![repo_hash, root_path, removed_at_ns, reason],
+    )?;
+    let event_id = tx.last_insert_rowid();
+    if !delete_repository(tx, repo_hash)? {
+        return Err(crate::Error::Internal(format!(
+            "repository disappeared while recording removal: {repo_hash}"
+        )));
+    }
+    Ok(Some(event_id))
+}
+
+/// Incomplete post-registry store cleanup, retained until it succeeds.
+pub fn list_incomplete_removals(conn: &Connection) -> Result<Vec<RepositoryRemovalEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id, repo_hash, root_path, removed_at_ns, reason,
+                store_cleanup_state, cleanup_error
+         FROM repository_removal_events
+         WHERE store_cleanup_state IN ('pending', 'error')
+         ORDER BY event_id",
+    )?;
+    let rows: rusqlite::Result<Vec<_>> = stmt.query_map([], row_to_removal_event)?.collect();
+    Ok(rows?)
+}
+
+/// Recent completed events for doctor/operator reporting.
+pub fn list_recent_completed_removals(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<RepositoryRemovalEvent>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT event_id, repo_hash, root_path, removed_at_ns, reason,
+                store_cleanup_state, cleanup_error
+         FROM repository_removal_events
+         WHERE store_cleanup_state = 'complete'
+         ORDER BY event_id DESC LIMIT ?1",
+    )?;
+    let rows: rusqlite::Result<Vec<_>> = stmt
+        .query_map(params![limit], row_to_removal_event)?
+        .collect();
+    Ok(rows?)
+}
+
+pub fn mark_store_cleanup_complete(tx: &Transaction<'_>, event_id: i64) -> Result<bool> {
+    let changed = tx.execute(
+        "UPDATE repository_removal_events
+         SET store_cleanup_state = 'complete', cleanup_error = NULL
+         WHERE event_id = ?1",
+        params![event_id],
+    )? == 1;
+    prune_completed_removal_events(tx, 100)?;
+    Ok(changed)
+}
+
+pub fn mark_store_cleanup_error(tx: &Transaction<'_>, event_id: i64, error: &str) -> Result<bool> {
+    Ok(tx.execute(
+        "UPDATE repository_removal_events
+         SET store_cleanup_state = 'error', cleanup_error = ?1
+         WHERE event_id = ?2",
+        params![truncate_utf8(error, MAX_ERROR_STRING_BYTES), event_id],
+    )? == 1)
+}
+
+pub fn prune_completed_removal_events(tx: &Transaction<'_>, keep: usize) -> Result<usize> {
+    let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+    Ok(tx.execute(
+        "DELETE FROM repository_removal_events
+         WHERE store_cleanup_state = 'complete'
+           AND event_id NOT IN (
+             SELECT event_id FROM repository_removal_events
+             WHERE store_cleanup_state = 'complete'
+             ORDER BY event_id DESC LIMIT ?1
+           )",
+        params![keep],
+    )?)
 }
 
 /// Count how many aliases reference `repo_hash`. Used by
@@ -673,10 +930,60 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<AliasEntry> {
 }
 
 fn row_to_repository(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryEntry> {
+    let requested_at_ns: Option<i64> = r.get(4)?;
+    let reason: Option<String> = r.get(5)?;
+    let removal_request = match (requested_at_ns, reason) {
+        (None, None) => None,
+        (Some(requested_at_ns), Some(reason)) => Some(RepositoryRemovalRequest {
+            requested_at_ns,
+            reason: RepositoryRemovalReason::from_db_str(&reason).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    format!("unknown removal_reason: {reason}").into(),
+                )
+            })?,
+        }),
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Null,
+                "removal request timestamp/reason must both be NULL or non-NULL".into(),
+            ));
+        }
+    };
     Ok(RepositoryEntry {
         repo_hash: r.get(0)?,
         root_path: r.get(1)?,
         registered_at_ns: r.get(2)?,
+        persistent: r.get::<_, i64>(3)? != 0,
+        removal_request,
+    })
+}
+
+fn row_to_removal_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRemovalEvent> {
+    let reason: String = r.get(4)?;
+    let state: String = r.get(5)?;
+    Ok(RepositoryRemovalEvent {
+        event_id: r.get(0)?,
+        repo_hash: r.get(1)?,
+        root_path: r.get(2)?,
+        removed_at_ns: r.get(3)?,
+        reason: RepositoryRemovalReason::from_db_str(&reason).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                format!("unknown repository removal reason: {reason}").into(),
+            )
+        })?,
+        store_cleanup_state: StoreCleanupState::from_db_str(&state).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                format!("unknown store cleanup state: {state}").into(),
+            )
+        })?,
+        cleanup_error: r.get(6)?,
     })
 }
 
@@ -1319,7 +1626,10 @@ mod tests {
         tx.commit().unwrap();
         assert!(get_reconcile_state(&c, "h").unwrap().is_none());
         assert_eq!(aliases_for_repo(&c, "h").unwrap().len(), 0);
-        assert!(list_repositories(&c).unwrap().is_empty());
+        let n_repositories: i64 = c
+            .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_repositories, 0);
     }
 
     #[test]
@@ -1531,7 +1841,10 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 4);
-        assert!(list_repositories(&c).unwrap().is_empty());
+        let n_repositories: i64 = c
+            .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_repositories, 0);
         // aliases table exists and is empty; the index the v2/v4
         // migration created must still resolve.
         let n_aliases: i64 = c
@@ -1561,14 +1874,16 @@ mod tests {
         .unwrap();
         apply_v4_only(&mut c).unwrap();
 
-        let repos = list_repositories(&c).unwrap();
-        assert_eq!(repos.len(), 1);
-        assert_eq!(repos[0].repo_hash, "h_a");
-        assert_eq!(repos[0].root_path, "/repos/a");
-        assert_eq!(
-            repos[0].registered_at_ns, 100,
-            "MIN(registered_at_ns) wins on collapse"
-        );
+        let repo: (String, String, i64) = c
+            .query_row(
+                "SELECT repo_hash, root_path, registered_at_ns FROM repositories",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(repo.0, "h_a");
+        assert_eq!(repo.1, "/repos/a");
+        assert_eq!(repo.2, 100, "MIN(registered_at_ns) wins on collapse");
 
         let mut labels = aliases_for_repo(&c, "h_a").unwrap();
         labels.sort();
@@ -1825,5 +2140,123 @@ mod tests {
         assert_eq!(truncate_utf8("あ", 2), "");
         // "aあb" is 5 bytes; asking for 4 must trim to "a" (1 byte).
         assert_eq!(truncate_utf8("aあb", 4), "aあ");
+    }
+
+    #[test]
+    fn v5_defaults_existing_repositories_to_ephemeral() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migration::apply(&mut conn, &MIGRATIONS[..4]).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            upsert(&tx, "demo", "/repo", "hash", 1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        crate::migration::apply(&mut conn, MIGRATIONS).unwrap();
+
+        let repo = lookup_repository(&conn, "hash").unwrap().unwrap();
+        assert!(!repo.persistent);
+        assert!(repo.removal_request.is_none());
+        assert_eq!(aliases_for_repo(&conn, "hash").unwrap(), vec!["demo"]);
+        assert!(get_reconcile_state(&conn, "hash").unwrap().is_some());
+    }
+
+    #[test]
+    fn persistence_updates_are_separate_from_identity_upsert() {
+        let (_t, mut conn) = fresh();
+        let tx = conn.transaction().unwrap();
+        upsert(&tx, "demo", "/repo", "hash", 1).unwrap();
+        assert!(set_repository_persistent(&tx, "hash", true).unwrap());
+        upsert_repository(&tx, "hash", "/repo", 2).unwrap();
+        tx.commit().unwrap();
+
+        assert!(
+            lookup_repository(&conn, "hash")
+                .unwrap()
+                .unwrap()
+                .persistent
+        );
+    }
+
+    #[test]
+    fn removal_request_and_registry_delete_event_are_atomic() {
+        let (_t, mut conn) = fresh();
+        let tx = conn.transaction().unwrap();
+        upsert(&tx, "demo", "/repo", "hash", 1).unwrap();
+        assert!(
+            mark_removal_requested(&tx, "hash", RepositoryRemovalReason::MissingRoot, 10).unwrap()
+        );
+        assert!(
+            !mark_removal_requested(&tx, "hash", RepositoryRemovalReason::LastAliasRemoved, 20,)
+                .unwrap()
+        );
+        let event_id = delete_repository_with_event(&tx, "hash", 30)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert!(lookup_repository(&conn, "hash").unwrap().is_none());
+        assert!(lookup_by_alias(&conn, "demo").unwrap().is_none());
+        let events = list_incomplete_removals(&conn).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, event_id);
+        assert_eq!(events[0].reason, RepositoryRemovalReason::MissingRoot);
+        assert_eq!(events[0].store_cleanup_state, StoreCleanupState::Pending);
+    }
+
+    #[test]
+    fn completed_event_retention_never_prunes_pending_or_error() {
+        let (_t, mut conn) = fresh();
+        for id in 0..5 {
+            conn.execute(
+                "INSERT INTO repository_removal_events
+                 (repo_hash, root_path, removed_at_ns, reason, store_cleanup_state)
+                 VALUES (?1, '/repo', ?2, 'missing_root', ?3)",
+                params![
+                    format!("h{id}"),
+                    id,
+                    if id == 0 { "pending" } else { "complete" }
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE repository_removal_events
+             SET store_cleanup_state = 'error', cleanup_error = 'failed'
+             WHERE repo_hash = 'h1'",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        assert_eq!(prune_completed_removal_events(&tx, 2).unwrap(), 1);
+        tx.commit().unwrap();
+
+        let incomplete = list_incomplete_removals(&conn).unwrap();
+        assert_eq!(incomplete.len(), 2);
+        assert_eq!(list_recent_completed_removals(&conn, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cleanup_error_is_utf8_safely_truncated() {
+        let (_t, mut conn) = fresh();
+        conn.execute(
+            "INSERT INTO repository_removal_events
+             (repo_hash, root_path, removed_at_ns, reason, store_cleanup_state)
+             VALUES ('h', '/repo', 1, 'missing_root', 'pending')",
+            [],
+        )
+        .unwrap();
+        let event_id = conn.last_insert_rowid();
+        let tx = conn.transaction().unwrap();
+        mark_store_cleanup_error(&tx, event_id, &"あ".repeat(3000)).unwrap();
+        tx.commit().unwrap();
+
+        let error = list_incomplete_removals(&conn).unwrap()[0]
+            .cleanup_error
+            .clone()
+            .unwrap();
+        assert!(error.len() <= MAX_ERROR_STRING_BYTES);
+        assert!(error.chars().all(|ch| ch == 'あ'));
     }
 }

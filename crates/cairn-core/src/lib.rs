@@ -54,6 +54,16 @@ pub enum Error {
     /// User-facing repo alias is not registered.
     #[error("unknown repo alias: `{alias}`")]
     RepoNotFound { alias: String },
+    /// A canonical repository exists in the registry but is not accepting
+    /// new activity while registration or removal is in progress.
+    #[error("repository `{repo_hash}` is unavailable ({state})")]
+    RepositoryUnavailable {
+        repo_hash: String,
+        state: &'static str,
+    },
+    /// A no-create store open found no existing SQLite database.
+    #[error("repository store not found: `{path}`")]
+    StoreNotFound { path: String },
     /// Requested snapshot anchor is not present in the store.
     #[error("anchor not found: `{name}`")]
     AnchorNotFound { name: String },
