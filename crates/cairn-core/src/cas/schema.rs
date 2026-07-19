@@ -536,6 +536,18 @@ DELETE FROM resolutions
 ALTER TABLE symbols ADD COLUMN scope TEXT NOT NULL DEFAULT 'top_level';
 "#,
     },
+    Migration {
+        version: 13,
+        sql: r#"
+-- Durable proof that a tentative anchor was published by one completed
+-- reconcile attempt. Direct registrations and pre-v13 rows remain NULL;
+-- query/status freshness treats those snapshots as unverified until the
+-- startup reconcile stamps them.
+ALTER TABLE anchors
+    ADD COLUMN reconcile_generation INTEGER
+        CHECK(reconcile_generation IS NULL OR reconcile_generation >= 0);
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -544,6 +556,46 @@ mod tests {
 
     use super::MIGRATIONS;
     use crate::migration::{apply, apply_standard_pragmas};
+
+    #[test]
+    fn migration_v13_preserves_anchors_with_unverified_generation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        let through_v12: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 12)
+            .cloned()
+            .collect();
+        apply(&mut conn, &through_v12).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+             VALUES ('tentative/1', 1, 20)",
+            [],
+        )
+        .unwrap();
+
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        let row: (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT manifest_id, last_updated_ns, reconcile_generation
+                 FROM anchors WHERE anchor_name = 'tentative/1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, 20, None));
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
+    }
 
     /// Schema v6 should apply cleanly on top of all prior migrations
     /// and the `resolutions` table should accept a representative row
@@ -559,7 +611,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).
@@ -735,7 +787,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
     }
 
     // ──── EXPLAIN QUERY PLAN: v11 composite partial indexes ────
