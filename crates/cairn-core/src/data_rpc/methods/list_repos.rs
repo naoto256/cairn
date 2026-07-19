@@ -60,7 +60,7 @@ impl DataMethod for ListRepos {
                     current_symbol_count: snapshot_summary.summary.current_symbol_count,
                 });
             }
-            let capped = if let Some(limit) = args.limit {
+            let capped = if let Some(limit) = args.pagination.limit {
                 let limit = limit as usize;
                 if out.len() > limit {
                     out.truncate(limit);

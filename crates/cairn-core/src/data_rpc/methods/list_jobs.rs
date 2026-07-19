@@ -27,7 +27,7 @@ impl DataMethod for ListJobs {
 
         let (jobs, capped) = tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool)> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let entries = match args.repo.as_deref() {
+            let entries = match args.scope.repo.as_deref() {
                 Some(alias) => {
                     let entry = cas_registry::lookup_by_alias(&index, alias)?.ok_or_else(|| {
                         Error::RepoNotFound {
@@ -49,7 +49,7 @@ impl DataMethod for ListJobs {
                 )?);
             }
             out.sort_by_key(|job| std::cmp::Reverse(job.job_id));
-            let capped = if let Some(limit) = args.limit {
+            let capped = if let Some(limit) = args.pagination.limit {
                 let limit = limit as usize;
                 if out.len() > limit {
                     out.truncate(limit);

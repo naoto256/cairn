@@ -74,9 +74,9 @@ pub struct ListReposArgs {
     /// Optional substring filter matched against alias and root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Maximum number of repositories to return.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    /// Result cap.
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 /// Result of `list_repos`.
@@ -121,12 +121,12 @@ pub enum RepoAggregateStatus {
     Error,
 }
 
-/// Arguments to `repo_status`.
+/// Arguments to `repo_status`. Exactly one of `repo` or `path` is required.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoStatusArgs {
-    /// Repository alias. Exactly one of `repo` or `path` is required.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// Repository selection.
+    #[serde(flatten)]
+    pub scope: RepoScope,
     /// Filesystem path under a registered repository. Exclusive with `repo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -284,14 +284,16 @@ mod list_repos_tests {
     #[test]
     fn repo_status_requires_exactly_one_of_repo_or_path() {
         let neither = RepoStatusArgs::default();
-        assert!(neither.repo.is_none() && neither.path.is_none());
+        assert!(neither.scope.repo.is_none() && neither.path.is_none());
 
         let both = RepoStatusArgs {
-            repo: Some("cairn".into()),
+            scope: RepoScope {
+                repo: Some("cairn".into()),
+            },
             path: Some("/tmp/cairn".into()),
             ..RepoStatusArgs::default()
         };
-        assert!(both.repo.is_some() && both.path.is_some());
+        assert!(both.scope.repo.is_some() && both.path.is_some());
     }
 
     #[test]
@@ -386,14 +388,14 @@ mod list_repos_tests {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListJobsArgs {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    #[serde(flatten)]
+    pub scope: RepoScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     #[serde(default)]
     pub include_terminal: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    #[serde(flatten)]
+    pub pagination: PaginationArgs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1335,6 +1337,81 @@ mod tests {
 
     use super::*;
     use crate::common::default_tier;
+
+    #[test]
+    fn list_repos_args_stay_flat_for_full_and_empty_payloads() {
+        let full = json!({"query": "cairn", "limit": 25});
+        let args: ListReposArgs = serde_json::from_value(full.clone()).unwrap();
+        assert_eq!(args.query.as_deref(), Some("cairn"));
+        assert_eq!(args.pagination.limit, Some(25));
+        assert_eq!(serde_json::to_value(args).unwrap(), full);
+
+        let empty: ListReposArgs = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.query.is_none());
+        assert!(empty.pagination.limit.is_none());
+        assert_eq!(serde_json::to_value(empty).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn list_jobs_args_stay_flat_for_full_and_empty_payloads() {
+        let full = json!({
+            "repo": "cairn",
+            "state": "failed",
+            "include_terminal": true,
+            "limit": 50
+        });
+        let args: ListJobsArgs = serde_json::from_value(full.clone()).unwrap();
+        assert_eq!(args.scope.repo.as_deref(), Some("cairn"));
+        assert_eq!(args.state.as_deref(), Some("failed"));
+        assert!(args.include_terminal);
+        assert_eq!(args.pagination.limit, Some(50));
+        assert_eq!(serde_json::to_value(args).unwrap(), full);
+
+        let empty: ListJobsArgs = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.scope.repo.is_none());
+        assert!(empty.state.is_none());
+        assert!(!empty.include_terminal);
+        assert!(empty.pagination.limit.is_none());
+        assert_eq!(
+            serde_json::to_value(empty).unwrap(),
+            json!({"include_terminal": false})
+        );
+    }
+
+    #[test]
+    fn repo_status_args_stay_flat_for_full_and_empty_payloads() {
+        let repo_scoped = json!({
+            "repo": "cairn",
+            "include_snapshots": true,
+            "verbose_tier3": true
+        });
+        let args: RepoStatusArgs = serde_json::from_value(repo_scoped.clone()).unwrap();
+        assert_eq!(args.scope.repo.as_deref(), Some("cairn"));
+        assert!(args.path.is_none());
+        assert!(args.include_snapshots);
+        assert!(args.tier3.verbose_tier3);
+        assert_eq!(serde_json::to_value(args).unwrap(), repo_scoped);
+
+        let path_scoped = json!({
+            "path": "/tmp/cairn",
+            "include_snapshots": true,
+            "verbose_tier3": true
+        });
+        let args: RepoStatusArgs = serde_json::from_value(path_scoped.clone()).unwrap();
+        assert!(args.scope.repo.is_none());
+        assert_eq!(args.path.as_deref(), Some("/tmp/cairn"));
+        assert_eq!(serde_json::to_value(args).unwrap(), path_scoped);
+
+        let empty: RepoStatusArgs = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.scope.repo.is_none());
+        assert!(empty.path.is_none());
+        assert!(!empty.include_snapshots);
+        assert!(!empty.tier3.verbose_tier3);
+        assert_eq!(
+            serde_json::to_value(empty).unwrap(),
+            json!({"include_snapshots": false})
+        );
+    }
 
     #[test]
     fn find_symbol_hit_round_trips_language_some() {
