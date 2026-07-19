@@ -17,7 +17,7 @@
 //!    `tentative/<worktree_id>` anchors to the right manifests.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use cairn_lang_api::{LanguageBackend, all_backends, pick_backend_for_path};
@@ -28,7 +28,9 @@ use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas;
 use crate::jobs::{EnqueueReindex, JobManager, QueuedAnalyzerJob};
-use crate::manifest::{self, ManifestEntry, ManifestId, PathHint};
+use crate::manifest::{
+    self, ManifestEntry, ManifestId, ManifestKind, PathHint, WorktreeFilePayload,
+};
 use crate::workspace_analyzer::{
     check_workspace_analyzer_current_succeeded, is_c_family_header_path,
     pick_backend_with_fallbacks, run_registered_workspace_analyzers,
@@ -44,7 +46,7 @@ pub struct RegisterOutcome {
     pub tentative_manifest: ManifestId,
     /// `true` iff the workspace analyzer pass was skipped because the
     /// tentative manifest entries were byte-identical to the prior
-    /// tentative, no blobs were re-parsed by `parse_pending_blobs`,
+    /// tentative, no blobs were re-parsed by the pre-publication parse pass,
     /// and every expected analyzer already has a `succeeded` run row
     /// at the current `analyzer_revision`. All three gates must hold
     /// — entries-unchanged alone is not enough to skip (it would let
@@ -190,21 +192,54 @@ where
     let head_commit = run_git_capture(worktree_path, &["rev-parse", "HEAD"])?;
     let branch = detect_branch(worktree_path);
 
-    let tx = conn.transaction()?;
+    // Complete every source read and Tier-1 parse before opening the
+    // manifest/anchor publication transaction. Parsed blobs are
+    // content-addressed and may safely warm the cache if a later file fails;
+    // no snapshot points at them until the transaction below commits.
+    let existing_committed = manifest::lookup_by_commit_sha(conn, &head_commit)?;
+    let committed_entries = match existing_committed {
+        Some(id) => manifest::get_entries(conn, id)?,
+        None => manifest::collect_git_tree(worktree_path, &head_commit, include)?,
+    };
+    let mut parse_progress = ParseProgress::default();
+    let tentative_entries = manifest::capture_worktree(worktree_path, include, |payload| {
+        parse_worktree_payload(conn, &backends, payload, now_ns, &mut parse_progress)
+    })?;
+    parse_committed_entries(
+        conn,
+        worktree_path,
+        &backends,
+        &committed_entries,
+        now_ns,
+        &mut parse_progress,
+    )?;
+    let blobs_parsed = parse_progress.fresh;
 
+    let tx = conn.transaction()?;
     let worktree_id = upsert_worktree(&tx, worktree_path, now_ns)?;
     let tentative_anchor = AnchorName::tentative(worktree_id);
     let prior_tentative = anchor::resolve(&tx, &tentative_anchor)?;
 
     // Manifest construction — reuse a committed manifest if one
     // already exists for this commit.
-    let committed = match manifest::lookup_by_commit_sha(&tx, &head_commit)? {
+    let committed = match existing_committed {
         Some(id) => id,
-        None => manifest::build_from_git_tree(&tx, worktree_path, &head_commit, now_ns, include)?,
+        None => manifest::persist_manifest(
+            &tx,
+            ManifestKind::Committed,
+            Some(&head_commit),
+            now_ns,
+            &committed_entries,
+        )?,
     };
 
-    let built_tentative = manifest::build_from_worktree(&tx, worktree_path, now_ns, include)?;
-    let built_tentative_entries = manifest::get_entries(&tx, built_tentative)?;
+    let built_tentative = manifest::persist_manifest(
+        &tx,
+        ManifestKind::Tentative,
+        None,
+        now_ns,
+        &tentative_entries,
+    )?;
 
     // Gate #1 (manifest reuse): tentative entries byte-identical to
     // the prior tentative manifest. When this holds we drop the
@@ -218,7 +253,7 @@ where
     // now gated separately below.
     let entries_unchanged = dedupe_unchanged_tentative
         && match prior_tentative {
-            Some(prior) => manifest::get_entries(&tx, prior)? == built_tentative_entries,
+            Some(prior) => manifest::get_entries(&tx, prior)? == tentative_entries,
             None => false,
         };
     let (tentative, tentative_entries) = if entries_unchanged {
@@ -230,9 +265,9 @@ where
             manifest_id = prior.0,
             "tentative manifest unchanged; reusing prior manifest"
         );
-        (prior, built_tentative_entries)
+        (prior, tentative_entries)
     } else {
-        (built_tentative, built_tentative_entries)
+        (built_tentative, tentative_entries)
     };
 
     // Anchors.
@@ -248,32 +283,18 @@ where
     prune_stale_ref_anchors(&tx, "tag/", &live_ref_names(worktree_path, "refs/tags")?)?;
     anchor::set(&tx, &tentative_anchor, tentative, now_ns)?;
 
-    // Collect every (blob_sha, source) pair we need to ensure is
-    // parsed. Source tells us where to fetch the content from:
-    // committed blobs come from git, tentative-only blobs from the
-    // worktree.
-    let committed_entries = manifest::get_entries(&tx, committed)?;
     tx.commit()?;
 
     // Gate #2 (blobs re-parsed): the truth-source for "Tier-1 facts
-    // moved under this manifest" is `parse_pending_blobs`. Any of
+    // moved under this manifest" is the pre-publication parse pass. Any of
     // (a) a new blob, (b) a parser_revision bump on an existing
     // blob, or (c) a missing parsed_data row triggers `blobs_parsed
     // > 0`. We use that signal directly instead of re-deriving a
     // parser-drift check, so the two paths cannot drift apart.
     //
-    // Order matters: `parse_pending_blobs` must run BEFORE the
-    // skip decision. Running it after would observe a post-skip
-    // state and let drift slip through (the F-A regression).
-    let blobs_parsed = parse_pending_blobs(
-        conn,
-        worktree_path,
-        &backends,
-        &committed_entries,
-        &tentative_entries,
-        now_ns,
-    )?;
-
+    // Order matters: parsing must finish before publication and before the
+    // skip decision. Running it after would observe a post-skip state and let
+    // drift slip through.
     // Gate #3 (analyzer revision current): every expected analyzer
     // has a `succeeded` workspace_analysis_runs row at the current
     // linked-in `revision()`. queued / running / failed / skipped /
@@ -324,122 +345,121 @@ where
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
-fn parse_pending_blobs(
+#[derive(Default)]
+struct ParseProgress {
+    seen: HashSet<(String, String)>,
+    fresh: usize,
+}
+
+fn parse_worktree_payload(
     conn: &mut Connection,
-    worktree_path: &Path,
     backends: &[Box<dyn LanguageBackend>],
-    committed: &[ManifestEntry],
-    tentative: &[ManifestEntry],
+    payload: WorktreeFilePayload<'_>,
     now_ns: i64,
-) -> Result<usize> {
-    // For each blob, prefer a worktree source when the same blob_sha
-    // shows up in the tentative manifest (= file content is on
-    // disk). Otherwise fall back to `git cat-file` for committed-
-    // only blobs.
-    use std::collections::HashMap;
+    progress: &mut ParseProgress,
+) -> Result<()> {
+    let Some(backend) = pick_backend_for_path(backends, &payload.entry.path)
+        .or_else(|| pick_backend_with_fallbacks(backends, &payload.entry.path, payload.bytes))
+    else {
+        return Ok(());
+    };
+    parse_borrowed(
+        conn,
+        payload.entry,
+        backend,
+        payload.bytes,
+        now_ns,
+        progress,
+    )
+}
 
-    let mut tentative_path_by_blob: HashMap<&str, &Path> = HashMap::new();
-    for e in tentative {
-        tentative_path_by_blob
-            .entry(e.blob_sha.as_str())
-            .or_insert_with(|| Path::new(e.path.as_str()));
-    }
-
-    let mut work_units: Vec<(String, String, WorkContent)> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for entry in committed.iter().chain(tentative.iter()) {
+fn parse_committed_entries(
+    conn: &mut Connection,
+    repo_root: &Path,
+    backends: &[Box<dyn LanguageBackend>],
+    entries: &[ManifestEntry],
+    now_ns: i64,
+    progress: &mut ParseProgress,
+) -> Result<()> {
+    for entry in entries {
         if let Some(backend) = pick_backend_for_path(backends, &entry.path) {
             let parser_id = backend.parser_id().to_string();
-            if !seen.insert((entry.blob_sha.clone(), parser_id.clone())) {
+            if !progress
+                .seen
+                .insert((entry.blob_sha.clone(), parser_id.clone()))
+            {
                 continue;
             }
-            let source = source_for(entry, &tentative_path_by_blob, worktree_path);
-            work_units.push((
-                entry.blob_sha.clone(),
-                parser_id,
-                WorkContent::Source(source),
-            ));
+            let analyzer = backend.analyzer();
+            let expected_analyzer = analyzer.as_deref().map(|a| (a.name(), a.revision()));
+            let was_fresh = cas::blob::reuse_or_compute(
+                conn,
+                &entry.blob_sha,
+                &parser_id,
+                backend.parser_revision(),
+                expected_analyzer,
+                now_ns,
+                || {
+                    let bytes = git_cat_file(repo_root, &entry.blob_sha)?;
+                    parse_bytes(backend, &bytes)
+                },
+            )?;
+            progress.record_result(&entry.blob_sha, &parser_id, was_fresh);
             continue;
         }
 
-        let source = match tentative_path_by_blob.get(entry.blob_sha.as_str()) {
-            Some(rel) => ContentSource::Worktree(worktree_path.join(rel)),
-            None => ContentSource::Git(entry.blob_sha.clone()),
-        };
-        let content = match &source {
-            ContentSource::Worktree(p) => std::fs::read(p)?,
-            ContentSource::Git(sha) => git_cat_file(worktree_path, sha)?,
-        };
-        let Some(backend) = pick_backend_with_fallbacks(backends, &entry.path, &content) else {
+        let bytes = git_cat_file(repo_root, &entry.blob_sha)?;
+        let Some(backend) = pick_backend_with_fallbacks(backends, &entry.path, &bytes) else {
             continue;
         };
-        let parser_id = backend.parser_id().to_string();
-        if !seen.insert((entry.blob_sha.clone(), parser_id.clone())) {
-            continue;
-        }
-        work_units.push((
-            entry.blob_sha.clone(),
-            parser_id,
-            WorkContent::Preread(content),
-        ));
+        parse_borrowed(conn, entry, backend, &bytes, now_ns, progress)?;
     }
+    Ok(())
+}
 
-    let mut fresh = 0;
-    for (blob_sha, parser_id, content) in work_units {
-        let backend = backends
-            .iter()
-            .find(|b| b.parser_id() == parser_id)
-            .expect("parser_id was just produced by a registered backend")
-            .as_ref();
-        let analyzer = backend.analyzer();
-        let expected_analyzer = analyzer.as_deref().map(|a| (a.name(), a.revision()));
-        let was_fresh = cas::blob::reuse_or_compute(
-            conn,
-            &blob_sha,
-            &parser_id,
-            backend.parser_revision(),
-            expected_analyzer,
-            now_ns,
-            || {
-                let bytes = match &content {
-                    WorkContent::Source(ContentSource::Worktree(p)) => std::fs::read(p)?,
-                    WorkContent::Source(ContentSource::Git(sha)) => {
-                        git_cat_file(worktree_path, sha)?
-                    }
-                    WorkContent::Preread(bytes) => bytes.clone(),
-                };
-                cas::parse::parse(backend, &bytes)
-                    .map_err(|e| crate::Error::InvalidArgument(format!("parse failed: {e}")))
-            },
-        )?;
+fn parse_borrowed(
+    conn: &mut Connection,
+    entry: &ManifestEntry,
+    backend: &dyn LanguageBackend,
+    bytes: &[u8],
+    now_ns: i64,
+    progress: &mut ParseProgress,
+) -> Result<()> {
+    let parser_id = backend.parser_id().to_string();
+    if !progress
+        .seen
+        .insert((entry.blob_sha.clone(), parser_id.clone()))
+    {
+        return Ok(());
+    }
+    let analyzer = backend.analyzer();
+    let expected_analyzer = analyzer.as_deref().map(|a| (a.name(), a.revision()));
+    let was_fresh = cas::blob::reuse_or_compute(
+        conn,
+        &entry.blob_sha,
+        &parser_id,
+        backend.parser_revision(),
+        expected_analyzer,
+        now_ns,
+        || parse_bytes(backend, bytes),
+    )?;
+    progress.record_result(&entry.blob_sha, &parser_id, was_fresh);
+    Ok(())
+}
+
+fn parse_bytes(backend: &dyn LanguageBackend, bytes: &[u8]) -> Result<cas::blob::ParsedData> {
+    cas::parse::parse(backend, bytes)
+        .map_err(|err| crate::Error::InvalidArgument(format!("parse failed: {err}")))
+}
+
+impl ParseProgress {
+    fn record_result(&mut self, blob_sha: &str, parser_id: &str, was_fresh: bool) {
         if was_fresh {
-            fresh += 1;
+            self.fresh += 1;
         } else {
             debug!(blob_sha, parser_id, "reused parsed_data");
         }
     }
-    Ok(fresh)
-}
-
-fn source_for(
-    entry: &ManifestEntry,
-    tentative_path_by_blob: &std::collections::HashMap<&str, &Path>,
-    worktree_path: &Path,
-) -> ContentSource {
-    match tentative_path_by_blob.get(entry.blob_sha.as_str()) {
-        Some(rel) => ContentSource::Worktree(worktree_path.join(rel)),
-        None => ContentSource::Git(entry.blob_sha.clone()),
-    }
-}
-
-enum ContentSource {
-    Worktree(PathBuf),
-    Git(String),
-}
-
-enum WorkContent {
-    Source(ContentSource),
-    Preread(Vec<u8>),
 }
 
 fn upsert_worktree(tx: &rusqlite::Transaction<'_>, path: &Path, now_ns: i64) -> Result<i64> {
@@ -673,6 +693,49 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_scan_preserves_published_anchors_and_skips_analyzers() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn old() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let analyzer_runs = Cell::new(0);
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        let head_before = anchor::resolve(&conn, &AnchorName::head()).unwrap();
+        let tentative_before =
+            anchor::resolve(&conn, &AnchorName::tentative(first.worktree_id)).unwrap();
+        let manifests_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manifests", [], |row| row.get(0))
+            .unwrap();
+
+        fs::write(repo.path().join("src/lib.rs"), "pub fn new() {}\n").unwrap();
+        fs::write(repo.path().join(".gitignore"), [0xff]).unwrap();
+        let err = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+            analyzer_runs.set(analyzer_runs.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, crate::Error::Scan(_)));
+        assert_eq!(
+            anchor::resolve(&conn, &AnchorName::head()).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            anchor::resolve(&conn, &AnchorName::tentative(first.worktree_id)).unwrap(),
+            tentative_before
+        );
+        let manifests_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manifests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(manifests_after, manifests_before);
+        assert_eq!(analyzer_runs.get(), 1);
+    }
+
+    #[test]
     fn unchanged_tentative_manifest_skips_analyzer_pass_on_second_register() {
         let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
         let db_tmp = tempfile::tempdir().unwrap();
@@ -703,7 +766,7 @@ mod tests {
     /// tentative.
     ///
     /// We simulate "blob re-parse fired" by deleting the parsed-blob
-    /// rows between the two registers. `parse_pending_blobs` will then
+    /// rows between the two registers. The pre-publication parse pass will then
     /// re-compute them and return `blobs_parsed > 0`, which is the
     /// truth-source the skip gate watches. Manifest entries stay
     /// identical because they reference the same `blob_sha` values.
@@ -784,7 +847,7 @@ mod tests {
         assert_eq!(analyzer_runs.get(), 1);
 
         // Simulate Tier-1 parser_revision bump: wipe parsed-blob rows.
-        // `parse_pending_blobs` on the next register will re-parse and
+        // The pre-publication parse pass on the next register will re-parse and
         // return `blobs_parsed > 0` — the truth-source the skip gate
         // watches. Manifest entries stay identical because the worktree
         // is unchanged.
@@ -836,6 +899,10 @@ mod tests {
         assert!(!first.skip_analyzers_for_unchanged_manifest);
         assert!(!second.skip_analyzers_for_unchanged_manifest);
         assert_ne!(second.tentative_manifest, first.tentative_manifest);
+        assert_eq!(
+            second.blobs_parsed, 0,
+            "force reindex bypasses manifest/analyzer dedupe but retains the Tier-1 CAS"
+        );
         assert_eq!(analyzer_runs.get(), 2);
     }
 

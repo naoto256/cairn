@@ -49,6 +49,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("scan: {0}")]
+    Scan(#[from] cairn_watch::scan::ScanFailure),
     /// JSON-RPC parameter parse / validation failure.
     #[error("invalid params: {0}")]
     InvalidParams(String),
