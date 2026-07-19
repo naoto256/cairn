@@ -667,10 +667,10 @@ impl RepoLifecycleManager {
         registered_at_ns: i64,
         reconcile_policy: RegistrationReconcilePolicy,
     ) -> Result<RegistrationPublication> {
-        let _transition = self.transition.lock().map_err(|_| {
+        let transition = self.transition.lock().map_err(|_| {
             Error::Internal("repository lifecycle transition mutex poisoned".into())
         })?;
-        let (old_hash, catch_up_generation) = {
+        let publication = (|| -> Result<(Option<String>, Option<i64>)> {
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
             let old_hash = cas_registry::lookup_by_alias(&index, alias)?
                 .map(|entry| entry.repo_hash)
@@ -730,7 +730,23 @@ impl RepoLifecycleManager {
                 }
             };
             tx.commit()?;
-            (old_hash, catch_up_generation)
+            Ok((old_hash, catch_up_generation))
+        })();
+        let (old_hash, catch_up_generation) = match publication {
+            Ok(publication) => publication,
+            Err(error) => {
+                // The alias/catch-up transaction did not commit, so this permit
+                // still owns an unpublished registration. Release the transition
+                // lock before routing cleanup through the same canonical abort
+                // path used by initial-scan failures.
+                drop(transition);
+                return match self.abort_registration_sync(permit) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(Error::Internal(format!(
+                        "registration publication failed: {error}; cleanup failed: {cleanup}"
+                    ))),
+                };
+            }
         };
         if let Some(gate) = self.gate(&permit.repo_hash) {
             gate.set_active()?;
@@ -747,7 +763,11 @@ impl RepoLifecycleManager {
 
     /// Abort a failed new registration without exposing a partial canonical
     /// owner. Existing owners are left intact.
-    pub async fn abort_registration(&self, mut permit: RegistrationPermit) -> Result<()> {
+    pub async fn abort_registration(&self, permit: RegistrationPermit) -> Result<()> {
+        self.abort_registration_sync(permit)
+    }
+
+    fn abort_registration_sync(&self, mut permit: RegistrationPermit) -> Result<()> {
         permit.lease.take();
         if !permit.newly_created {
             return Ok(());
@@ -1274,6 +1294,62 @@ mod tests {
             registry::lookup_by_alias(&index, "demo").unwrap().is_none(),
             "alias publication must roll back with catch-up generation failure"
         );
+    }
+
+    #[tokio::test]
+    async fn catch_up_failure_cleans_up_newly_created_owner_and_gate() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let permit = lifecycle
+            .begin_registration("hash".into(), repo.path().to_path_buf(), 1)
+            .unwrap();
+        let first_gate = lifecycle.gate("hash").unwrap();
+        {
+            let index = registry::open(&cas.index_db_path()).unwrap();
+            index
+                .execute(
+                    "UPDATE repo_reconcile_state SET desired_generation = ?1
+                     WHERE repo_hash = 'hash'",
+                    rusqlite::params![i64::MAX],
+                )
+                .unwrap();
+        }
+
+        let err = lifecycle
+            .publish_registration(
+                permit,
+                "demo",
+                None,
+                2,
+                RegistrationReconcilePolicy::ImmediateCatchUp,
+            )
+            .unwrap_err();
+
+        assert!(format!("{err}").contains("overflow"));
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        assert!(
+            registry::lookup_repository(&index, "hash")
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry::lookup_by_alias(&index, "demo").unwrap().is_none());
+        assert_eq!(
+            first_gate.snapshot(),
+            (RepoActivityState::Removed, 0),
+            "failed publication must release the permit and close its gate"
+        );
+        drop(index);
+
+        let retry = lifecycle
+            .begin_registration("hash".into(), repo.path().to_path_buf(), 3)
+            .unwrap();
+        let retry_gate = lifecycle.gate("hash").unwrap();
+        assert!(!Arc::ptr_eq(&first_gate, &retry_gate));
+        assert_eq!(retry_gate.snapshot(), (RepoActivityState::Registering, 1));
+        lifecycle.abort_registration(retry).await.unwrap();
     }
 
     #[tokio::test]
