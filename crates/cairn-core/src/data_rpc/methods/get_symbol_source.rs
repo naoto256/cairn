@@ -95,11 +95,18 @@ impl DataMethod for GetSymbolSource {
         let freshness_issues = execution.freshness_issues;
         let Some(hit) = execution.items.into_iter().next() else {
             if let Some(issue) = freshness_issues.first() {
-                return Err(Error::FileNotIndexed {
-                    repo: (issue.repo != "*").then(|| issue.repo.clone()),
-                    file: args.file.clone().unwrap_or_else(|| "<unspecified>".into()),
-                    reason: issue.reason.into(),
-                });
+                let repo = (issue.repo != "*").then(|| issue.repo.clone());
+                return match args.file.clone() {
+                    Some(file) => Err(Error::FileNotIndexed {
+                        repo,
+                        file,
+                        reason: issue.reason.into(),
+                    }),
+                    None => Err(Error::SnapshotStale {
+                        repo,
+                        reason: issue.reason.into(),
+                    }),
+                };
             }
             let scope = requested_repo
                 .as_deref()
@@ -189,10 +196,27 @@ fn materialise(worktree_root: &std::path::Path, row: &SymbolSourceRow) -> Result
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
     use serde_json::json;
 
     use super::*;
+    use crate::cas::registry as cas_registry;
     use crate::data_rpc::helpers::test_support;
+
+    fn mark_fixture_stale(fixture: &test_support::DataRpcFixture) {
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = applied_generation + 1
+                 WHERE repo_hash = ?1",
+                params![entry.repo_hash],
+            )
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn explicit_missing_file_returns_typed_file_not_indexed() {
@@ -237,5 +261,76 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn fresh_qualified_miss_without_file_keeps_existing_not_found_contract() {
+        let fixture = test_support::registered_fixture();
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "crate::missing"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn stale_qualified_miss_without_file_returns_snapshot_stale() {
+        let fixture = test_support::registered_fixture();
+        mark_fixture_stale(&fixture);
+
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "crate::missing"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SnapshotStale {
+                repo: Some(repo),
+                reason
+            } if repo == "demo" && reason == "reconcile_generation_gap"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_qualified_miss_with_file_keeps_file_not_indexed_contract() {
+        let fixture = test_support::registered_fixture();
+        mark_fixture_stale(&fixture);
+
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "crate::missing",
+                    "file": "src/lib.rs"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::FileNotIndexed {
+                repo: Some(repo),
+                file,
+                reason
+            } if repo == "demo"
+                && file == "src/lib.rs"
+                && reason == "reconcile_generation_gap"
+        ));
     }
 }
