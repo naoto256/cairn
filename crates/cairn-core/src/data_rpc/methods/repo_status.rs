@@ -32,7 +32,7 @@ impl DataMethod for RepoStatus {
             let backends = all_backends();
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
             let entry =
-                match (args.repo.as_deref(), args.path.as_deref()) {
+                match (args.scope.repo.as_deref(), args.path.as_deref()) {
                     (Some(alias), None) => cas_registry::lookup_by_alias(&index, alias)?
                         .ok_or_else(|| Error::RepoNotFound {
                             alias: alias.to_string(),
@@ -244,7 +244,7 @@ pub(crate) fn reconcile_state_to_wire(
 }
 
 fn validate_repo_status_args(args: &RepoStatusArgs) -> Result<()> {
-    match (args.repo.as_ref(), args.path.as_ref()) {
+    match (args.scope.repo.as_ref(), args.path.as_ref()) {
         (Some(_), None) | (None, Some(_)) => Ok(()),
         (None, None) => Err(Error::InvalidParams(
             "repo_status requires exactly one of `repo` or `path`".into(),
@@ -264,13 +264,16 @@ mod tests {
     use super::*;
     use crate::data_rpc::helpers::test_support;
     use cairn_proto::common::{TierAnalyzerStatus, default_tier};
+    use cairn_proto::methods::RepoScope;
 
     #[test]
     fn repo_status_requires_exactly_one_of_repo_or_path() {
         assert!(validate_repo_status_args(&RepoStatusArgs::default()).is_err());
         assert!(
             validate_repo_status_args(&RepoStatusArgs {
-                repo: Some("demo".into()),
+                scope: RepoScope {
+                    repo: Some("demo".into()),
+                },
                 path: Some("/tmp/demo".into()),
                 ..RepoStatusArgs::default()
             })
@@ -278,7 +281,9 @@ mod tests {
         );
         assert!(
             validate_repo_status_args(&RepoStatusArgs {
-                repo: Some("demo".into()),
+                scope: RepoScope {
+                    repo: Some("demo".into()),
+                },
                 ..RepoStatusArgs::default()
             })
             .is_ok()
