@@ -301,6 +301,17 @@ column is likewise `Option<T>` with skip-when-`None` — required
 scalar fields (`repo_hash`, generation counters,
 `consecutive_failures`, `watcher_state`) always serialize.
 
+The default current view is reported as ready only when its tentative anchor
+is backed by the latest applied reconcile generation, no reconcile attempt or
+dirty gap remains, the watcher is active, and the last successful full scan is
+recent. Queries still return rows from an older current snapshot when useful,
+but mark the response partial with
+`file_not_indexed_or_snapshot_stale`; exact file queries also verify that the
+file belongs to the selected manifest. Explicit `--anchor` / `--branch`
+queries are historical reads and are not judged against current-worktree
+freshness. A stale or unindexed file passed to `get_symbol_source` is surfaced
+as JSON-RPC `-32002` with structured recovery data instead of a silent miss.
+
 ## Languages
 
 | Language | Tier-1 (syntax) | Tier-2 (semantic) | Tier-2.5 (in-process) | Tier-3 (cross-file) |
