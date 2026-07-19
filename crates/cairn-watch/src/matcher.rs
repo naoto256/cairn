@@ -35,7 +35,7 @@ impl GitMetadataPaths {
 
 pub(crate) fn resolve_git_metadata(repo_root: &Path) -> io::Result<GitMetadataPaths> {
     let dot_git = repo_root.join(".git");
-    let worktree_git_dir = if dot_git.is_file() {
+    let worktree_git_dir = if try_is_file(&dot_git)? {
         let contents = fs::read_to_string(&dot_git)?;
         let raw = contents
             .lines()
@@ -118,14 +118,26 @@ impl RepoIgnoreMatcher {
     /// In addition to the fixed always-pruned directory names, any
     /// directory below the registered root that contains a `.git`
     /// file or directory is a nested repository boundary. Metadata
-    /// lookup errors intentionally fail open here; the scanner's
-    /// fallible-I/O contract is handled separately.
+    /// lookup errors intentionally fail open here. Full scans use
+    /// [`Self::try_is_pruned_path`] so the same error rejects publication.
     pub(crate) fn is_pruned_path(&self, path: &Path) -> bool {
+        self.try_is_pruned_path(path).unwrap_or_else(|err| {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "nested repository boundary lookup failed; classifier is fail-open"
+            );
+            false
+        })
+    }
+
+    /// Fallible form of [`Self::is_pruned_path`] for full-scan callers.
+    pub(crate) fn try_is_pruned_path(&self, path: &Path) -> io::Result<bool> {
         let Ok(relative) = path.strip_prefix(&self.repo_root) else {
-            return false;
+            return Ok(false);
         };
         if relative.as_os_str().is_empty() {
-            return false;
+            return Ok(false);
         }
         if relative.components().any(|component| {
             component
@@ -133,13 +145,19 @@ impl RepoIgnoreMatcher {
                 .to_str()
                 .is_some_and(|name| ALWAYS_PRUNED_DIR_NAMES.contains(&name))
         }) {
-            return true;
+            return Ok(true);
         }
 
-        path.ancestors()
+        for directory in path
+            .ancestors()
             .take_while(|directory| *directory != self.repo_root)
             .take_while(|directory| directory.starts_with(&self.repo_root))
-            .any(has_git_marker)
+        {
+            if try_has_git_marker(directory)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
@@ -177,7 +195,7 @@ impl RepoIgnoreMatcher {
 
     fn discover_directory(&mut self, directory: &Path) -> io::Result<()> {
         let ignore_file = directory.join(".gitignore");
-        if ignore_file.is_file() {
+        if try_is_file(&ignore_file)? {
             self.layers.push(IgnoreLayer {
                 directory: directory.to_path_buf(),
                 matcher: load_matcher(directory, &ignore_file)?,
@@ -192,7 +210,7 @@ impl RepoIgnoreMatcher {
                 continue;
             }
             let path = entry.path();
-            if self.is_pruned_path(&path) || self.is_ignored(&path, true) {
+            if self.is_ignored(&path, true) || self.try_is_pruned_path(&path)? {
                 continue;
             }
             self.discover_directory(&path)?;
@@ -217,7 +235,7 @@ fn decision(matched: Match<&ignore::gitignore::Glob>) -> MatchDecision {
 }
 
 fn load_matcher(root: &Path, source: &Path) -> io::Result<Gitignore> {
-    if !source.is_file() {
+    if !try_is_file(source)? {
         return Ok(Gitignore::empty());
     }
     let mut builder = GitignoreBuilder::new(root);
@@ -229,9 +247,38 @@ fn load_matcher(root: &Path, source: &Path) -> io::Result<Gitignore> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-fn has_git_marker(directory: &Path) -> bool {
+fn try_is_file(path: &Path) -> io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn try_has_git_marker(directory: &Path) -> io::Result<bool> {
     let marker = directory.join(".git");
-    marker.is_file() || marker.is_dir()
+    match fs::metadata(marker) {
+        Ok(metadata) => Ok(metadata.is_file() || metadata.is_dir()),
+        // A file path can be the first ancestor examined. Appending `.git`
+        // to it yields NotADirectory, which means "not a boundary" rather
+        // than a failed metadata lookup.
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub(crate) fn is_nested_git_marker_path(repo_root: &Path, path: &Path) -> bool {
@@ -321,6 +368,19 @@ mod tests {
 
         let matcher = RepoIgnoreMatcher::fail_open(root);
         assert!(matcher.is_pruned_path(&root.join("nested/src/lib.rs")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn strict_boundary_lookup_reports_metadata_error_while_classifier_fails_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+        let matcher = RepoIgnoreMatcher::fail_open(root);
+        let path = root.join("loop/source.rs");
+
+        assert!(matcher.try_is_pruned_path(&path).is_err());
+        assert!(!matcher.is_pruned_path(&path));
     }
 
     #[test]

@@ -3,11 +3,13 @@
 //! Filesystem watchers — `FSEvents` in particular — drop events under
 //! load. Re-running the entire `(path, mtime, size)` tuple set after
 //! a watcher restart lets the daemon detect drift the watcher missed
-//! while it was down. The output is intentionally a streaming
-//! iterator so callers can process the tree without buffering
-//! everything in memory.
+//! while it was down. A scan keeps walking after individual I/O errors to
+//! collect bounded diagnostics, but callers must reject the complete report
+//! when any error was observed.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ignore::{DirEntry, WalkBuilder};
 use tracing::warn;
@@ -22,6 +24,130 @@ pub struct ScannedFile {
     pub size_bytes: u64,
     pub is_executable: bool,
 }
+
+const MAX_SCAN_ERROR_SAMPLES: usize = 64;
+const MAX_SCAN_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// Filesystem operation that failed during a full scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScanOperation {
+    ResolveGitMetadata,
+    BuildIgnoreMatcher,
+    BoundaryMetadata,
+    Walk,
+    EntryMetadata,
+    ModifiedTime,
+}
+
+/// One bounded diagnostic retained from an incomplete scan.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScanErrorSample {
+    pub operation: ScanOperation,
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// Error summary for a scan. `total` includes diagnostics omitted from
+/// `samples` after the bounded retention limit is reached.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanErrors {
+    pub total: usize,
+    pub samples: Vec<ScanErrorSample>,
+}
+
+impl ScanErrors {
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn record(
+        &mut self,
+        operation: ScanOperation,
+        path: impl Into<PathBuf>,
+        message: impl AsRef<str>,
+    ) {
+        self.total = self.total.saturating_add(1);
+        let sample = ScanErrorSample {
+            operation,
+            path: path.into(),
+            message: truncate_utf8(message.as_ref(), MAX_SCAN_ERROR_MESSAGE_BYTES),
+        };
+        if self.samples.len() < MAX_SCAN_ERROR_SAMPLES {
+            self.samples.push(sample);
+            return;
+        }
+        let Some((largest_index, largest)) = self
+            .samples
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.cmp(b))
+        else {
+            return;
+        };
+        if sample < *largest {
+            self.samples[largest_index] = sample;
+        }
+    }
+
+    fn finish(&mut self) {
+        self.samples.sort();
+    }
+}
+
+/// Complete result of walking a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    pub root: PathBuf,
+    pub entries: Vec<ScannedFile>,
+    pub errors: ScanErrors,
+}
+
+impl ScanReport {
+    /// Return entries only when every required filesystem operation succeeded.
+    pub fn into_entries(self) -> Result<Vec<ScannedFile>, ScanFailure> {
+        if self.errors.is_empty() {
+            Ok(self.entries)
+        } else {
+            Err(ScanFailure {
+                root: self.root,
+                partial_entry_count: self.entries.len(),
+                errors: self.errors,
+            })
+        }
+    }
+}
+
+/// A full scan was incomplete and therefore cannot be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanFailure {
+    pub root: PathBuf,
+    pub partial_entry_count: usize,
+    pub errors: ScanErrors,
+}
+
+impl fmt::Display for ScanFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "repository scan of {} was incomplete: {} error(s), {} partial entries",
+            self.root.display(),
+            self.errors.total,
+            self.partial_entry_count
+        )?;
+        if let Some(sample) = self.errors.samples.first() {
+            write!(
+                f,
+                " (first: {:?} at {}: {})",
+                sample.operation,
+                sample.path.display(),
+                sample.message
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ScanFailure {}
 
 /// Directory names that cairn always prunes from the working-tree
 /// walk, even when they are not present in any `.gitignore`. These
@@ -40,20 +166,32 @@ pub struct ScannedFile {
 pub(crate) const ALWAYS_PRUNED_DIR_NAMES: &[&str] = &[".git", "target", "node_modules", ".claude"];
 
 /// Walk `repo_root`, honoring `.gitignore` and `.git/info/exclude`,
-/// and yield every regular file found. Directories listed in
+/// and collect every regular file found. Directories listed in
 /// [`ALWAYS_PRUNED_DIR_NAMES`] are skipped regardless of gitignore.
-pub fn walk_repo(repo_root: &Path) -> impl Iterator<Item = ScannedFile> {
-    let info_exclude = resolve_git_metadata(repo_root)
-        .map(|paths| paths.info_exclude)
-        .unwrap_or_else(|_| repo_root.join(".git/info/exclude"));
+pub fn walk_repo(repo_root: &Path) -> ScanReport {
+    let errors = Arc::new(Mutex::new(ScanErrors::default()));
+    let info_exclude = match resolve_git_metadata(repo_root) {
+        Ok(paths) => paths.info_exclude,
+        Err(err) => {
+            record_error(
+                &errors,
+                ScanOperation::ResolveGitMetadata,
+                repo_root.join(".git"),
+                err,
+            );
+            repo_root.join(".git/info/exclude")
+        }
+    };
     let matcher = RepoIgnoreMatcher::build(repo_root, &info_exclude).unwrap_or_else(|err| {
+        record_error(&errors, ScanOperation::BuildIgnoreMatcher, repo_root, &err);
         warn!(
             root = %repo_root.display(),
             error = %err,
-            "ignore matcher build failed during scan; scan is fail-open"
+            "ignore matcher build failed during scan; collecting diagnostics fail-open"
         );
         RepoIgnoreMatcher::fail_open(repo_root)
     });
+    let filter_errors = Arc::clone(&errors);
     let walker = WalkBuilder::new(repo_root)
         .hidden(false) // we want dotfiles like .env, but excluded set covers .git
         // Ignore policy is owned by RepoIgnoreMatcher so the startup
@@ -67,30 +205,133 @@ pub fn walk_repo(repo_root: &Path) -> impl Iterator<Item = ScannedFile> {
         .git_global(false)
         .require_git(false)
         .filter_entry(move |e| {
-            !matcher.is_pruned_path(e.path())
-                && !matcher.is_ignored(e.path(), e.file_type().is_some_and(|kind| kind.is_dir()))
+            let is_dir = e.file_type().is_some_and(|kind| kind.is_dir());
+            if matcher.is_ignored(e.path(), is_dir) {
+                return false;
+            }
+            let pruned = matcher.try_is_pruned_path(e.path()).unwrap_or_else(|err| {
+                record_error(
+                    &filter_errors,
+                    ScanOperation::BoundaryMetadata,
+                    e.path(),
+                    err,
+                );
+                false
+            });
+            !pruned
         })
         .build();
 
-    walker.filter_map(Result::ok).filter_map(scanned_from_entry)
+    let mut entries = Vec::new();
+    for result in walker {
+        match result {
+            Ok(entry) => {
+                if let Some(file) = scanned_from_entry(entry, &errors) {
+                    entries.push(file);
+                }
+            }
+            Err(err) => {
+                let path = ignore_error_path(&err)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| repo_root.to_path_buf());
+                record_error(&errors, ScanOperation::Walk, path, err);
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut errors = take_errors(errors);
+    errors.finish();
+    ScanReport {
+        root: repo_root.to_path_buf(),
+        entries,
+        errors,
+    }
 }
 
-fn scanned_from_entry(entry: DirEntry) -> Option<ScannedFile> {
+fn scanned_from_entry(entry: DirEntry, errors: &Arc<Mutex<ScanErrors>>) -> Option<ScannedFile> {
     if !entry.file_type().is_some_and(|t| t.is_file()) {
         return None;
     }
-    let meta = entry.metadata().ok()?;
-    let mtime_ns = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX));
+    let path = entry.path().to_path_buf();
+    let meta = match entry.metadata() {
+        Ok(meta) => meta,
+        Err(err) => {
+            record_error(errors, ScanOperation::EntryMetadata, &path, err);
+            return None;
+        }
+    };
+    let modified = match meta.modified() {
+        Ok(modified) => modified,
+        Err(err) => {
+            record_error(errors, ScanOperation::ModifiedTime, &path, err);
+            return None;
+        }
+    };
+    let mtime_ns = match modified_time_ns(modified) {
+        Ok(mtime_ns) => mtime_ns,
+        Err(err) => {
+            record_error(errors, ScanOperation::ModifiedTime, &path, err);
+            return None;
+        }
+    };
     Some(ScannedFile {
-        path: entry.into_path(),
+        path,
         mtime_ns,
         size_bytes: meta.len(),
         is_executable: is_executable(&meta),
     })
+}
+
+fn modified_time_ns(modified: std::time::SystemTime) -> Result<i128, std::time::SystemTimeError> {
+    let elapsed = modified.duration_since(std::time::UNIX_EPOCH)?;
+    Ok(i128::try_from(elapsed.as_nanos()).unwrap_or(i128::MAX))
+}
+
+fn record_error(
+    errors: &Arc<Mutex<ScanErrors>>,
+    operation: ScanOperation,
+    path: impl Into<PathBuf>,
+    error: impl fmt::Display,
+) {
+    let mut guard = errors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.record(operation, path, error.to_string());
+}
+
+fn take_errors(errors: Arc<Mutex<ScanErrors>>) -> ScanErrors {
+    match Arc::try_unwrap(errors) {
+        Ok(mutex) => mutex
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        Err(errors) => errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    }
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::Partial(errors) => errors.iter().find_map(ignore_error_path),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::Loop { child, .. } => Some(child),
+        _ => None,
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 #[cfg(unix)]
@@ -115,6 +356,15 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    fn scan_entries(root: &Path) -> Vec<ScannedFile> {
+        let report = walk_repo(root);
+        assert!(
+            report.errors.is_empty(),
+            "unexpected scan errors: {report:?}"
+        );
+        report.into_entries().unwrap()
+    }
+
     #[test]
     fn walks_simple_tree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -123,11 +373,143 @@ mod tests {
         fs::create_dir(root.join("sub")).unwrap();
         fs::write(root.join("sub").join("b.rs"), "fn b() {}").unwrap();
 
-        let names: HashSet<String> = walk_repo(root)
+        let names: HashSet<String> = scan_entries(root)
+            .into_iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(names.contains("a.rs"));
         assert!(names.contains("b.rs"));
+    }
+
+    #[test]
+    fn successful_scan_report_has_no_errors_and_sorted_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("z.rs"), "").unwrap();
+        fs::write(root.join("a.rs"), "").unwrap();
+
+        let report = walk_repo(root);
+        assert!(report.errors.is_empty());
+        let paths = report
+            .into_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path.file_name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["a.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn incomplete_scan_report_rejects_partial_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+
+        let failure = walk_repo(&missing).into_entries().unwrap_err();
+        assert!(failure.errors.total > 0);
+        assert!(failure.errors.samples.iter().any(|sample| matches!(
+            sample.operation,
+            ScanOperation::BuildIgnoreMatcher | ScanOperation::Walk
+        )));
+    }
+
+    #[test]
+    fn scan_error_samples_are_bounded_and_utf8_safe() {
+        let mut errors = ScanErrors::default();
+        let message = "あ".repeat(MAX_SCAN_ERROR_MESSAGE_BYTES);
+        for index in 0..(MAX_SCAN_ERROR_SAMPLES + 10) {
+            errors.record(
+                ScanOperation::EntryMetadata,
+                format!("file-{index}"),
+                &message,
+            );
+        }
+
+        assert_eq!(errors.total, MAX_SCAN_ERROR_SAMPLES + 10);
+        assert_eq!(errors.samples.len(), MAX_SCAN_ERROR_SAMPLES);
+        assert!(
+            errors
+                .samples
+                .iter()
+                .all(|sample| sample.message.len() <= MAX_SCAN_ERROR_MESSAGE_BYTES)
+        );
+    }
+
+    #[test]
+    fn bounded_error_sample_selection_is_order_independent() {
+        fn collect(indices: impl Iterator<Item = usize>) -> ScanErrors {
+            let mut errors = ScanErrors::default();
+            for index in indices {
+                errors.record(
+                    ScanOperation::EntryMetadata,
+                    format!("file-{index:03}"),
+                    "error",
+                );
+            }
+            errors.finish();
+            errors
+        }
+
+        let forward = collect(0..100);
+        let reverse = collect((0..100).rev());
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.total, 100);
+        assert_eq!(forward.samples.len(), MAX_SCAN_ERROR_SAMPLES);
+        assert_eq!(forward.samples.first().unwrap().path, Path::new("file-000"));
+        assert_eq!(forward.samples.last().unwrap().path, Path::new("file-063"));
+    }
+
+    #[test]
+    fn modified_time_before_epoch_is_not_silently_coerced_to_zero() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert!(modified_time_ns(before_epoch).is_err());
+    }
+
+    #[test]
+    fn malformed_git_metadata_is_reported_instead_of_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join(".git"), "not a gitdir declaration\n").unwrap();
+        fs::write(root.join("keep.rs"), "").unwrap();
+
+        let report = walk_repo(root);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.path.ends_with("keep.rs"))
+        );
+        assert!(
+            report
+                .errors
+                .samples
+                .iter()
+                .any(|sample| { sample.operation == ScanOperation::ResolveGitMetadata })
+        );
+        assert!(report.into_entries().is_err());
+    }
+
+    #[test]
+    fn unreadable_ignore_rules_are_reported_instead_of_publishing_fail_open_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join(".gitignore"), [0xff]).unwrap();
+        fs::write(root.join("keep.rs"), "").unwrap();
+
+        let report = walk_repo(root);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.path.ends_with("keep.rs"))
+        );
+        assert!(
+            report
+                .errors
+                .samples
+                .iter()
+                .any(|sample| { sample.operation == ScanOperation::BuildIgnoreMatcher })
+        );
+        assert!(report.into_entries().is_err());
     }
 
     #[test]
@@ -138,7 +520,8 @@ mod tests {
         fs::write(root.join("kept.rs"), "").unwrap();
         fs::write(root.join("ignored.txt"), "secret").unwrap();
 
-        let names: HashSet<String> = walk_repo(root)
+        let names: HashSet<String> = scan_entries(root)
+            .into_iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(names.contains("kept.rs"));
@@ -155,7 +538,10 @@ mod tests {
         fs::write(root.join("sub/gen/ignored.rs"), "").unwrap();
         fs::write(root.join("gen/kept.rs"), "").unwrap();
 
-        let paths = walk_repo(root).map(|file| file.path).collect::<Vec<_>>();
+        let paths = scan_entries(root)
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
         assert!(paths.iter().any(|path| path.ends_with("gen/kept.rs")));
         assert!(
             paths
@@ -176,7 +562,8 @@ mod tests {
             fs::write(root.join(name), "").unwrap();
         }
 
-        let names = walk_repo(&root)
+        let names = scan_entries(&root)
+            .into_iter()
             .filter_map(|file| file.path.file_name().map(|name| name.to_os_string()))
             .collect::<HashSet<_>>();
         assert!(names.contains(std::ffi::OsStr::new("from-parent.rs")));
@@ -206,7 +593,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("keep.rs"), "fn keep() {}").unwrap();
 
-        let paths: Vec<PathBuf> = walk_repo(root).map(|f| f.path).collect();
+        let paths: Vec<PathBuf> = scan_entries(root).into_iter().map(|f| f.path).collect();
         assert!(paths.iter().any(|p| p.ends_with("keep.rs")));
         for dir in [".git", "target", "node_modules", ".claude"] {
             assert!(
@@ -233,7 +620,10 @@ mod tests {
         fs::write(root.join("vendor/nested/lib.rs"), "").unwrap();
         fs::write(root.join("vendor/keep.rs"), "").unwrap();
 
-        let paths = walk_repo(root).map(|file| file.path).collect::<Vec<_>>();
+        let paths = scan_entries(root)
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
         assert!(
             paths
                 .iter()
@@ -285,7 +675,10 @@ mod tests {
         let index = run_git(root, &["ls-files", "--stage", "vendor/submodule"]);
         assert!(index.starts_with("160000 "), "expected gitlink: {index}");
 
-        let paths = walk_repo(root).map(|file| file.path).collect::<Vec<_>>();
+        let paths = scan_entries(root)
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
         assert!(paths.iter().any(|path| path.ends_with("keep.rs")));
         assert!(
             paths

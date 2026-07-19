@@ -6,13 +6,14 @@
 //!   and persist `(path, blob_sha)` pairs that match the caller's
 //!   inclusion predicate (= "this path is something a backend
 //!   handles").
-//! - `build_from_worktree`: walk the worktree honoring `.gitignore`
-//!   via `cairn_watch::scan::walk_repo`, hash each file with
-//!   `cas::hash::git_blob_sha`, and persist the pairs.
+//! - `capture_worktree`: walk the worktree honoring `.gitignore`, read each
+//!   included file once, hash and expose that immutable payload to the parser,
+//!   then return entries for later publication via `persist_manifest`.
 //!
-//! Both produce a fresh `manifest_id`. Reuse across commits is the
-//! caller's responsibility — `lookup_by_commit_sha` exposes the
-//! check.
+//! The build wrappers produce fresh manifest rows. Registration instead uses
+//! the collect/capture APIs and publishes only after all source processing has
+//! succeeded. Reuse across commits is the caller's responsibility —
+//! `lookup_by_commit_sha` exposes the check.
 
 use std::path::Path;
 use std::process::Command;
@@ -49,6 +50,13 @@ impl ManifestKind {
 pub struct ManifestEntry {
     pub path: String,
     pub blob_sha: String,
+}
+
+/// One included worktree file. The entry hash and `bytes` are derived from
+/// the same single filesystem read and are only borrowed for the callback.
+pub struct WorktreeFilePayload<'a> {
+    pub entry: &'a ManifestEntry,
+    pub bytes: &'a [u8],
 }
 
 /// Transient path metadata used by manifest inclusion predicates.
@@ -99,20 +107,37 @@ pub fn build_from_git_tree<F>(
 where
     F: Fn(&PathHint<'_>) -> bool,
 {
-    let entries = list_git_tree(repo_root, commit_sha)?;
-    let id = create_empty(tx, ManifestKind::Committed, Some(commit_sha), built_at_ns)?;
-    insert_entries(
+    let entries = collect_git_tree(repo_root, commit_sha, include)?;
+    persist_manifest(
         tx,
-        id,
-        entries.into_iter().filter_map(|e| {
+        ManifestKind::Committed,
+        Some(commit_sha),
+        built_at_ns,
+        &entries,
+    )
+}
+
+/// Collect included entries from a committed git tree without mutating the
+/// store. This lets registration finish all source reads and parsing before
+/// publishing a manifest or anchor.
+pub fn collect_git_tree<F>(
+    repo_root: &Path,
+    commit_sha: &str,
+    include: F,
+) -> Result<Vec<ManifestEntry>>
+where
+    F: Fn(&PathHint<'_>) -> bool,
+{
+    Ok(list_git_tree(repo_root, commit_sha)?
+        .into_iter()
+        .filter_map(|entry| {
             include(&PathHint {
-                path: &e.manifest.path,
-                is_executable: e.is_executable,
+                path: &entry.manifest.path,
+                is_executable: entry.is_executable,
             })
-            .then_some(e.manifest)
-        }),
-    )?;
-    Ok(id)
+            .then_some(entry.manifest)
+        })
+        .collect())
 }
 
 /// Build a `Tentative` manifest from the current worktree contents.
@@ -120,9 +145,8 @@ where
 /// computes the git-style blob sha for each included file.
 ///
 /// # Errors
-/// Filesystem errors (file vanished between walk and read) propagate
-/// as `crate::Error::Io`; SQLite errors propagate as
-/// `crate::Error::Sqlite`.
+/// An incomplete scan or file read propagates without inserting a manifest;
+/// SQLite errors from publication propagate as `crate::Error::Sqlite`.
 pub fn build_from_worktree<F>(
     tx: &Transaction<'_>,
     worktree_path: &Path,
@@ -132,39 +156,88 @@ pub fn build_from_worktree<F>(
 where
     F: Fn(&PathHint<'_>) -> bool,
 {
-    let id = create_empty(tx, ManifestKind::Tentative, None, built_at_ns)?;
+    let entries = capture_worktree(worktree_path, include, |_| Ok(()))?;
+    persist_manifest(tx, ManifestKind::Tentative, None, built_at_ns, &entries)
+}
 
-    let entries: Vec<ManifestEntry> = cairn_watch::scan::walk_repo(worktree_path)
-        .filter_map(|sf| {
-            if std::fs::symlink_metadata(&sf.path)
-                .ok()?
-                .file_type()
-                .is_symlink()
-            {
-                // Tentative manifests are a trust boundary for later
-                // blob reads; skipping symlinks keeps registration
-                // scoped to files physically inside the worktree.
-                return None;
-            }
-            let rel = sf.path.strip_prefix(worktree_path).ok()?.to_owned();
-            let rel_str = rel.to_string_lossy().into_owned();
-            if !include(&PathHint {
-                path: &rel_str,
-                is_executable: sf.is_executable,
-            }) {
-                return None;
-            }
-            // Slow path: read + hash. Worktree-only files (= not in
-            // any git commit) get a freshly-computed blob_sha equal
-            // to what `git add` would produce.
-            let content = std::fs::read(&sf.path).ok()?;
-            Some(ManifestEntry {
-                path: rel_str,
-                blob_sha: git_blob_sha(&content),
-            })
-        })
-        .collect();
-    insert_entries(tx, id, entries)?;
+/// Scan and read the included worktree files without mutating the store.
+/// Each included file is read exactly once. `consume` receives the exact
+/// bytes used to compute `entry.blob_sha` before the next file is read.
+pub fn capture_worktree<F, C>(
+    worktree_path: &Path,
+    include: F,
+    consume: C,
+) -> Result<Vec<ManifestEntry>>
+where
+    F: Fn(&PathHint<'_>) -> bool,
+    C: FnMut(WorktreeFilePayload<'_>) -> Result<()>,
+{
+    capture_worktree_with(worktree_path, include, consume, |path| std::fs::read(path))
+}
+
+fn capture_worktree_with<F, C, R>(
+    worktree_path: &Path,
+    include: F,
+    mut consume: C,
+    mut read: R,
+) -> Result<Vec<ManifestEntry>>
+where
+    F: Fn(&PathHint<'_>) -> bool,
+    C: FnMut(WorktreeFilePayload<'_>) -> Result<()>,
+    R: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
+    let scanned = cairn_watch::scan::walk_repo(worktree_path).into_entries()?;
+    let mut entries = Vec::new();
+    for file in scanned {
+        let relative = file.path.strip_prefix(worktree_path).map_err(|err| {
+            crate::Error::Internal(format!(
+                "scanned path {} escaped root {}: {err}",
+                file.path.display(),
+                worktree_path.display()
+            ))
+        })?;
+        let path = relative.to_string_lossy().into_owned();
+        if !include(&PathHint {
+            path: &path,
+            is_executable: file.is_executable,
+        }) {
+            continue;
+        }
+
+        // Re-check the trust boundary immediately before opening the path.
+        // This is metadata-only; source bytes are still read exactly once.
+        if std::fs::symlink_metadata(&file.path)?
+            .file_type()
+            .is_symlink()
+        {
+            continue;
+        }
+
+        let bytes = read(&file.path)?;
+        let entry = ManifestEntry {
+            path,
+            blob_sha: git_blob_sha(&bytes),
+        };
+        consume(WorktreeFilePayload {
+            entry: &entry,
+            bytes: &bytes,
+        })?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Persist a fully collected manifest. Callers are responsible for completing
+/// source reads and Tier-1 parsing before opening the publication transaction.
+pub fn persist_manifest(
+    tx: &Transaction<'_>,
+    kind: ManifestKind,
+    commit_sha: Option<&str>,
+    built_at_ns: i64,
+    entries: &[ManifestEntry],
+) -> Result<ManifestId> {
+    let id = create_empty(tx, kind, commit_sha, built_at_ns)?;
+    insert_entries(tx, id, entries.iter().cloned())?;
     Ok(id)
 }
 
@@ -335,6 +408,7 @@ mod tests {
     use crate::cas::store;
     use crate::testutil::init_repo;
     use std::fs;
+    use std::path::PathBuf;
 
     fn fresh_db() -> (tempfile::TempDir, Connection) {
         let tmp = tempfile::tempdir().unwrap();
@@ -440,6 +514,84 @@ mod tests {
         assert_eq!(entries.len(), 2);
         let a_entry = entries.iter().find(|e| e.path == "a.rs").unwrap();
         assert_eq!(a_entry.blob_sha, git_blob_sha(b"fn a() {}\n"));
+    }
+
+    #[test]
+    fn capture_worktree_reads_each_included_file_once_and_borrows_same_bytes() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+        fs::write(root.join("ignored.txt"), "not parsed\n").unwrap();
+
+        let mut reads = HashMap::<PathBuf, usize>::new();
+        let entries = capture_worktree_with(
+            root,
+            |hint| hint.path.ends_with(".rs"),
+            |payload| {
+                assert_eq!(payload.entry.blob_sha, git_blob_sha(payload.bytes));
+                Ok(())
+            },
+            |path| {
+                *reads.entry(path.to_path_buf()).or_default() += 1;
+                fs::read(path)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(reads.get(&root.join("a.rs")), Some(&1));
+        assert_eq!(reads.get(&root.join("b.rs")), Some(&1));
+        assert!(!reads.contains_key(&root.join("ignored.txt")));
+    }
+
+    #[test]
+    fn capture_worktree_propagates_consumer_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let err = capture_worktree(
+            root,
+            |_| true,
+            |_| Err(crate::Error::InvalidArgument("consumer failed".into())),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("consumer failed"));
+    }
+
+    #[test]
+    fn capture_failure_after_first_file_keeps_only_content_addressed_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+        let mut consumed = Vec::new();
+
+        let err = capture_worktree_with(
+            root,
+            |_| true,
+            |payload| {
+                consumed.push(payload.entry.path.clone());
+                Ok(())
+            },
+            |path| {
+                if path.ends_with("b.rs") {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected read failure",
+                    ))
+                } else {
+                    fs::read(path)
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("injected read failure"));
+        assert_eq!(consumed, ["a.rs"]);
     }
 
     #[test]
