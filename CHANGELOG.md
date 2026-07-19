@@ -9,6 +9,17 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Daemon shutdown is bounded and cancellation-safe.** Shutdown now closes
+  analyzer-job admission, cancels active analyzer progress handles, force-reaps
+  pooled LSP children through a process-control handle that does not wait for
+  the per-entry work mutex, and only then drains job workers. LSP definition
+  passes poll cancellation at file and request-stream boundaries; a cancelled
+  run is recorded as `cancelled` before persistence, so partial facts cannot
+  replace the previous successful result. The async teardown has one 10-second
+  deadline and reports `ShutdownDeadlineExceeded` instead of hanging. The CLI
+  also uses Tokio's bounded runtime shutdown on both success and error paths,
+  so a residual blocking reconcile scan cannot hold the process open forever.
+
 - **Filesystem watcher ignore parity and bounded event coalescing.** Startup
   scans and live watcher events now share one repository-scoped gitignore
   matcher covering nested `.gitignore` files and the actual Git directory's

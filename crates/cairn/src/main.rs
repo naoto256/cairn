@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::time::Duration;
 
 // Each language backend registers itself into `LANGUAGE_BACKENDS` via
 // `#[distributed_slice]`. Those static items live in the backend's
@@ -74,18 +75,26 @@ enum Command {
     Query(cmd::query::Args),
 }
 
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let result = rt.block_on(async {
         match cli.command {
             Command::Daemon(args) => cmd::daemon::run(args).await,
             Command::Mcp(args) => cmd::mcp::run(args).await,
             Command::Ctl(args) => cmd::ctl::run(args).await,
             Command::Query(args) => cmd::query::run(args).await,
         }
-    })
+    });
+    // `Runtime::drop` waits indefinitely for spawn_blocking work. Reconcile
+    // registration is intentionally crash-safe and may still be inside a
+    // blocking filesystem scan after async daemon teardown completed, so both
+    // success and failure paths use Tokio's bounded runtime shutdown instead.
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
 }
 
 fn init_tracing() {
@@ -103,6 +112,8 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn runtime_language_backend_registry_includes_cli_linked_backends() {
@@ -132,6 +143,27 @@ mod tests {
                 "tsx",
                 "typescript"
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_shutdown_timeout_does_not_wait_for_residual_blocking_work() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        rt.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking task did not start");
+
+        let started = Instant::now();
+        rt.shutdown_timeout(Duration::from_millis(50));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "runtime shutdown waited for residual blocking work: {:?}",
+            started.elapsed()
         );
     }
 
