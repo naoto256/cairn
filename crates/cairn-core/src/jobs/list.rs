@@ -9,14 +9,30 @@ impl JobManager {
     ) -> Result<Vec<JobSnapshot>> {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
         let mut out = Vec::new();
+        let enumerate_all = alias_filter.is_none();
         for entry in cas_registry::list_all(&index)? {
             if let Some(alias) = alias_filter
                 && entry.alias != alias
             {
                 continue;
             }
+            let _lease = self
+                .lifecycle
+                .as_ref()
+                .map(|lifecycle| {
+                    if enumerate_all {
+                        lifecycle.acquire_for_enumeration(&entry.repo_hash)
+                    } else {
+                        lifecycle.acquire_by_repo_hash(&entry.repo_hash).map(Some)
+                    }
+                })
+                .transpose()?
+                .flatten();
+            if self.lifecycle.is_some() && _lease.is_none() {
+                continue;
+            }
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             let mut rows = if options.include_all {
                 collect_all_job_rows(&conn, &entry.alias)?
             } else {
@@ -44,6 +60,7 @@ impl JobManager {
 
     pub fn prune_jobs(&self, repo_filter: Option<&str>, dry_run: bool) -> Result<JobsPruneSummary> {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+        let enumerate_all = repo_filter.is_none();
         let entries = match repo_filter {
             Some(alias) => {
                 let entry = cas_registry::lookup_by_alias(&index, alias)?.ok_or_else(|| {
@@ -60,8 +77,23 @@ impl JobManager {
         let mut total_deleted_runs = 0_u64;
         let mut total_deleted_index_entries = 0_u64;
         for entry in entries {
+            let _lease = self
+                .lifecycle
+                .as_ref()
+                .map(|lifecycle| {
+                    if enumerate_all {
+                        lifecycle.acquire_for_enumeration(&entry.repo_hash)
+                    } else {
+                        lifecycle.acquire_by_repo_hash(&entry.repo_hash).map(Some)
+                    }
+                })
+                .transpose()?
+                .flatten();
+            if self.lifecycle.is_some() && _lease.is_none() {
+                continue;
+            }
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
-            let mut conn = cas_store::open(&store_path)?;
+            let mut conn = cas_store::open_existing(&store_path)?;
             let active_orphans = count_orphan_active_runs(&conn)?;
             if active_orphans > 0 {
                 warn!(

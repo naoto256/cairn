@@ -297,6 +297,17 @@ impl WatchManager {
                     error = %err,
                     "failed to persist watcher failed state (repo may not be registered)"
                 );
+                return;
+            }
+            if let Err(err) = reconcile
+                .request_dirty_by_repo_hash(hash.clone(), ReconcileTrigger::WatchEvent)
+                .await
+            {
+                debug!(
+                    repo_hash = %hash,
+                    error = %err,
+                    "failed to wake reconcile after watcher failure"
+                );
             }
         });
     }

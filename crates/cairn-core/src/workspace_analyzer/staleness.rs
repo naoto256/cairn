@@ -219,6 +219,7 @@ fn scan_one_alias(
     entry: &cas_registry::AliasEntry,
     expected_revision_for: &HashMap<&'static str, u32>,
 ) -> Result<PerAliasSummary> {
+    let _lease = job_manager.acquire_repository_lease(&entry.repo_hash)?;
     let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
     if !store_path.exists() {
         // The alias row references a store file that was deleted out
@@ -226,7 +227,7 @@ fn scan_one_alias(
         // staleness scan has nothing to do.
         return Ok(PerAliasSummary::default());
     }
-    let mut conn = cas_store::open(&store_path)?;
+    let mut conn = cas_store::open_existing(&store_path)?;
     let repo_root = Path::new(&entry.root_path);
     let manifest_id = match crate::anchor::resolve_tentative_manifest_id(&conn, repo_root)? {
         Some(id) => id,

@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 use crate::cas::registry::{self as cas_registry, WatcherState};
 use crate::cas::store as cas_store;
 use crate::jobs::JobManager;
+use crate::lifecycle::{RemovalIntent, RepoLifecycleManager};
 use crate::paths::CasDataDir;
 use crate::register::{register_repo_enqueue_analyzers, register_repo_force_analyzers_enqueue};
 use crate::{Error, Result};
@@ -191,6 +192,7 @@ pub type TestRegisterHookFn =
 pub struct RepoReconcileManager {
     cas_data_dir: Arc<CasDataDir>,
     job_manager: Option<Arc<JobManager>>,
+    lifecycle: Option<Arc<RepoLifecycleManager>>,
     clock: Arc<dyn Clock>,
     retry: RetryPolicy,
     runtimes: Mutex<HashMap<String, RepoRuntime>>,
@@ -221,9 +223,25 @@ impl RepoReconcileManager {
     /// callers pass `Some(job_manager)`.
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>, job_manager: Option<Arc<JobManager>>) -> Arc<Self> {
-        Self::with_config(
+        Self::with_config_and_lifecycle(
             cas_data_dir,
             job_manager,
+            None,
+            Arc::new(SystemClock),
+            RetryPolicy::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_lifecycle(
+        cas_data_dir: Arc<CasDataDir>,
+        job_manager: Option<Arc<JobManager>>,
+        lifecycle: Arc<RepoLifecycleManager>,
+    ) -> Arc<Self> {
+        Self::with_config_and_lifecycle(
+            cas_data_dir,
+            job_manager,
+            Some(lifecycle),
             Arc::new(SystemClock),
             RetryPolicy::default(),
         )
@@ -238,9 +256,21 @@ impl RepoReconcileManager {
         clock: Arc<dyn Clock>,
         retry: RetryPolicy,
     ) -> Arc<Self> {
+        Self::with_config_and_lifecycle(cas_data_dir, job_manager, None, clock, retry)
+    }
+
+    #[must_use]
+    pub fn with_config_and_lifecycle(
+        cas_data_dir: Arc<CasDataDir>,
+        job_manager: Option<Arc<JobManager>>,
+        lifecycle: Option<Arc<RepoLifecycleManager>>,
+        clock: Arc<dyn Clock>,
+        retry: RetryPolicy,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cas_data_dir,
             job_manager,
+            lifecycle,
             clock,
             retry,
             runtimes: Mutex::new(HashMap::new()),
@@ -323,6 +353,10 @@ impl RepoReconcileManager {
         alias: Option<String>,
         trigger: ReconcileTrigger,
     ) -> Result<ReconcileRequestOutcome> {
+        let _lease = match &self.lifecycle {
+            Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&repo_hash)?),
+            None => None,
+        };
         let cas_data_dir = self.cas_data_dir.clone();
         let now_ns = self.clock.now_ns();
         let repo_hash_task = repo_hash.clone();
@@ -357,6 +391,10 @@ impl RepoReconcileManager {
         alias: Option<String>,
         trigger: ReconcileTrigger,
     ) -> Result<ReconcileRequestOutcome> {
+        let _lease = match &self.lifecycle {
+            Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&repo_hash)?),
+            None => None,
+        };
         let cas_data_dir = self.cas_data_dir.clone();
         let now_ns = self.clock.now_ns();
         let repo_hash_task = repo_hash.clone();
@@ -484,6 +522,16 @@ impl RepoReconcileManager {
                 _ = notified => {}
                 _ = tokio::time::sleep_until(deadline) => {}
             }
+        }
+    }
+
+    /// Prevent future in-process wakes for a repository. The lifecycle
+    /// gate blocks new requests while its lease drain waits for any
+    /// already-running attempt to leave the store.
+    pub fn quiesce_repository(&self, repo_hash: &str) {
+        let mut runtimes = self.lock_runtimes();
+        if let Some(runtime) = runtimes.remove(repo_hash) {
+            runtime.notify.notify_waiters();
         }
     }
 
@@ -692,12 +740,24 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         #[cfg(test)]
         mgr.test_attempts_started.fetch_add(1, Ordering::SeqCst);
         match attempt_res {
-            Ok(()) => info!(
+            Ok(AttemptOutcome::Completed) => info!(
                 repo_hash = %repo_hash,
                 generation,
                 forced,
                 "reconcile attempt succeeded"
             ),
+            Ok(AttemptOutcome::RemovalRequested) => {
+                info!(
+                    repo_hash = %repo_hash,
+                    generation,
+                    "reconcile worker handed missing root to lifecycle owner; exiting"
+                );
+                let mut runtimes = mgr.lock_runtimes();
+                if let Some(runtime) = runtimes.get_mut(&repo_hash) {
+                    runtime.worker_running = false;
+                }
+                return;
+            }
             Err(err) => warn!(
                 repo_hash = %repo_hash,
                 generation,
@@ -710,6 +770,12 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         // again if an event landed mid-attempt, or the failure
         // path might have set `next_retry_at_ns`.
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    Completed,
+    RemovalRequested,
 }
 
 async fn load_state(
@@ -736,7 +802,37 @@ async fn run_attempt(
     repo_hash: &str,
     generation: i64,
     forced: bool,
-) -> Result<()> {
+) -> Result<AttemptOutcome> {
+    let _lease = match &mgr.lifecycle {
+        Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(repo_hash)?),
+        None => None,
+    };
+    if let Some(lifecycle) = &mgr.lifecycle {
+        let cas_data_dir = mgr.cas_data_dir.clone();
+        let hash = repo_hash.to_string();
+        let missing_ephemeral = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+            let Some(repo) = cas_registry::lookup_repository(&index, &hash)? else {
+                return Ok(false);
+            };
+            if repo.persistent {
+                return Ok(false);
+            }
+            match std::fs::metadata(&repo.root_path) {
+                Ok(_) => Ok(false),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(err) => Err(err.into()),
+            }
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("reconcile root lifecycle check", e))??;
+        if missing_ephemeral {
+            lifecycle.request_removal(RemovalIntent::MissingRoot {
+                repo_hash: repo_hash.to_string(),
+            })?;
+            return Ok(AttemptOutcome::RemovalRequested);
+        }
+    }
     let now_ns = mgr.clock.now_ns();
     let cas_data_dir = mgr.cas_data_dir.clone();
     let hash = repo_hash.to_string();
@@ -854,7 +950,7 @@ async fn run_attempt(
     .await
     .map_err(|e| Error::internal_task_panic("reconcile finalize", e))?;
     finalize_res?;
-    register_result.map(|_| ())
+    register_result.map(|_| AttemptOutcome::Completed)
 }
 
 async fn run_register_work(
@@ -877,7 +973,7 @@ async fn run_register_work(
             alias: format!("no aliases for repo_hash={repo_hash}"),
         })?;
         let store_path = cas_data_dir.store_db_path(&repo_hash);
-        let mut conn = cas_store::open(&store_path)?;
+        let mut conn = cas_store::open_existing(&store_path)?;
         let root = PathBuf::from(&repo.root_path);
         run_register(
             &mut conn,

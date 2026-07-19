@@ -60,7 +60,7 @@ impl JobManager {
         // per-store id is ever written to disk.
         for entry in &unique_entries {
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             conn.execute(
                 "UPDATE workspace_analysis_runs
                  SET status = 'queued', finished_at_ns = NULL, error = NULL
@@ -95,7 +95,7 @@ impl JobManager {
         }
         for entry in &unique_entries {
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             // Whole-store historical max — includes terminal rows.
             let store_max: Option<i64> = conn
                 .query_row(
@@ -164,7 +164,7 @@ impl JobManager {
         // `i64::MAX` fails closed rather than silently reissuing.
         for row in missing_id_rows {
             let new_id = self.allocate_job_id()?;
-            let conn = cas_store::open(&row.store_path)?;
+            let conn = cas_store::open_existing(&row.store_path)?;
             // Identity-only: assign the new `job_id` without
             // touching `cancel_requested`. A queued row whose
             // cancel had already been requested must remain
@@ -224,7 +224,7 @@ impl JobManager {
             }
             for row in rows {
                 let new_id = self.allocate_job_id()?;
-                let conn = cas_store::open(&row.store_path)?;
+                let conn = cas_store::open_existing(&row.store_path)?;
                 // Identity-only rewrite: `cancel_requested` is a
                 // scheduling flag, not part of the identity, so it
                 // must survive the recycle. Otherwise a queued row
