@@ -43,6 +43,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use super::client::LspProcessControl;
 use super::{Error, LspClient, Position, Result, Url};
 
 const DEFAULT_POOL_CAPACITY: usize = 16;
@@ -699,6 +700,41 @@ impl LspClientPool {
         })
     }
 
+    /// Permanently stop the pool and force-terminate every child through its
+    /// process-control handle, without waiting for an analyzer pass to release
+    /// the entry's data-plane mutex.
+    ///
+    /// This is the daemon-final shutdown API. Unlike
+    /// [`Self::force_shutdown_all`], it never returns the pool to `Running` and
+    /// never permits replacement children after cleanup begins.
+    ///
+    /// # Errors
+    /// Returns the first cleanup error after attempting every entry. A timeout
+    /// is surfaced as [`Error::ChildTerminationFailed`] because child
+    /// termination could not be proven.
+    pub fn shutdown_all_bounded(&self, entry_timeout: Duration) -> Result<()> {
+        let entries = {
+            let mut reg = self.lock_registry()?;
+            reg.mode = PoolMode::Stopped;
+            reg.entries
+                .drain()
+                .map(|(_, record)| record.entry)
+                .collect::<Vec<_>>()
+        };
+        self.runtime.block_on(async move {
+            let results = futures::future::join_all(
+                entries
+                    .into_iter()
+                    .map(|entry| async move { entry.shutdown_bounded(entry_timeout).await }),
+            )
+            .await;
+            results
+                .into_iter()
+                .find_map(Result::err)
+                .map_or(Ok(()), Err)
+        })
+    }
+
     /// Evict all live clients and give each entry a bounded grace
     /// period to shut down. Used after analyzer stall detection so
     /// the next analyzer run does not inherit a wedged pool key.
@@ -898,6 +934,16 @@ impl LspClientPool {
 #[derive(Default)]
 struct PoolEntry {
     state: Mutex<PoolEntryState>,
+    /// Child-process control is deliberately independent from `state`. Normal
+    /// work holds `state` across an analyzer pass, but final daemon shutdown
+    /// must still be able to kill and reap the child to unblock that pass.
+    process_control: StdMutex<ProcessControlSlot>,
+}
+
+#[derive(Default)]
+struct ProcessControlSlot {
+    stopping: bool,
+    control: Option<LspProcessControl>,
 }
 
 #[derive(Default)]
@@ -987,15 +1033,19 @@ impl PoolEntry {
         let mut state = self.state.lock().await;
         if state.client.is_none() {
             check_lsp_available(&spec.binary, &spec.availability, spec.request_timeout).await?;
-            let client = LspClient::start_configured(
+            let client = LspClient::configured(
                 &spec.binary,
                 spec.launch_args.clone(),
                 spec.env.clone(),
                 &spec.workspace_root,
                 spec.initialization_options.clone(),
                 spec.request_timeout,
-            )
-            .await?;
+            );
+            self.install_process_control(client.process_control())?;
+            if let Err(err) = client.start_process().await {
+                self.clear_process_control()?;
+                return Err(err);
+            }
             // Readiness check runs against a spawned + initialized
             // child. If it fails (timeout or `$/progress` error),
             // we must terminate the child before returning — the
@@ -1008,13 +1058,15 @@ impl PoolEntry {
             })
             .await
             {
-                return Err(match client.force_terminate().await {
+                let result = match client.force_terminate().await {
                     Ok(()) => err,
                     Err(cleanup) => Error::OperationWithCleanupFailure {
                         original: Box::new(err),
                         cleanup: Box::new(cleanup),
                     },
-                });
+                };
+                self.clear_process_control()?;
+                return Err(result);
             }
             state.client = Some(client);
             state.opened_documents.clear();
@@ -1053,11 +1105,13 @@ impl PoolEntry {
                 && let Err(cleanup) = client.force_terminate().await
             {
                 let original = result.err().expect("just matched Err above");
+                self.clear_process_control()?;
                 return Err(super::Error::OperationWithCleanupFailure {
                     original: Box::new(original),
                     cleanup: Box::new(cleanup),
                 });
             }
+            self.clear_process_control()?;
         }
         result
     }
@@ -1065,9 +1119,56 @@ impl PoolEntry {
     async fn shutdown(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         state.opened_documents.clear();
-        if let Some(client) = state.client.take() {
-            client.shutdown().await?;
+        let result = match state.client.take() {
+            Some(client) => client.shutdown().await,
+            None => Ok(()),
+        };
+        self.clear_process_control()?;
+        result
+    }
+
+    /// Final-shutdown path that never waits for the data-plane state mutex.
+    /// The independent process-control handle first disables respawn, then
+    /// kills and reaps the child. Dropping the pool record later discards any
+    /// document state still held by a pass that is unwinding.
+    async fn shutdown_bounded(&self, entry_timeout: Duration) -> Result<()> {
+        let control = {
+            let mut slot = self
+                .process_control
+                .lock()
+                .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+            slot.stopping = true;
+            slot.control.clone()
+        };
+        let Some(control) = control else {
+            return Ok(());
+        };
+        match timeout(entry_timeout, control.stop_and_terminate()).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::ChildTerminationFailed(format!(
+                "bounded final shutdown exceeded {}ms",
+                entry_timeout.as_millis()
+            ))),
         }
+    }
+
+    fn install_process_control(&self, control: LspProcessControl) -> Result<()> {
+        let mut slot = self
+            .process_control
+            .lock()
+            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+        if slot.stopping {
+            return Err(Error::PoolStopped);
+        }
+        slot.control = Some(control);
+        Ok(())
+    }
+
+    fn clear_process_control(&self) -> Result<()> {
+        self.process_control
+            .lock()
+            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?
+            .control = None;
         Ok(())
     }
 }
@@ -1112,6 +1213,21 @@ pub async fn shutdown_global_if_initialized() -> Result<()> {
         tokio::task::spawn_blocking(move || pool.shutdown_all())
             .await
             .map_err(|e| super::Error::Protocol(format!("lsp pool shutdown task: {e}")))??;
+    }
+    Ok(())
+}
+
+/// Force-terminate the daemon-global pool through the final-shutdown control
+/// plane. The blocking wrapper isolates the pool-owned runtime from the
+/// caller's Tokio runtime.
+///
+/// # Errors
+/// Returns process cleanup or join errors from bounded shutdown.
+pub async fn shutdown_global_bounded_if_initialized(entry_timeout: Duration) -> Result<()> {
+    if let Some(pool) = GLOBAL_POOL.get() {
+        tokio::task::spawn_blocking(move || pool.shutdown_all_bounded(entry_timeout))
+            .await
+            .map_err(|err| super::Error::Protocol(format!("lsp pool shutdown task: {err}")))??;
     }
     Ok(())
 }

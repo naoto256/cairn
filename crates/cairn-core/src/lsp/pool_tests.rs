@@ -935,6 +935,97 @@ fn force_shutdown_all_with_active_entry_returns_running() {
 
 #[cfg(unix)]
 #[test]
+fn bounded_final_shutdown_reaps_child_while_pass_holds_state_mutex() {
+    let fake = FakeLspBinary::new();
+    let methods_log = fake.pid_file.with_file_name("bounded-shutdown-methods.log");
+    let pool = Arc::new(pool(1));
+    let key = fake_pool_key(&fake, 1);
+    let spec = LspSpawnSpec {
+        env: fake.env_with_methods_log(&methods_log),
+        ..spawn_spec(&fake, Duration::from_secs(10))
+    };
+    let worker_pool = Arc::clone(&pool);
+    let uri = Url::from("file:///tmp/pool-test/bounded-shutdown.py");
+    let worker = std::thread::spawn(move || {
+        worker_pool.with_lsp(key, spec, move |pooled| {
+            Box::pin(async move {
+                pooled.sync_document(&uri, "print('waiting')").await?;
+                pooled
+                    .definition(
+                        &uri,
+                        Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    )
+                    .await?;
+                Ok::<(), Error>(())
+            })
+        })
+    });
+
+    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
+    assert!(
+        methods.values().any(|methods| methods
+            .iter()
+            .any(|method| method == "textDocument/definition")),
+        "fake LSP must receive the pending definition request before shutdown"
+    );
+    let pid = read_pid(
+        &fake.pid_file,
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .expect("fake LSP must publish its PID");
+
+    let started = std::time::Instant::now();
+    pool.shutdown_all_bounded(Duration::from_secs(2))
+        .expect("bounded shutdown must prove child termination");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "bounded shutdown exceeded its process-control budget"
+    );
+    assert_eq!(pool.mode(), PoolMode::Stopped);
+    assert!(
+        wait_until_dead(pid, Duration::from_secs(2)),
+        "bounded shutdown must reap child pid {pid}"
+    );
+
+    let worker_result = worker
+        .join()
+        .expect("pass thread must unwind after child exit");
+    assert!(
+        matches!(
+            worker_result,
+            Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
+        ),
+        "pending request must be released by child cleanup, got {worker_result:?}"
+    );
+}
+
+#[test]
+fn bounded_final_shutdown_rejects_late_process_control_install() {
+    let entry = PoolEntry::default();
+    let runtime = Runtime::new().unwrap();
+    runtime
+        .block_on(entry.shutdown_bounded(Duration::from_millis(10)))
+        .unwrap();
+
+    let client = LspClient::configured(
+        Path::new("unused-lsp"),
+        Vec::new(),
+        Vec::new(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(1),
+    );
+    assert!(matches!(
+        entry.install_process_control(client.process_control()),
+        Err(Error::PoolStopped)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn force_shutdown_all_with_stalled_shutdown_transitions_to_poisoned() {
     let fake = FakeLspBinary::new();
     let pool = pool(2);
