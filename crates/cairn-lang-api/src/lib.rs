@@ -313,10 +313,16 @@ pub trait LanguageBackend: Send + Sync {
     /// recorded in `files.parser` so a stale snapshot is detectable.
     fn parser_id(&self) -> &'static str;
 
-    /// Monotonic revision for this backend's syntactic output. Bump
-    /// when the same input would produce different facts.
+    /// Monotonic revision for this backend's syntactic output. Bump when the
+    /// same input would produce different facts, or when input-capture
+    /// semantics change such that an existing cache key may name facts from
+    /// different bytes.
     fn parser_revision(&self) -> u32 {
-        1
+        // Revision 2 invalidates rows created before worktree hashing and
+        // parsing shared one immutable, single-read payload. A pre-revision-2
+        // filesystem race could otherwise persist facts from bytes B under
+        // the blob hash for bytes A.
+        2
     }
 
     /// Extract syntactic facts from one source buffer. Synchronous; the
