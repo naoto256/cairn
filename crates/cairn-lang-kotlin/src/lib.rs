@@ -18,8 +18,8 @@ use cairn_lang_api::{
     SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
-    NestingTracker, Visitor, child_by_field, end_line_of, extract, line_of, node_text,
-    signature_slice, truncate,
+    DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
+    extract_doc_above_node, line_of, node_text, signature_slice, truncate,
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
@@ -471,30 +471,14 @@ fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
 /// KDoc: the closest preceding `/** ... */` block comment, with nothing but
 /// extras between it and the declaration.
 fn extract_kdoc(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut last_doc: Option<String> = None;
-
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
+    extract_doc_above_node(node, source, |sibling, text| match sibling.kind() {
+        "block_comment" if text.trim_start().starts_with("/**") => {
+            Some(DocCommentPart::Replace(strip_kdoc_markers(text)))
         }
-        match sibling.kind() {
-            "block_comment" => {
-                let text = node_text(sibling, source);
-                if text.trim_start().starts_with("/**") {
-                    last_doc = Some(strip_kdoc_markers(text));
-                } else {
-                    last_doc = None;
-                }
-            }
-            "line_comment" => last_doc = None,
-            _ if sibling.is_extra() => {}
-            _ => last_doc = None,
-        }
-    }
-
-    last_doc.filter(|doc| !doc.is_empty())
+        "block_comment" | "line_comment" => Some(DocCommentPart::Reset),
+        _ => None,
+    })
+    .filter(|doc| !doc.is_empty())
 }
 
 fn strip_kdoc_markers(text: &str) -> String {
@@ -785,6 +769,42 @@ suspend fun process(input: String): Result<User> {
             symbol(&facts, "com.example.app.Service").doc.as_deref(),
             Some("Greets and fetches.")
         );
+    }
+
+    #[test]
+    fn kdoc_adjacency_characterization() {
+        let cases: &[(&str, &[u8], Option<&str>)] = &[
+            (
+                "Direct",
+                b"/**\n * Direct KDoc.\n * Second line.\n */\nclass Direct",
+                Some("Direct KDoc.\nSecond line."),
+            ),
+            (
+                "Closest",
+                b"/** Earlier. */\n/** Closest. */\nclass Closest",
+                Some("Closest."),
+            ),
+            (
+                "BlankLine",
+                b"/** Separated today. */\n\nclass BlankLine",
+                None,
+            ),
+            (
+                "LineReset",
+                b"/** Stale. */\n// reset\nclass LineReset",
+                None,
+            ),
+        ];
+
+        for (name, source, expected) in cases {
+            let facts = KotlinBackend.extract_syntactic(source).unwrap();
+            let symbol = facts
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == *name)
+                .unwrap_or_else(|| panic!("symbol {name} missing"));
+            assert_eq!(symbol.doc.as_deref(), *expected, "case {name}");
+        }
     }
 
     #[test]
