@@ -164,10 +164,14 @@ pub struct Anchor {
     pub name: AnchorName,
     pub manifest_id: ManifestId,
     pub last_updated_ns: i64,
+    /// Reconcile generation that atomically published this tentative
+    /// anchor. `None` means the publication is not freshness-verified.
+    pub reconcile_generation: Option<i64>,
 }
 
 /// Upsert an anchor. If `name` already exists, its `manifest_id` and
-/// `last_updated_ns` are replaced.
+/// `last_updated_ns` are replaced. Direct publication always clears any
+/// prior reconcile receipt so an unrelated write cannot preserve stale proof.
 ///
 /// # Errors
 /// SQLite failure (including FK violation if `manifest_id` doesn't
@@ -179,12 +183,52 @@ pub fn set(
     last_updated_ns: i64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO anchors
+             (anchor_name, manifest_id, last_updated_ns, reconcile_generation)
+         VALUES (?1, ?2, ?3, NULL)
          ON CONFLICT(anchor_name) DO UPDATE SET
              manifest_id = excluded.manifest_id,
-             last_updated_ns = excluded.last_updated_ns",
+             last_updated_ns = excluded.last_updated_ns,
+             reconcile_generation = NULL",
         params![name.as_str(), manifest_id.0, last_updated_ns],
+    )?;
+    Ok(())
+}
+
+/// Publish a tentative anchor with durable proof of the reconcile generation
+/// that produced it. The receipt is committed in the same transaction as the
+/// manifest and anchor move.
+///
+/// # Errors
+/// Returns [`crate::Error::InvalidArgument`] for a non-tentative anchor or a
+/// negative generation. SQLite failures otherwise.
+pub fn set_reconciled(
+    tx: &Transaction<'_>,
+    name: &AnchorName,
+    manifest_id: ManifestId,
+    last_updated_ns: i64,
+    generation: i64,
+) -> Result<()> {
+    if !matches!(name.kind(), Some(AnchorKind::Tentative(_))) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "reconcile publication requires a tentative anchor, got `{}`",
+            name.as_str()
+        )));
+    }
+    if generation < 0 {
+        return Err(crate::Error::InvalidArgument(
+            "reconcile generation must be non-negative".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO anchors
+             (anchor_name, manifest_id, last_updated_ns, reconcile_generation)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(anchor_name) DO UPDATE SET
+             manifest_id = excluded.manifest_id,
+             last_updated_ns = excluded.last_updated_ns,
+             reconcile_generation = excluded.reconcile_generation",
+        params![name.as_str(), manifest_id.0, last_updated_ns, generation],
     )?;
     Ok(())
 }
@@ -196,7 +240,7 @@ pub fn set(
 pub fn get(conn: &Connection, name: &AnchorName) -> Result<Option<Anchor>> {
     Ok(conn
         .query_row(
-            "SELECT anchor_name, manifest_id, last_updated_ns
+            "SELECT anchor_name, manifest_id, last_updated_ns, reconcile_generation
              FROM anchors WHERE anchor_name = ?1",
             params![name.as_str()],
             row_to_anchor,
@@ -218,7 +262,7 @@ pub fn resolve(conn: &Connection, name: &AnchorName) -> Result<Option<ManifestId
 /// SQLite failure.
 pub fn list_all(conn: &Connection) -> Result<Vec<Anchor>> {
     let mut stmt = conn.prepare(
-        "SELECT anchor_name, manifest_id, last_updated_ns
+        "SELECT anchor_name, manifest_id, last_updated_ns, reconcile_generation
          FROM anchors ORDER BY anchor_name",
     )?;
     let rows: rusqlite::Result<Vec<Anchor>> = stmt.query_map([], row_to_anchor)?.collect();
@@ -232,7 +276,7 @@ pub fn list_all(conn: &Connection) -> Result<Vec<Anchor>> {
 /// SQLite failure.
 pub fn list_prefix(conn: &Connection, prefix: &str) -> Result<Vec<Anchor>> {
     let mut stmt = conn.prepare(
-        "SELECT anchor_name, manifest_id, last_updated_ns
+        "SELECT anchor_name, manifest_id, last_updated_ns, reconcile_generation
          FROM anchors WHERE anchor_name LIKE ?1 || '%' ORDER BY anchor_name",
     )?;
     let rows: rusqlite::Result<Vec<Anchor>> = stmt.query_map([prefix], row_to_anchor)?.collect();
@@ -301,6 +345,7 @@ fn row_to_anchor(r: &rusqlite::Row<'_>) -> rusqlite::Result<Anchor> {
         name: AnchorName(r.get::<_, String>(0)?),
         manifest_id: ManifestId(r.get::<_, i64>(1)?),
         last_updated_ns: r.get::<_, i64>(2)?,
+        reconcile_generation: r.get::<_, Option<i64>>(3)?,
     })
 }
 
@@ -391,6 +436,7 @@ mod tests {
         assert_eq!(got.name, name);
         assert_eq!(got.manifest_id, mid);
         assert_eq!(got.last_updated_ns, 1234);
+        assert_eq!(got.reconcile_generation, None);
     }
 
     #[test]
@@ -413,6 +459,58 @@ mod tests {
         let got = get(&c, &name).unwrap().unwrap();
         assert_eq!(got.manifest_id, m2);
         assert_eq!(got.last_updated_ns, 200);
+        assert_eq!(got.reconcile_generation, None);
+    }
+
+    #[test]
+    fn reconciled_set_stamps_generation_and_direct_set_clears_it() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "tentative");
+        let name = AnchorName::tentative(7);
+        set_reconciled(&tx, &name, m, 100, 9).unwrap();
+        tx.commit().unwrap();
+
+        let stamped = get(&c, &name).unwrap().unwrap();
+        assert_eq!(stamped.reconcile_generation, Some(9));
+
+        let tx = c.transaction().unwrap();
+        set(&tx, &name, m, 200).unwrap();
+        tx.commit().unwrap();
+        let direct = get(&c, &name).unwrap().unwrap();
+        assert_eq!(direct.reconcile_generation, None);
+    }
+
+    #[test]
+    fn set_reconciled_rejects_non_tentative_anchor() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "committed");
+
+        let err = set_reconciled(&tx, &AnchorName::head(), m, 100, 1).unwrap_err();
+
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+        assert!(get(&tx, &AnchorName::head()).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_reconcile_publication_transaction_preserves_prior_receipt() {
+        let (_tmp, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        let m = placeholder_manifest(&tx, "tentative");
+        let name = AnchorName::tentative(3);
+        set_reconciled(&tx, &name, m, 100, 4).unwrap();
+        tx.commit().unwrap();
+
+        {
+            let tx = c.transaction().unwrap();
+            set_reconciled(&tx, &name, m, 200, 5).unwrap();
+            // Dropping the transaction models any failure before commit.
+        }
+
+        let got = get(&c, &name).unwrap().unwrap();
+        assert_eq!(got.last_updated_ns, 100);
+        assert_eq!(got.reconcile_generation, Some(4));
     }
 
     #[test]

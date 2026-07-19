@@ -123,3 +123,57 @@ impl ControlMethod for ReindexRepo {
 #[allow(unsafe_code)]
 #[distributed_slice(CONTROL_METHODS)]
 static REGISTER: fn() -> Box<dyn ControlMethod> = || Box::new(ReindexRepo);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use serde_json::json;
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::paths::CasDataDir;
+    use crate::reconcile::{RepoReconcileManager, TestRegisterHookFn};
+
+    #[tokio::test]
+    async fn production_reindex_with_driver_never_uses_direct_writer_fallback() {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(&tx, "demo", "/not/a/worktree", "hash", 1).unwrap();
+        tx.commit().unwrap();
+
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        let hook: TestRegisterHookFn = Arc::new(|_, _, _, _| Ok(()));
+        reconcile.set_test_register_hook(hook);
+        let ctx = CtlCtx {
+            cas_data_dir: cas.clone(),
+            shutdown: Arc::new(Notify::new()),
+            watch_manager: None,
+            job_manager: None,
+            reconcile: Some(reconcile.clone()),
+            lifecycle: None,
+            version: "test",
+            started_at: Instant::now(),
+        };
+
+        let value = ReindexRepo
+            .dispatch(&ctx, json!({ "alias": "demo" }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["reconcile"]["repo_hash"], "hash");
+        assert_eq!(value["reconcile"]["forced"], true);
+        assert_eq!(value["jobs"], json!([]));
+        assert!(
+            !cas.store_db_path("hash").exists(),
+            "the inline fallback must not open or create a store when a driver exists"
+        );
+
+        reconcile.shutdown(Duration::from_secs(2)).await;
+    }
+}

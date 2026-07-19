@@ -29,7 +29,7 @@
 //! - Per-file incremental indexing.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +44,10 @@ use crate::cas::store as cas_store;
 use crate::jobs::JobManager;
 use crate::lifecycle::{RemovalIntent, RepoLifecycleManager};
 use crate::paths::CasDataDir;
-use crate::register::{register_repo_enqueue_analyzers, register_repo_force_analyzers_enqueue};
+use crate::register::{
+    ReconcilePublicationReceipt, ReconcileRegistration, register_repo_reconcile,
+    register_repo_reconcile_enqueue_analyzers,
+};
 use crate::{Error, Result};
 
 /// Why the reconcile driver was woken. Recorded for logs and
@@ -1124,11 +1127,13 @@ async fn run_attempt(
             cas_data_dir.clone(),
             hash.clone(),
             preferred_alias,
+            generation,
             forced,
             job_manager,
             now_ns,
         )
         .await
+        .map(|_| ())
     };
 
     // Phase C: commit success or failure to index.db.
@@ -1180,11 +1185,12 @@ async fn run_register_work(
     cas_data_dir: Arc<CasDataDir>,
     repo_hash: String,
     preferred_alias: Option<String>,
+    generation: i64,
     forced: bool,
     job_manager: Option<Arc<JobManager>>,
     now_ns: i64,
-) -> Result<()> {
-    tokio::task::spawn_blocking(move || -> Result<()> {
+) -> Result<ReconcilePublicationReceipt> {
+    tokio::task::spawn_blocking(move || -> Result<ReconcilePublicationReceipt> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
         let repo = cas_registry::lookup_repository(&index, &repo_hash)?.ok_or_else(|| {
             Error::RepoNotFound {
@@ -1198,15 +1204,20 @@ async fn run_register_work(
         let store_path = cas_data_dir.store_db_path(&repo_hash);
         let mut conn = cas_store::open_existing(&store_path)?;
         let root = PathBuf::from(&repo.root_path);
-        run_register(
+        let receipt = run_register(
             &mut conn,
-            &alias,
-            &repo_hash,
-            &root,
-            forced,
+            ReconcileRegistration {
+                alias: &alias,
+                repo_hash: &repo_hash,
+                worktree_path: &root,
+                now_ns,
+                generation,
+                forced,
+            },
             &job_manager,
-            now_ns,
-        )
+        )?;
+        verify_publication_receipt(&conn, &receipt)?;
+        Ok(receipt)
     })
     .await
     .map_err(|e| Error::internal_task_panic("reconcile register work", e))?
@@ -1214,31 +1225,45 @@ async fn run_register_work(
 
 fn run_register(
     conn: &mut rusqlite::Connection,
-    alias: &str,
-    repo_hash: &str,
-    worktree_path: &Path,
-    forced: bool,
+    request: ReconcileRegistration<'_>,
     job_manager: &Option<Arc<JobManager>>,
-    now_ns: i64,
+) -> Result<ReconcilePublicationReceipt> {
+    let outcome = match job_manager.as_deref() {
+        Some(jm) => register_repo_reconcile_enqueue_analyzers(conn, request, jm)?,
+        None => register_repo_reconcile(
+            conn,
+            request.worktree_path,
+            request.now_ns,
+            request.generation,
+            request.forced,
+        )?,
+    };
+    outcome.publication.ok_or_else(|| {
+        Error::Internal("reconcile register completed without a publication receipt".into())
+    })
+}
+
+fn verify_publication_receipt(
+    conn: &rusqlite::Connection,
+    receipt: &ReconcilePublicationReceipt,
 ) -> Result<()> {
-    match job_manager.as_deref() {
-        Some(jm) => {
-            if forced {
-                register_repo_force_analyzers_enqueue(
-                    conn,
-                    alias,
-                    repo_hash,
-                    worktree_path,
-                    now_ns,
-                    jm,
-                )?;
-            } else {
-                register_repo_enqueue_analyzers(conn, alias, repo_hash, worktree_path, now_ns, jm)?;
-            }
-        }
-        None => {
-            crate::register::register_repo(conn, worktree_path, now_ns)?;
-        }
+    let durable = crate::anchor::get(conn, &receipt.anchor)?.ok_or_else(|| {
+        Error::Internal(format!(
+            "reconcile publication anchor `{}` disappeared before finalize",
+            receipt.anchor.as_str()
+        ))
+    })?;
+    if durable.manifest_id != receipt.manifest_id
+        || durable.reconcile_generation != Some(receipt.generation)
+    {
+        return Err(Error::Internal(format!(
+            "reconcile publication receipt mismatch for `{}`: expected manifest={} generation={}, got manifest={} generation={:?}",
+            receipt.anchor.as_str(),
+            receipt.manifest_id.0,
+            receipt.generation,
+            durable.manifest_id.0,
+            durable.reconcile_generation
+        )));
     }
     Ok(())
 }
