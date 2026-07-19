@@ -45,10 +45,9 @@ pub struct Daemon {
     pub data_handler: Arc<dyn LineHandler>,
     pub control_handler: Arc<dyn LineHandler>,
     pub shutdown: Arc<Notify>,
-    /// Shutdown is ordered by ownership boundaries: stop accepting first so no
-    /// new request can enter, drain in-flight connections so active replies are
-    /// not cut off, stop analyzer jobs before the shared LSP pool so workers
-    /// cannot race pool teardown, and finally reap LSP child processes.
+    /// Shutdown is ordered by ownership boundaries: stop accepting and drain
+    /// admitted RPCs, close job admission and cancel active analyzers, reap LSP
+    /// children so pending requests unwind, then drain job workers.
     pub job_manager: Option<Arc<JobManager>>,
     /// Reconcile driver — required in production so the startup
     /// revision-staleness scan can route parser-revision drift
@@ -58,8 +57,10 @@ pub struct Daemon {
     pub reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
 }
 
-const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const JOB_MANAGER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const LSP_ENTRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const JOB_MANAGER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Daemon {
     /// Bind both sockets, run accept loops until `shutdown` is
@@ -69,6 +70,11 @@ impl Daemon {
     /// # Errors
     /// Bind / accept failures propagate.
     pub async fn run(self) -> Result<()> {
+        self.run_with_shutdown_timeout(DAEMON_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn run_with_shutdown_timeout(self, shutdown_timeout: Duration) -> Result<()> {
         self.paths.ensure()?;
         let cairn = bind_socket_with_mode(&self.paths.cairn)?;
         let ctrl = bind_socket_with_mode(&self.paths.control)?;
@@ -126,36 +132,56 @@ impl Daemon {
             });
         }
 
-        let cairn_task = spawn_accept_loop(
+        let mut cairn_task = spawn_accept_loop(
             "cairn",
             cairn,
             self.data_handler.clone(),
             self.shutdown.clone(),
         );
-        let ctrl_task = spawn_accept_loop(
+        let mut ctrl_task = spawn_accept_loop(
             "control",
             ctrl,
             self.control_handler.clone(),
             self.shutdown.clone(),
         );
 
-        // Wait for both accept loops to stop accepting and drain their
-        // in-flight connection tasks before subsystem teardown begins.
-        let _ = tokio::join!(cairn_task, ctrl_task);
-        if let Some(job_manager) = &self.job_manager {
-            job_manager.shutdown(JOB_MANAGER_DRAIN_TIMEOUT).await;
-        }
-        test_observe_lsp_pool_shutdown();
-        if let Err(err) = crate::lsp::pool::shutdown_global_if_initialized().await {
-            warn!(error = %err, "lsp pool shutdown failed");
-        }
-        info!("daemon stopped");
+        let teardown = async {
+            // Stop accepting first and let already-admitted RPCs finish.
+            let _ = tokio::join!(&mut cairn_task, &mut ctrl_task);
+            // This lock-backed transition rejects every later enqueue and
+            // cancels handles registered by already-running analyzers.
+            if let Some(job_manager) = &self.job_manager {
+                job_manager.begin_shutdown();
+            }
+            // Kill LSP children before awaiting workers. Pending requests then
+            // fail and release the PoolEntry state mutex held by each pass.
+            test_observe_lsp_pool_shutdown();
+            crate::lsp::pool::shutdown_global_bounded_if_initialized(LSP_ENTRY_SHUTDOWN_TIMEOUT)
+                .await?;
+            if let Some(job_manager) = &self.job_manager {
+                job_manager.shutdown(JOB_MANAGER_DRAIN_TIMEOUT).await;
+            }
+            Ok(())
+        };
+        let result = match tokio::time::timeout(shutdown_timeout, teardown).await {
+            Ok(result) => result,
+            Err(_) => {
+                cairn_task.abort();
+                ctrl_task.abort();
+                Err(crate::Error::ShutdownDeadlineExceeded {
+                    timeout_ms: u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
+                })
+            }
+        };
 
         // Best-effort cleanup of socket files; the OS leaves them
         // behind after the listener is dropped.
         let _ = std::fs::remove_file(&self.paths.cairn);
         let _ = std::fs::remove_file(&self.paths.control);
-        Ok(())
+        if result.is_ok() {
+            info!("daemon stopped");
+        }
+        result
     }
 }
 
@@ -325,7 +351,7 @@ mod tests {
     use cairn_watch::WatchBackend;
     use serde_json::json;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
@@ -447,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_shuts_down_jobs_before_lsp_pool() {
+    async fn daemon_cancels_jobs_then_stops_lsp_before_job_drain() {
         let tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
@@ -462,7 +488,7 @@ mod tests {
             *crate::jobs::JOB_MANAGER_SHUTDOWN_OBSERVER
                 .lock()
                 .expect("job observer poisoned") = Some(Box::new(move || {
-                events.lock().expect("events poisoned").push("jobs");
+                events.lock().expect("events poisoned").push("begin");
             }));
         }
         {
@@ -471,6 +497,14 @@ mod tests {
                 .lock()
                 .expect("lsp observer poisoned") = Some(Box::new(move || {
                 events.lock().expect("events poisoned").push("lsp");
+            }));
+        }
+        {
+            let events = events.clone();
+            *crate::jobs::JOB_MANAGER_DRAIN_OBSERVER
+                .lock()
+                .expect("job drain observer poisoned") = Some(Box::new(move || {
+                events.lock().expect("events poisoned").push("drain");
             }));
         }
 
@@ -503,11 +537,186 @@ mod tests {
         *LSP_POOL_SHUTDOWN_OBSERVER
             .lock()
             .expect("lsp observer poisoned") = None;
+        *crate::jobs::JOB_MANAGER_DRAIN_OBSERVER
+            .lock()
+            .expect("job drain observer poisoned") = None;
 
-        assert_eq!(
-            events.lock().expect("events poisoned").as_slice(),
-            ["jobs", "lsp"]
+        let events = events.lock().expect("events poisoned");
+        let begin = events
+            .iter()
+            .position(|event| *event == "begin")
+            .expect("job admission close was not observed");
+        let drain = events
+            .iter()
+            .rposition(|event| *event == "drain")
+            .expect("job drain was not observed");
+        assert!(
+            begin < drain && events[begin + 1..drain].contains(&"lsp"),
+            "expected begin -> lsp -> drain ordering, got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_deadline_is_typed_and_aborts_connection_drain() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                Daemon {
+                    paths,
+                    data_handler: Arc::new(BlockingHandler { entered, release }),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: None,
+                    reconcile: None,
+                }
+                .run_with_shutdown_timeout(Duration::from_millis(100))
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut conn = UnixStream::connect(&paths.cairn).await.unwrap();
+        conn.write_all(b"hold\n").await.unwrap();
+        conn.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("blocking handler was not entered");
+
+        shutdown.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(1), daemon_task)
+            .await
+            .expect("daemon exceeded test bound")
+            .expect("daemon task panicked");
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShutdownDeadlineExceeded { timeout_ms: 100 })
+        ));
+        assert!(!paths.cairn.exists());
+        assert!(!paths.control.exists());
+    }
+
+    #[tokio::test]
+    async fn clean_teardown_does_not_await_reconcile_register_and_state_recovers() {
+        let runtime_tmp = runtime_tempdir();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
+        let cas = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let repo_hash = path_hash(&repo.path().canonicalize().unwrap());
+        {
+            let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(&tx, "demo", repo.path().to_str().unwrap(), &repo_hash, 1)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        reconcile.set_test_register_hook({
+            let gate = gate.clone();
+            Arc::new(move |_, _, _, _| {
+                let (lock, wake) = &*gate;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake.wait(state).unwrap();
+                }
+                Ok(())
+            })
+        });
+
+        let shutdown = Arc::new(Notify::new());
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            let reconcile = reconcile.clone();
+            async move {
+                Daemon {
+                    paths,
+                    data_handler: Arc::new(EchoHandler),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: None,
+                    reconcile: Some(reconcile),
+                }
+                .run()
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reconcile
+            .request_dirty_by_alias(
+                "demo".into(),
+                crate::reconcile::ReconcileTrigger::WatchEvent,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if gate.0.lock().unwrap().0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconcile register hook did not enter");
+
+        shutdown.notify_waiters();
+        let daemon_result = tokio::time::timeout(Duration::from_secs(1), daemon_task)
+            .await
+            .expect("clean daemon teardown awaited blocked reconcile work")
+            .expect("daemon task panicked");
+        assert!(daemon_result.is_ok());
+        let interrupted = {
+            let index = cas_registry::open(&cas.index_db_path()).unwrap();
+            cas_registry::get_reconcile_state(&index, &repo_hash)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(interrupted.desired_generation, 1);
+        assert_eq!(interrupted.applied_generation, 0);
+        assert_eq!(interrupted.attempt_generation, Some(1));
+
+        let recovered = RepoReconcileManager::new(cas.clone(), None);
+        recovered.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        let recovered_hashes = recovered.recover_interrupted_attempts().await.unwrap();
+        assert_eq!(recovered_hashes, vec![repo_hash.clone()]);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = {
+                    let index = cas_registry::open(&cas.index_db_path()).unwrap();
+                    cas_registry::get_reconcile_state(&index, &repo_hash)
+                        .unwrap()
+                        .unwrap()
+                };
+                if state.applied_generation == 1 && state.attempt_generation.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup recovery did not apply the abandoned generation");
+
+        {
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            wake.notify_all();
+        }
+        reconcile.shutdown(Duration::from_secs(2)).await;
+        recovered.shutdown(Duration::from_secs(2)).await;
     }
 
     #[tokio::test]
