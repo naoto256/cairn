@@ -217,6 +217,9 @@ pub enum DiagnosticCode {
     AnalyzerBinaryMissing,
     WorkspaceUnsuitable,
     QueryFailedPartial,
+    /// The selected current snapshot could not prove that the requested file
+    /// and rows came from a fresh, fully reconciled publication.
+    FileNotIndexedOrSnapshotStale,
 }
 
 /// Severity for structured diagnostics.
@@ -263,6 +266,9 @@ pub enum HintCode {
     DaemonNotReady,
     RepoNotRegistered,
     SnapshotStale,
+    /// Reconcile the repository or wait for the current snapshot to publish
+    /// the requested file before trusting an empty result.
+    FileNotIndexedOrSnapshotStale,
     /// Repository has a durable dirty gap (`desired > applied`)
     /// with no in-flight attempt — the reconcile manager will
     /// pick it up on the next wake or startup.

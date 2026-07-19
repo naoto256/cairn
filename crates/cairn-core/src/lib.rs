@@ -20,6 +20,7 @@ pub mod ctl;
 pub mod daemon;
 pub mod data_rpc;
 pub(crate) mod enrichment;
+pub(crate) mod freshness;
 pub mod jobs;
 pub(crate) mod jsonrpc_dispatch;
 pub(crate) mod jsonrpc_errors;
@@ -70,6 +71,14 @@ pub enum Error {
     /// Requested snapshot anchor is not present in the store.
     #[error("anchor not found: `{name}`")]
     AnchorNotFound { name: String },
+    /// A file-target query cannot distinguish a genuinely empty result from
+    /// a file missing in, or a stale publication of, the selected snapshot.
+    #[error("file `{file}` is not indexed in a freshness-verified snapshot{repo_suffix}", repo_suffix = repo.as_ref().map(|repo| format!(" for repo `{repo}`")).unwrap_or_default())]
+    FileNotIndexed {
+        repo: Option<String>,
+        file: String,
+        reason: String,
+    },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("internal error: {0}")]

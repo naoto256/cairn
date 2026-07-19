@@ -8,9 +8,9 @@ use tracing::debug;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
+    build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
+    parser_id_filter, query_one_or_all_snapshots,
 };
 use crate::query::{self, OutlineFilter, OutlineItem as QueryOutlineItem};
 use crate::{Error, Result};
@@ -33,6 +33,7 @@ impl DataMethod for GetOutline {
 
         let repo_alias = args.scope.repo.clone();
         let file = args.file.clone();
+        let exact_file = file.clone();
         let path = args.path.clone();
         let effective_limit = args.pagination.limit.unwrap_or(200).clamp(1, 1000);
         let kind_filter_set = args.kind.is_some();
@@ -41,15 +42,20 @@ impl DataMethod for GetOutline {
             max_depth: args.max_depth,
         };
 
-        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
+        let execution = query_one_or_all_snapshots(
             ctx,
-            repo_alias,
-            "outline",
-            effective_limit,
-            move |_entry, conn| -> Result<Vec<(OutlineItem, String)>> {
-                let anchor = crate::anchor::resolve_explicit_or_default(conn, None, None)?;
+            SnapshotQueryRequest {
+                requested_repo: repo_alias,
+                anchor: None,
+                branch: None,
+                method_name: "outline",
+                effective_limit,
+                verbose_tier3: args.tier3.verbose_tier3,
+                exact_file,
+            },
+            move |_entry, conn, snapshot| -> Result<Vec<(OutlineItem, String)>> {
                 if let Some(file) = file.as_deref() {
-                    let raw = match query::get_outline(conn, &anchor, file, None) {
+                    let raw = match query::get_outline(conn, &snapshot.anchor, file, None) {
                         Ok(r) => r,
                         Err(Error::AnchorNotFound { .. }) => Vec::new(),
                         Err(other) => return Err(other),
@@ -68,7 +74,7 @@ impl DataMethod for GetOutline {
                 let path = path.as_deref().expect("validated path when file is absent");
                 let raw = match query::get_outline_under_path(
                     conn,
-                    &anchor,
+                    &snapshot.anchor,
                     path,
                     None,
                     limit_with_probe(effective_limit),
@@ -86,11 +92,11 @@ impl DataMethod for GetOutline {
                     })
                     .collect())
             },
+            |hits| parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone())),
             |_out: &mut Vec<(OutlineItem, String)>| {},
         )
         .await?;
-        let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
-        let items: Vec<OutlineItem> = hits.into_iter().map(|(item, _)| item).collect();
+        let items: Vec<OutlineItem> = execution.items.into_iter().map(|(item, _)| item).collect();
 
         debug!(
             repo = ?args.scope.repo,
@@ -99,17 +105,13 @@ impl DataMethod for GetOutline {
             count = items.len(),
             "outline served"
         );
-        let tier3_status = tier_status_for_query(
-            ctx,
-            args.scope.repo.clone(),
-            None,
-            None,
-            parser_ids,
-            args.tier3.verbose_tier3,
-            "get_outline",
-        )
-        .await?;
-        let completeness = completeness_for_scan(capped, skipped_unavailable);
+        let tier3_status = execution.tier3_status;
+        let freshness_issues = execution.freshness_issues;
+        let completeness = completeness_for_snapshot_scan(
+            execution.capped,
+            execution.skipped_unavailable,
+            &freshness_issues,
+        );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::GetOutline,
             items_empty: items.is_empty(),
@@ -126,8 +128,8 @@ impl DataMethod for GetOutline {
                 ..QueryArgsView::default()
             },
         };
-        let diagnostics = build_diagnostics(&emission_ctx);
-        let hints = build_hints(&emission_ctx);
+        let (diagnostics, hints) =
+            build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
         Ok(serde_json::to_value(OutlineResult {
             items,
             completeness,
@@ -165,9 +167,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use cairn_proto::Completeness;
+    use rusqlite::params;
     use serde_json::json;
 
     use super::*;
+    use crate::anchor;
     use crate::cas::{registry as cas_registry, store as cas_store};
     use crate::paths::{CasDataDir, path_hash};
     use crate::register::register_repo;
@@ -213,6 +217,45 @@ mod tests {
         for item in items {
             assert_eq!(item["kind"], "function");
         }
+    }
+
+    #[tokio::test]
+    async fn missing_exact_file_is_partial_without_speculative_empty_hints() {
+        let fixture = outline_fixture();
+        let result = GetOutline
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "file": "a/not-indexed.rs"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            serde_json::from_value::<Completeness>(result["completeness"].clone()).unwrap(),
+            Completeness::partial_truncated("file_not_indexed_or_snapshot_stale")
+        );
+        assert_eq!(
+            result["diagnostics"][0]["code"],
+            "file_not_indexed_or_snapshot_stale"
+        );
+        assert!(
+            result["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| { hint["code"] == "file_not_indexed_or_snapshot_stale" })
+        );
+        assert!(result["hints"].as_array().unwrap().iter().all(|hint| {
+            !matches!(
+                hint["code"].as_str(),
+                Some(
+                    "empty_result_relax_filter"
+                        | "empty_result_try_fuzzy"
+                        | "empty_result_widen_scope"
+                )
+            )
+        }));
     }
 
     #[tokio::test]
@@ -273,7 +316,7 @@ mod tests {
                 .as_nanos(),
         )
         .unwrap_or(i64::MAX);
-        register_repo(&mut store, &canonical, now_ns).unwrap();
+        let registration = register_repo(&mut store, &canonical, now_ns).unwrap();
 
         let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
         let tx = index.transaction().unwrap();
@@ -286,6 +329,7 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
+        mark_fresh(&mut store, &index, &repo_hash, now_ns, &registration);
 
         OutlineFixture {
             _repo: repo,
@@ -333,7 +377,7 @@ mod tests {
                 .as_nanos(),
         )
         .unwrap_or(i64::MAX);
-        register_repo(&mut store, &canonical, now_ns).unwrap();
+        let registration = register_repo(&mut store, &canonical, now_ns).unwrap();
 
         let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
         let tx = index.transaction().unwrap();
@@ -346,6 +390,7 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
+        mark_fresh(&mut store, &index, &repo_hash, now_ns, &registration);
 
         OutlineFixture {
             _repo: repo,
@@ -355,5 +400,35 @@ mod tests {
                 lifecycle: None,
             },
         }
+    }
+
+    fn mark_fresh(
+        store: &mut rusqlite::Connection,
+        index: &rusqlite::Connection,
+        repo_hash: &str,
+        now_ns: i64,
+        registration: &crate::register::RegisterOutcome,
+    ) {
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = 1,
+                     applied_generation = 1,
+                     last_success_ns = ?1,
+                     watcher_state = 'active'
+                 WHERE repo_hash = ?2",
+                params![now_ns, repo_hash],
+            )
+            .unwrap();
+        let tx = store.transaction().unwrap();
+        anchor::set_reconciled(
+            &tx,
+            &anchor::AnchorName::tentative(registration.worktree_id),
+            registration.tentative_manifest,
+            now_ns,
+            1,
+        )
+        .unwrap();
+        tx.commit().unwrap();
     }
 }

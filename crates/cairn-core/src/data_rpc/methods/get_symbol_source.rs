@@ -13,16 +13,23 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    compute_tier_status_response, parser_id_filter,
+    EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
+    build_snapshot_aware_feedback, completeness_for_snapshot_scan, parser_id_filter,
+    query_one_or_all_snapshots,
 };
 use crate::query::{self, SymbolSourceRow};
 use crate::register::load_blob_or_worktree;
 use crate::{Error, Result};
 
 pub struct GetSymbolSource;
+
+struct SourceHit {
+    repo: String,
+    anchor: String,
+    row: SymbolSourceRow,
+    source: String,
+}
 
 #[async_trait::async_trait]
 impl DataMethod for GetSymbolSource {
@@ -40,139 +47,114 @@ impl DataMethod for GetSymbolSource {
 
         let qualified = args.qualified.clone();
         let file_filter = args.file.clone();
+        let exact_file = file_filter.clone();
         let signature_only = args.signature_only;
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
         let verbose_tier3 = args.tier3.verbose_tier3;
-        let cas_data_dir = ctx.cas_data_dir.clone();
-        let lifecycle = ctx.lifecycle.clone();
-
-        let result = tokio::task::spawn_blocking(move || -> Result<GetSymbolSourceResult> {
-            let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let aliases = match requested_repo.as_deref() {
-                Some(name) => {
-                    let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
-                        Error::RepoNotFound {
-                            alias: name.to_string(),
-                        }
-                    })?;
-                    vec![entry]
-                }
-                None => cas_registry::list_all(&index)?,
-            };
-            let enumerate_all = requested_repo.is_none();
-            let mut skipped_unavailable = 0_usize;
-
-            for entry in &aliases {
-                let _lease = match &lifecycle {
-                    Some(lifecycle) if enumerate_all => {
-                        let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)?
-                        else {
-                            skipped_unavailable = skipped_unavailable.saturating_add(1);
-                            continue;
-                        };
-                        Some(lease)
-                    }
-                    Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
-                    None => None,
-                };
-                let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-                let conn = cas_store::open_existing(&store_path)?;
-                let anchor = crate::anchor::resolve_explicit_or_default(
-                    &conn,
-                    anchor_arg.as_deref(),
-                    branch_arg.as_deref(),
-                )?;
-                let manifest_id = crate::anchor::resolve(&conn, &anchor)?.ok_or_else(|| {
-                    Error::AnchorNotFound {
-                        name: anchor.as_str().to_string(),
-                    }
-                })?;
+        let execution = query_one_or_all_snapshots(
+            ctx,
+            SnapshotQueryRequest {
+                requested_repo: requested_repo.clone(),
+                anchor: anchor_arg,
+                branch: branch_arg,
+                method_name: "get_symbol_source",
+                effective_limit: 1,
+                verbose_tier3,
+                exact_file,
+            },
+            move |entry, conn, snapshot| {
                 let row = match query::get_symbol_source_row(
-                    &conn,
-                    &anchor,
+                    conn,
+                    &snapshot.anchor,
                     &qualified,
                     file_filter.as_deref(),
                 )? {
                     Some(row) => row,
-                    None => continue,
+                    None => return Ok(Vec::new()),
                 };
-
                 let worktree_root = PathBuf::from(&entry.root_path);
                 let source = if signature_only {
                     String::new()
                 } else {
                     materialise(&worktree_root, &row)?
                 };
-                let parser_ids = parser_id_filter(std::iter::once(row.parser_id.clone()));
-                let tier3_status = compute_tier_status_response(
-                    &conn,
-                    manifest_id,
-                    Some(&parser_ids),
-                    verbose_tier3,
-                )?;
-                let completeness = cairn_proto::Completeness::complete();
-                let emission_ctx = EmissionContext {
-                    tool: QueryToolKind::GetSymbolSource,
-                    items_empty: false,
-                    completeness: &completeness,
-                    tier3_status: &tier3_status,
-                    query_args: QueryArgsView {
-                        repo: requested_repo.as_deref(),
-                        fuzzy: true,
-                        kind: false,
-                        container: None,
-                        file: file_filter.as_deref(),
-                        ..QueryArgsView::default()
-                    },
-                };
-                let diagnostics = build_diagnostics(&emission_ctx);
-                let hints = build_hints(&emission_ctx);
-
-                return Ok(GetSymbolSourceResult {
-                    qualified: row.qualified,
-                    name: row.name,
-                    kind: row.kind,
-                    branch: anchor.as_str().to_string(),
-                    location: format!(
-                        "{}:{}:{}:{}",
-                        entry.alias,
-                        anchor.as_str(),
-                        row.path,
-                        row.line_start
-                    ),
-                    line_start: row.line_start,
-                    line_end: row.line_end,
+                Ok(vec![SourceHit {
+                    repo: entry.alias.clone(),
+                    anchor: snapshot.anchor.as_str().to_string(),
+                    row,
                     source,
-                    signature: row.signature,
-                    doc: row.doc,
-                    // `get_symbol_source` reads source bytes from the
-                    // manifest blob rather than a specific analyzer row.
-                    // Until rows carry their originating analyzer tier,
-                    // report the source text itself as syntactic.
-                    source_tier: SourceTier::Syntactic,
-                    tier3_status,
-                    diagnostics,
-                    hints,
-                    timing: cairn_proto::Timing::default(),
+                }])
+            },
+            |hits| parser_id_filter(hits.iter().map(|hit| hit.row.parser_id.clone())),
+            |_hits: &mut Vec<SourceHit>| {},
+        )
+        .await?;
+
+        let freshness_issues = execution.freshness_issues;
+        let Some(hit) = execution.items.into_iter().next() else {
+            if let Some(issue) = freshness_issues.first() {
+                return Err(Error::FileNotIndexed {
+                    repo: (issue.repo != "*").then(|| issue.repo.clone()),
+                    file: args.file.clone().unwrap_or_else(|| "<unspecified>".into()),
+                    reason: issue.reason.into(),
                 });
             }
-
-            let scope = match requested_repo.as_deref() {
-                Some(name) => format!("repo=`{name}`"),
-                None => format!(
-                    "any of {} registered repos ({} unavailable skipped)",
-                    aliases.len(),
-                    skipped_unavailable
-                ),
-            };
-            Err(Error::InvalidArgument(format!(
-                "no symbol matches qualified=`{qualified}` in {scope}"
-            )))
-        })
-        .await
-        .map_err(|e| Error::internal_task_panic("get_symbol_source", e))??;
+            let scope = requested_repo
+                .as_deref()
+                .map(|name| format!("repo=`{name}`"))
+                .unwrap_or_else(|| "registered repositories".into());
+            return Err(Error::InvalidArgument(format!(
+                "no symbol matches qualified=`{}` in {scope}",
+                args.qualified
+            )));
+        };
+        let tier3_status = execution.tier3_status;
+        let completeness = completeness_for_snapshot_scan(
+            execution.capped,
+            execution.skipped_unavailable,
+            &freshness_issues,
+        );
+        let emission_ctx = EmissionContext {
+            tool: QueryToolKind::GetSymbolSource,
+            items_empty: false,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: args.scope.repo.as_deref(),
+                fuzzy: true,
+                kind: false,
+                container: None,
+                file: args.file.as_deref(),
+                ..QueryArgsView::default()
+            },
+        };
+        let (diagnostics, hints) =
+            build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
+        let row = hit.row;
+        let result = GetSymbolSourceResult {
+            qualified: row.qualified,
+            name: row.name,
+            kind: row.kind,
+            branch: hit.anchor.clone(),
+            location: format!(
+                "{}:{}:{}:{}",
+                hit.repo, hit.anchor, row.path, row.line_start
+            ),
+            line_start: row.line_start,
+            line_end: row.line_end,
+            source: hit.source,
+            signature: row.signature,
+            doc: row.doc,
+            // Source bytes come from the manifest blob, not one analyzer row.
+            source_tier: SourceTier::Syntactic,
+            completeness,
+            tier3_status,
+            diagnostics,
+            hints,
+            timing: cairn_proto::Timing::default(),
+        };
 
         Ok(serde_json::to_value(result).unwrap())
     }
@@ -203,4 +185,57 @@ fn materialise(worktree_root: &std::path::Path, row: &SymbolSourceRow) -> Result
         )));
     }
     Ok(String::from_utf8_lossy(&bytes[row.byte_start..row.byte_end]).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::data_rpc::helpers::test_support;
+
+    #[tokio::test]
+    async fn explicit_missing_file_returns_typed_file_not_indexed() {
+        let fixture = test_support::registered_fixture();
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "crate::missing",
+                    "file": "src/not-indexed.rs"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::FileNotIndexed {
+                repo: Some(repo),
+                file,
+                reason
+            } if repo == "demo"
+                && file == "src/not-indexed.rs"
+                && reason == "file_not_indexed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_member_qualified_miss_keeps_existing_not_found_contract() {
+        let fixture = test_support::registered_fixture();
+        let err = GetSymbolSource
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "qualified": "crate::missing",
+                    "file": "src/lib.rs"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
 }
