@@ -82,5 +82,5 @@ pub mod runner;
 pub mod types;
 
 pub use report::{EvalReport, TierReport};
-pub use runner::run_case;
+pub use runner::{RegisteredFixture, register_fixture, run_case};
 pub use types::{ActualHit, ExpectedHit, GoldenCase, Query, Tool};
