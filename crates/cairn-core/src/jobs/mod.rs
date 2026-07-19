@@ -174,6 +174,7 @@ impl JobKey {
 
 pub struct JobManager {
     cas_data_dir: Arc<CasDataDir>,
+    lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
     scheduler_sender: Mutex<Option<mpsc::UnboundedSender<SchedulerMsg>>>,
     scheduler_receiver: Mutex<Option<mpsc::UnboundedReceiver<SchedulerMsg>>>,
     scheduler: Mutex<Option<JoinHandle<()>>>,
@@ -281,12 +282,38 @@ pub struct EnqueueAnalyzerRun<'a> {
 }
 
 impl JobManager {
+    pub(crate) fn acquire_repository_lease(
+        &self,
+        repo_hash: &str,
+    ) -> Result<Option<crate::lifecycle::RepoLease>> {
+        self.lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.acquire_by_repo_hash(repo_hash))
+            .transpose()
+    }
+
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Arc<Self> {
+        Self::build(cas_data_dir, None)
+    }
+
+    #[must_use]
+    pub fn with_lifecycle(
+        cas_data_dir: Arc<CasDataDir>,
+        lifecycle: Arc<crate::lifecycle::RepoLifecycleManager>,
+    ) -> Arc<Self> {
+        Self::build(cas_data_dir, Some(lifecycle))
+    }
+
+    fn build(
+        cas_data_dir: Arc<CasDataDir>,
+        lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
+    ) -> Arc<Self> {
         let (scheduler_sender, scheduler_receiver) = mpsc::unbounded_channel();
         let (worker_sender, worker_receiver) = mpsc::unbounded_channel();
         Arc::new(Self {
             cas_data_dir,
+            lifecycle,
             scheduler_sender: Mutex::new(Some(scheduler_sender)),
             scheduler_receiver: Mutex::new(Some(scheduler_receiver)),
             scheduler: Mutex::new(None),
@@ -610,9 +637,14 @@ impl JobManager {
         let entry = entry.ok_or_else(|| Error::RepoNotFound {
             alias: alias.to_string(),
         })?;
+        let _lease = self
+            .lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.acquire_by_repo_hash(&entry.repo_hash))
+            .transpose()?;
 
         let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
-        let mut conn = cas_store::open(&store_path)?;
+        let mut conn = cas_store::open_existing(&store_path)?;
         let repo_root = PathBuf::from(&entry.root_path);
 
         let outcome = crate::register::register_repo_force_analyzers_enqueue(
@@ -729,8 +761,13 @@ impl JobManager {
             return Err(Error::InvalidArgument(format!("unknown job id: {job_id}")));
         }
         if let Some(locator) = self.job_index.get(job_id) {
+            let _lease = self
+                .lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.acquire_by_repo_hash(&locator.repo_hash))
+                .transpose()?;
             let store_path = self.cas_data_dir.store_db_path(&locator.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             if let Some(result) = self.cancel_in_store(&conn, job_id)? {
                 return Ok(result);
             }
@@ -742,8 +779,17 @@ impl JobManager {
             );
         }
         for entry in cas_registry::list_all(&index)? {
+            let _lease = self
+                .lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.acquire_for_enumeration(&entry.repo_hash))
+                .transpose()?
+                .flatten();
+            if self.lifecycle.is_some() && _lease.is_none() {
+                continue;
+            }
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open(&store_path)?;
+            let conn = cas_store::open_existing(&store_path)?;
             if let Some(result) = self.cancel_in_store(&conn, job_id)? {
                 self.job_index
                     .insert(job_id, &entry.alias, &entry.repo_hash);
@@ -751,6 +797,44 @@ impl JobManager {
             }
         }
         Err(Error::InvalidArgument(format!("unknown job id: {job_id}")))
+    }
+
+    /// Cancel every queued/running analyzer job owned by one canonical
+    /// repository. The lifecycle gate has already linearized Removing, so no
+    /// new enqueue can become runnable after this scan.
+    pub fn cancel_repository(&self, repo_hash: &str) -> Result<usize> {
+        let store_path = self.cas_data_dir.store_db_path(repo_hash);
+        let conn = match cas_store::open_existing(&store_path) {
+            Ok(conn) => conn,
+            Err(Error::StoreNotFound { .. }) => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let mut stmt = conn.prepare(
+            "SELECT job_id, status FROM workspace_analysis_runs
+             WHERE job_id IS NOT NULL AND status IN ('queued', 'running')",
+        )?;
+        let rows: Vec<(JobId, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        for (job_id, status) in &rows {
+            if status == RunStatus::Queued.as_str() {
+                conn.execute(
+                    "UPDATE workspace_analysis_runs
+                     SET status = 'cancelled', cancel_requested = 1, finished_at_ns = ?1
+                     WHERE job_id = ?2",
+                    params![now_ns(), job_id],
+                )?;
+                self.notify_cancelled_job(*job_id);
+            } else {
+                conn.execute(
+                    "UPDATE workspace_analysis_runs SET cancel_requested = 1 WHERE job_id = ?1",
+                    params![job_id],
+                )?;
+                self.cancel_active_progress(*job_id);
+            }
+        }
+        Ok(rows.len())
     }
 
     fn cancel_in_store(&self, conn: &Connection, job_id: JobId) -> Result<Option<CancelResult>> {
@@ -788,15 +872,7 @@ impl JobManager {
                      WHERE manifest_id = ?1 AND analyzer_id = ?2",
                     params![manifest_id, analyzer_id],
                 )?;
-                if let Some(progress) = self
-                    .admission
-                    .lock()
-                    .expect("job admission lock poisoned")
-                    .active_progress
-                    .get(&job_id)
-                {
-                    progress.cancel();
-                }
+                self.cancel_active_progress(job_id);
                 CancelResult {
                     cancelled: false,
                     reason:
@@ -879,6 +955,18 @@ impl JobManager {
             progress.cancel();
         }
         admission.active_progress.insert(job_id, progress);
+    }
+
+    fn cancel_active_progress(&self, job_id: JobId) {
+        if let Some(progress) = self
+            .admission
+            .lock()
+            .expect("job admission lock poisoned")
+            .active_progress
+            .get(&job_id)
+        {
+            progress.cancel();
+        }
     }
 
     fn unregister_active_progress(&self, job_id: JobId) {
