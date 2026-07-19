@@ -5,6 +5,24 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [Unreleased] — 0.8.0
+
+### Fixed
+
+- **Filesystem watcher ignore parity and bounded event coalescing.** Startup
+  scans and live watcher events now share one repository-scoped gitignore
+  matcher covering nested `.gitignore` files and the actual Git directory's
+  `info/exclude` (including linked worktrees). Ignore-rule changes, backend
+  rescan notices, and directory topology changes rebuild the matcher and
+  schedule a durable full reconcile; matcher failures temporarily fail open
+  and retry rather than silently hiding source changes. Watcher bursts are
+  reduced to one bounded edge and at most one dirty-generation bump per
+  500 ms window, with the edge retained until persistence succeeds.
+
+  This deliberately narrows scanning to Git ignore semantics: `.ignore`
+  files and `.gitignore` files above the registered repository root are no
+  longer inherited. Cairn's fixed always-pruned directories remain unchanged.
+
 ## [0.7.1] — 2026-07-12
 
 ### Added

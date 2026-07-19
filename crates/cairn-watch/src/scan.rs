@@ -10,6 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use ignore::{DirEntry, WalkBuilder};
+use tracing::warn;
+
+use crate::matcher::{RepoIgnoreMatcher, resolve_git_metadata};
 
 /// One observed file inside the repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,15 +43,33 @@ pub(crate) const ALWAYS_PRUNED_DIR_NAMES: &[&str] = &[".git", "target", "node_mo
 /// and yield every regular file found. Directories listed in
 /// [`ALWAYS_PRUNED_DIR_NAMES`] are skipped regardless of gitignore.
 pub fn walk_repo(repo_root: &Path) -> impl Iterator<Item = ScannedFile> {
+    let info_exclude = resolve_git_metadata(repo_root)
+        .map(|paths| paths.info_exclude)
+        .unwrap_or_else(|_| repo_root.join(".git/info/exclude"));
+    let matcher = RepoIgnoreMatcher::build(repo_root, &info_exclude).unwrap_or_else(|err| {
+        warn!(
+            root = %repo_root.display(),
+            error = %err,
+            "ignore matcher build failed during scan; scan is fail-open"
+        );
+        RepoIgnoreMatcher::fail_open(repo_root)
+    });
     let walker = WalkBuilder::new(repo_root)
         .hidden(false) // we want dotfiles like .env, but excluded set covers .git
-        .git_ignore(true)
-        .git_exclude(true)
+        // Ignore policy is owned by RepoIgnoreMatcher so the startup
+        // scan and event classifier cannot drift. In particular, do
+        // not inherit ripgrep-style `.ignore` files or `.gitignore`
+        // files above the repository root.
+        .ignore(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_exclude(false)
         .git_global(false)
-        // Honor .gitignore even without an initialized `.git` directory.
-        // The repos cairn watches always have one, but tests can skip it.
         .require_git(false)
-        .filter_entry(|e| !is_always_pruned(e))
+        .filter_entry(move |e| {
+            !is_always_pruned(e)
+                && !matcher.is_ignored(e.path(), e.file_type().is_some_and(|kind| kind.is_dir()))
+        })
         .build();
 
     walker.filter_map(Result::ok).filter_map(scanned_from_entry)
@@ -128,6 +149,45 @@ mod tests {
             .collect();
         assert!(names.contains("kept.rs"));
         assert!(!names.contains("ignored.txt"));
+    }
+
+    #[test]
+    fn respects_nested_gitignore_with_directory_anchoring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("sub/gen")).unwrap();
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join("sub/.gitignore"), "/gen/\n").unwrap();
+        fs::write(root.join("sub/gen/ignored.rs"), "").unwrap();
+        fs::write(root.join("gen/kept.rs"), "").unwrap();
+
+        let paths = walk_repo(root).map(|file| file.path).collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path.ends_with("gen/kept.rs")));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.ends_with("sub/gen/ignored.rs"))
+        );
+    }
+
+    #[test]
+    fn ignores_git_exclude_but_not_dot_ignore_or_parent_gitignore() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("repo");
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(parent.path().join(".gitignore"), "from-parent.rs\n").unwrap();
+        fs::write(root.join(".ignore"), "from-dot-ignore.rs\n").unwrap();
+        fs::write(root.join(".git/info/exclude"), "from-exclude.rs\n").unwrap();
+        for name in ["from-parent.rs", "from-dot-ignore.rs", "from-exclude.rs"] {
+            fs::write(root.join(name), "").unwrap();
+        }
+
+        let names = walk_repo(&root)
+            .filter_map(|file| file.path.file_name().map(|name| name.to_os_string()))
+            .collect::<HashSet<_>>();
+        assert!(names.contains(std::ffi::OsStr::new("from-parent.rs")));
+        assert!(names.contains(std::ffi::OsStr::new("from-dot-ignore.rs")));
+        assert!(!names.contains(std::ffi::OsStr::new("from-exclude.rs")));
     }
 
     #[test]

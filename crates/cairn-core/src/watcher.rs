@@ -30,6 +30,10 @@ use crate::reconcile::{ReconcileTrigger, RepoReconcileManager};
 use crate::{Error, Result};
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+const WATCH_EDGE_CAPACITY: usize = 1;
+const WATCH_COALESCE_WINDOW: Duration = Duration::from_millis(500);
+const WATCH_REQUEST_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const WATCH_REQUEST_RETRY_MAX: Duration = Duration::from_secs(1);
 
 /// Keeps one live watcher per registered `repo_hash`.
 pub struct WatchManager {
@@ -161,7 +165,7 @@ impl WatchManager {
             ));
         }
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
         let handle = watch_repo_with_backend(&root_path, WATCH_DEBOUNCE, tx, self.backend)
             .map_err(|e| {
                 let msg = format!("watch_repo {}: {e}", root_path.display());
@@ -305,33 +309,74 @@ impl WatchManager {
     }
 }
 
-/// Consume raw watch events and forward each one as a durable
-/// dirty request through the reconcile driver. No debounce here
-/// — the manager owns the debounce/retry policy.
+/// Consume a bounded edge signal and record at most one durable
+/// dirty generation per fixed coalescing window. The pending edge
+/// is not forgotten until `request_dirty` succeeds.
 async fn dispatch_events(
     reconcile: Option<Arc<RepoReconcileManager>>,
     repo_hash: String,
-    mut rx: mpsc::UnboundedReceiver<WatchEvent>,
+    mut rx: mpsc::Receiver<WatchEvent>,
 ) {
-    while let Some(event) = rx.recv().await {
-        debug!(repo_hash = %repo_hash, ?event, "repo watcher event");
+    while let Some(first_event) = rx.recv().await {
+        let mut event_count = 1_u64;
+        let mut channel_closed = false;
+        debug!(repo_hash = %repo_hash, ?first_event, "repo watcher event edge");
+        let deadline = tokio::time::Instant::now() + WATCH_COALESCE_WINDOW;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                event = rx.recv() => match event {
+                    Some(event) => {
+                        event_count = event_count.saturating_add(1);
+                        debug!(repo_hash = %repo_hash, ?event, "coalesced repo watcher event");
+                    }
+                    None => {
+                        channel_closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         let Some(reconcile) = reconcile.clone() else {
+            if channel_closed {
+                break;
+            }
             continue;
         };
-        match reconcile
-            .request_dirty_by_repo_hash(repo_hash.clone(), ReconcileTrigger::WatchEvent)
-            .await
-        {
-            Ok(outcome) => debug!(
-                repo_hash = %repo_hash,
-                generation = outcome.generation,
-                "watcher request recorded"
-            ),
-            Err(err) => warn!(
-                repo_hash = %repo_hash,
-                error = %err,
-                "watcher failed to record dirty request"
-            ),
+
+        let mut retry_delay = WATCH_REQUEST_RETRY_INITIAL;
+        loop {
+            match reconcile
+                .request_dirty_by_repo_hash(repo_hash.clone(), ReconcileTrigger::WatchEvent)
+                .await
+            {
+                Ok(outcome) => {
+                    debug!(
+                        repo_hash = %repo_hash,
+                        generation = outcome.generation,
+                        events = event_count,
+                        "watcher request recorded"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        repo_hash = %repo_hash,
+                        error = %err,
+                        retry_ms = retry_delay.as_millis(),
+                        "watcher failed to record dirty request; retaining pending edge"
+                    );
+                    if channel_closed || rx.is_closed() {
+                        return;
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(WATCH_REQUEST_RETRY_MAX);
+                }
+            }
+        }
+        if channel_closed {
+            break;
         }
     }
 }
@@ -339,6 +384,33 @@ async fn dispatch_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_event() -> WatchEvent {
+        WatchEvent::File {
+            path: PathBuf::from("src/lib.rs"),
+            change: cairn_watch::FileChange::Touched,
+        }
+    }
+
+    fn desired_generation(cas: &CasDataDir, repo_hash: &str) -> Option<i64> {
+        let index = cas_registry::open(&cas.index_db_path()).unwrap();
+        cas_registry::get_reconcile_state(&index, repo_hash)
+            .unwrap()
+            .map(|state| state.desired_generation)
+    }
+
+    async fn wait_for_desired(cas: &CasDataDir, repo_hash: &str, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if desired_generation(cas, repo_hash).is_some_and(|value| value >= expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("desired generation did not reach {expected}"));
+    }
 
     fn seed_repo(cas: &CasDataDir, repo_hash: &str, root: &std::path::Path) {
         let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
@@ -409,5 +481,78 @@ mod tests {
         }));
 
         assert!(!manager.is_watching_repository("missing"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_coalesces_events_by_fixed_window() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, "h", root.path());
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        reconcile.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
+        let task = tokio::spawn(dispatch_events(Some(reconcile), "h".into(), rx));
+
+        tx.send(test_event()).await.unwrap();
+        tx.send(test_event()).await.unwrap();
+        tx.send(test_event()).await.unwrap();
+        wait_for_desired(&cas, "h", 1).await;
+        assert_eq!(desired_generation(&cas, "h"), Some(1));
+
+        tokio::time::sleep(WATCH_COALESCE_WINDOW + Duration::from_millis(50)).await;
+        tx.send(test_event()).await.unwrap();
+        wait_for_desired(&cas, "h", 2).await;
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_events_do_not_starve_dirty_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, "h", root.path());
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        reconcile.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
+        let task = tokio::spawn(dispatch_events(Some(reconcile), "h".into(), rx));
+        let producer = tokio::spawn(async move {
+            for _ in 0..30 {
+                tx.send(test_event()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        wait_for_desired(&cas, "h", 1).await;
+        assert!(
+            !producer.is_finished(),
+            "generation advanced only after the producer stopped"
+        );
+        producer.await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_dirty_request_retains_edge_until_repository_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        reconcile.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
+        let task = tokio::spawn(dispatch_events(Some(reconcile), "h".into(), rx));
+
+        tx.send(test_event()).await.unwrap();
+        tokio::time::sleep(WATCH_COALESCE_WINDOW + Duration::from_millis(100)).await;
+        assert_eq!(desired_generation(&cas, "h"), None);
+        seed_repo(&cas, "h", root.path());
+        wait_for_desired(&cas, "h", 1).await;
+
+        drop(tx);
+        task.await.unwrap();
     }
 }
