@@ -21,8 +21,8 @@ use cairn_lang_api::{
     SymbolScope, SyntacticFacts, Visibility,
 };
 use cairn_lang_treesitter_generic::{
-    NestingTracker, Visitor, child_by_field, end_line_of, extract, line_of, node_text,
-    signature_slice, truncate,
+    DocCommentPart, NestingTracker, Visitor, child_by_field, end_line_of, extract,
+    extract_doc_above_node, line_of, node_text, signature_slice,
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
@@ -279,54 +279,23 @@ fn extract_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
     None
 }
 
-/// Walk preceding siblings of `node` (within its parent) collecting
-/// contiguous `line_comment` / `block_comment` nodes that are doc
-/// comments (start with `///` or `//!`, `/**` or `/*!`).
+/// Collect contiguous Rust doc comments immediately above `node`.
+/// Attributes are transparent because Rust permits them between a doc
+/// comment and the declaration it documents.
 fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut lines: Vec<String> = Vec::new();
-    let mut prev_end_row: Option<usize> = None;
-
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
+    extract_doc_above_node(node, source, |sibling, text| match sibling.kind() {
+        "line_comment" | "block_comment"
+            if text.starts_with("///")
+                || text.starts_with("//!")
+                || text.starts_with("/**")
+                || text.starts_with("/*!") =>
+        {
+            Some(DocCommentPart::Append(strip_doc_markers(text)))
         }
-        let kind = sibling.kind();
-        if kind == "line_comment" || kind == "block_comment" {
-            let text = node_text(sibling, source);
-            if !text.starts_with("///")
-                && !text.starts_with("//!")
-                && !text.starts_with("/**")
-                && !text.starts_with("/*!")
-            {
-                // Not a doc comment — break the contiguous run.
-                lines.clear();
-                prev_end_row = None;
-                continue;
-            }
-            // Only keep contiguous (adjacent rows).
-            let start_row = sibling.start_position().row;
-            if let Some(p) = prev_end_row {
-                if start_row > p + 1 {
-                    lines.clear();
-                }
-            }
-            lines.push(strip_doc_markers(text));
-            prev_end_row = Some(sibling.end_position().row);
-        } else if !sibling.is_extra() && sibling.kind() != "attribute_item" {
-            // A non-comment, non-attribute sibling resets the run.
-            lines.clear();
-            prev_end_row = None;
-        }
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        let joined = lines.join("\n");
-        Some(truncate(&joined, 1024))
-    }
+        "line_comment" | "block_comment" => Some(DocCommentPart::Reset),
+        "attribute_item" => Some(DocCommentPart::Ignore),
+        _ => None,
+    })
 }
 
 fn strip_doc_markers(text: &str) -> String {
@@ -458,6 +427,52 @@ fn hi() {}
         let doc = facts.symbols[0].doc.as_deref().unwrap();
         assert!(doc.contains("Greet someone"));
         assert!(doc.contains("Multi-line"));
+    }
+
+    #[test]
+    fn doc_comment_adjacency_characterization() {
+        let cases: &[(&str, &[u8], Option<&str>)] = &[
+            (
+                "outer_line",
+                b"/// First line.\n/// Second line.\nfn outer_line() {}",
+                Some("First line.\nSecond line."),
+            ),
+            (
+                "inner_line",
+                b"//! Inner first.\n//! Inner second.\nfn inner_line() {}",
+                Some("Inner first.\nInner second."),
+            ),
+            (
+                "block",
+                b"/** Block doc. */\nfn block() {}",
+                Some("Block doc."),
+            ),
+            (
+                "attribute",
+                b"/// Through attribute.\n#[inline]\nfn attribute() {}",
+                Some("Through attribute."),
+            ),
+            (
+                "blank_line",
+                b"/// Separated today.\n\nfn blank_line() {}",
+                None,
+            ),
+            (
+                "plain_comment",
+                b"/// Stale.\n// reset\nfn plain_comment() {}",
+                None,
+            ),
+        ];
+
+        for (name, source, expected) in cases {
+            let facts = RustBackend.extract_syntactic(source).unwrap();
+            let symbol = facts
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == *name)
+                .unwrap_or_else(|| panic!("symbol {name} missing"));
+            assert_eq!(symbol.doc.as_deref(), *expected, "case {name}");
+        }
     }
 
     #[test]
