@@ -117,7 +117,7 @@ impl Default for PeriodicReconcilePolicy {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(5 * 60),
-            max_clean_age: Duration::from_secs(30 * 60),
+            max_clean_age: crate::freshness::MAX_CURRENT_SNAPSHOT_AGE,
         }
     }
 }

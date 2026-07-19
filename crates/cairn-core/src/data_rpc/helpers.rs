@@ -1,6 +1,7 @@
 //! Shared blocking helpers for data-RPC methods.
 
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_proto::{
     AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,
@@ -10,8 +11,10 @@ use cairn_proto::{
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
+#[cfg(test)]
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
+use crate::freshness::{self, EvaluatedSnapshot, SnapshotFreshness};
 use crate::manifest::ManifestId;
 use crate::workspace_analyzer::{
     WorkspaceAnalyzer, expected_analyzers_for_manifest, manifest_parser_ids,
@@ -20,27 +23,71 @@ use crate::{Error, Result};
 
 use super::DataCtx;
 
-/// Open one requested repo store or every registered store, run the
-/// per-store query, and apply the shared limit-probe semantics.
-pub(crate) async fn with_one_or_all_stores<T, F, S>(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryFreshnessIssue {
+    pub(crate) repo: String,
+    pub(crate) reason: &'static str,
+}
+
+#[derive(Debug)]
+pub(crate) struct SnapshotQueryResult<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) capped: bool,
+    pub(crate) skipped_unavailable: bool,
+    pub(crate) tier3_status: TierStatus,
+    pub(crate) freshness_issues: Vec<QueryFreshnessIssue>,
+}
+
+pub(crate) struct SnapshotQueryRequest {
+    pub(crate) requested_repo: Option<String>,
+    pub(crate) anchor: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) method_name: &'static str,
+    pub(crate) effective_limit: u32,
+    pub(crate) verbose_tier3: bool,
+    /// Exact repo-relative path whose membership is required before query SQL.
+    /// Prefix/path-filter queries leave this unset.
+    pub(crate) exact_file: Option<String>,
+}
+
+struct CapturedSnapshot {
+    entry: cas_registry::AliasEntry,
+    selected: EvaluatedSnapshot,
+}
+
+/// Execute a query against one immutable manifest per repository.
+///
+/// Anchor resolution and the query itself share one SQLite read transaction,
+/// so an anchor move cannot mix rows from two manifests. Tier status is then
+/// evaluated against the captured manifest ids rather than resolving anchors
+/// a second time. Finally, current-snapshot freshness is revalidated against
+/// both databases before the response is assembled.
+pub(crate) async fn query_one_or_all_snapshots<T, F, P, S>(
     ctx: &DataCtx,
-    requested_repo: Option<String>,
-    method_name: &'static str,
-    effective_limit: u32,
+    request: SnapshotQueryRequest,
     mut query_store: F,
+    parser_ids_for_items: P,
     mut finalize: S,
-) -> Result<(Vec<T>, bool, bool)>
+) -> Result<SnapshotQueryResult<T>>
 where
     T: Send + 'static,
-    F: FnMut(&cas_registry::AliasEntry, &rusqlite::Connection) -> Result<Vec<T>> + Send + 'static,
+    F: FnMut(
+            &cas_registry::AliasEntry,
+            &rusqlite::Connection,
+            &EvaluatedSnapshot,
+        ) -> Result<Vec<T>>
+        + Send
+        + 'static,
+    P: Fn(&[T]) -> BTreeSet<String> + Send + 'static,
     S: FnMut(&mut Vec<T>) + Send + 'static,
 {
     let cas_data_dir = ctx.cas_data_dir.clone();
     let lifecycle = ctx.lifecycle.clone();
-    tokio::task::spawn_blocking(move || -> Result<(Vec<T>, bool, bool)> {
+    let method_name = request.method_name;
+    tokio::task::spawn_blocking(move || -> Result<SnapshotQueryResult<T>> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-        let enumerate_all = requested_repo.is_none();
-        let aliases = match requested_repo.as_deref() {
+        let enumerate_all = request.requested_repo.is_none();
+        let aliases = match request.requested_repo.as_deref() {
             Some(name) => {
                 let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
                     Error::RepoNotFound {
@@ -53,8 +100,11 @@ where
         };
 
         let mut out = Vec::new();
+        let mut captured = Vec::new();
         let mut capped = false;
         let mut skipped_unavailable = false;
+        let mut freshness_issues = Vec::new();
+        let mut exact_member_found = false;
         for entry in aliases {
             let _lease = match &lifecycle {
                 Some(lifecycle) if enumerate_all => {
@@ -68,22 +118,128 @@ where
                 None => None,
             };
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open_existing(&store_path)?;
-            let mut hits = match query_store(&entry, &conn) {
-                Ok(h) => h,
+            let mut conn = cas_store::open_existing(&store_path)?;
+            let tx = conn.transaction()?;
+            let selected = match freshness::evaluate_snapshot(
+                &index,
+                &tx,
+                &entry.repo_hash,
+                request.anchor.as_deref(),
+                request.branch.as_deref(),
+                system_now_ns(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(Error::AnchorNotFound { .. }) if enumerate_all => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some(file) = request.exact_file.as_deref() {
+                let member = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM manifest_entries
+                         WHERE manifest_id = ?1 AND path = ?2
+                     )",
+                    params![selected.manifest_id.0, file],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !member {
+                    if !enumerate_all {
+                        freshness_issues.push(QueryFreshnessIssue {
+                            repo: entry.alias.clone(),
+                            reason: "file_not_indexed",
+                        });
+                    }
+                    continue;
+                }
+                exact_member_found = true;
+            }
+            let mut hits = match query_store(&entry, &tx, &selected) {
+                Ok(hits) => hits,
                 Err(Error::AnchorNotFound { .. }) => continue,
                 Err(other) => return Err(other),
             };
-            capped |= trim_to_requested_limit(&mut hits, effective_limit);
+            tx.commit()?;
+            capped |= trim_to_requested_limit(&mut hits, request.effective_limit);
             out.extend(hits);
+            captured.push(CapturedSnapshot { entry, selected });
+        }
+        if enumerate_all && request.exact_file.is_some() && !exact_member_found {
+            freshness_issues.push(QueryFreshnessIssue {
+                repo: "*".into(),
+                reason: "file_not_indexed",
+            });
         }
 
         finalize(&mut out);
-        capped |= trim_to_requested_limit(&mut out, effective_limit);
-        Ok((out, capped, skipped_unavailable))
+        capped |= trim_to_requested_limit(&mut out, request.effective_limit);
+        let relevant_parser_ids = parser_ids_for_items(&out);
+
+        let mut analyzers = Vec::new();
+        let mut repo_wide_analyzers = Vec::new();
+        for mut snapshot in captured {
+            let store_path = cas_data_dir.store_db_path(&snapshot.entry.repo_hash);
+            let conn = cas_store::open_existing(&store_path)?;
+            analyzers.extend(
+                compute_tier_status_for_parser_ids(
+                    &conn,
+                    snapshot.selected.manifest_id,
+                    Some(&relevant_parser_ids),
+                )?
+                .analyzers,
+            );
+            if request.verbose_tier3 {
+                repo_wide_analyzers.extend(
+                    compute_tier_status(&conn, snapshot.selected.manifest_id)?
+                        .this_query
+                        .analyzers,
+                );
+            }
+            snapshot.selected.freshness = freshness::revalidate_snapshot(
+                &index,
+                &conn,
+                &snapshot.entry.repo_hash,
+                &snapshot.selected,
+                system_now_ns(),
+            )?;
+            if let SnapshotFreshness::Stale(reason) = snapshot.selected.freshness {
+                freshness_issues.push(QueryFreshnessIssue {
+                    repo: snapshot.entry.alias,
+                    reason: reason.as_str(),
+                });
+            }
+        }
+        analyzers.sort();
+        analyzers.dedup();
+        let mut tier3_status = TierStatus::from_body(TierStatusBody::from_analyzers(analyzers));
+        if request.verbose_tier3 {
+            repo_wide_analyzers.sort();
+            repo_wide_analyzers.dedup();
+            tier3_status =
+                tier3_status.with_repo_wide(TierStatusBody::from_analyzers(repo_wide_analyzers));
+        }
+        if !freshness_issues.is_empty() {
+            tier3_status.this_query.ready = false;
+            if let Some(repo_wide) = &mut tier3_status.repo_wide {
+                repo_wide.ready = false;
+            }
+        }
+
+        Ok(SnapshotQueryResult {
+            items: out,
+            capped,
+            skipped_unavailable,
+            tier3_status,
+            freshness_issues,
+        })
     })
     .await
-    .map_err(|e| Error::internal_task_panic(method_name, e))?
+    .map_err(|error| Error::internal_task_panic(method_name, error))?
+}
+
+pub(crate) fn system_now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 pub(crate) fn limit_with_probe(effective_limit: u32) -> u32 {
@@ -110,6 +266,19 @@ pub(crate) fn completeness_for_scan(capped: bool, skipped_unavailable: bool) -> 
     }
 }
 
+pub(crate) fn completeness_for_snapshot_scan(
+    capped: bool,
+    skipped_unavailable: bool,
+    freshness_issues: &[QueryFreshnessIssue],
+) -> Completeness {
+    if !freshness_issues.is_empty() {
+        Completeness::partial_truncated("file_not_indexed_or_snapshot_stale")
+    } else {
+        completeness_for_scan(capped, skipped_unavailable)
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct EmissionContext<'a> {
     pub(crate) tool: QueryToolKind,
     pub(crate) items_empty: bool,
@@ -393,6 +562,71 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
     hints
 }
 
+/// Build query feedback while giving snapshot uncertainty priority over
+/// speculative empty-result advice. Cap and analyzer signals remain visible.
+pub(crate) fn build_snapshot_aware_feedback(
+    ctx: &EmissionContext<'_>,
+    freshness_issues: &[QueryFreshnessIssue],
+    capped: bool,
+) -> (Vec<Diagnostic>, Vec<Hint>) {
+    let mut diagnostics = build_diagnostics(ctx);
+    let mut hints = build_hints(ctx);
+    if freshness_issues.is_empty() {
+        return (diagnostics, hints);
+    }
+
+    diagnostics.retain(|diagnostic| diagnostic.code != DiagnosticCode::QueryFailedPartial);
+    diagnostics.extend(freshness_issues.iter().map(|issue| Diagnostic {
+        code: DiagnosticCode::FileNotIndexedOrSnapshotStale,
+        severity: DiagnosticSeverity::Warning,
+        message: "The query used a file-missing or freshness-unverified current snapshot.".into(),
+        language: None,
+        analyzer_id: None,
+        repo: (issue.repo != "*").then(|| issue.repo.clone()),
+        file: ctx.query_args.file.map(str::to_string),
+        details: Some(json!({ "reason": issue.reason })),
+    }));
+    hints.retain(|hint| {
+        !matches!(
+            hint.code,
+            HintCode::EmptyResultRelaxFilter
+                | HintCode::EmptyResultTryFuzzy
+                | HintCode::EmptyResultWidenScope
+        )
+    });
+    if capped {
+        let cap = Completeness::partial_truncated(PartialReason::Cap);
+        let cap_ctx = EmissionContext {
+            completeness: &cap,
+            ..*ctx
+        };
+        hints.extend(build_hints(&cap_ctx).into_iter().filter(|hint| {
+            matches!(
+                hint.code,
+                HintCode::CappedIncreaseLimit | HintCode::CappedNarrowFilter
+            )
+        }));
+    }
+    hints.insert(
+        0,
+        Hint {
+            code: HintCode::FileNotIndexedOrSnapshotStale,
+            message: "Wait for reconciliation or run `cairn ctl repo reindex <alias>` before trusting an empty file query.".into(),
+            action: Some(HintAction::WaitForIndex),
+            tool: None,
+            params: None,
+            drop_params: Vec::new(),
+            target: ctx
+                .query_args
+                .repo
+                .or(ctx.query_args.file)
+                .map(str::to_string),
+        },
+    );
+    hints.dedup_by_key(|hint| hint.code);
+    (diagnostics, hints)
+}
+
 fn diagnostic_for_analyzer(analyzer: &TierAnalyzerStatus) -> Option<Diagnostic> {
     let (code, severity, fallback_message) = match (analyzer.state, analyzer.reason_code) {
         (AnalyzerState::Missing, Some(ReasonCode::NotRecorded)) => (
@@ -458,83 +692,6 @@ where
         .collect::<BTreeSet<_>>()
 }
 
-pub(crate) async fn tier_status_for_query(
-    ctx: &DataCtx,
-    requested_repo: Option<String>,
-    anchor_arg: Option<String>,
-    branch_arg: Option<String>,
-    relevant_parser_ids: BTreeSet<String>,
-    verbose_tier3: bool,
-    method_name: &'static str,
-) -> Result<TierStatus> {
-    let cas_data_dir = ctx.cas_data_dir.clone();
-    let lifecycle = ctx.lifecycle.clone();
-    tokio::task::spawn_blocking(move || -> Result<TierStatus> {
-        let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-        let aliases = match requested_repo.as_deref() {
-            Some(name) => {
-                let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
-                    Error::RepoNotFound {
-                        alias: name.to_string(),
-                    }
-                })?;
-                vec![entry]
-            }
-            None => cas_registry::list_all(&index)?,
-        };
-
-        let mut analyzers = Vec::new();
-        let mut repo_wide_analyzers = Vec::new();
-        let enumerate_all = requested_repo.is_none();
-        for entry in aliases {
-            let _lease = match &lifecycle {
-                Some(lifecycle) if enumerate_all => {
-                    let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)? else {
-                        continue;
-                    };
-                    Some(lease)
-                }
-                Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
-                None => None,
-            };
-            let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-            let conn = cas_store::open_existing(&store_path)?;
-            let anchor = anchor::resolve_explicit_or_default(
-                &conn,
-                anchor_arg.as_deref(),
-                branch_arg.as_deref(),
-            )?;
-            let Some(manifest_id) = anchor::resolve(&conn, &anchor)? else {
-                continue;
-            };
-            analyzers.extend(
-                compute_tier_status_for_parser_ids(&conn, manifest_id, Some(&relevant_parser_ids))?
-                    .analyzers,
-            );
-            if verbose_tier3 {
-                repo_wide_analyzers.extend(
-                    compute_tier_status(&conn, manifest_id)?
-                        .this_query
-                        .analyzers,
-                );
-            }
-        }
-        analyzers.sort();
-        analyzers.dedup();
-        let this_query = TierStatusBody::from_analyzers(analyzers);
-        let status = TierStatus::from_body(this_query);
-        if verbose_tier3 {
-            repo_wide_analyzers.sort();
-            repo_wide_analyzers.dedup();
-            Ok(status.with_repo_wide(TierStatusBody::from_analyzers(repo_wide_analyzers)))
-        } else {
-            Ok(status)
-        }
-    })
-    .await
-    .map_err(|e| Error::internal_task_panic(format!("{method_name} tier3 status"), e))?
-}
-
 pub(crate) fn compute_tier_status(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
@@ -547,24 +704,6 @@ pub(crate) fn compute_tier_status(
             None,
         )?,
     ))
-}
-
-pub(crate) fn compute_tier_status_response(
-    conn: &rusqlite::Connection,
-    manifest_id: ManifestId,
-    parser_ids: Option<&BTreeSet<String>>,
-    verbose_tier3: bool,
-) -> Result<TierStatus> {
-    let status = TierStatus::from_body(compute_tier_status_for_parser_ids(
-        conn,
-        manifest_id,
-        parser_ids,
-    )?);
-    if verbose_tier3 {
-        Ok(status.with_repo_wide(compute_tier_status(conn, manifest_id)?.this_query))
-    } else {
-        Ok(status)
-    }
 }
 
 pub(crate) fn compute_tier_status_for_parser_ids(
@@ -732,8 +871,10 @@ pub(crate) mod test_support {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use cairn_proto::Completeness;
+    use rusqlite::params;
     use serde_json::Value;
 
+    use crate::anchor;
     use crate::cas::{registry as cas_registry, store as cas_store};
     use crate::paths::{CasDataDir, path_hash};
     use crate::register::register_repo;
@@ -784,7 +925,7 @@ pub(crate) mod test_support {
                 .as_nanos(),
         )
         .unwrap_or(i64::MAX);
-        register_repo(&mut store, &canonical, now_ns).unwrap();
+        let registration = register_repo(&mut store, &canonical, now_ns).unwrap();
 
         let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
         let tx = index.transaction().unwrap();
@@ -794,6 +935,27 @@ pub(crate) mod test_support {
             &canonical.to_string_lossy(),
             &repo_hash,
             now_ns,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = 1,
+                     applied_generation = 1,
+                     last_success_ns = ?1,
+                     watcher_state = 'active'
+                 WHERE repo_hash = ?2",
+                params![now_ns, repo_hash],
+            )
+            .unwrap();
+        let tx = store.transaction().unwrap();
+        anchor::set_reconciled(
+            &tx,
+            &anchor::AnchorName::tentative(registration.worktree_id),
+            registration.tentative_manifest,
+            now_ns,
+            1,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -835,6 +997,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::mpsc;
 
     use crate::workspace_analyzer::{AnalyzerProgress, WorkspaceFacts, WorkspaceFile};
 
@@ -887,6 +1050,298 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_feedback_suppresses_speculative_empty_hints_and_keeps_cap() {
+        let completeness = Completeness::partial_truncated("file_not_indexed_or_snapshot_stale");
+        let tier3_status = TierStatus::ready();
+        let ctx = EmissionContext {
+            tool: QueryToolKind::FindSymbols,
+            items_empty: true,
+            completeness: &completeness,
+            tier3_status: &tier3_status,
+            query_args: QueryArgsView {
+                repo: Some("demo"),
+                fuzzy: false,
+                ..QueryArgsView::default()
+            },
+        };
+        let issues = vec![QueryFreshnessIssue {
+            repo: "demo".into(),
+            reason: "reconcile_generation_gap",
+        }];
+
+        let (diagnostics, hints) = build_snapshot_aware_feedback(&ctx, &issues, true);
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == DiagnosticCode::FileNotIndexedOrSnapshotStale
+        }));
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.code == HintCode::FileNotIndexedOrSnapshotStale)
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.code == HintCode::CappedIncreaseLimit)
+        );
+        assert!(!hints.iter().any(|hint| {
+            matches!(
+                hint.code,
+                HintCode::EmptyResultRelaxFilter
+                    | HintCode::EmptyResultTryFuzzy
+                    | HintCode::EmptyResultWidenScope
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_is_not_tier_ready_when_no_analyzers_apply() {
+        let fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = applied_generation + 1
+                 WHERE repo_hash = ?1",
+                params![entry.repo_hash],
+            )
+            .unwrap();
+
+        let result = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: Some("demo".into()),
+                anchor: None,
+                branch: None,
+                method_name: "stale tier readiness test",
+                effective_limit: 10,
+                verbose_tier3: true,
+                exact_file: None,
+            },
+            |_, _, _| Ok(Vec::<String>::new()),
+            |_| BTreeSet::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.tier3_status.this_query.ready);
+        assert!(!result.tier3_status.repo_wide.unwrap().ready);
+        assert_eq!(
+            result.freshness_issues[0].reason,
+            "reconcile_generation_gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_executor_pins_manifest_and_reports_concurrent_anchor_move() {
+        let fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        let store_path = fixture.ctx.cas_data_dir.store_db_path(&entry.repo_hash);
+        let mut store = cas_store::open_existing(&store_path).unwrap();
+        let tentative = anchor::list_prefix(&store, "tentative/")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let original_manifest = tentative.manifest_id;
+        let tx = store.transaction().unwrap();
+        anchor::set_reconciled(&tx, &tentative.name, original_manifest, 100, 1).unwrap();
+        tx.execute(
+            "INSERT INTO manifests (kind, built_at_ns) VALUES ('tentative', 101)",
+            [],
+        )
+        .unwrap();
+        let moved_manifest = ManifestId(tx.last_insert_rowid());
+        tx.commit().unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = 1,
+                     applied_generation = 1,
+                     last_success_ns = ?1,
+                     watcher_state = 'active'
+                 WHERE repo_hash = ?2",
+                params![system_now_ns(), entry.repo_hash],
+            )
+            .unwrap();
+
+        let (start_tx, start_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let writer_path = store_path.clone();
+        let anchor_name = tentative.name.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut writer_store = cas_store::open_existing(&writer_path).unwrap();
+            let tx = writer_store.transaction().unwrap();
+            anchor::set_reconciled(&tx, &anchor_name, moved_manifest, 101, 2).unwrap();
+            tx.commit().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        let result = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: Some("demo".into()),
+                anchor: None,
+                branch: None,
+                method_name: "snapshot pin test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            move |_, _, snapshot| {
+                start_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+                Ok(vec![snapshot.manifest_id.0])
+            },
+            |_| BTreeSet::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(result.items, vec![original_manifest.0]);
+        assert_eq!(
+            result.freshness_issues,
+            vec![QueryFreshnessIssue {
+                repo: "demo".into(),
+                reason: "snapshot_changed_during_query",
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_repo_exact_file_skips_unrelated_repo_without_partiality() {
+        let fixture = test_support::registered_fixture();
+        let (other_repo, _) = crate::testutil::init_repo(&[("other.rs", "pub fn other() {}\n")]);
+        let canonical = other_repo.path().canonicalize().unwrap();
+        let repo_hash = crate::paths::path_hash(&canonical);
+        let store_path = fixture.ctx.cas_data_dir.store_db_path(&repo_hash);
+        let mut store = cas_store::open(&store_path).unwrap();
+        let now_ns = system_now_ns();
+        let registration = crate::register::register_repo(&mut store, &canonical, now_ns).unwrap();
+        let mut index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(
+            &tx,
+            "other",
+            &canonical.to_string_lossy(),
+            &repo_hash,
+            now_ns,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        index
+            .execute(
+                "UPDATE repo_reconcile_state
+                 SET desired_generation = 1, applied_generation = 1,
+                     last_success_ns = ?1, watcher_state = 'active'
+                 WHERE repo_hash = ?2",
+                params![now_ns, repo_hash],
+            )
+            .unwrap();
+        let tx = store.transaction().unwrap();
+        anchor::set_reconciled(
+            &tx,
+            &anchor::AnchorName::tentative(registration.worktree_id),
+            registration.tentative_manifest,
+            now_ns,
+            1,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let result = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: None,
+                anchor: None,
+                branch: None,
+                method_name: "all repo membership test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: Some("src/lib.rs".into()),
+            },
+            |entry, _, _| Ok(vec![entry.alias.clone()]),
+            |_| BTreeSet::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.items, vec!["demo"]);
+        assert!(result.freshness_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_repo_query_skips_unpublished_repo_but_explicit_scope_errors() {
+        let fixture = test_support::registered_fixture();
+        let (other_repo, _) = crate::testutil::init_repo(&[("other.rs", "pub fn other() {}\n")]);
+        let canonical = other_repo.path().canonicalize().unwrap();
+        let repo_hash = crate::paths::path_hash(&canonical);
+        let store_path = fixture.ctx.cas_data_dir.store_db_path(&repo_hash);
+        let store = cas_store::open(&store_path).unwrap();
+        store.execute("DELETE FROM anchors", []).unwrap();
+        let mut index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert(
+            &tx,
+            "unpublished",
+            &canonical.to_string_lossy(),
+            &repo_hash,
+            system_now_ns(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let all = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: None,
+                anchor: None,
+                branch: None,
+                method_name: "all repo unpublished skip test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            |entry, _, _| Ok(vec![entry.alias.clone()]),
+            |_| BTreeSet::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.items, vec!["demo"]);
+
+        let explicit = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: Some("unpublished".into()),
+                anchor: None,
+                branch: None,
+                method_name: "explicit unpublished error test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            |entry, _, _| Ok(vec![entry.alias.clone()]),
+            |_| BTreeSet::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(explicit, Error::AnchorNotFound { .. }));
+    }
+
+    #[test]
     fn probe_limit_adds_one() {
         assert_eq!(limit_with_probe(2), 3);
     }
@@ -924,26 +1379,40 @@ mod tests {
             .unwrap();
         fixture.ctx.lifecycle = Some(lifecycle);
 
-        let (rows, capped, skipped) = with_one_or_all_stores(
+        let result = query_one_or_all_snapshots(
             &fixture.ctx,
-            None,
-            "enumeration skip test",
-            10,
-            |_entry, _conn| Ok(vec![1_u8]),
+            SnapshotQueryRequest {
+                requested_repo: None,
+                anchor: None,
+                branch: None,
+                method_name: "enumeration skip test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            |_entry, _conn, _snapshot| Ok(vec![1_u8]),
+            |_| BTreeSet::new(),
             |_| {},
         )
         .await
         .unwrap();
-        assert!(rows.is_empty());
-        assert!(!capped);
-        assert!(skipped);
+        assert!(result.items.is_empty());
+        assert!(!result.capped);
+        assert!(result.skipped_unavailable);
 
-        let err = with_one_or_all_stores(
+        let err = query_one_or_all_snapshots(
             &fixture.ctx,
-            Some("demo".into()),
-            "explicit removing test",
-            10,
-            |_entry, _conn| Ok(vec![1_u8]),
+            SnapshotQueryRequest {
+                requested_repo: Some("demo".into()),
+                anchor: None,
+                branch: None,
+                method_name: "explicit removing test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            |_entry, _conn, _snapshot| Ok(vec![1_u8]),
+            |_| BTreeSet::new(),
             |_| {},
         )
         .await

@@ -11,14 +11,19 @@ use serde_json::Value;
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_references::SnippetCache;
 use crate::data_rpc::helpers::{
-    EmissionContext, QueryArgsView, QueryToolKind, build_diagnostics, build_hints,
-    completeness_for_scan, limit_with_probe, parser_id_filter, tier_status_for_query,
-    with_one_or_all_stores,
+    EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
+    build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
+    parser_id_filter, query_one_or_all_snapshots,
 };
 use crate::query::{self, FindReferencesArgs as QueryArgs, ReferenceHit};
 use crate::{Error, Result};
 
 pub struct FindCallers;
+
+enum CallerScanItem {
+    Hit(Box<CallHit>, String),
+    TsxDefinition,
+}
 
 #[async_trait::async_trait]
 impl DataMethod for FindCallers {
@@ -45,49 +50,80 @@ impl DataMethod for FindCallers {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
+        let component_name = is_component_name(&args.name).then(|| args.name.clone());
 
-        let (hits, capped, skipped_unavailable) = with_one_or_all_stores(
+        let execution = query_one_or_all_snapshots(
             ctx,
-            requested_repo,
-            "find_callers",
-            effective_limit,
-            move |entry, conn| {
-                let anchor = crate::anchor::resolve_explicit_or_default(
-                    conn,
-                    anchor_arg.as_deref(),
-                    branch_arg.as_deref(),
-                )?;
-                let anchor_label = anchor.as_str().to_string();
+            SnapshotQueryRequest {
+                requested_repo,
+                anchor: anchor_arg,
+                branch: branch_arg,
+                method_name: "find_callers",
+                effective_limit,
+                verbose_tier3: args.tier3.verbose_tier3,
+                exact_file: None,
+            },
+            move |entry, conn, snapshot| {
+                let anchor_label = snapshot.anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
-                let hits = query::find_references(conn, &anchor, &q)?;
+                let hits = query::find_references(conn, &snapshot.anchor, &q)?;
                 let mut snippets = SnippetCache::new(worktree_root);
-                Ok(hits
+                let mut items = hits
                     .into_iter()
                     .map(|h| {
                         let parser_id = h.parser_id.clone();
-                        (
-                            into_call_hit(&entry.alias, &anchor_label, h, &mut snippets),
+                        CallerScanItem::Hit(
+                            Box::new(into_call_hit(&entry.alias, &anchor_label, h, &mut snippets)),
                             parser_id,
                         )
                     })
-                    .collect())
+                    .collect::<Vec<_>>();
+                if items.is_empty()
+                    && let Some(name) = component_name.as_deref()
+                    && symbol_defined_in_jsx_snapshot(conn, &snapshot.anchor, name)?
+                {
+                    items.push(CallerScanItem::TsxDefinition);
+                }
+                Ok(items)
             },
-            |_out: &mut Vec<(CallHit, String)>| {},
+            |items| {
+                parser_id_filter(items.iter().filter_map(|item| match item {
+                    CallerScanItem::Hit(_, parser_id) => Some(parser_id.clone()),
+                    CallerScanItem::TsxDefinition => None,
+                }))
+            },
+            |items: &mut Vec<CallerScanItem>| {
+                let mut saw_marker = false;
+                items.retain(|item| match item {
+                    CallerScanItem::TsxDefinition if saw_marker => false,
+                    CallerScanItem::TsxDefinition => {
+                        saw_marker = true;
+                        true
+                    }
+                    CallerScanItem::Hit(_, _) => true,
+                });
+            },
         )
         .await?;
-        let parser_ids = parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone()));
-        let items: Vec<_> = hits.into_iter().map(|(item, _)| item).collect();
-        let tier3_status = tier_status_for_query(
-            ctx,
-            args.scope.repo.clone(),
-            args.scope.anchor.clone(),
-            args.scope.branch.clone(),
-            parser_ids,
-            args.tier3.verbose_tier3,
-            "find_callers",
-        )
-        .await?;
-        let completeness = completeness_for_scan(capped, skipped_unavailable);
+        let tsx_definition = execution
+            .items
+            .iter()
+            .any(|item| matches!(item, CallerScanItem::TsxDefinition));
+        let items: Vec<_> = execution
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                CallerScanItem::Hit(hit, _) => Some(*hit),
+                CallerScanItem::TsxDefinition => None,
+            })
+            .collect();
+        let tier3_status = execution.tier3_status;
+        let freshness_issues = execution.freshness_issues;
+        let completeness = completeness_for_snapshot_scan(
+            execution.capped,
+            execution.skipped_unavailable,
+            &freshness_issues,
+        );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindCallers,
             items_empty: items.is_empty(),
@@ -102,19 +138,9 @@ impl DataMethod for FindCallers {
                 ..QueryArgsView::default()
             },
         };
-        let diagnostics = build_diagnostics(&emission_ctx);
-        let mut hints = build_hints(&emission_ctx);
-        if items.is_empty()
-            && is_component_name(&args.name)
-            && symbol_defined_in_jsx_file(
-                ctx,
-                args.scope.repo.clone(),
-                args.scope.anchor.clone(),
-                args.scope.branch.clone(),
-                args.name.clone(),
-            )
-            .await?
-        {
+        let (diagnostics, mut hints) =
+            build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
+        if freshness_issues.is_empty() && items.is_empty() && tsx_definition {
             hints.retain(|hint| {
                 !matches!(
                     hint.code,
@@ -176,46 +202,25 @@ fn tsx_component_usage_hint() -> Hint {
     }
 }
 
-async fn symbol_defined_in_jsx_file(
-    ctx: &DataCtx,
-    requested_repo: Option<String>,
-    anchor_arg: Option<String>,
-    branch_arg: Option<String>,
-    name: String,
+fn symbol_defined_in_jsx_snapshot(
+    conn: &rusqlite::Connection,
+    anchor: &crate::anchor::AnchorName,
+    name: &str,
 ) -> Result<bool> {
     let q = crate::query::FindSymbolsArgs {
-        query: Some(name.clone()),
+        query: Some(name.to_string()),
         fuzzy: false,
         kind: None,
         container: None,
         path_prefix: None,
         limit: Some(20),
     };
-    let (matches, _, _) = with_one_or_all_stores(
-        ctx,
-        requested_repo,
-        "find_callers tsx hint",
-        1,
-        move |_entry, conn| {
-            let anchor = crate::anchor::resolve_explicit_or_default(
-                conn,
-                anchor_arg.as_deref(),
-                branch_arg.as_deref(),
-            )?;
-            let hits = query::find_symbols(conn, &anchor, &q)?;
-            Ok(hits
-                .into_iter()
-                .filter(|hit| {
-                    (hit.name == name || hit.qualified.rsplit("::").next() == Some(name.as_str()))
-                        && (hit.path.ends_with(".tsx") || hit.path.ends_with(".jsx"))
-                })
-                .map(|_| ())
-                .collect())
-        },
-        |_out: &mut Vec<()>| {},
-    )
-    .await?;
-    Ok(!matches.is_empty())
+    Ok(query::find_symbols(conn, anchor, &q)?
+        .into_iter()
+        .any(|hit| {
+            (hit.name == name || hit.qualified.rsplit("::").next() == Some(name))
+                && (hit.path.ends_with(".tsx") || hit.path.ends_with(".jsx"))
+        }))
 }
 
 #[cfg(test)]

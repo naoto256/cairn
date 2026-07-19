@@ -1324,6 +1324,9 @@ pub struct GetSymbolSourceResult {
     pub doc: Option<String>,
     /// Index tier that produced the returned source metadata.
     pub source_tier: SourceTier,
+    /// Whether the selected current snapshot was freshness-verified.
+    #[serde(default = "Completeness::complete")]
+    pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
     #[serde(default = "TierStatus::ready")]
     pub tier3_status: TierStatus,
