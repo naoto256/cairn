@@ -15,6 +15,15 @@ pub(crate) struct GitMetadataPaths {
 }
 
 impl GitMetadataPaths {
+    pub(crate) fn fail_open(repo_root: &Path) -> Self {
+        let dot_git = repo_root.join(".git");
+        Self {
+            info_exclude: dot_git.join("info").join("exclude"),
+            worktree_git_dir: dot_git.clone(),
+            common_git_dir: dot_git,
+        }
+    }
+
     pub(crate) fn watch_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.worktree_git_dir.clone()];
         if self.common_git_dir != self.worktree_git_dir {
