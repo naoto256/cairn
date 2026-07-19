@@ -158,6 +158,12 @@ pub enum DocCommentPart {
     Replace(String),
     /// Clear any candidate doc seen so far.
     Reset,
+    /// Keep the current doc content while advancing the adjacency
+    /// boundary across this sibling. Used for language syntax that may
+    /// legally sit between a doc comment and its declaration, such as
+    /// Rust attributes. A blank line before the sibling still resets
+    /// the run.
+    Ignore,
 }
 
 /// Extract the doc comment immediately above `node`.
@@ -202,6 +208,16 @@ pub fn extract_doc_above_node(
             Some(DocCommentPart::Reset) => {
                 lines.clear();
                 prev_end_row = None;
+            }
+            Some(DocCommentPart::Ignore) => {
+                if let Some(prev) = prev_end_row {
+                    if sibling.start_position().row > prev + 1 {
+                        lines.clear();
+                        prev_end_row = None;
+                    } else {
+                        prev_end_row = Some(occupied_end_row(sibling, sibling_text));
+                    }
+                }
             }
             None if !sibling.is_extra() => {
                 lines.clear();
@@ -361,6 +377,24 @@ mod tests {
         assert_eq!(doc.as_deref(), Some("new"));
     }
 
+    #[test]
+    fn extract_doc_above_node_ignore_preserves_current_run() {
+        let src = "/// documented\n#[inline]\nfn f() {}\n";
+
+        let doc = first_function_doc(src);
+
+        assert_eq!(doc.as_deref(), Some("documented"));
+    }
+
+    #[test]
+    fn extract_doc_above_node_ignore_does_not_bridge_blank_line() {
+        let src = "/// stale\n\n#[inline]\nfn f() {}\n";
+
+        let doc = first_function_doc(src);
+
+        assert_eq!(doc, None);
+    }
+
     fn first_function_doc(src: &str) -> Option<String> {
         let mut parser = Parser::new();
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
@@ -376,6 +410,9 @@ mod tests {
     }
 
     fn rust_doc_part(node: Node<'_>, text: &str) -> Option<DocCommentPart> {
+        if node.kind() == "attribute_item" {
+            return Some(DocCommentPart::Ignore);
+        }
         if node.kind() != "line_comment" && node.kind() != "block_comment" {
             return None;
         }
