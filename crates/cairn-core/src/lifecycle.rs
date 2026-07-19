@@ -91,6 +91,25 @@ impl RepoActivityGate {
         }
     }
 
+    fn acquire_active(self: &Arc<Self>) -> Result<RepoLease> {
+        let mut inner = self.lock();
+        match inner.state {
+            RepoActivityState::Active => {
+                inner.leases = inner.leases.checked_add(1).ok_or_else(|| {
+                    Error::Internal(format!("repo lease counter overflow: {}", self.repo_hash))
+                })?;
+                Ok(RepoLease {
+                    gate: Arc::clone(self),
+                    released: false,
+                })
+            }
+            state => Err(Error::RepositoryUnavailable {
+                repo_hash: self.repo_hash.clone(),
+                state: state.as_str(),
+            }),
+        }
+    }
+
     fn set_active(&self) -> Result<()> {
         let mut inner = self.lock();
         match inner.state {
@@ -255,6 +274,21 @@ impl RegistrationPermit {
     pub fn root_path(&self) -> &str {
         &self.root_path
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationReconcilePolicy {
+    /// Focused legacy constructors without a reconcile manager.
+    None,
+    /// Atomically publish the alias and record an immediately runnable
+    /// post-arm catch-up generation.
+    ImmediateCatchUp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationPublication {
+    pub repo_hash: String,
+    pub catch_up_generation: Option<i64>,
 }
 
 /// Thin coordinator for canonical registry mutation and removal sequencing.
@@ -516,6 +550,19 @@ impl RepoLifecycleManager {
             .acquire()
     }
 
+    /// Acquire a lease only after registration publication has made the
+    /// canonical owner Active. Event producers use this form so an edge
+    /// observed while the initial scan is still Registering remains pending
+    /// in the watcher dispatcher until publication completes.
+    pub fn acquire_active_by_repo_hash(&self, repo_hash: &str) -> Result<RepoLease> {
+        self.gate(repo_hash)
+            .ok_or_else(|| Error::RepositoryUnavailable {
+                repo_hash: repo_hash.to_string(),
+                state: RepoActivityState::Removed.as_str(),
+            })?
+            .acquire_active()
+    }
+
     /// Acquire a repository for an unscoped multi-repository scan. Lifecycle
     /// transitions are skipped so one Removing owner cannot fail the whole
     /// inventory; counter and internal failures still propagate.
@@ -618,11 +665,12 @@ impl RepoLifecycleManager {
         alias: &str,
         persistent: Option<bool>,
         registered_at_ns: i64,
-    ) -> Result<()> {
+        reconcile_policy: RegistrationReconcilePolicy,
+    ) -> Result<RegistrationPublication> {
         let _transition = self.transition.lock().map_err(|_| {
             Error::Internal("repository lifecycle transition mutex poisoned".into())
         })?;
-        let old_hash = {
+        let (old_hash, catch_up_generation) = {
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
             let old_hash = cas_registry::lookup_by_alias(&index, alias)?
                 .map(|entry| entry.repo_hash)
@@ -671,8 +719,18 @@ impl RepoLifecycleManager {
                     now_ns(),
                 )?;
             }
+            let catch_up_generation = match reconcile_policy {
+                RegistrationReconcilePolicy::None => None,
+                RegistrationReconcilePolicy::ImmediateCatchUp => {
+                    Some(cas_registry::increment_immediate_desired_generation(
+                        &tx,
+                        &permit.repo_hash,
+                        registered_at_ns,
+                    )?)
+                }
+            };
             tx.commit()?;
-            old_hash
+            (old_hash, catch_up_generation)
         };
         if let Some(gate) = self.gate(&permit.repo_hash) {
             gate.set_active()?;
@@ -681,7 +739,10 @@ impl RepoLifecycleManager {
         if let Some(repo_hash) = old_hash {
             self.request_removal(RemovalIntent::AliasRetargeted { repo_hash })?;
         }
-        Ok(())
+        Ok(RegistrationPublication {
+            repo_hash: permit.repo_hash,
+            catch_up_generation,
+        })
     }
 
     /// Abort a failed new registration without exposing a partial canonical
@@ -951,6 +1012,21 @@ mod tests {
         assert_eq!(gate.snapshot(), (RepoActivityState::Removing, 0));
     }
 
+    #[test]
+    fn active_only_lease_rejects_registering_gate_until_publication() {
+        let gate = RepoActivityGate::new("h".into(), RepoActivityState::Registering);
+
+        assert!(matches!(
+            gate.acquire_active(),
+            Err(Error::RepositoryUnavailable {
+                state: "registering",
+                ..
+            })
+        ));
+        gate.set_active().unwrap();
+        assert!(gate.acquire_active().is_ok());
+    }
+
     #[tokio::test]
     async fn lease_drain_timeout_keeps_gate_fail_closed_for_retry() {
         let gate = RepoActivityGate::new("h".into(), RepoActivityState::Active);
@@ -1082,14 +1158,20 @@ mod tests {
         assert!(registry::lookup_by_alias(&index, "demo").unwrap().is_none());
         drop(index);
         lifecycle
-            .publish_registration(permit, "demo", Some(true), 2)
+            .publish_registration(
+                permit,
+                "demo",
+                Some(true),
+                2,
+                RegistrationReconcilePolicy::None,
+            )
             .unwrap();
 
         let permit = lifecycle
             .begin_registration(hash.clone(), repo.path().to_path_buf(), 3)
             .unwrap();
         lifecycle
-            .publish_registration(permit, "demo", None, 4)
+            .publish_registration(permit, "demo", None, 4, RegistrationReconcilePolicy::None)
             .unwrap();
         let index = registry::open(&cas.index_db_path()).unwrap();
         assert!(
@@ -1104,7 +1186,13 @@ mod tests {
             .begin_registration(hash.clone(), repo.path().to_path_buf(), 5)
             .unwrap();
         lifecycle
-            .publish_registration(permit, "demo", Some(false), 6)
+            .publish_registration(
+                permit,
+                "demo",
+                Some(false),
+                6,
+                RegistrationReconcilePolicy::None,
+            )
             .unwrap();
         let index = registry::open(&cas.index_db_path()).unwrap();
         assert!(
@@ -1112,6 +1200,79 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .persistent
+        );
+    }
+
+    #[test]
+    fn registration_alias_and_catch_up_generation_publish_atomically() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+
+        let permit = lifecycle
+            .begin_registration("hash".into(), repo.path().to_path_buf(), 1)
+            .unwrap();
+        let publication = lifecycle
+            .publish_registration(
+                permit,
+                "demo",
+                None,
+                2,
+                RegistrationReconcilePolicy::ImmediateCatchUp,
+            )
+            .unwrap();
+
+        assert_eq!(publication.repo_hash, "hash");
+        assert_eq!(publication.catch_up_generation, Some(1));
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        assert!(registry::lookup_by_alias(&index, "demo").unwrap().is_some());
+        assert_eq!(
+            registry::get_reconcile_state(&index, "hash")
+                .unwrap()
+                .unwrap()
+                .desired_generation,
+            1
+        );
+    }
+
+    #[test]
+    fn catch_up_generation_failure_rolls_back_alias_publication() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let permit = lifecycle
+            .begin_registration("hash".into(), repo.path().to_path_buf(), 1)
+            .unwrap();
+        {
+            let index = registry::open(&cas.index_db_path()).unwrap();
+            index
+                .execute(
+                    "UPDATE repo_reconcile_state SET desired_generation = ?1
+                     WHERE repo_hash = 'hash'",
+                    rusqlite::params![i64::MAX],
+                )
+                .unwrap();
+        }
+
+        let err = lifecycle
+            .publish_registration(
+                permit,
+                "demo",
+                None,
+                2,
+                RegistrationReconcilePolicy::ImmediateCatchUp,
+            )
+            .unwrap_err();
+
+        assert!(format!("{err}").contains("overflow"));
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        assert!(
+            registry::lookup_by_alias(&index, "demo").unwrap().is_none(),
+            "alias publication must roll back with catch-up generation failure"
         );
     }
 
@@ -1197,13 +1358,19 @@ mod tests {
             .begin_registration("old".into(), old_root.path().to_path_buf(), 1)
             .unwrap();
         lifecycle
-            .publish_registration(old, "demo", Some(true), 2)
+            .publish_registration(
+                old,
+                "demo",
+                Some(true),
+                2,
+                RegistrationReconcilePolicy::None,
+            )
             .unwrap();
         let new = lifecycle
             .begin_registration("new".into(), new_root.path().to_path_buf(), 3)
             .unwrap();
         lifecycle
-            .publish_registration(new, "demo", None, 4)
+            .publish_registration(new, "demo", None, 4, RegistrationReconcilePolicy::None)
             .unwrap();
 
         let index = registry::open(&cas.index_db_path()).unwrap();
@@ -1234,7 +1401,7 @@ mod tests {
             .begin_registration("hash".into(), repo.path().to_path_buf(), 1)
             .unwrap();
         lifecycle
-            .publish_registration(initial, "demo", None, 2)
+            .publish_registration(initial, "demo", None, 2, RegistrationReconcilePolicy::None)
             .unwrap();
         let stale_permit = lifecycle
             .begin_registration("hash".into(), repo.path().to_path_buf(), 3)
@@ -1242,7 +1409,13 @@ mod tests {
 
         assert!(lifecycle.remove_alias("demo").await.is_err());
         let err = lifecycle
-            .publish_registration(stale_permit, "demo", None, 4)
+            .publish_registration(
+                stale_permit,
+                "demo",
+                None,
+                4,
+                RegistrationReconcilePolicy::None,
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1272,7 +1445,13 @@ mod tests {
             .begin_registration("hash".into(), repo.path().to_path_buf(), 1)
             .unwrap();
         lifecycle
-            .publish_registration(permit, "demo", Some(true), 2)
+            .publish_registration(
+                permit,
+                "demo",
+                Some(true),
+                2,
+                RegistrationReconcilePolicy::None,
+            )
             .unwrap();
         let jobs = JobManager::new(cas.clone());
         let reconcile = RepoReconcileManager::new(cas.clone(), None);
@@ -1303,7 +1482,13 @@ mod tests {
             .begin_registration("hash".into(), repo.path().to_path_buf(), 3)
             .unwrap();
         lifecycle
-            .publish_registration(permit, "demo-again", None, 4)
+            .publish_registration(
+                permit,
+                "demo-again",
+                None,
+                4,
+                RegistrationReconcilePolicy::None,
+            )
             .unwrap();
         let index = registry::open(&cas.index_db_path()).unwrap();
         assert!(

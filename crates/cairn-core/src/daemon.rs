@@ -707,8 +707,15 @@ mod tests {
 
         let recovered = RepoReconcileManager::new(cas.clone(), None);
         recovered.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
-        let recovered_hashes = recovered.recover_interrupted_attempts().await.unwrap();
+        let recovered_hashes = recovered
+            .recover_interrupted_attempts_without_wake()
+            .await
+            .unwrap();
         assert_eq!(recovered_hashes, vec![repo_hash.clone()]);
+        recovered
+            .prime_startup_reconcile(recovered_hashes)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let state = {
@@ -717,7 +724,7 @@ mod tests {
                         .unwrap()
                         .unwrap()
                 };
-                if state.applied_generation == 1 && state.attempt_generation.is_none() {
+                if state.applied_generation == 2 && state.attempt_generation.is_none() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -875,19 +882,17 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_reindexes_repo_registered_via_daemon_control() {
-        // With Phase 2, watcher events land in the reconcile
-        // manager which then executes the register/enqueue work.
-        // The test therefore wires a real reconcile driver and
-        // asserts BOTH the durable generation bump AND the
-        // symbol appearing in the store — the reindex is real
-        // work, not just a durable intent record.
+        // Wire the production lifecycle and reconcile path so registration
+        // catch-up and later watcher events both execute real indexing work.
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
         let runtime_tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
         let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
         cas_data_dir.ensure().unwrap();
-        let reconcile = RepoReconcileManager::new(cas_data_dir.clone(), None);
+        let lifecycle = RepoLifecycleManager::new(cas_data_dir.clone());
+        let reconcile =
+            RepoReconcileManager::new_with_lifecycle(cas_data_dir.clone(), None, lifecycle.clone());
         let watch_manager = Arc::new(WatchManager::with_backend_and_reconcile(
             cas_data_dir.clone(),
             WatchBackend::Poll,
@@ -901,10 +906,14 @@ mod tests {
             let shutdown = shutdown.clone();
             let watch_manager = watch_manager.clone();
             let reconcile = reconcile.clone();
+            let lifecycle = lifecycle.clone();
             async move {
                 let daemon = Daemon {
                     paths,
-                    data_handler: Arc::new(DataRpc::new(cas_data_dir.clone())),
+                    data_handler: Arc::new(DataRpc::with_lifecycle(
+                        cas_data_dir.clone(),
+                        Some(lifecycle.clone()),
+                    )),
                     control_handler: Arc::new(CtlHandler::with_full_context(
                         cas_data_dir,
                         shutdown.clone(),
@@ -912,12 +921,12 @@ mod tests {
                         Some(watch_manager),
                         None,
                         Some(reconcile),
-                        None,
+                        Some(lifecycle.clone()),
                     )),
                     shutdown,
                     job_manager: None,
                     reconcile: None,
-                    lifecycle: None,
+                    lifecycle: Some(lifecycle),
                 };
                 daemon.run().await.unwrap();
             }
@@ -948,6 +957,12 @@ mod tests {
             .unwrap()
             .expect("reconcile state row must exist for watched repo");
         let baseline_desired = baseline_state.desired_generation;
+        assert!(
+            baseline_desired >= 1
+                && baseline_state.applied_generation >= baseline_desired
+                && baseline_state.attempt_generation.is_none(),
+            "registration catch-up must leave a clean applied generation: {baseline_state:?}"
+        );
 
         let symbol_name = "daemon_watcher_probe_symbol";
         std::fs::write(
@@ -994,11 +1009,9 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_register_reports_degraded_when_watcher_start_fails() {
-        // Phase 2: a failed watcher start now ALSO persists
-        // `WatcherState::Failed` on the reconcile state row so
-        // status/doctor can observe the degradation. The old
-        // in-response `watcher_failed` string is preserved so
-        // wire consumers keep working through the transition.
+        // A failed watcher start persists `WatcherState::Failed` so
+        // status/doctor can observe the degradation. The response also keeps
+        // the existing `watcher_failed` field for control clients.
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
         let runtime_tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
@@ -1076,23 +1089,16 @@ mod tests {
             .expect("alias must be registered");
         assert!(!watch_manager.is_watching_alias("degraded"));
 
-        // Poll — record_watcher_failed is fire-and-forget via
-        // tokio::spawn, so give it a moment to land.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut observed_failed = false;
-        while tokio::time::Instant::now() < deadline {
-            let state = cas_registry::get_reconcile_state(&index, &entry.repo_hash).unwrap();
-            if let Some(s) = state
-                && s.watcher_state == cas_registry::WatcherState::Failed
-                && s.watcher_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("injected watcher start failure"))
-            {
-                observed_failed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        // The state must be durable before the registration response returns.
+        let observed_failed = cas_registry::get_reconcile_state(&index, &entry.repo_hash)
+            .unwrap()
+            .is_some_and(|state| {
+                state.watcher_state == cas_registry::WatcherState::Failed
+                    && state
+                        .watcher_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("injected watcher start failure"))
+            });
         assert!(
             observed_failed,
             "watcher failure must be persisted on the reconcile state row"

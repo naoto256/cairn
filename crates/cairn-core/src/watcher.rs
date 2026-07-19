@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -44,14 +45,50 @@ pub struct WatchManager {
     fail_watcher_start: bool,
     #[cfg(test)]
     dropped_watchers: Arc<AtomicUsize>,
+    next_arm_id: AtomicU64,
     watchers: Mutex<HashMap<String, RepoWatcher>>,
 }
 
 struct RepoWatcher {
+    arm_id: u64,
     _handle: WatcherHandle,
     task: tokio::task::JoinHandle<()>,
     #[cfg(test)]
     drop_counter: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchArmDisposition {
+    AlreadyArmed,
+    Armed,
+}
+
+/// Opaque ownership receipt for a watcher arm operation. Rollback only
+/// removes the exact watcher created by this receipt, never a replacement.
+#[derive(Debug)]
+pub struct WatchArmReceipt {
+    repo_hash: String,
+    arm_id: u64,
+    disposition: WatchArmDisposition,
+}
+
+impl WatchArmReceipt {
+    #[must_use]
+    pub fn disposition(&self) -> WatchArmDisposition {
+        self.disposition
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchStartFailure {
+    pub repo_hash: String,
+    pub error: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WatchStartupReport {
+    pub armed: Vec<String>,
+    pub failed: Vec<WatchStartFailure>,
 }
 
 impl Drop for RepoWatcher {
@@ -108,6 +145,7 @@ impl WatchManager {
             fail_watcher_start: false,
             #[cfg(test)]
             dropped_watchers: Arc::new(AtomicUsize::new(0)),
+            next_arm_id: AtomicU64::new(1),
             watchers: Mutex::new(HashMap::new()),
         }
     }
@@ -121,6 +159,7 @@ impl WatchManager {
             reconcile: None,
             fail_watcher_start: true,
             dropped_watchers: Arc::new(AtomicUsize::new(0)),
+            next_arm_id: AtomicU64::new(1),
             watchers: Mutex::new(HashMap::new()),
         }
     }
@@ -133,20 +172,88 @@ impl WatchManager {
     /// daemon keeps starting; per-repo failures are persisted
     /// via [`RepoReconcileManager::set_watcher_state_by_repo_hash`]
     /// so `repo_status` / doctor can observe them.
-    pub fn start_registered(&self) -> Result<()> {
+    pub fn start_registered(&self) -> Result<WatchStartupReport> {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+        let mut report = WatchStartupReport::default();
         for repo in cas_registry::list_repositories(&index)? {
-            if let Err(err) =
-                self.watch_repository(repo.repo_hash.clone(), PathBuf::from(repo.root_path))
+            if repo.removal_request.is_some() {
+                continue;
+            }
+            match self
+                .arm_repository_if_absent(repo.repo_hash.clone(), PathBuf::from(repo.root_path))
             {
-                warn!(
-                    repo_hash = %repo.repo_hash,
-                    error = %err,
-                    "failed to start repo watcher"
-                );
+                Ok(_) => {
+                    self.persist_watcher_state(&repo.repo_hash, WatcherState::Active, None)?;
+                    report.armed.push(repo.repo_hash)
+                }
+                Err(err) => {
+                    self.persist_watcher_state(
+                        &repo.repo_hash,
+                        WatcherState::Failed,
+                        Some(&err.to_string()),
+                    )?;
+                    warn!(
+                        repo_hash = %repo.repo_hash,
+                        error = %err,
+                        "failed to start repo watcher"
+                    );
+                    report.failed.push(WatchStartFailure {
+                        repo_hash: repo.repo_hash,
+                        error: err.to_string(),
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(report)
+    }
+
+    /// Arm a repository only when no watcher is already published for its
+    /// canonical owner. The check and insertion are linearized under the
+    /// watcher registry mutex so concurrent registrations cannot replace one
+    /// another accidentally.
+    pub fn arm_repository_if_absent(
+        &self,
+        repo_hash: String,
+        root_path: PathBuf,
+    ) -> Result<WatchArmReceipt> {
+        let mut watchers = self.lock_recovering();
+        if let Some(existing) = watchers.get(&repo_hash) {
+            return Ok(WatchArmReceipt {
+                repo_hash,
+                arm_id: existing.arm_id,
+                disposition: WatchArmDisposition::AlreadyArmed,
+            });
+        }
+        let arm_id = self.allocate_arm_id()?;
+        let watcher = self.start_watcher(&repo_hash, &root_path, arm_id)?;
+        watchers.insert(repo_hash.clone(), watcher);
+        drop(watchers);
+        info!(
+            repo_hash = %repo_hash,
+            path = %root_path.display(),
+            "repo watcher armed"
+        );
+        Ok(WatchArmReceipt {
+            repo_hash,
+            arm_id,
+            disposition: WatchArmDisposition::Armed,
+        })
+    }
+
+    /// Roll back only the watcher created by `receipt`. A stale receipt is a
+    /// no-op after another operation replaced the watcher.
+    pub fn rollback_arm(&self, receipt: WatchArmReceipt) {
+        if receipt.disposition != WatchArmDisposition::Armed {
+            return;
+        }
+        let mut watchers = self.lock_recovering();
+        let matches = watchers
+            .get(&receipt.repo_hash)
+            .is_some_and(|watcher| watcher.arm_id == receipt.arm_id);
+        if matches {
+            watchers.remove(&receipt.repo_hash);
+            info!(repo_hash = %receipt.repo_hash, "repo watcher arm rolled back");
+        }
     }
 
     /// Start or replace the watcher for one canonical repo.
@@ -157,44 +264,64 @@ impl WatchManager {
     /// drop the existing one — an operator-observable failed
     /// state is preferable to a silently blinded repo.
     pub fn watch_repository(&self, repo_hash: String, root_path: PathBuf) -> Result<()> {
+        let arm_id = self.allocate_arm_id()?;
+        let watcher = self
+            .start_watcher(&repo_hash, &root_path, arm_id)
+            .inspect_err(|err| {
+                self.record_watcher_failed(&repo_hash, &err.to_string());
+            })?;
+
+        self.persist_watcher_state(&repo_hash, WatcherState::Active, None)?;
+
+        // Only swap after setup succeeds; a start failure must not
+        // blind an existing watched repo.
+        self.lock_recovering().insert(repo_hash.clone(), watcher);
+        info!(
+            repo_hash = %repo_hash,
+            path = %root_path.display(),
+            "repo watcher started"
+        );
+        Ok(())
+    }
+
+    fn start_watcher(
+        &self,
+        repo_hash: &str,
+        root_path: &std::path::Path,
+        arm_id: u64,
+    ) -> Result<RepoWatcher> {
         #[cfg(test)]
         if self.fail_watcher_start {
-            self.record_watcher_failed(&repo_hash, "injected watcher start failure");
             return Err(Error::InvalidArgument(
                 "injected watcher start failure".into(),
             ));
         }
 
         let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
-        let handle = watch_repo_with_backend(&root_path, WATCH_DEBOUNCE, tx, self.backend)
-            .map_err(|e| {
-                let msg = format!("watch_repo {}: {e}", root_path.display());
-                self.record_watcher_failed(&repo_hash, &msg);
-                Error::InvalidArgument(msg)
+        let handle =
+            watch_repo_with_backend(root_path, WATCH_DEBOUNCE, tx, self.backend).map_err(|e| {
+                Error::InvalidArgument(format!("watch_repo {}: {e}", root_path.display()))
             })?;
+        let task = tokio::spawn(dispatch_events(
+            self.reconcile.clone(),
+            repo_hash.to_string(),
+            rx,
+        ));
+        Ok(RepoWatcher {
+            arm_id,
+            _handle: handle,
+            task,
+            #[cfg(test)]
+            drop_counter: self.dropped_watchers.clone(),
+        })
+    }
 
-        let reconcile = self.reconcile.clone();
-        let hash_for_task = repo_hash.clone();
-        let task = tokio::spawn(dispatch_events(reconcile, hash_for_task, rx));
-
-        // Only swap after setup succeeds; a start failure must not
-        // blind an existing watched repo.
-        self.lock_recovering().insert(
-            repo_hash.clone(),
-            RepoWatcher {
-                _handle: handle,
-                task,
-                #[cfg(test)]
-                drop_counter: self.dropped_watchers.clone(),
-            },
-        );
-        info!(
-            repo_hash = %repo_hash,
-            path = %root_path.display(),
-            "repo watcher started"
-        );
-        self.record_watcher_active(&repo_hash);
-        Ok(())
+    fn allocate_arm_id(&self) -> Result<u64> {
+        self.next_arm_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| Error::Internal("watcher arm id overflow".into()))
     }
 
     /// Compatibility wrapper: resolves alias → repo_hash and
@@ -262,43 +389,31 @@ impl WatchManager {
         self.dropped_watchers.load(Ordering::SeqCst)
     }
 
-    fn record_watcher_active(&self, repo_hash: &str) {
-        let Some(reconcile) = self.reconcile.clone() else {
-            return;
-        };
-        let hash = repo_hash.to_string();
-        tokio::spawn(async move {
-            if let Err(err) = reconcile
-                .set_watcher_state_by_repo_hash(hash.clone(), WatcherState::Active, None)
-                .await
-            {
-                warn!(
-                    repo_hash = %hash,
-                    error = %err,
-                    "failed to persist watcher active state"
-                );
-            }
-        });
+    fn persist_watcher_state(
+        &self,
+        repo_hash: &str,
+        state: WatcherState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.reconcile.as_ref().map_or(Ok(()), |reconcile| {
+            reconcile.set_watcher_state_immediate(repo_hash, state, error)
+        })
     }
 
     fn record_watcher_failed(&self, repo_hash: &str, msg: &str) {
+        if let Err(err) = self.persist_watcher_state(repo_hash, WatcherState::Failed, Some(msg)) {
+            debug!(
+                repo_hash = %repo_hash,
+                error = %err,
+                "failed to persist watcher failed state (repo may not be registered)"
+            );
+            return;
+        }
         let Some(reconcile) = self.reconcile.clone() else {
             return;
         };
         let hash = repo_hash.to_string();
-        let msg = msg.to_string();
         tokio::spawn(async move {
-            if let Err(err) = reconcile
-                .set_watcher_state_by_repo_hash(hash.clone(), WatcherState::Failed, Some(msg))
-                .await
-            {
-                debug!(
-                    repo_hash = %hash,
-                    error = %err,
-                    "failed to persist watcher failed state (repo may not be registered)"
-                );
-                return;
-            }
             if let Err(err) = reconcile
                 .request_dirty_by_repo_hash(hash.clone(), ReconcileTrigger::WatchEvent)
                 .await
@@ -395,6 +510,7 @@ async fn dispatch_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::{RegistrationReconcilePolicy, RepoLifecycleManager};
 
     fn test_event() -> WatchEvent {
         WatchEvent::File {
@@ -476,6 +592,130 @@ mod tests {
         assert!(err.to_string().contains("injected watcher start failure"));
         assert!(manager.is_watching_repository("h"));
         assert_eq!(manager.dropped_watcher_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn arm_if_absent_reuses_existing_watcher_without_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, "h", root.path());
+        let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
+
+        let first = manager
+            .arm_repository_if_absent("h".into(), root.path().to_path_buf())
+            .unwrap();
+        let second = manager
+            .arm_repository_if_absent("h".into(), root.path().to_path_buf())
+            .unwrap();
+
+        assert_eq!(first.disposition(), WatchArmDisposition::Armed);
+        assert_eq!(second.disposition(), WatchArmDisposition::AlreadyArmed);
+        assert_eq!(manager.dropped_watcher_count(), 0);
+        manager.rollback_arm(second);
+        assert!(manager.is_watching_repository("h"));
+    }
+
+    #[tokio::test]
+    async fn rollback_arm_only_removes_the_matching_arm_id() {
+        let first_root = tempfile::tempdir().unwrap();
+        let replacement_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, "h", first_root.path());
+        let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
+
+        let stale = manager
+            .arm_repository_if_absent("h".into(), first_root.path().to_path_buf())
+            .unwrap();
+        manager
+            .watch_repository("h".into(), replacement_root.path().to_path_buf())
+            .unwrap();
+        assert_eq!(manager.dropped_watcher_count(), 1);
+
+        manager.rollback_arm(stale);
+        assert!(manager.is_watching_repository("h"));
+        assert_eq!(
+            manager.dropped_watcher_count(),
+            1,
+            "a stale receipt must not remove the replacement"
+        );
+
+        manager.unwatch_repository("h");
+        assert_eq!(manager.dropped_watcher_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn matching_arm_receipt_can_roll_back_its_watcher() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, "h", root.path());
+        let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
+
+        let receipt = manager
+            .arm_repository_if_absent("h".into(), root.path().to_path_buf())
+            .unwrap();
+        manager.rollback_arm(receipt);
+
+        assert!(!manager.is_watching_repository("h"));
+        assert_eq!(manager.dropped_watcher_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_registered_reports_each_success_and_failure() {
+        let good_root = tempfile::tempdir().unwrap();
+        let missing_parent = tempfile::tempdir().unwrap();
+        let missing_root = missing_parent.path().join("gone");
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        {
+            let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert_repository(&tx, "good", &good_root.path().to_string_lossy(), 1)
+                .unwrap();
+            cas_registry::upsert_repository(&tx, "missing", &missing_root.to_string_lossy(), 1)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        reconcile.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        let manager = WatchManager::with_backend_and_reconcile(
+            cas.clone(),
+            WatchBackend::Poll,
+            reconcile.clone(),
+        );
+
+        let report = manager.start_registered().unwrap();
+
+        assert_eq!(report.armed, vec!["good"]);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].repo_hash, "missing");
+        assert!(manager.is_watching_repository("good"));
+        assert!(!manager.is_watching_repository("missing"));
+        let index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let good = cas_registry::get_reconcile_state(&index, "good")
+            .unwrap()
+            .unwrap();
+        let missing = cas_registry::get_reconcile_state(&index, "missing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(good.watcher_state, WatcherState::Active);
+        assert_eq!(missing.watcher_state, WatcherState::Failed);
+        assert!(missing.watcher_error.is_some());
+
+        let primed = reconcile.prime_startup_reconcile(Vec::new()).await.unwrap();
+        assert_eq!(
+            primed.primed,
+            vec![("good".to_string(), 1), ("missing".to_string(), 1)]
+        );
+        wait_for_desired(&cas, "good", 1).await;
+        wait_for_desired(&cas, "missing", 1).await;
+        reconcile.shutdown(Duration::from_secs(1)).await;
     }
 
     #[test]
@@ -565,5 +805,46 @@ mod tests {
 
         drop(tx);
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registering_edge_is_retained_until_publication_activates_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let reconcile =
+            RepoReconcileManager::new_with_lifecycle(cas.clone(), None, lifecycle.clone());
+        reconcile.set_test_register_hook(Arc::new(|_, _, _, _| Ok(())));
+        let permit = lifecycle
+            .begin_registration("h".into(), root.path().to_path_buf(), 1)
+            .unwrap();
+        let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
+        let task = tokio::spawn(dispatch_events(Some(reconcile.clone()), "h".into(), rx));
+
+        tx.send(test_event()).await.unwrap();
+        tokio::time::sleep(WATCH_COALESCE_WINDOW + Duration::from_millis(100)).await;
+        assert_eq!(
+            desired_generation(&cas, "h"),
+            Some(0),
+            "the Registering lifecycle gate rejects the first dirty attempt"
+        );
+
+        let publication = lifecycle
+            .publish_registration(
+                permit,
+                "demo",
+                None,
+                2,
+                RegistrationReconcilePolicy::ImmediateCatchUp,
+            )
+            .unwrap();
+        reconcile.wake_recorded_generation(&publication.repo_hash, Some("demo".into()));
+        wait_for_desired(&cas, "h", 2).await;
+
+        drop(tx);
+        task.await.unwrap();
+        reconcile.shutdown(Duration::from_secs(1)).await;
     }
 }

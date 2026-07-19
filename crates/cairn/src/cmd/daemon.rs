@@ -13,9 +13,9 @@ use cairn_core::data_rpc::DataRpc;
 use cairn_core::jobs::JobManager;
 use cairn_core::lifecycle::RepoLifecycleManager;
 use cairn_core::paths::CasDataDir;
-use cairn_core::reconcile::RepoReconcileManager;
+use cairn_core::reconcile::{PeriodicReconcilePolicy, RepoReconcileManager};
 use cairn_core::sockets::SocketPaths;
-use cairn_core::watcher::WatchManager;
+use cairn_core::watcher::{WatchManager, WatchStartupReport};
 use clap::Args as ClapArgs;
 use tokio::sync::Notify;
 use tracing::info;
@@ -60,13 +60,12 @@ pub async fn run(args: Args) -> Result<()> {
         Some(job_manager.clone()),
         lifecycle.clone(),
     );
-    // Clear any `attempt_generation` left set by a prior crash
-    // BEFORE spawning workers or starting watchers — a stale
-    // in-flight marker would otherwise block the first real
-    // attempt.
-    if let Err(err) = reconcile.recover_interrupted_attempts().await {
-        tracing::warn!(error = %err, "reconcile: failed to recover interrupted attempts");
-    }
+    // Clear stale in-flight markers before watcher startup, but do not wake
+    // reconcile workers until every canonical repository has attempted to arm
+    // its watcher.
+    let recovered = reconcile
+        .recover_interrupted_attempts_without_wake()
+        .await?;
     let watch_manager = Arc::new(WatchManager::with_reconcile(
         cas_data_dir.clone(),
         reconcile.clone(),
@@ -76,13 +75,19 @@ pub async fn run(args: Args) -> Result<()> {
         Arc::downgrade(&watch_manager),
         Arc::downgrade(&reconcile),
     )?;
-    start_registered_watchers(watch_manager.clone()).await;
-    // Kick workers for repos whose dirty gap survived the last
-    // shutdown so `desired > applied` catches up without waiting
-    // for the next watcher event.
-    if let Err(err) = reconcile.wake_dirty_repositories().await {
-        tracing::warn!(error = %err, "reconcile: failed to wake dirty repositories at startup");
-    }
+    let watch_report = start_registered_watchers(watch_manager.clone()).await?;
+    info!(
+        armed = watch_report.armed.len(),
+        failed = watch_report.failed.len(),
+        "registered repository watcher barrier complete"
+    );
+    let startup = reconcile.prime_startup_reconcile(recovered).await?;
+    info!(
+        recovered = startup.recovered.len(),
+        primed = startup.primed.len(),
+        "startup full reconcile generations recorded"
+    );
+    reconcile.start_periodic_reconcile(PeriodicReconcilePolicy::default())?;
 
     let shutdown = Arc::new(Notify::new());
     spawn_signal_handler(shutdown.clone());
@@ -162,16 +167,11 @@ fn init_job_manager(
     Ok(job_manager)
 }
 
-async fn start_registered_watchers(watch_manager: Arc<WatchManager>) {
-    let result = tokio::task::spawn_blocking(move || {
-        if let Err(err) = watch_manager.start_registered() {
-            tracing::warn!(error = %err, "failed to start registered repo watchers");
-        }
-    })
-    .await;
-    if let Err(err) = result {
-        tracing::warn!(error = %err, "registered repo watcher startup task failed");
-    }
+async fn start_registered_watchers(watch_manager: Arc<WatchManager>) -> Result<WatchStartupReport> {
+    tokio::task::spawn_blocking(move || watch_manager.start_registered())
+        .await
+        .map_err(|err| anyhow::anyhow!("registered repo watcher startup task failed: {err}"))?
+        .map_err(|err| anyhow::anyhow!("failed to start registered repo watchers: {err}"))
 }
 
 #[cfg(test)]
@@ -235,8 +235,25 @@ mod tests {
 
         let watch_manager = Arc::new(WatchManager::new(cas));
 
-        start_registered_watchers(watch_manager.clone()).await;
+        start_registered_watchers(watch_manager.clone())
+            .await
+            .unwrap();
 
         assert!(watch_manager.is_watching_alias("demo"));
+    }
+
+    #[tokio::test]
+    async fn start_registered_watchers_propagates_registry_open_failure() {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        std::fs::create_dir(cas.index_db_path()).unwrap();
+        let watch_manager = Arc::new(WatchManager::new(cas));
+
+        let err = start_registered_watchers(watch_manager)
+            .await
+            .expect_err("registry open failure must fail the startup barrier");
+
+        assert!(format!("{err:#}").contains("failed to start registered repo watchers"));
     }
 }
