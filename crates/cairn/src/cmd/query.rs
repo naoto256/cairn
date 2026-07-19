@@ -138,6 +138,10 @@ enum QueryCommand {
         /// qualified name when it exists in multiple files.
         #[arg(long)]
         file: Option<String>,
+        /// 1-indexed declaration start line. Requires `--file` and is sent
+        /// without conversion.
+        #[arg(long, requires = "file", value_parser = clap::value_parser!(u32).range(1..))]
+        line: Option<u32>,
         /// Include repo-wide Tier-3 readiness in addition to this query's analyzers.
         #[arg(long)]
         verbose_tier3: bool,
@@ -365,6 +369,7 @@ pub async fn run(args: Args) -> Result<()> {
             branch,
             anchor,
             file,
+            line,
             verbose_tier3,
         } => {
             let mut p = serde_json::Map::new();
@@ -380,6 +385,9 @@ pub async fn run(args: Args) -> Result<()> {
             }
             if let Some(f) = file {
                 p.insert("file".into(), Value::String(f.clone()));
+            }
+            if let Some(line) = line {
+                p.insert("line".into(), json!(line));
             }
             insert_verbose_tier3(&mut p, *verbose_tier3);
             ("get_symbol_source", Value::Object(p))
@@ -806,7 +814,51 @@ fn render(method: &str, value: &Value) {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
+
+    #[test]
+    fn source_line_is_one_indexed_and_forwarded_without_conversion() {
+        let cli = crate::Cli::try_parse_from([
+            "cairn",
+            "query",
+            "source",
+            "crate::same",
+            "--file",
+            "src/lib.rs",
+            "--line",
+            "1",
+        ])
+        .unwrap();
+
+        let crate::Command::Query(Args {
+            command: QueryCommand::Source { file, line, .. },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected query source command");
+        };
+        assert_eq!(file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(line, Some(1));
+    }
+
+    #[test]
+    fn source_line_zero_is_rejected_by_cli() {
+        let err = crate::Cli::try_parse_from([
+            "cairn",
+            "query",
+            "source",
+            "crate::same",
+            "--file",
+            "src/lib.rs",
+            "--line",
+            "0",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
 
     #[test]
     fn symbols_query_includes_path_and_container_filters() {

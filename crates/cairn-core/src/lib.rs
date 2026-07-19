@@ -86,6 +86,16 @@ pub enum Error {
         repo: Option<String>,
         reason: String,
     },
+    /// A source lookup matched multiple physical declarations and requires a
+    /// narrower repo, file, or line selector.
+    #[error(
+        "multiple source declarations match qualified name `{qualified}`; add `repo`, `file`, or `line`"
+    )]
+    AmbiguousSource {
+        qualified: String,
+        candidates: Vec<cairn_proto::methods::SymbolSourceCandidate>,
+        candidates_truncated: bool,
+    },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("internal error: {0}")]
