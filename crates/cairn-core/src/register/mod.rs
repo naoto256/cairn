@@ -716,25 +716,30 @@ pub(crate) fn load_blob_or_verified_worktree(
     worktree_root: &Path,
     blob_sha: &str,
     path: &str,
-) -> std::io::Result<Vec<u8>> {
+) -> std::result::Result<Vec<u8>, BlobLoadError> {
     if !is_git_sha1(blob_sha) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid git blob sha: expected 40 hex characters",
-        ));
+        return Err(BlobLoadError::InvalidBlobSha);
     }
     if let Ok(bytes) = git_cat_file(worktree_root, blob_sha) {
         return Ok(bytes);
     }
 
-    let bytes = std::fs::read(worktree_root.join(path))?;
+    let bytes = std::fs::read(worktree_root.join(path)).map_err(BlobLoadError::WorktreeRead)?;
     if crate::cas::hash::git_blob_sha(&bytes) != blob_sha {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "worktree content does not match indexed blob sha",
-        ));
+        return Err(BlobLoadError::WorktreeBlobMismatch);
     }
     Ok(bytes)
+}
+
+/// Failure to materialise the exact bytes identified by a manifest entry.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BlobLoadError {
+    #[error("invalid git blob sha: expected 40 hex characters")]
+    InvalidBlobSha,
+    #[error("worktree content could not be read")]
+    WorktreeRead(#[source] std::io::Error),
+    #[error("worktree content does not match indexed blob sha")]
+    WorktreeBlobMismatch,
 }
 
 #[cfg(test)]
@@ -782,7 +787,7 @@ mod tests {
         let err =
             load_blob_or_verified_worktree(tmp.path(), &indexed_sha, "src/lib.rs").unwrap_err();
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(matches!(err, BlobLoadError::WorktreeBlobMismatch));
     }
 
     #[test]
