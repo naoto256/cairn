@@ -35,6 +35,7 @@ pub mod reconcile;
 pub mod register;
 pub mod resolution;
 pub mod sockets;
+pub mod startup;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod timefmt;
