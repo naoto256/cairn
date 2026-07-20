@@ -5,17 +5,22 @@
 //! triggers a clean shutdown.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use cairn_core::ctl::CtlHandler;
-use cairn_core::daemon::Daemon;
+use cairn_core::daemon::{
+    InitializingDaemon, shutdown_unpublished_resources, spawn_revision_staleness_scan,
+};
 use cairn_core::data_rpc::DataRpc;
 use cairn_core::jobs::JobManager;
 use cairn_core::lifecycle::RepoLifecycleManager;
 use cairn_core::paths::CasDataDir;
 use cairn_core::reconcile::{PeriodicReconcilePolicy, RepoReconcileManager};
 use cairn_core::sockets::SocketPaths;
+use cairn_core::startup::{ReadyDaemon, StartupGate};
 use cairn_core::watcher::{WatchManager, WatchStartupReport};
+use cairn_proto::control::{DaemonInitializationDetail, DaemonInitializationPhase};
 use clap::Args as ClapArgs;
 use tokio::sync::Notify;
 use tracing::info;
@@ -42,8 +47,59 @@ pub async fn run(args: Args) -> Result<()> {
         Some(p) => CasDataDir::with_root(p),
         None => CasDataDir::from_platform_default()?,
     });
+    let shutdown = Arc::new(Notify::new());
+    spawn_signal_handler(shutdown.clone());
+    let gate = StartupGate::new(shutdown.clone(), env!("CARGO_PKG_VERSION"));
+    let daemon = InitializingDaemon::bind(paths, gate.clone(), shutdown.clone())?;
+    let mut initialization = tokio::spawn(initialize_runtime(cas_data_dir, shutdown.clone(), gate));
+    let daemon_run = daemon.run();
+    tokio::pin!(daemon_run);
+
+    let (daemon_result, initialization_result) = tokio::select! {
+        daemon_result = &mut daemon_run => {
+            let initialization_result = match tokio::time::timeout(
+                Duration::from_secs(10),
+                &mut initialization,
+            ).await {
+                Ok(result) => join_initialization(result),
+                Err(_) => {
+                    initialization.abort();
+                    tracing::warn!("startup task did not stop within shutdown grace; runtime shutdown will abandon residual blocking work");
+                    Ok(())
+                }
+            };
+            (daemon_result, initialization_result)
+        }
+        initialization_result = &mut initialization => {
+            let initialization_result = join_initialization(initialization_result);
+            if initialization_result.is_err() {
+                shutdown.notify_waiters();
+            }
+            (daemon_run.await, initialization_result)
+        }
+    };
+
+    daemon_result?;
+    initialization_result
+}
+
+fn join_initialization(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.map_err(|err| anyhow!("daemon initialization task failed: {err}"))?
+}
+
+async fn initialize_runtime(
+    cas_data_dir: Arc<CasDataDir>,
+    shutdown: Arc<Notify>,
+    gate: Arc<StartupGate>,
+) -> Result<()> {
     cas_data_dir.ensure()?;
     info!(root = %cas_data_dir.root().display(), "storage open");
+    gate.advance(
+        DaemonInitializationPhase::RepositoryLifecycle,
+        Some(DaemonInitializationDetail::SweepingRepositories),
+    )?;
     let lifecycle = RepoLifecycleManager::new(cas_data_dir.clone());
     let sweep = lifecycle.startup_sweep().await?;
     info!(
@@ -53,70 +109,114 @@ pub async fn run(args: Args) -> Result<()> {
         cleanup_retried = sweep.cleanup_retried.len(),
         "repository lifecycle startup sweep complete"
     );
+
+    gate.advance(
+        DaemonInitializationPhase::JobManager,
+        Some(DaemonInitializationDetail::RestoringJobs),
+    )?;
     let job_manager = init_job_manager(cas_data_dir.clone(), lifecycle.clone())?;
+    gate.advance(
+        DaemonInitializationPhase::JobManager,
+        Some(DaemonInitializationDetail::StartingJobWorkers),
+    )?;
     job_manager.start_workers();
     let reconcile = RepoReconcileManager::new_with_lifecycle(
         cas_data_dir.clone(),
         Some(job_manager.clone()),
         lifecycle.clone(),
     );
-    // Clear stale in-flight markers before watcher startup, but do not wake
-    // reconcile workers until every canonical repository has attempted to arm
-    // its watcher.
-    let recovered = reconcile
-        .recover_interrupted_attempts_without_wake()
-        .await?;
     let watch_manager = Arc::new(WatchManager::with_reconcile(
         cas_data_dir.clone(),
         reconcile.clone(),
     ));
-    lifecycle.bind_runtime(
-        Arc::downgrade(&job_manager),
-        Arc::downgrade(&watch_manager),
-        Arc::downgrade(&reconcile),
-    )?;
-    let watch_report = start_registered_watchers(watch_manager.clone()).await?;
-    info!(
-        armed = watch_report.armed.len(),
-        failed = watch_report.failed.len(),
-        "registered repository watcher barrier complete"
-    );
-    let startup = reconcile.prime_startup_reconcile(recovered).await?;
-    info!(
-        recovered = startup.recovered.len(),
-        primed = startup.primed.len(),
-        "startup full reconcile generations recorded"
-    );
-    reconcile.start_periodic_reconcile(PeriodicReconcilePolicy::default())?;
-
-    let shutdown = Arc::new(Notify::new());
-    spawn_signal_handler(shutdown.clone());
-
-    let daemon = Daemon {
-        paths,
+    let resources = ReadyDaemon {
         data_handler: Arc::new(DataRpc::with_lifecycle(
             cas_data_dir.clone(),
             Some(lifecycle.clone()),
         )),
         control_handler: Arc::new(CtlHandler::with_full_context(
             cas_data_dir,
-            shutdown.clone(),
+            shutdown,
             env!("CARGO_PKG_VERSION"),
-            Some(watch_manager),
+            Some(watch_manager.clone()),
             Some(job_manager.clone()),
             Some(reconcile.clone()),
             Some(lifecycle.clone()),
         )),
-        shutdown,
-        job_manager: Some(job_manager),
-        reconcile: Some(reconcile.clone()),
-        lifecycle: Some(lifecycle.clone()),
+        job_manager: job_manager.clone(),
+        reconcile: reconcile.clone(),
+        lifecycle: lifecycle.clone(),
+        watch_manager: watch_manager.clone(),
     };
-    // Retain the reconcile driver until daemon.run returns so
-    // watcher requests keep landing on a live manager.
-    let _reconcile_owner = reconcile;
-    daemon.run().await?;
-    Ok(())
+
+    let initialized = async {
+        gate.advance(
+            DaemonInitializationPhase::ReconcileRecovery,
+            Some(DaemonInitializationDetail::RecoveringReconcileAttempts),
+        )?;
+        let recovered = reconcile
+            .recover_interrupted_attempts_without_wake()
+            .await?;
+        gate.advance(
+            DaemonInitializationPhase::ReconcileRecovery,
+            Some(DaemonInitializationDetail::BindingRuntimeManagers),
+        )?;
+        lifecycle.bind_runtime(
+            Arc::downgrade(&job_manager),
+            Arc::downgrade(&watch_manager),
+            Arc::downgrade(&reconcile),
+        )?;
+        gate.advance(
+            DaemonInitializationPhase::WatcherBarrier,
+            Some(DaemonInitializationDetail::ArmingRegisteredWatchers),
+        )?;
+        let watch_report = start_registered_watchers(watch_manager).await?;
+        info!(
+            armed = watch_report.armed.len(),
+            failed = watch_report.failed.len(),
+            "registered repository watcher barrier complete"
+        );
+        gate.advance(
+            DaemonInitializationPhase::ReconcilePrime,
+            Some(DaemonInitializationDetail::RecordingStartupGenerations),
+        )?;
+        let startup = reconcile.prime_startup_reconcile(recovered).await?;
+        info!(
+            recovered = startup.recovered.len(),
+            primed = startup.primed.len(),
+            "startup full reconcile generations recorded"
+        );
+        gate.advance(
+            DaemonInitializationPhase::PeriodicScheduler,
+            Some(DaemonInitializationDetail::StartingPeriodicReconcile),
+        )?;
+        reconcile.start_periodic_reconcile(PeriodicReconcilePolicy::default())?;
+        Result::<()>::Ok(())
+    }
+    .await;
+
+    if let Err(err) = initialized {
+        shutdown_unpublished_resources(resources)
+            .await
+            .context("cleaning up failed daemon initialization")?;
+        return Err(err);
+    }
+
+    let staleness_jobs = job_manager;
+    let staleness_reconcile = reconcile;
+    match gate.publish_ready(resources) {
+        Ok(()) => {
+            spawn_revision_staleness_scan(staleness_jobs, Some(staleness_reconcile));
+            info!("daemon initialization complete");
+            Ok(())
+        }
+        Err(resources) => {
+            shutdown_unpublished_resources(resources)
+                .await
+                .context("cleaning up daemon initialization after shutdown")?;
+            Ok(())
+        }
+    }
 }
 
 fn spawn_signal_handler(shutdown: Arc<Notify>) {
@@ -255,5 +355,24 @@ mod tests {
             .expect_err("registry open failure must fail the startup barrier");
 
         assert!(format!("{err:#}").contains("failed to start registered repo watchers"));
+    }
+
+    #[tokio::test]
+    async fn fresh_initialization_publishes_one_ready_bundle() {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        let shutdown = Arc::new(Notify::new());
+        let gate = StartupGate::new(shutdown.clone(), "test-version");
+
+        initialize_runtime(cas, shutdown, gate.clone())
+            .await
+            .unwrap();
+
+        assert!(gate.status().is_ready());
+        let resources = gate
+            .begin_shutdown()
+            .expect("ready resources were not published");
+        assert!(gate.begin_shutdown().is_none());
+        shutdown_unpublished_resources(resources).await.unwrap();
     }
 }

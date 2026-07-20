@@ -17,9 +17,7 @@ use cairn_proto::jsonrpc::{
 };
 use tokio::sync::Notify;
 
-use crate::ctl::CtlHandler;
 use crate::daemon::LineHandler;
-use crate::data_rpc::DataRpc;
 use crate::jobs::JobManager;
 use crate::lifecycle::RepoLifecycleManager;
 use crate::reconcile::RepoReconcileManager;
@@ -31,8 +29,8 @@ use crate::{Error, jsonrpc_errors};
 /// The gate owns this bundle after publication. Teardown takes it back exactly
 /// once through [`StartupGate::begin_shutdown`].
 pub struct ReadyDaemon {
-    pub data_handler: Arc<DataRpc>,
-    pub control_handler: Arc<CtlHandler>,
+    pub data_handler: Arc<dyn LineHandler>,
+    pub control_handler: Arc<dyn LineHandler>,
     pub job_manager: Arc<JobManager>,
     pub reconcile: Arc<RepoReconcileManager>,
     pub lifecycle: Arc<RepoLifecycleManager>,
@@ -96,7 +94,10 @@ impl StartupGate {
             StartupState::Ready(_) => Err(Error::InvalidArgument(
                 "startup progress cannot advance after ready publication".into(),
             )),
-            StartupState::ShuttingDown => Err(Error::JobManagerShuttingDown),
+            // Shutdown owns the terminal transition. An initializer already
+            // between cancellation checks may finish constructing resources;
+            // publish_ready will return that bundle for partial cleanup.
+            StartupState::ShuttingDown => Ok(()),
         }
     }
 
@@ -134,7 +135,7 @@ impl StartupGate {
         }
     }
 
-    fn data_admission(&self) -> Admission<Arc<DataRpc>> {
+    fn data_admission(&self) -> Admission<Arc<dyn LineHandler>> {
         match &*self.state.lock().expect("startup gate poisoned") {
             StartupState::Initializing(status) => Admission::Initializing(status.clone()),
             StartupState::Ready(resources) => Admission::Ready(resources.data_handler.clone()),
@@ -142,7 +143,7 @@ impl StartupGate {
         }
     }
 
-    fn control_admission(&self) -> Admission<Arc<CtlHandler>> {
+    fn control_admission(&self) -> Admission<Arc<dyn LineHandler>> {
         match &*self.state.lock().expect("startup gate poisoned") {
             StartupState::Initializing(status) => Admission::Initializing(status.clone()),
             StartupState::Ready(resources) => Admission::Ready(resources.control_handler.clone()),
@@ -271,6 +272,7 @@ mod tests {
     use serde_json::json;
 
     use crate::paths::CasDataDir;
+    use crate::{ctl::CtlHandler, data_rpc::DataRpc};
 
     fn request(method: &str) -> String {
         json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": null}).to_string()
@@ -388,7 +390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_publication_switches_admission_and_resources_are_taken_once() {
+    async fn publish_before_shutdown_transfers_bundle_to_teardown_once() {
         let shutdown = Arc::new(Notify::new());
         let gate = StartupGate::new(shutdown, "test-version");
         let data_handler = StartupDataHandler::new(gate.clone());
@@ -410,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_before_publication_returns_resources_to_initializer() {
+    fn shutdown_before_publish_returns_bundle_for_partial_cleanup() {
         let gate = StartupGate::new(Arc::new(Notify::new()), "test-version");
         let (_data, resources) = ready_resources();
 
