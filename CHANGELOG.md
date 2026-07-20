@@ -7,7 +7,17 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.8.0] — 2026-07-20
 
-> Compatibility: no breaking changes. Pre-1.0 SemVer policy per README.
+> Compatibility: no source-code breaking changes. `get_symbol_source` has a
+> wire behavior change for the previously underspecified cross-file duplicate
+> case described below. Pre-1.0 SemVer policy applies per README.
+
+### Behavior changes
+
+- **Ambiguous source lookups now require explicit selection.** When the same
+  qualified symbol has multiple physical declarations across files,
+  `get_symbol_source` returns JSON-RPC `-32003` (`AmbiguousSource`) instead of
+  choosing an arbitrary declaration. Use `--file` and, when needed, `--line`
+  to select the intended declaration.
 
 ### Added
 
@@ -162,6 +172,18 @@ versions follow [SemVer](https://semver.org/).
   expect an analyzer but have no recorded run continue to receive the warning
   and reindex remediation.
 
+- **Operational diagnostics and recovery paths are more precise.** Repository
+  enumeration now skips repositories that become unavailable between passes,
+  committed alias retargets remain successful when the runtime cleanup wake is
+  deferred, and status and freshness errors retain actionable alias and reason
+  details. Release-smoke diagnostics are drained and joined on every exit path,
+  while evaluation fixtures avoid non-finite JSON ratios and cleanup races.
+
+- **Failed forced reindexes now return to normal backoff.** A manual force
+  request bypasses an existing retry deadline once. If that attempt fails, its
+  newly persisted deadline is respected even while the force generation remains
+  pending, preventing chronically unreadable repositories from hot-spinning.
+
 ### PRs
 
 - Snapshot integrity and source-query correctness: #252, #253, #254, #255,
@@ -169,6 +191,8 @@ versions follow [SemVer](https://semver.org/).
 - Daemon lifetime and verified source-mismatch handling: #258
 - Early socket binding and initialization progress: #259
 - Analyzer-free repository doctor correction: #260
+- Repository recovery, diagnostics, and evaluation hygiene: #263
+- Forced-reindex retry backoff: #264
 
 ## [0.7.1] — 2026-07-12
 
