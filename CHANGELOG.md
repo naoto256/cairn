@@ -191,6 +191,7 @@ versions follow [SemVer](https://semver.org/).
 - Daemon lifetime and verified source-mismatch handling: #258
 - Early socket binding and initialization progress: #259
 - Analyzer-free repository doctor correction: #260
+- Concurrent schema migration and registration cleanup correctness: #262
 - Repository recovery, diagnostics, and evaluation hygiene: #263
 - Forced-reindex retry backoff: #264
 
