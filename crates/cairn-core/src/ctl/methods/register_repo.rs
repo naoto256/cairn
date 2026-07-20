@@ -19,6 +19,20 @@ use crate::{Error, Result};
 
 struct RegisterRepo;
 
+async fn preserve_registration_error_after_cleanup(
+    registration_error: Error,
+    cleanup: impl std::future::Future<Output = Result<()>>,
+) -> Error {
+    if let Err(cleanup_error) = cleanup.await {
+        warn!(
+            error = %registration_error,
+            cleanup_error = %cleanup_error,
+            "registration cleanup failed; preserving the primary registration error"
+        );
+    }
+    registration_error
+}
+
 #[async_trait::async_trait]
 impl ControlMethod for RegisterRepo {
     fn name(&self) -> &'static str {
@@ -162,9 +176,16 @@ impl ControlMethod for RegisterRepo {
                 {
                     watch_manager.rollback_arm(receipt);
                 }
-                if let (Some(lifecycle), Some(permit)) = (&ctx.lifecycle, permit) {
-                    lifecycle.abort_registration(permit).await?;
-                }
+                let err = match (&ctx.lifecycle, permit) {
+                    (Some(lifecycle), Some(permit)) => {
+                        preserve_registration_error_after_cleanup(
+                            err,
+                            lifecycle.abort_registration(permit),
+                        )
+                        .await
+                    }
+                    _ => err,
+                };
                 return Err(err);
             }
         };
@@ -210,6 +231,20 @@ mod tests {
     use crate::paths::CasDataDir;
     use crate::reconcile::RepoReconcileManager;
     use crate::watcher::WatchManager;
+
+    #[tokio::test]
+    async fn abort_cleanup_failure_does_not_mask_registration_error() {
+        let error = preserve_registration_error_after_cleanup(
+            Error::InvalidArgument("primary registration failure".into()),
+            async { Err(Error::Internal("abort cleanup failure".into())) },
+        )
+        .await;
+
+        assert!(matches!(
+            error,
+            Error::InvalidArgument(message) if message == "primary registration failure"
+        ));
+    }
 
     #[tokio::test]
     async fn failed_initial_scan_rolls_back_only_its_watcher_arm() {
