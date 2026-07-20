@@ -939,9 +939,11 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             continue;
         }
 
-        // Retry backoff — honoured only if no force is pending.
-        // A manual reindex should not wait for the retry timer.
-        if !force_pending && let Some(retry_at) = state.next_retry_at_ns {
+        // A manual force request clears any pre-existing retry deadline when
+        // it records the new generation, bypassing backoff exactly once. A
+        // failed forced attempt installs a fresh deadline, and that deadline
+        // remains authoritative while the same force generation is pending.
+        if let Some(retry_at) = state.next_retry_at_ns {
             let now = mgr.clock.now_ns();
             if retry_at > now {
                 let sleep_ns = retry_at.saturating_sub(now);
