@@ -5,7 +5,7 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [Unreleased] — 0.8.0
+## [0.8.0] — 2026-07-20
 
 ### Added
 
@@ -31,6 +31,12 @@ versions follow [SemVer](https://semver.org/).
   Persistence protects missing roots only. A canonical repository with no
   aliases is unreachable and is removed regardless of policy, including when
   its final alias is retargeted.
+
+- **Tier-2.5 quality gates now cover all seven self-contained backends.** The
+  resolver evaluation harness records Tier-2 and Tier-2.5 precision/recall
+  floors for Ruby, PHP, Python, Kotlin, Swift, C#, and JavaScript. A separate
+  ignored, record-only benchmark captures registration and query medians
+  without turning machine-dependent performance into a CI gate.
 
 ### Fixed
 
@@ -74,7 +80,10 @@ versions follow [SemVer](https://semver.org/).
   for an `<unspecified>` path. Store migration v13 adds a nullable
   reconcile-generation receipt to tentative anchor publication; ordinary
   non-reconcile anchor writes clear that receipt rather than carrying stale
-  freshness forward.
+  freshness forward. If fallback worktree bytes no longer match the indexed
+  blob SHA, `get_symbol_source` now preserves that typed cause and returns
+  `-32002` with `reason=source_blob_mismatch` instead of collapsing it into a
+  generic invalid-argument error.
 
 - **Full scans now fail closed without publishing partial snapshots.** Git
   metadata, ignore discovery, directory walking, metadata lookup, file reads,
@@ -117,6 +126,9 @@ versions follow [SemVer](https://semver.org/).
   deadline and reports `ShutdownDeadlineExceeded` instead of hanging. The CLI
   also uses Tokio's bounded runtime shutdown on both success and error paths,
   so a residual blocking reconcile scan cannot hold the process open forever.
+  The teardown deadline starts only after an explicit shutdown notification;
+  an idle daemon therefore remains alive instead of entering teardown after
+  the deadline duration.
 
 - **Filesystem watcher ignore parity and bounded event coalescing.** Startup
   scans and live watcher events now share one repository-scoped gitignore
@@ -141,6 +153,12 @@ versions follow [SemVer](https://semver.org/).
   store opens, preventing a query racing removal from recreating a deleted CAS
   directory. The prior final-alias removal path could leave canonical and
   reconcile rows orphaned; it now routes through the same lifecycle owner.
+
+- **Doctor treats analyzer-free repositories as healthy.** A repository with
+  no expected workspace analyzers and no Tier-3 runs now reports the check as
+  not applicable instead of warning that a run is missing. Repositories that
+  expect an analyzer but have no recorded run continue to receive the warning
+  and reindex remediation.
 
 ## [0.7.1] — 2026-07-12
 

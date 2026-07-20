@@ -43,7 +43,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Naoto Morishima"]
@@ -152,43 +152,43 @@ linkme = "0.3"
 clap = { version = "4", features = ["derive"] }
 
 # Internal crates
-cairn-core = { version = "0.7.1", path = "crates/cairn-core" }
-cairn-proto = { version = "0.7.1", path = "crates/cairn-proto" }
-cairn-lang-api = { version = "0.7.1", path = "crates/cairn-lang-api" }
-cairn-lang-treesitter-generic = { version = "0.7.1", path = "crates/cairn-lang-treesitter-generic" }
-cairn-lang-rust = { version = "0.7.1", path = "crates/cairn-lang-rust" }
-cairn-lang-rust-tier3 = { version = "0.7.1", path = "crates/cairn-lang-rust-tier3" }
-cairn-lang-python = { version = "0.7.1", path = "crates/cairn-lang-python" }
-cairn-lang-python-tier25 = { version = "0.7.1", path = "crates/cairn-lang-python-tier25" }
-cairn-lang-python-tier3 = { version = "0.7.1", path = "crates/cairn-lang-python-tier3" }
-cairn-lang-markdown = { version = "0.7.1", path = "crates/cairn-lang-markdown" }
-cairn-lang-php = { version = "0.7.1", path = "crates/cairn-lang-php" }
-cairn-lang-php-tier3 = { version = "0.7.1", path = "crates/cairn-lang-php-tier3" }
-cairn-lang-php-tier25 = { version = "0.7.1", path = "crates/cairn-lang-php-tier25" }
-cairn-lang-ruby = { version = "0.7.1", path = "crates/cairn-lang-ruby" }
-cairn-lang-ruby-tier25 = { version = "0.7.1", path = "crates/cairn-lang-ruby-tier25" }
-cairn-lang-ruby-tier3 = { version = "0.7.1", path = "crates/cairn-lang-ruby-tier3" }
-cairn-lang-typescript = { version = "0.7.1", path = "crates/cairn-lang-typescript" }
-cairn-lang-typescript-tier3 = { version = "0.7.1", path = "crates/cairn-lang-typescript-tier3" }
-cairn-lang-go = { version = "0.7.1", path = "crates/cairn-lang-go" }
-cairn-lang-go-tier3 = { version = "0.7.1", path = "crates/cairn-lang-go-tier3" }
-cairn-lang-clangd-tier3 = { version = "0.7.1", path = "crates/cairn-lang-clangd-tier3" }
-cairn-lang-c = { version = "0.7.1", path = "crates/cairn-lang-c" }
-cairn-lang-cpp = { version = "0.7.1", path = "crates/cairn-lang-cpp" }
-cairn-lang-csharp = { version = "0.7.1", path = "crates/cairn-lang-csharp" }
-cairn-lang-csharp-tier3 = { version = "0.7.1", path = "crates/cairn-lang-csharp-tier3" }
-cairn-lang-csharp-tier25 = { version = "0.7.1", path = "crates/cairn-lang-csharp-tier25" }
-cairn-lang-java = { version = "0.7.1", path = "crates/cairn-lang-java" }
-cairn-lang-java-tier3 = { version = "0.7.1", path = "crates/cairn-lang-java-tier3" }
-cairn-lang-javascript-tier25 = { version = "0.7.1", path = "crates/cairn-lang-javascript-tier25" }
-cairn-lang-kotlin = { version = "0.7.1", path = "crates/cairn-lang-kotlin" }
-cairn-lang-kotlin-tier25 = { version = "0.7.1", path = "crates/cairn-lang-kotlin-tier25" }
-cairn-lang-kotlin-tier3 = { version = "0.7.1", path = "crates/cairn-lang-kotlin-tier3" }
-cairn-lang-swift = { version = "0.7.1", path = "crates/cairn-lang-swift" }
-cairn-lang-swift-tier25 = { version = "0.7.1", path = "crates/cairn-lang-swift-tier25" }
-cairn-lang-swift-tier3 = { version = "0.7.1", path = "crates/cairn-lang-swift-tier3" }
-cairn-lang-objc = { version = "0.7.1", path = "crates/cairn-lang-objc" }
-cairn-watch = { version = "0.7.1", path = "crates/cairn-watch" }
+cairn-core = { version = "0.8.0", path = "crates/cairn-core" }
+cairn-proto = { version = "0.8.0", path = "crates/cairn-proto" }
+cairn-lang-api = { version = "0.8.0", path = "crates/cairn-lang-api" }
+cairn-lang-treesitter-generic = { version = "0.8.0", path = "crates/cairn-lang-treesitter-generic" }
+cairn-lang-rust = { version = "0.8.0", path = "crates/cairn-lang-rust" }
+cairn-lang-rust-tier3 = { version = "0.8.0", path = "crates/cairn-lang-rust-tier3" }
+cairn-lang-python = { version = "0.8.0", path = "crates/cairn-lang-python" }
+cairn-lang-python-tier25 = { version = "0.8.0", path = "crates/cairn-lang-python-tier25" }
+cairn-lang-python-tier3 = { version = "0.8.0", path = "crates/cairn-lang-python-tier3" }
+cairn-lang-markdown = { version = "0.8.0", path = "crates/cairn-lang-markdown" }
+cairn-lang-php = { version = "0.8.0", path = "crates/cairn-lang-php" }
+cairn-lang-php-tier3 = { version = "0.8.0", path = "crates/cairn-lang-php-tier3" }
+cairn-lang-php-tier25 = { version = "0.8.0", path = "crates/cairn-lang-php-tier25" }
+cairn-lang-ruby = { version = "0.8.0", path = "crates/cairn-lang-ruby" }
+cairn-lang-ruby-tier25 = { version = "0.8.0", path = "crates/cairn-lang-ruby-tier25" }
+cairn-lang-ruby-tier3 = { version = "0.8.0", path = "crates/cairn-lang-ruby-tier3" }
+cairn-lang-typescript = { version = "0.8.0", path = "crates/cairn-lang-typescript" }
+cairn-lang-typescript-tier3 = { version = "0.8.0", path = "crates/cairn-lang-typescript-tier3" }
+cairn-lang-go = { version = "0.8.0", path = "crates/cairn-lang-go" }
+cairn-lang-go-tier3 = { version = "0.8.0", path = "crates/cairn-lang-go-tier3" }
+cairn-lang-clangd-tier3 = { version = "0.8.0", path = "crates/cairn-lang-clangd-tier3" }
+cairn-lang-c = { version = "0.8.0", path = "crates/cairn-lang-c" }
+cairn-lang-cpp = { version = "0.8.0", path = "crates/cairn-lang-cpp" }
+cairn-lang-csharp = { version = "0.8.0", path = "crates/cairn-lang-csharp" }
+cairn-lang-csharp-tier3 = { version = "0.8.0", path = "crates/cairn-lang-csharp-tier3" }
+cairn-lang-csharp-tier25 = { version = "0.8.0", path = "crates/cairn-lang-csharp-tier25" }
+cairn-lang-java = { version = "0.8.0", path = "crates/cairn-lang-java" }
+cairn-lang-java-tier3 = { version = "0.8.0", path = "crates/cairn-lang-java-tier3" }
+cairn-lang-javascript-tier25 = { version = "0.8.0", path = "crates/cairn-lang-javascript-tier25" }
+cairn-lang-kotlin = { version = "0.8.0", path = "crates/cairn-lang-kotlin" }
+cairn-lang-kotlin-tier25 = { version = "0.8.0", path = "crates/cairn-lang-kotlin-tier25" }
+cairn-lang-kotlin-tier3 = { version = "0.8.0", path = "crates/cairn-lang-kotlin-tier3" }
+cairn-lang-swift = { version = "0.8.0", path = "crates/cairn-lang-swift" }
+cairn-lang-swift-tier25 = { version = "0.8.0", path = "crates/cairn-lang-swift-tier25" }
+cairn-lang-swift-tier3 = { version = "0.8.0", path = "crates/cairn-lang-swift-tier3" }
+cairn-lang-objc = { version = "0.8.0", path = "crates/cairn-lang-objc" }
+cairn-watch = { version = "0.8.0", path = "crates/cairn-watch" }
 
 [profile.release]
 lto = "thin"
