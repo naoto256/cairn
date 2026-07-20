@@ -150,6 +150,7 @@ mod tests {
             let report = StatusReport {
                 daemon_version: version.into(),
                 uptime_secs: 1,
+                initialization: cairn_proto::control::DaemonInitializationStatus::ready(),
                 repos: Vec::new(),
             };
             let response = ok_response(RequestId::Number(1), json!(report));
