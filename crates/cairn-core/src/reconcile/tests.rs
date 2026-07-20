@@ -57,6 +57,9 @@ struct FakeRegister {
     // If set to Some, the hook returns Err(msg) once and clears
     // the slot. Otherwise Ok.
     fail_next: Mutex<Option<String>>,
+    // If set, every hook invocation fails. Used to pin retry
+    // pacing without allowing a later attempt to clear state.
+    fail_always: Mutex<Option<String>>,
     // Optional gate: if set, the hook blocks the calling thread
     // on this notify until the test releases it. Used by MF-3
     // (event during in-flight attempt) and MF-9 (concurrent wake
@@ -93,6 +96,9 @@ impl FakeRegister {
     fn set_fail_next(&self, msg: &str) {
         *self.fail_next.lock().unwrap() = Some(msg.to_string());
     }
+    fn set_fail_always(&self, msg: &str) {
+        *self.fail_always.lock().unwrap() = Some(msg.to_string());
+    }
     fn install_gate(&self) -> Arc<GateInner> {
         let gate = Arc::new(GateInner {
             entered: AtomicUsize::new(0),
@@ -125,6 +131,9 @@ impl FakeRegister {
                     drop(guard);
                 }
                 if let Some(msg) = this.fail_next.lock().unwrap().take() {
+                    return Err(crate::Error::Internal(msg));
+                }
+                if let Some(msg) = this.fail_always.lock().unwrap().clone() {
                     return Err(crate::Error::Internal(msg));
                 }
                 Ok(())
@@ -448,6 +457,91 @@ async fn mf5_failure_preserves_gap_and_bumps_failure_counter() {
             .as_deref()
             .is_some_and(|s| s.contains("register EMFILE"))
     );
+
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn forced_failure_honours_backoff_after_one_immediate_attempt() {
+    const SECOND_NS: i64 = 1_000_000_000;
+
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "demo", "/p", "h");
+    let clock = ManualClock::new(SECOND_NS);
+
+    // Seed an existing failure whose long deadline would block ordinary
+    // dirty work. The manual force request must bypass this deadline once.
+    let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+    let tx = index.transaction().unwrap();
+    cas_registry::increment_desired_generation(&tx, "h", clock.now_ns()).unwrap();
+    cas_registry::mark_attempt_start(&tx, "h", 1, clock.now_ns()).unwrap();
+    cas_registry::mark_attempt_failure(
+        &tx,
+        "h",
+        1,
+        "existing failure",
+        clock.now_ns() + 60 * SECOND_NS,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(index);
+
+    let mgr = RepoReconcileManager::with_config(
+        cas.clone(),
+        None,
+        clock.clone(),
+        RetryPolicy {
+            base_delay: Duration::from_secs(10),
+            max_delay: Duration::from_secs(60),
+        },
+    );
+    let register = FakeRegister::new();
+    register.set_fail_always("forced register failure");
+    mgr.set_test_register_hook(register.as_hook());
+
+    mgr.request_force_by_alias("demo".into(), ReconcileTrigger::ManualReindex)
+        .await
+        .unwrap();
+    wait_for(
+        || register.call_count() == 1 && read_state(&cas, "h").consecutive_failures == 2,
+        2000,
+        "immediate forced failure",
+    )
+    .await;
+
+    // The second failure uses a 20-second delay. Advance a 27-second
+    // production-equivalent observation window without real sleeps and wake
+    // the worker at every second so a missed backoff check cannot hide.
+    for elapsed in 1..=27 {
+        clock.advance(SECOND_NS);
+        mgr.wake_recorded_generation("h", None);
+        if elapsed == 20 {
+            wait_for(
+                || register.call_count() == 2,
+                2000,
+                "retry at the persisted deadline",
+            )
+            .await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let expected = if elapsed < 20 { 1 } else { 2 };
+        assert_eq!(
+            register.call_count(),
+            expected,
+            "unexpected forced attempt count at second {elapsed}"
+        );
+    }
+
+    let calls = register.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.forced));
+    assert!(calls.iter().all(|call| call.generation == 2));
+    let state = read_state(&cas, "h");
+    assert_eq!(state.consecutive_failures, 3);
+    assert_eq!(state.applied_generation, 0);
+    assert_eq!(state.desired_generation, 2);
+    assert!(state.next_retry_at_ns.is_some());
 
     mgr.shutdown(Duration::from_secs(2)).await;
 }
