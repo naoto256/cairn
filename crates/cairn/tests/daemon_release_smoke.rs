@@ -3,18 +3,56 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-struct ChildGuard(Child);
+struct ChildGuard {
+    child: Child,
+    stderr_reader: Option<JoinHandle<String>>,
+}
+
+impl ChildGuard {
+    fn new(mut child: Child) -> Self {
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_reader = thread::spawn(move || {
+            let mut output = String::new();
+            stderr.read_to_string(&mut output).unwrap();
+            output
+        });
+        Self {
+            child,
+            stderr_reader: Some(stderr_reader),
+        }
+    }
+
+    fn assert_running(&mut self, context: &str) {
+        if let Some(status) = self.child.try_wait().unwrap() {
+            let stderr = self.join_stderr();
+            panic!("{context}: {status}; stderr={stderr}");
+        }
+    }
+
+    fn join_stderr(&mut self) -> String {
+        self.stderr_reader
+            .take()
+            .map(|reader| reader.join().unwrap())
+            .unwrap_or_default()
+    }
+
+    fn try_wait(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().unwrap()
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
+        let _ = self.stderr_reader.take().map(JoinHandle::join);
     }
 }
 
@@ -43,7 +81,7 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
     let runtime = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut child = ChildGuard(
+    let mut child = ChildGuard::new(
         Command::new(env!("CARGO_BIN_EXE_cairn"))
             .arg("daemon")
             .arg("--runtime-dir")
@@ -55,14 +93,6 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
             .spawn()
             .unwrap(),
     );
-    let mut stderr_reader = Some(thread::spawn({
-        let mut stderr = child.0.stderr.take().unwrap();
-        move || {
-            let mut output = String::new();
-            stderr.read_to_string(&mut output).unwrap();
-            output
-        }
-    }));
     let control = runtime.path().join("control.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !control.exists() {
@@ -70,18 +100,12 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
             Instant::now() < deadline,
             "daemon control socket did not appear"
         );
-        if let Some(status) = child.0.try_wait().unwrap() {
-            let stderr = stderr_reader.take().unwrap().join().unwrap();
-            panic!("daemon exited before binding its socket: {status}; stderr={stderr}");
-        }
+        child.assert_running("daemon exited before binding its socket");
         thread::sleep(Duration::from_millis(20));
     }
 
     thread::sleep(Duration::from_secs(30));
-    assert!(
-        child.0.try_wait().unwrap().is_none(),
-        "idle daemon exited during the 30-second smoke window"
-    );
+    child.assert_running("idle daemon exited during the 30-second smoke window");
     let status = request(&control, "status");
     assert_eq!(status["result"]["initialization"]["state"], "ready");
     let shutdown = request(&control, "shutdown");
@@ -89,8 +113,8 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            let stderr = stderr_reader.take().unwrap().join().unwrap();
+        if let Some(status) = child.try_wait() {
+            let stderr = child.join_stderr();
             assert!(
                 status.success(),
                 "daemon exited unsuccessfully: {status}; stderr={stderr}"
