@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use crate::Result;
 use crate::jobs::JobManager;
 use crate::sockets::{SocketPaths, bind_socket_with_mode};
+use crate::startup::{ReadyDaemon, StartupControlHandler, StartupDataHandler, StartupGate};
 
 /// Implementations receive one newline-delimited request line at a
 /// time and return one response line.
@@ -82,122 +83,219 @@ impl Daemon {
         let cairn = bind_socket_with_mode(&self.paths.cairn)?;
         let ctrl = bind_socket_with_mode(&self.paths.control)?;
         info!(cairn = %self.paths.cairn.display(), control = %self.paths.control.display(), "daemon listening");
-
-        // Revision-staleness scan: enqueue analyzer reruns for any
-        // registered alias whose tentative manifest carries a
-        // `workspace_analysis_runs` row at an old `analyzer_revision`
-        // (or no row at all). Runs once per daemon boot, fire-and-
-        // forget on a blocking thread because every step is sync
-        // rusqlite I/O.
-        //
-        // Crash-isolation invariant: failures inside the scan must
-        // never escape this spawn. The scan itself downgrades
-        // per-alias errors to a `warn!` and continues; an outer-level
-        // failure (e.g. alias-index unreadable) is logged here.
         if let Some(job_manager) = self.job_manager.clone() {
-            let cas_data_dir_for_staleness = job_manager.cas_data_dir().clone();
-            let reconcile_for_staleness = self.reconcile.clone();
-            // The scan is sync SQLite I/O, so we hand it to the blocking
-            // pool. We then `spawn` an awaiter so a panic inside the
-            // blocking thread surfaces as a `JoinError` and gets
-            // logged instead of vanishing silently. The awaiter does
-            // not block daemon startup; the outer `if let` returns
-            // immediately.
-            let scan_handle = tokio::task::spawn_blocking(move || {
-                crate::workspace_analyzer::check_revision_staleness_and_enqueue(
-                    &cas_data_dir_for_staleness,
-                    &job_manager,
-                    reconcile_for_staleness.as_ref(),
-                )
-            });
-            tokio::spawn(async move {
-                match scan_handle.await {
-                    Ok(Ok(_summary)) => {
-                        // staleness module already emits a structured
-                        // `info!` summary; nothing more to do here.
-                    }
-                    Ok(Err(err)) => {
-                        warn!(
-                            error = %err,
-                            "revision staleness scan failed; daemon continues"
-                        );
-                    }
-                    Err(join_err) => {
-                        // Panic inside the blocking thread. Loud so a
-                        // never-fires invariant violation doesn't sit
-                        // hidden in production.
-                        tracing::error!(
-                            error = %join_err,
-                            "revision staleness scan panicked; daemon continues (no auto-rerun this boot)"
-                        );
-                    }
-                }
-            });
+            spawn_revision_staleness_scan(job_manager, self.reconcile.clone());
         }
-
-        let mut cairn_task = spawn_accept_loop(
-            "cairn",
+        run_bound(
+            self.paths,
             cairn,
-            self.data_handler.clone(),
-            self.shutdown.clone(),
-        );
-        let mut ctrl_task = spawn_accept_loop(
-            "control",
             ctrl,
-            self.control_handler.clone(),
-            self.shutdown.clone(),
-        );
+            self.data_handler,
+            self.control_handler,
+            self.shutdown,
+            RuntimeOwnership::Static {
+                job_manager: self.job_manager,
+                lifecycle: self.lifecycle,
+            },
+            shutdown_timeout,
+        )
+        .await
+    }
+}
 
-        // The daemon lifetime is unbounded. Only teardown work after the
-        // Running -> ShuttingDown transition consumes the shutdown budget.
-        self.shutdown.notified().await;
+/// Daemon sockets bound before runtime initialization completes.
+pub struct InitializingDaemon {
+    paths: SocketPaths,
+    cairn: UnixListener,
+    control: UnixListener,
+    gate: Arc<StartupGate>,
+    shutdown: Arc<Notify>,
+}
 
-        let teardown = async {
-            // Stop accepting first and let already-admitted RPCs finish.
-            let _ = tokio::join!(&mut cairn_task, &mut ctrl_task);
-            // This lock-backed transition rejects every later enqueue and
-            // cancels handles registered by already-running analyzers.
-            if let Some(job_manager) = &self.job_manager {
-                job_manager.begin_shutdown();
-            }
-            if let Some(lifecycle) = &self.lifecycle {
-                if let Err(err) = lifecycle.shutdown(Duration::from_secs(1)).await {
-                    warn!(
-                        error = %err,
-                        "repository lifecycle shutdown did not drain; durable state will recover on next startup"
-                    );
+impl InitializingDaemon {
+    /// Bind both sockets synchronously so callers can begin initialization only
+    /// after transport availability is guaranteed.
+    pub fn bind(paths: SocketPaths, gate: Arc<StartupGate>, shutdown: Arc<Notify>) -> Result<Self> {
+        paths.ensure()?;
+        let cairn = bind_socket_with_mode(&paths.cairn)?;
+        let control = bind_socket_with_mode(&paths.control)?;
+        info!(cairn = %paths.cairn.display(), control = %paths.control.display(), "daemon listening; initialization in progress");
+        Ok(Self {
+            paths,
+            cairn,
+            control,
+            gate,
+            shutdown,
+        })
+    }
+
+    pub async fn run(self) -> Result<()> {
+        self.run_with_shutdown_timeout(DAEMON_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn run_with_shutdown_timeout(self, shutdown_timeout: Duration) -> Result<()> {
+        run_bound(
+            self.paths,
+            self.cairn,
+            self.control,
+            Arc::new(StartupDataHandler::new(self.gate.clone())),
+            Arc::new(StartupControlHandler::new(self.gate.clone())),
+            self.shutdown,
+            RuntimeOwnership::Startup(self.gate),
+            shutdown_timeout,
+        )
+        .await
+    }
+}
+
+enum RuntimeOwnership {
+    Static {
+        job_manager: Option<Arc<JobManager>>,
+        lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
+    },
+    Startup(Arc<StartupGate>),
+}
+
+struct TeardownResources {
+    job_manager: Option<Arc<JobManager>>,
+    lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
+    _ready: Option<ReadyDaemon>,
+}
+
+impl RuntimeOwnership {
+    fn begin_shutdown(self) -> TeardownResources {
+        match self {
+            Self::Static {
+                job_manager,
+                lifecycle,
+            } => TeardownResources {
+                job_manager,
+                lifecycle,
+                _ready: None,
+            },
+            Self::Startup(gate) => {
+                // This transition is the single linearization point between
+                // ready publication and shutdown. If publication won, teardown
+                // takes the bundle. If shutdown won, the initializer retains
+                // ownership and performs partial cleanup.
+                let ready = gate.begin_shutdown();
+                TeardownResources {
+                    job_manager: ready.as_ref().map(|ready| ready.job_manager.clone()),
+                    lifecycle: ready.as_ref().map(|ready| ready.lifecycle.clone()),
+                    _ready: ready,
                 }
             }
-            // Kill LSP children before awaiting workers. Pending requests then
-            // fail and release the PoolEntry state mutex held by each pass.
-            test_observe_lsp_pool_shutdown();
-            crate::lsp::pool::shutdown_global_bounded_if_initialized(LSP_ENTRY_SHUTDOWN_TIMEOUT)
-                .await?;
-            if let Some(job_manager) = &self.job_manager {
-                job_manager.shutdown(JOB_MANAGER_DRAIN_TIMEOUT).await;
-            }
-            Ok(())
-        };
-        let result = match tokio::time::timeout(shutdown_timeout, teardown).await {
-            Ok(result) => result,
-            Err(_) => {
-                cairn_task.abort();
-                ctrl_task.abort();
-                Err(crate::Error::ShutdownDeadlineExceeded {
-                    timeout_ms: u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
-                })
-            }
-        };
-
-        // Best-effort cleanup of socket files; the OS leaves them
-        // behind after the listener is dropped.
-        let _ = std::fs::remove_file(&self.paths.cairn);
-        let _ = std::fs::remove_file(&self.paths.control);
-        if result.is_ok() {
-            info!("daemon stopped");
         }
-        result
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bound(
+    paths: SocketPaths,
+    cairn: UnixListener,
+    control: UnixListener,
+    data_handler: Arc<dyn LineHandler>,
+    control_handler: Arc<dyn LineHandler>,
+    shutdown: Arc<Notify>,
+    ownership: RuntimeOwnership,
+    shutdown_timeout: Duration,
+) -> Result<()> {
+    let mut cairn_task = spawn_accept_loop("cairn", cairn, data_handler, shutdown.clone());
+    let mut ctrl_task = spawn_accept_loop("control", control, control_handler, shutdown.clone());
+
+    // The daemon lifetime is unbounded. Only teardown work after the
+    // Running -> ShuttingDown transition consumes the shutdown budget.
+    shutdown.notified().await;
+
+    let teardown = async {
+        // Stop accepting first and let already-admitted RPCs finish.
+        let _ = tokio::join!(&mut cairn_task, &mut ctrl_task);
+        let resources = ownership.begin_shutdown();
+        if let Some(job_manager) = &resources.job_manager {
+            job_manager.begin_shutdown();
+        }
+        if let Some(lifecycle) = &resources.lifecycle
+            && let Err(err) = lifecycle.shutdown(Duration::from_secs(1)).await
+        {
+            warn!(
+                error = %err,
+                "repository lifecycle shutdown did not drain; durable state will recover on next startup"
+            );
+        }
+        test_observe_lsp_pool_shutdown();
+        crate::lsp::pool::shutdown_global_bounded_if_initialized(LSP_ENTRY_SHUTDOWN_TIMEOUT)
+            .await?;
+        if let Some(job_manager) = &resources.job_manager {
+            job_manager.shutdown(JOB_MANAGER_DRAIN_TIMEOUT).await;
+        }
+        drop(resources);
+        Ok(())
+    };
+    let result = match tokio::time::timeout(shutdown_timeout, teardown).await {
+        Ok(result) => result,
+        Err(_) => {
+            cairn_task.abort();
+            ctrl_task.abort();
+            Err(crate::Error::ShutdownDeadlineExceeded {
+                timeout_ms: u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
+            })
+        }
+    };
+
+    let _ = std::fs::remove_file(&paths.cairn);
+    let _ = std::fs::remove_file(&paths.control);
+    if result.is_ok() {
+        info!("daemon stopped");
+    }
+    result
+}
+
+/// Start the revision drift scan after ready publication.
+pub fn spawn_revision_staleness_scan(
+    job_manager: Arc<JobManager>,
+    reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+) {
+    let cas_data_dir = job_manager.cas_data_dir().clone();
+    let scan_handle = tokio::task::spawn_blocking(move || {
+        crate::workspace_analyzer::check_revision_staleness_and_enqueue(
+            &cas_data_dir,
+            &job_manager,
+            reconcile.as_ref(),
+        )
+    });
+    tokio::spawn(async move {
+        match scan_handle.await {
+            Ok(Ok(_summary)) => {}
+            Ok(Err(err)) => {
+                warn!(error = %err, "revision staleness scan failed; daemon continues");
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    error = %join_err,
+                    "revision staleness scan panicked; daemon continues (no auto-rerun this boot)"
+                );
+            }
+        }
+    });
+}
+
+/// Clean up a fully constructed bundle that lost the ready-publication race.
+pub async fn shutdown_unpublished_resources(resources: ReadyDaemon) -> Result<()> {
+    resources.job_manager.begin_shutdown();
+    if let Err(err) = resources.lifecycle.shutdown(Duration::from_secs(1)).await {
+        warn!(
+            error = %err,
+            "unpublished repository lifecycle did not drain; durable state will recover on next startup"
+        );
+    }
+    crate::lsp::pool::shutdown_global_bounded_if_initialized(LSP_ENTRY_SHUTDOWN_TIMEOUT).await?;
+    resources
+        .job_manager
+        .shutdown(JOB_MANAGER_DRAIN_TIMEOUT)
+        .await;
+    drop(resources);
+    Ok(())
 }
 
 fn spawn_accept_loop(
@@ -398,6 +496,35 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    fn ready_resources_with_handlers(
+        data_handler: Arc<dyn LineHandler>,
+        control_handler: Arc<dyn LineHandler>,
+        _shutdown: Arc<Notify>,
+    ) -> (tempfile::TempDir, ReadyDaemon) {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let jobs = crate::jobs::JobManager::with_lifecycle(cas.clone(), lifecycle.clone());
+        let reconcile = RepoReconcileManager::new_with_lifecycle(
+            cas.clone(),
+            Some(jobs.clone()),
+            lifecycle.clone(),
+        );
+        let watcher = Arc::new(WatchManager::with_reconcile(cas, reconcile.clone()));
+        (
+            data,
+            ReadyDaemon {
+                data_handler,
+                control_handler,
+                job_manager: jobs,
+                reconcile,
+                lifecycle,
+                watch_manager: watcher,
+            },
+        )
+    }
+
     #[tokio::test]
     async fn round_trip_one_request() {
         let tmp = runtime_tempdir();
@@ -475,6 +602,83 @@ mod tests {
             .expect("daemon did not stop after notification")
             .expect("daemon task panicked");
         assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn initializing_daemon_outlives_deadline_and_acknowledges_shutdown() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let gate = StartupGate::new(shutdown.clone(), "test-version");
+        let daemon = InitializingDaemon::bind(paths.clone(), gate, shutdown).unwrap();
+        let mut daemon_task =
+            tokio::spawn(daemon.run_with_shutdown_timeout(Duration::from_millis(50)));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !daemon_task.is_finished(),
+            "initialization must not consume the teardown deadline"
+        );
+        let status = send_control_request(
+            &paths.control,
+            r#"{"jsonrpc":"2.0","id":1,"method":"status","params":null}"#,
+        )
+        .await;
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["result"]["daemon_version"], "test-version");
+        assert_eq!(status["result"]["initialization"]["state"], "initializing");
+
+        let response = send_control_request(
+            &paths.control,
+            r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#,
+        )
+        .await;
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["ok"], true);
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut daemon_task)
+            .await
+            .expect("initializing daemon did not stop")
+            .expect("initializing daemon task panicked");
+        assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn initializing_daemon_deadline_aborts_blocked_ready_connection() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let gate = StartupGate::new(shutdown.clone(), "test-version");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (_data, resources) = ready_resources_with_handlers(
+            Arc::new(BlockingHandler {
+                entered: entered.clone(),
+                release,
+            }),
+            Arc::new(EchoHandler),
+            shutdown.clone(),
+        );
+        assert!(gate.publish_ready(resources).is_ok());
+        let daemon = InitializingDaemon::bind(paths.clone(), gate, shutdown.clone()).unwrap();
+        let daemon_task =
+            tokio::spawn(daemon.run_with_shutdown_timeout(Duration::from_millis(100)));
+
+        let mut conn = UnixStream::connect(&paths.cairn).await.unwrap();
+        conn.write_all(b"hold\n").await.unwrap();
+        conn.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("blocking ready handler was not entered");
+        shutdown.notify_waiters();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), daemon_task)
+            .await
+            .expect("daemon exceeded test bound")
+            .expect("daemon task panicked");
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShutdownDeadlineExceeded { timeout_ms: 100 })
+        ));
     }
 
     #[tokio::test]
