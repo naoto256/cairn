@@ -1176,6 +1176,12 @@ pub fn increment_periodic_generation_if_due(
 /// picks the max desired but honours `force_generation` for the
 /// analyzer-enqueue variant.
 ///
+/// A manual force request clears an existing retry deadline so
+/// the operator's newly requested attempt can run immediately.
+/// If that attempt fails, `mark_attempt_failure` installs a new
+/// deadline which the worker must honour even while this force
+/// generation remains pending.
+///
 /// # Errors
 /// See [`increment_desired_generation`].
 pub fn increment_force_generation(
@@ -1183,7 +1189,7 @@ pub fn increment_force_generation(
     repo_hash: &str,
     now_ns: i64,
 ) -> Result<i64> {
-    let next = increment_desired_generation(tx, repo_hash, now_ns)?;
+    let next = increment_immediate_desired_generation(tx, repo_hash, now_ns)?;
     tx.execute(
         "UPDATE repo_reconcile_state SET force_generation = ?1 WHERE repo_hash = ?2",
         params![next, repo_hash],
@@ -1974,15 +1980,21 @@ mod tests {
     }
 
     #[test]
-    fn increment_force_generation_bumps_both_desired_and_force() {
+    fn increment_force_generation_bumps_both_desired_and_force_and_clears_retry() {
         let (_t, mut c) = fresh();
         let tx = c.transaction().unwrap();
         upsert_repository(&tx, "h", "/p", 0).unwrap();
-        assert_eq!(increment_force_generation(&tx, "h", 10).unwrap(), 1);
+        assert_eq!(increment_desired_generation(&tx, "h", 10).unwrap(), 1);
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        mark_attempt_failure(&tx, "h", 1, "transient failure", 5_000).unwrap();
+        assert_eq!(increment_force_generation(&tx, "h", 30).unwrap(), 2);
         tx.commit().unwrap();
         let s = get_reconcile_state(&c, "h").unwrap().unwrap();
-        assert_eq!(s.desired_generation, 1);
-        assert_eq!(s.force_generation, 1);
+        assert_eq!(s.desired_generation, 2);
+        assert_eq!(s.force_generation, 2);
+        assert_eq!(s.next_retry_at_ns, None);
+        assert_eq!(s.consecutive_failures, 1);
+        assert_eq!(s.last_error.as_deref(), Some("transient failure"));
     }
 
     // ─── MF-3: direct v3 → v4 migration path ────────────────────
