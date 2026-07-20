@@ -520,7 +520,7 @@ pub fn swift_cases() -> Vec<GoldenCase> {
             tier3_expected: vec![],
         },
         GoldenCase {
-            name: "swift_find_callers_top_level",
+            name: "swift_find_callees_top_level",
             language: "swift",
             tool: Tool::FindCallees,
             query: Query {
@@ -957,4 +957,20 @@ pub fn all_cases() -> Vec<GoldenCase> {
     v.extend(javascript_cases());
     v.extend(ruby_cases());
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swift_top_level_case_name_matches_callee_tool() {
+        let case = swift_cases()
+            .into_iter()
+            .find(|case| case.query.symbol.as_deref() == Some("runHelper"))
+            .unwrap();
+
+        assert_eq!(case.name, "swift_find_callees_top_level");
+        assert_eq!(case.tool, Tool::FindCallees);
+    }
 }
