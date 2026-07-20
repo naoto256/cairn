@@ -1108,5 +1108,4 @@ fn fallback_worker_concurrency() -> usize {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests;
