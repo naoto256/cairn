@@ -352,7 +352,7 @@ fn control_invocation(method: &'static str, params: Value) -> CtlInvocation {
 
 fn render(method: &str, resp: &Response, render_hint: RenderHint) {
     if let Some(err) = &resp.error {
-        eprintln!("error: {}", err.message);
+        rpc_client::render_error(err);
         return;
     }
     let Some(value) = &resp.result else {
@@ -574,6 +574,10 @@ fn format_repo_list_lines(r: &ListReposResult) -> Vec<String> {
 
 fn render_status(r: &StatusReport, snapshots: bool) {
     println!("cairn {} (uptime: {}s)", r.daemon_version, r.uptime_secs);
+    if let Some(line) = initialization_status_line(r) {
+        println!("  {line}");
+        return;
+    }
     if r.repos.is_empty() {
         println!("  (no repositories registered)");
         return;
@@ -597,6 +601,24 @@ fn render_status(r: &StatusReport, snapshots: bool) {
             println!("      jobs: {}", render_job_summary(&repo.job_summary));
         }
     }
+}
+
+fn initialization_status_line(report: &StatusReport) -> Option<String> {
+    if report.initialization.is_ready() {
+        return None;
+    }
+    let detail = report
+        .initialization
+        .detail
+        .map(|detail| format!(" ({})", detail.label()))
+        .unwrap_or_default();
+    Some(format!(
+        "initializing {}/{}: {}{}",
+        report.initialization.completed_phases,
+        report.initialization.total_phases,
+        report.initialization.phase.label(),
+        detail
+    ))
 }
 
 fn render_status_repo_summary(repo: &cairn_proto::control::RepoStatus) -> String {
@@ -797,6 +819,24 @@ mod tests {
         assert_eq!(
             invocation.render_hint,
             RenderHint::Status { snapshots: true }
+        );
+    }
+
+    #[test]
+    fn daemon_status_formats_initialization_progress_without_repo_placeholder() {
+        let report = StatusReport {
+            daemon_version: "0.8.0".into(),
+            uptime_secs: 1,
+            initialization: cairn_proto::control::DaemonInitializationStatus::initializing(
+                cairn_proto::control::DaemonInitializationPhase::WatcherBarrier,
+                Some(cairn_proto::control::DaemonInitializationDetail::ArmingRegisteredWatchers),
+            ),
+            repos: Vec::new(),
+        };
+
+        assert_eq!(
+            initialization_status_line(&report).as_deref(),
+            Some("initializing 4/7: watcher barrier (arming registered watchers)")
         );
     }
 
