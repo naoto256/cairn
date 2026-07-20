@@ -9,6 +9,16 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **Daemon sockets now expose typed startup progress immediately.** The data
+  and control sockets bind before storage, job restoration, watcher arming,
+  and startup reconciliation complete. `cairn ctl daemon status` remains
+  available with monotonic `N/7` phase progress, and shutdown is accepted
+  during initialization. Other requests fail once with JSON-RPC `-32005`
+  (`DaemonInitializing`) plus closed phase metadata and a retry hint; clients
+  are not placed in an automatic retry loop. The complete handler and manager
+  bundle is published atomically, so socket availability does not weaken the
+  watcher/reconcile readiness barrier or race shutdown cleanup.
+
 - **Explicit repository lifecycle policy and automatic orphan cleanup.** New
   registrations are ephemeral by default and are automatically deregistered,
   with their CAS store removed, when the root is definitively missing.

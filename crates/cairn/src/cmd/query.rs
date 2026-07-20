@@ -515,7 +515,7 @@ pub async fn run(args: Args) -> Result<()> {
         .with_context(|| format!("talking to {}", paths.cairn.display()))?;
 
     if let Some(err) = &resp.error {
-        eprintln!("error: {}", err.message);
+        rpc_client::render_error(err);
         return Err(anyhow!(err.message.clone()));
     }
     let Some(value) = resp.result else {
