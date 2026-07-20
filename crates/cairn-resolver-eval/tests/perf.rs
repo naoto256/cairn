@@ -68,7 +68,7 @@ struct QueryPerf {
     cases: usize,
     tier25_median_ms: f64,
     tier2_median_ms: f64,
-    tier25_to_tier2_ratio: f64,
+    tier25_to_tier2_ratio: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,8 +217,13 @@ fn query_perf(
         cases: cases.len(),
         tier25_median_ms: tier25,
         tier2_median_ms: tier2,
-        tier25_to_tier2_ratio: tier25 / tier2,
+        tier25_to_tier2_ratio: finite_ratio(tier25, tier2),
     })
+}
+
+fn finite_ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    let ratio = numerator / denominator;
+    ratio.is_finite().then_some(ratio)
 }
 
 fn median(samples: &mut [Duration]) -> Duration {
@@ -243,11 +248,14 @@ fn print_markdown(report: &PerfReport) {
             language.register_median_ms,
             metric_value(language.find_subtypes.as_ref(), |m| m.tier25_median_ms),
             metric_value(language.find_subtypes.as_ref(), |m| m.tier2_median_ms),
-            metric_value(language.find_subtypes.as_ref(), |m| m.tier25_to_tier2_ratio),
+            optional_metric_value(language.find_subtypes.as_ref(), |m| {
+                m.tier25_to_tier2_ratio
+            }),
             metric_value(language.find_references.as_ref(), |m| m.tier25_median_ms),
             metric_value(language.find_references.as_ref(), |m| m.tier2_median_ms),
-            metric_value(language.find_references.as_ref(), |m| m
-                .tier25_to_tier2_ratio),
+            optional_metric_value(language.find_references.as_ref(), |m| {
+                m.tier25_to_tier2_ratio
+            }),
         );
     }
     if let Some(lsp) = &report.lsp_pool {
@@ -270,6 +278,16 @@ fn print_markdown(report: &PerfReport) {
 fn metric_value(metric: Option<&QueryPerf>, value: impl FnOnce(&QueryPerf) -> f64) -> String {
     metric
         .map(|metric| format!("{:.3}", value(metric)))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_metric_value(
+    metric: Option<&QueryPerf>,
+    value: impl FnOnce(&QueryPerf) -> Option<f64>,
+) -> String {
+    metric
+        .and_then(value)
+        .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -483,6 +501,22 @@ fn median_selects_middle_of_five_samples() {
         Duration::from_millis(30),
     ];
     assert_eq!(median(&mut samples), Duration::from_millis(30));
+}
+
+#[test]
+fn non_finite_perf_ratio_serializes_as_null() {
+    let perf = QueryPerf {
+        cases: 1,
+        tier25_median_ms: 0.0,
+        tier2_median_ms: 0.0,
+        tier25_to_tier2_ratio: finite_ratio(0.0, 0.0),
+    };
+
+    assert_eq!(perf.tier25_to_tier2_ratio, None);
+    assert_eq!(
+        serde_json::to_value(perf).unwrap()["tier25_to_tier2_ratio"],
+        json!(null)
+    );
 }
 
 #[test]
