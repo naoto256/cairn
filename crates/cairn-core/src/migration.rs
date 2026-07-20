@@ -10,7 +10,7 @@
 //! migration goes badly, the worst case is deleting the file and
 //! re-indexing.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use tracing::debug;
 
 use crate::Result;
@@ -34,6 +34,14 @@ pub struct Migration {
 /// # Panics
 /// Panics if `migrations` is not sorted strictly ascending by `version`.
 pub fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
+    apply_with_pending_hook(conn, migrations, || {})
+}
+
+fn apply_with_pending_hook(
+    conn: &mut Connection,
+    migrations: &[Migration],
+    before_lock: impl FnOnce(),
+) -> Result<()> {
     // Enforce ordering at the call site rather than silently doing the
     // wrong thing on a typo.
     for pair in migrations.windows(2) {
@@ -51,7 +59,21 @@ pub fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
         return Ok(());
     }
 
-    let tx = conn.transaction()?;
+    before_lock();
+
+    // Serialize migration planning with migration execution. Another
+    // opener may have completed the same migrations after the optimistic
+    // read above, so the pending set must be refreshed under the writer lock.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let pending: Vec<&Migration> = migrations.iter().filter(|m| m.version > current).collect();
+
+    if pending.is_empty() {
+        debug!(current, "schema brought up to date by concurrent opener");
+        tx.commit()?;
+        return Ok(());
+    }
+
     for m in &pending {
         debug!(version = m.version, "applying migration");
         tx.execute_batch(m.sql)?;
@@ -113,6 +135,8 @@ pub fn open_with_migrations(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     fn make_conn() -> Connection {
@@ -202,5 +226,68 @@ mod tests {
             .unwrap();
         // In-memory DBs can report "memory" instead of WAL; on disk they'd be WAL.
         assert!(mode == "wal" || mode == "memory");
+    }
+
+    #[test]
+    fn concurrent_openers_refresh_pending_migrations_under_writer_lock() {
+        const MIGRATIONS: &[Migration] = &[
+            Migration {
+                version: 1,
+                sql: "CREATE TABLE a (x INTEGER);",
+            },
+            Migration {
+                version: 2,
+                sql: "ALTER TABLE a ADD COLUMN y INTEGER;",
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let mut blocker = Connection::open(&path).unwrap();
+        blocker
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let observed = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let observed = Arc::clone(&observed);
+            workers.push(std::thread::spawn(move || {
+                let mut conn = Connection::open(path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                apply_with_pending_hook(&mut conn, MIGRATIONS, || {
+                    observed.wait();
+                })
+            }));
+        }
+
+        // Both workers have observed user_version=0. Releasing the third
+        // connection's lock lets them migrate serially from the same stale
+        // observation; the second worker must refresh before executing SQL.
+        observed.wait();
+        blocker_tx.commit().unwrap();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let conn = Connection::open(path).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(a)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(columns, ["x", "y"]);
     }
 }
