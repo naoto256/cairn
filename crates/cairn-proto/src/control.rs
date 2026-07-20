@@ -224,6 +224,21 @@ impl DaemonInitializationPhase {
             Self::Ready => Self::TOTAL_PHASES,
         }
     }
+
+    /// Stable human label used by CLI progress output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SocketBound => "socket bound",
+            Self::RepositoryLifecycle => "repository lifecycle",
+            Self::JobManager => "job manager",
+            Self::ReconcileRecovery => "reconcile recovery",
+            Self::WatcherBarrier => "watcher barrier",
+            Self::ReconcilePrime => "reconcile prime",
+            Self::PeriodicScheduler => "periodic scheduler",
+            Self::Ready => "ready",
+        }
+    }
 }
 
 /// Closed, path-free detail vocabulary for the current startup operation.
@@ -242,6 +257,24 @@ pub enum DaemonInitializationDetail {
     ArmingRegisteredWatchers,
     RecordingStartupGenerations,
     StartingPeriodicReconcile,
+}
+
+impl DaemonInitializationDetail {
+    /// Stable human label with no repository or error text.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OpeningStorage => "opening storage",
+            Self::SweepingRepositories => "sweeping repositories",
+            Self::RestoringJobs => "restoring jobs",
+            Self::StartingJobWorkers => "starting job workers",
+            Self::RecoveringReconcileAttempts => "recovering reconcile attempts",
+            Self::BindingRuntimeManagers => "binding runtime managers",
+            Self::ArmingRegisteredWatchers => "arming registered watchers",
+            Self::RecordingStartupGenerations => "recording startup generations",
+            Self::StartingPeriodicReconcile => "starting periodic reconcile",
+        }
+    }
 }
 
 /// One monotonic daemon-startup observation.

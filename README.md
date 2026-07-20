@@ -225,6 +225,15 @@ Runs in the foreground. Data dir defaults to
 `~/Library/Caches/cairn/` (macOS) or `$XDG_RUNTIME_DIR/cairn/` (Linux),
 both clamped to mode 0700.
 
+The sockets open before repository and analyzer initialization finishes.
+`cairn ctl daemon status` remains available throughout startup and exits
+successfully with closed progress such as `initializing 4/7: watcher barrier`.
+Other control and query requests fail once with JSON-RPC `-32005`
+(`DaemonInitializing`), including the current phase and a retry hint; clients
+choose when to retry rather than entering an automatic retry loop. The daemon
+publishes normal query access only after lifecycle recovery, watcher arming,
+startup reconciliation, and the periodic scheduler are all ready.
+
 **Environment variables** (all optional):
 
 - `CAIRN_LSP_POOL_MAX_ENTRIES` — hard cap on the number of live
@@ -238,7 +247,8 @@ both clamped to mode 0700.
   eviction completes, or via `cairn ctl repo reindex <alias>`).
 
 `cairn ctl daemon shutdown` acknowledges the shutdown request immediately;
-process teardown continues asynchronously. Cairn stops accepting requests,
+this also works while initialization is in progress. Process teardown continues
+asynchronously. Cairn stops accepting requests,
 cancels active analyzer work, reaps LSP children, and drains workers under a
 10-second daemon deadline, followed by a 2-second runtime backstop for residual
 blocking filesystem work.

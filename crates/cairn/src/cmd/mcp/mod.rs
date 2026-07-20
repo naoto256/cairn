@@ -516,6 +516,35 @@ mod tests {
     }
 
     #[test]
+    fn initializing_error_data_is_forwarded_without_rewriting() {
+        let data = serde_json::json!({
+            "initialization": {
+                "state": "initializing",
+                "phase": "watcher_barrier",
+                "completed_phases": 4,
+                "total_phases": 7,
+                "detail": "arming_registered_watchers"
+            },
+            "hints": [{"code": "daemon_not_ready", "message": "Retry later."}]
+        });
+        let response = RpcResponse {
+            jsonrpc: JsonRpcVersion::V2,
+            id: RequestId::Number(1),
+            result: None,
+            error: Some(cairn_proto::jsonrpc::ResponseError {
+                code: error_code::DAEMON_INITIALIZING,
+                message: "daemon is initializing".into(),
+                data: Some(data.clone()),
+            }),
+        };
+
+        let forwarded = mcp_wrap_rpc_response(RequestId::String("mcp".into()), response);
+        let error = forwarded.error.unwrap();
+        assert_eq!(error.code, error_code::DAEMON_INITIALIZING);
+        assert_eq!(error.data, Some(data));
+    }
+
+    #[test]
     fn mcp_tool_descriptions_mention_when_not_for_recovery() {
         let specs = dispatcher().tool_specs();
 
