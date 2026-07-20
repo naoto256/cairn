@@ -105,6 +105,9 @@ pub mod error_code {
     pub const AMBIGUOUS_SOURCE: i32 = -32003;
     /// A non-file-targeted lookup could not prove current-snapshot freshness.
     pub const SNAPSHOT_STALE: i32 = -32004;
+    /// The daemon accepted the connection but has not published its ready
+    /// resource bundle yet.
+    pub const DAEMON_INITIALIZING: i32 = -32005;
 }
 
 /// Construct a successful JSON-RPC response.
