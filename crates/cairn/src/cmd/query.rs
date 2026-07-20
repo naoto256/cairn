@@ -124,8 +124,9 @@ enum QueryCommand {
         /// Fully-qualified name (`crate::module::name` or just `name`
         /// when unambiguous).
         qualified: String,
-        /// Repository alias. Omit to search every registered repo
-        /// (first matching symbol wins).
+        /// Repository alias. Omit to search every registered repo. Duplicate
+        /// physical declarations return ambiguity candidates; use `--repo`,
+        /// `--file`, or `--file` with `--line` to select one.
         #[arg(long)]
         repo: Option<String>,
         #[arg(long)]
@@ -134,8 +135,8 @@ enum QueryCommand {
         /// `tentative/<id>`). Takes priority over `--branch`.
         #[arg(long)]
         anchor: Option<String>,
-        /// File path (relative to repo root) to disambiguate the
-        /// qualified name when it exists in multiple files.
+        /// File path (relative to repo root) to disambiguate the qualified
+        /// name. If multiple declarations share the file, add `--line`.
         #[arg(long)]
         file: Option<String>,
         /// 1-indexed declaration start line. Requires `--file` and is sent

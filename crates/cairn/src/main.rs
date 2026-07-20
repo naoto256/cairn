@@ -219,6 +219,21 @@ mod tests {
     }
 
     #[test]
+    fn query_source_help_describes_fail_closed_ambiguity_selection() {
+        let mut cmd = super::Cli::command();
+        let query = cmd.find_subcommand_mut("query").unwrap();
+        let source = query.find_subcommand_mut("source").unwrap();
+        let mut help = Vec::new();
+        source.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("Duplicate physical declarations return ambiguity candidates"));
+        assert!(help.contains("use `--repo`, `--file`, or `--file` with `--line` to select one"));
+        assert!(help.contains("If multiple declarations share the file, add `--line`"));
+        assert!(!help.contains("first matching symbol wins"));
+    }
+
+    #[test]
     fn ctl_help_uses_object_action_surface_without_legacy_top_level_verbs() {
         let cmd = super::Cli::command();
         let ctl = cmd
