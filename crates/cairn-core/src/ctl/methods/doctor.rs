@@ -1543,9 +1543,18 @@ pub(crate) fn reconcile_state_checks(cas_data_dir: &CasDataDir) -> Result<Vec<Do
         ));
     }
     let completed = cas_registry::list_recent_completed_removals(&index, 10)?;
-    if !completed.is_empty() {
-        checks.push(doctor_check(
-            "recent repository auto-prune",
+    if let Some(check) = completed_removal_history_check(&completed) {
+        checks.push(check);
+    }
+    Ok(checks)
+}
+
+fn completed_removal_history_check(
+    completed: &[cas_registry::RepositoryRemovalEvent],
+) -> Option<DoctorCheck> {
+    (!completed.is_empty()).then(|| {
+        doctor_check(
+            "recent repository removals",
             DoctorStatus::Pass,
             Some(
                 completed
@@ -1555,9 +1564,8 @@ pub(crate) fn reconcile_state_checks(cas_data_dir: &CasDataDir) -> Result<Vec<Do
                     .join(", "),
             ),
             None,
-        ));
-    }
-    Ok(checks)
+        )
+    })
 }
 
 fn format_repo_label(repo_hash: &str, aliases: &[String]) -> String {
@@ -3315,6 +3323,27 @@ mod tests {
         // nothing more here.
         let _ = repo_hash;
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn completed_removal_history_does_not_mislabel_explicit_removals_as_auto_prune() {
+        let check = completed_removal_history_check(&[cas_registry::RepositoryRemovalEvent {
+            event_id: 1,
+            repo_hash: "old-hash".into(),
+            root_path: "/repos/old".into(),
+            removed_at_ns: 10,
+            reason: cas_registry::RepositoryRemovalReason::AliasRetargeted,
+            store_cleanup_state: cas_registry::StoreCleanupState::Complete,
+            cleanup_error: None,
+        }])
+        .expect("completed removal should be reported");
+
+        assert_eq!(check.name, "recent repository removals");
+        assert_eq!(check.status, DoctorStatus::Pass);
+        assert_eq!(
+            check.detail.as_deref(),
+            Some("/repos/old (alias_retargeted)")
+        );
     }
 
     /// MF-6 (doctor dirty-gap classification): desired>applied,
