@@ -55,6 +55,14 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
             .spawn()
             .unwrap(),
     );
+    let mut stderr_reader = Some(thread::spawn({
+        let mut stderr = child.0.stderr.take().unwrap();
+        move || {
+            let mut output = String::new();
+            stderr.read_to_string(&mut output).unwrap();
+            output
+        }
+    }));
     let control = runtime.path().join("control.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !control.exists() {
@@ -63,14 +71,7 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
             "daemon control socket did not appear"
         );
         if let Some(status) = child.0.try_wait().unwrap() {
-            let mut stderr = String::new();
-            child
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
+            let stderr = stderr_reader.take().unwrap().join().unwrap();
             panic!("daemon exited before binding its socket: {status}; stderr={stderr}");
         }
         thread::sleep(Duration::from_millis(20));
@@ -89,7 +90,11 @@ fn idle_daemon_survives_thirty_seconds_and_shutdown_remains_responsive() {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "daemon exited unsuccessfully: {status}");
+            let stderr = stderr_reader.take().unwrap().join().unwrap();
+            assert!(
+                status.success(),
+                "daemon exited unsuccessfully: {status}; stderr={stderr}"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "daemon did not stop after ACK");
