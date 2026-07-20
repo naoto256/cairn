@@ -1248,11 +1248,9 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
 
         return doctor_check(
             format!("repo `{alias}` Tier-3 analyzer status"),
-            DoctorStatus::Warn,
-            Some("no Tier-3 run recorded for this alias".into()),
-            Some(format!(
-                "Trigger a reindex with `cairn ctl repo reindex {alias}` or wait for the next file edit to drive a watcher tick."
-            )),
+            DoctorStatus::Pass,
+            Some("not applicable (no workspace analyzers expected)".into()),
+            None,
         );
     }
 
@@ -2009,8 +2007,8 @@ mod tests {
                 expected_analyzer_revisions: HashMap::new(),
             },
         );
-        let missing = tier3_run_check(
-            "missing",
+        let not_applicable = tier3_run_check(
+            "not-applicable",
             &AliasStoreState {
                 tentative_manifest_id: Some(4),
                 tier3_runs: Vec::new(),
@@ -2056,13 +2054,42 @@ mod tests {
                 .unwrap()
                 .contains("manifest 3")
         );
-        assert_eq!(missing.status, DoctorStatus::Warn);
+        assert_eq!(not_applicable.status, DoctorStatus::Pass);
+        assert_eq!(
+            not_applicable.detail.as_deref(),
+            Some("not applicable (no workspace analyzers expected)")
+        );
+        assert!(not_applicable.remediation.is_none());
+    }
+
+    #[test]
+    fn tier3_run_check_warns_when_expected_analyzer_has_no_run() {
+        let check = tier3_run_check(
+            "missing",
+            &AliasStoreState {
+                tentative_manifest_id: Some(4),
+                tier3_runs: Vec::new(),
+                expected_tier3_analyzer_ids: vec!["demo-analyzer".into()],
+                stale_revisions: Vec::new(),
+                stale_parser_revisions: Vec::new(),
+                expected_analyzer_revisions: HashMap::new(),
+            },
+        );
+
+        assert_eq!(check.status, DoctorStatus::Warn);
         assert!(
-            missing
+            check
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("demo-analyzer=not yet recorded")
+        );
+        assert!(
+            check
                 .remediation
                 .as_deref()
                 .unwrap()
-                .contains("repo reindex")
+                .contains("repo reindex missing")
         );
     }
 
