@@ -148,6 +148,10 @@ impl Daemon {
             self.shutdown.clone(),
         );
 
+        // The daemon lifetime is unbounded. Only teardown work after the
+        // Running -> ShuttingDown transition consumes the shutdown budget.
+        self.shutdown.notified().await;
+
         let teardown = async {
             // Stop accepting first and let already-admitted RPCs finish.
             let _ = tokio::join!(&mut cairn_task, &mut ctrl_task);
@@ -431,6 +435,99 @@ mod tests {
 
         shutdown.notify_waiters();
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon_task).await;
+    }
+
+    #[tokio::test]
+    async fn idle_daemon_outlives_its_teardown_deadline() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let mut daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                Daemon {
+                    paths,
+                    data_handler: Arc::new(EchoHandler),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: None,
+                    reconcile: None,
+                    lifecycle: None,
+                }
+                .run_with_shutdown_timeout(Duration::from_millis(50))
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !daemon_task.is_finished(),
+            "idle lifetime must not consume the teardown deadline"
+        );
+        let response = send_control_request(&paths.control, "health-check").await;
+        assert!(response.contains("echo: health-check"), "got: {response:?}");
+
+        shutdown.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut daemon_task)
+            .await
+            .expect("daemon did not stop after notification")
+            .expect("daemon task panicked");
+        assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn control_shutdown_acknowledges_before_clean_daemon_exit() {
+        let runtime_tmp = runtime_tempdir();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas_data_dir.ensure().unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let control_handler = Arc::new(CtlHandler::new(
+            cas_data_dir,
+            shutdown.clone(),
+            "test-version",
+        ));
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                Daemon {
+                    paths,
+                    data_handler: Arc::new(EchoHandler),
+                    control_handler,
+                    shutdown,
+                    job_manager: None,
+                    reconcile: None,
+                    lifecycle: None,
+                }
+                .run_with_shutdown_timeout(Duration::from_secs(1))
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_control_request(
+                &paths.control,
+                r#"{"jsonrpc":"2.0","id":1,"method":"shutdown","params":{}}"#,
+            ),
+        )
+        .await
+        .expect("shutdown acknowledgement timed out");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["ok"], true);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), daemon_task)
+            .await
+            .expect("daemon did not exit after acknowledged shutdown")
+            .expect("daemon task panicked");
+        assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+        assert!(!paths.cairn.exists());
+        assert!(!paths.control.exists());
     }
 
     #[tokio::test]
