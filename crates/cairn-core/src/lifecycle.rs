@@ -753,7 +753,18 @@ impl RepoLifecycleManager {
         }
         permit.lease.take();
         if let Some(repo_hash) = old_hash {
-            self.request_removal(RemovalIntent::AliasRetargeted { repo_hash })?;
+            // The alias retarget and durable removal request committed together above. A
+            // runtime wake failure must not report the committed registration as rolled back;
+            // startup recovery will resume the retained removal request.
+            if let Err(error) = self.request_removal(RemovalIntent::AliasRetargeted {
+                repo_hash: repo_hash.clone(),
+            }) {
+                warn!(
+                    %repo_hash,
+                    %error,
+                    "alias retarget committed; runtime removal wake deferred"
+                );
+            }
         }
         Ok(RegistrationPublication {
             repo_hash: permit.repo_hash,
@@ -1464,6 +1475,50 @@ mod tests {
             RepositoryRemovalReason::AliasRetargeted
         );
         assert_eq!(registry::count_aliases_for_repo(&index, "old").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn committed_alias_retarget_survives_runtime_wake_failure() {
+        let old_root = tempfile::tempdir().unwrap();
+        let new_root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+
+        let old = lifecycle
+            .begin_registration("old".into(), old_root.path().to_path_buf(), 1)
+            .unwrap();
+        lifecycle
+            .publish_registration(old, "demo", None, 2, RegistrationReconcilePolicy::None)
+            .unwrap();
+        let new = lifecycle
+            .begin_registration("new".into(), new_root.path().to_path_buf(), 3)
+            .unwrap();
+        lifecycle.shutdown(Duration::from_secs(1)).await.unwrap();
+
+        let publication = lifecycle
+            .publish_registration(new, "demo", None, 4, RegistrationReconcilePolicy::None)
+            .unwrap();
+
+        assert_eq!(publication.repo_hash, "new");
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        assert_eq!(
+            registry::lookup_by_alias(&index, "demo")
+                .unwrap()
+                .unwrap()
+                .repo_hash,
+            "new"
+        );
+        assert_eq!(
+            registry::lookup_repository(&index, "old")
+                .unwrap()
+                .unwrap()
+                .removal_request
+                .unwrap()
+                .reason,
+            RepositoryRemovalReason::AliasRetargeted
+        );
     }
 
     #[tokio::test]
