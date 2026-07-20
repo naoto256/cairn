@@ -125,6 +125,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_guard_precedes_initialization_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let initialization = cairn_proto::control::DaemonInitializationStatus::initializing(
+            cairn_proto::control::DaemonInitializationPhase::WatcherBarrier,
+            Some(cairn_proto::control::DaemonInitializationDetail::ArmingRegisteredWatchers),
+        );
+        let _server =
+            spawn_status_server_with_initialization(socket.clone(), "1.0.0", initialization);
+
+        let err = check_daemon_version(&socket, VersionGuardMode::Cli)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("incompatible major versions"));
+        assert!(!err.to_string().contains("initializing"));
+    }
+
+    #[tokio::test]
     async fn mcp_guard_warns_but_continues_on_major_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
@@ -139,6 +157,18 @@ mod tests {
         socket: std::path::PathBuf,
         version: &'static str,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_status_server_with_initialization(
+            socket,
+            version,
+            cairn_proto::control::DaemonInitializationStatus::ready(),
+        )
+    }
+
+    fn spawn_status_server_with_initialization(
+        socket: std::path::PathBuf,
+        version: &'static str,
+        initialization: cairn_proto::control::DaemonInitializationStatus,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -150,7 +180,7 @@ mod tests {
             let report = StatusReport {
                 daemon_version: version.into(),
                 uptime_secs: 1,
-                initialization: cairn_proto::control::DaemonInitializationStatus::ready(),
+                initialization,
                 repos: Vec::new(),
             };
             let response = ok_response(RequestId::Number(1), json!(report));
