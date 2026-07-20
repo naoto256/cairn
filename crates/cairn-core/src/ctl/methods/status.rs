@@ -73,14 +73,13 @@ impl ControlMethod for Status {
                         )));
                     }
                 };
+                let persistent = cas_registry::lookup_repository(&index, &entry.repo_hash)?
+                    .ok_or_else(|| missing_status_repository(&entry.alias))?
+                    .persistent;
                 out.push(RepoStatus {
                     alias: entry.alias,
                     root: entry.root_path,
-                    persistent: cas_registry::lookup_repository(&index, &entry.repo_hash)?
-                        .ok_or_else(|| Error::RepoNotFound {
-                            alias: entry.repo_hash.clone(),
-                        })?
-                        .persistent,
+                    persistent,
                     snapshots,
                     job_summary,
                     jobs: Vec::new(),
@@ -99,6 +98,12 @@ impl ControlMethod for Status {
             repos,
         })
         .unwrap())
+    }
+}
+
+fn missing_status_repository(alias: &str) -> Error {
+    Error::RepoNotFound {
+        alias: alias.to_owned(),
     }
 }
 
@@ -210,6 +215,16 @@ fn collect_job_summary(conn: &rusqlite::Connection) -> Result<JobSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_status_repository_reports_the_user_facing_alias() {
+        let error = missing_status_repository("demo");
+
+        assert!(matches!(
+            error,
+            Error::RepoNotFound { alias } if alias == "demo"
+        ));
+    }
     use cairn_lang_api::all_backends;
     use cairn_lang_markdown as _;
     use cairn_lang_python as _;
