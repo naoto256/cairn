@@ -7,6 +7,8 @@ versions follow [SemVer](https://semver.org/).
 
 ## [0.8.0] — 2026-07-20
 
+> Compatibility: no breaking changes. Pre-1.0 SemVer policy per README.
+
 ### Added
 
 - **Daemon sockets now expose typed startup progress immediately.** The data
@@ -159,6 +161,14 @@ versions follow [SemVer](https://semver.org/).
   not applicable instead of warning that a run is missing. Repositories that
   expect an analyzer but have no recorded run continue to receive the warning
   and reindex remediation.
+
+### PRs
+
+- Snapshot integrity and source-query correctness: #252, #253, #254, #255,
+  #256, #257
+- Daemon lifetime and verified source-mismatch handling: #258
+- Early socket binding and initialization progress: #259
+- Analyzer-free repository doctor correction: #260
 
 ## [0.7.1] — 2026-07-12
 
