@@ -20,7 +20,7 @@ use crate::data_rpc::helpers::{
     query_one_or_all_snapshots,
 };
 use crate::query::{self, SymbolSourceRow};
-use crate::register::load_blob_or_verified_worktree;
+use crate::register::{BlobLoadError, load_blob_or_verified_worktree};
 use crate::{Error, Result};
 
 pub struct GetSymbolSource;
@@ -257,11 +257,18 @@ fn materialise(
     row: &SymbolSourceRow,
 ) -> Result<String> {
     let bytes = load_blob_or_verified_worktree(worktree_root, &row.blob_sha, &row.path).map_err(
-        |_| {
-            Error::InvalidArgument(format!(
+        |err| match err {
+            BlobLoadError::WorktreeBlobMismatch => Error::FileNotIndexed {
+                repo: Some(repo.to_string()),
+                file: row.path.clone(),
+                reason: "source_blob_mismatch".into(),
+            },
+            BlobLoadError::InvalidBlobSha | BlobLoadError::WorktreeRead(_) => {
+                Error::InvalidArgument(format!(
                 "get_symbol_source: indexed bytes unavailable or changed for {repo}:{}; reindex needed",
                 row.path
-            ))
+                ))
+            }
         },
     )?;
     if row.byte_end > bytes.len() || row.byte_start > row.byte_end {
@@ -331,10 +338,51 @@ mod tests {
 
         assert!(matches!(
             err,
-            Error::InvalidArgument(message)
-                if message.contains("demo:source.rs")
-                    && !message.contains(&tmp.path().display().to_string())
+            Error::FileNotIndexed {
+                repo: Some(repo),
+                file,
+                reason,
+            } if repo == "demo"
+                && file == "source.rs"
+                && reason == "source_blob_mismatch"
         ));
+    }
+
+    #[test]
+    fn source_blob_mismatch_maps_to_structured_file_not_indexed_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("source.rs"), b"changed\n").unwrap();
+        let row = SymbolSourceRow {
+            symbol_id: 1,
+            qualified: "crate::source".into(),
+            name: "source".into(),
+            kind: cairn_proto::common::SymbolKind::Function,
+            signature: None,
+            doc: None,
+            path: "source.rs".into(),
+            blob_sha: crate::cas::hash::git_blob_sha(b"indexed\n"),
+            byte_start: 0,
+            byte_end: 7,
+            line_start: 1,
+            line_end: 1,
+            parser_id: "rust".into(),
+        };
+
+        let err = materialise("demo", tmp.path(), &row).unwrap_err();
+        let response =
+            crate::jsonrpc_errors::error_from(cairn_proto::jsonrpc::RequestId::Number(1), &err);
+        let rpc_error = response.error.expect("error response");
+
+        assert_eq!(
+            rpc_error.code,
+            cairn_proto::jsonrpc::error_code::FILE_NOT_INDEXED
+        );
+        assert_eq!(rpc_error.data.as_ref().unwrap()["repo"], "demo");
+        assert_eq!(rpc_error.data.as_ref().unwrap()["file"], "source.rs");
+        assert_eq!(
+            rpc_error.data.as_ref().unwrap()["reason"],
+            "source_blob_mismatch"
+        );
     }
 
     #[tokio::test]
