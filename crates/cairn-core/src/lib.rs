@@ -74,7 +74,7 @@ pub enum Error {
     AnchorNotFound { name: String },
     /// A file-target query cannot distinguish a genuinely empty result from
     /// a file missing in, or a stale publication of, the selected snapshot.
-    #[error("file `{file}` is not indexed in a freshness-verified snapshot{repo_suffix}", repo_suffix = repo.as_ref().map(|repo| format!(" for repo `{repo}`")).unwrap_or_default())]
+    #[error("file `{file}` is not indexed in a freshness-verified snapshot{repo_suffix}: {reason}", repo_suffix = repo.as_ref().map(|repo| format!(" for repo `{repo}`")).unwrap_or_default())]
     FileNotIndexed {
         repo: Option<String>,
         file: String,

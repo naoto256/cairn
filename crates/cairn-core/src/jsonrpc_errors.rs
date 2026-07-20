@@ -235,13 +235,15 @@ mod tests {
             &Error::FileNotIndexed {
                 repo: Some("demo".into()),
                 file: "src/new.rs".into(),
-                reason: "file_not_indexed".into(),
+                reason: "source_blob_mismatch".into(),
             },
         );
         let error = response.error.unwrap();
 
         assert_eq!(error.code, error_code::FILE_NOT_INDEXED);
+        assert!(error.message.contains("source_blob_mismatch"));
         let data = error.data.unwrap();
+        assert_eq!(data["reason"], "source_blob_mismatch");
         assert_eq!(
             data["completeness"]["reason"],
             "file_not_indexed_or_snapshot_stale"
