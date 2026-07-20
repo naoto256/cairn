@@ -44,11 +44,12 @@ use crate::types::{ActualHit, GoldenCase, Tool};
 /// then delete Tier-2.5 resolutions from that same store to obtain a Tier-2
 /// baseline without changing any other input.
 pub struct RegisteredFixture {
-    _live: fixture::LiveFixture,
-    _db_tmp: tempfile::TempDir,
+    // Rust drops fields in declaration order. Close SQLite before removing either tempdir.
     conn: rusqlite::Connection,
     anchor: AnchorName,
     register_elapsed: Duration,
+    _db_tmp: tempfile::TempDir,
+    _live: fixture::LiveFixture,
 }
 
 impl RegisteredFixture {
@@ -97,11 +98,11 @@ pub fn register_fixture(language: &str) -> Result<RegisteredFixture> {
     }
 
     Ok(RegisteredFixture {
-        _live: live,
-        _db_tmp: db_tmp,
         conn,
         anchor: AnchorName::tentative(outcome.worktree_id),
         register_elapsed,
+        _db_tmp: db_tmp,
+        _live: live,
     })
 }
 
@@ -316,4 +317,19 @@ fn run_tool(
     };
 
     Ok(hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_fixture_removes_store_after_connection_closes() {
+        let fixture = register_fixture("rust").unwrap();
+        let store_dir = fixture._db_tmp.path().to_path_buf();
+
+        drop(fixture);
+
+        assert!(!store_dir.exists());
+    }
 }
