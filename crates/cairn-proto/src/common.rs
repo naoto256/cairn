@@ -223,6 +223,9 @@ pub enum DiagnosticCode {
     /// The selected current snapshot could not prove that the requested file
     /// and rows came from a fresh, fully reconciled publication.
     FileNotIndexedOrSnapshotStale,
+    /// The daemon socket is accepting status and shutdown requests while the
+    /// ready resource bundle is still being constructed.
+    DaemonInitializing,
 }
 
 /// Severity for structured diagnostics.

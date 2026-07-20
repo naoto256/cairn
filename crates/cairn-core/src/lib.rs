@@ -86,6 +86,17 @@ pub enum Error {
         repo: Option<String>,
         reason: String,
     },
+    /// The daemon socket is available, but startup has not atomically
+    /// published the resource bundle required by this method.
+    #[error(
+        "daemon is initializing ({completed}/{total}: {phase:?})",
+        completed = initialization.completed_phases,
+        total = initialization.total_phases,
+        phase = initialization.phase
+    )]
+    DaemonInitializing {
+        initialization: cairn_proto::control::DaemonInitializationStatus,
+    },
     /// A source lookup matched multiple physical declarations and requires a
     /// narrower repo, file, or line selector.
     #[error(
@@ -160,6 +171,18 @@ mod tests {
         assert_eq!(
             Error::ShutdownDeadlineExceeded { timeout_ms: 10_000 }.to_string(),
             "daemon shutdown deadline exceeded after 10000ms"
+        );
+        assert_eq!(
+            Error::DaemonInitializing {
+                initialization: cairn_proto::control::DaemonInitializationStatus::initializing(
+                    cairn_proto::control::DaemonInitializationPhase::WatcherBarrier,
+                    Some(
+                        cairn_proto::control::DaemonInitializationDetail::ArmingRegisteredWatchers,
+                    ),
+                ),
+            }
+            .to_string(),
+            "daemon is initializing (4/7: WatcherBarrier)"
         );
     }
 

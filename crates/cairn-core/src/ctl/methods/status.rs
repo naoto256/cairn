@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use cairn_lang_api::{LanguageBackend, all_backends};
 use cairn_proto::control::{
-    JobSummary, RepoStatus, SnapshotStatus as ProtoSnapshotStatus, StatusReport,
+    DaemonInitializationStatus, JobSummary, RepoStatus, SnapshotStatus as ProtoSnapshotStatus,
+    StatusReport,
 };
 use linkme::distributed_slice;
 use rusqlite::params;
@@ -94,6 +95,7 @@ impl ControlMethod for Status {
         Ok(serde_json::to_value(StatusReport {
             daemon_version: version,
             uptime_secs: uptime,
+            initialization: DaemonInitializationStatus::ready(),
             repos,
         })
         .unwrap())

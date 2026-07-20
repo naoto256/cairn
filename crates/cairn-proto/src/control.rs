@@ -184,6 +184,116 @@ pub struct JobsPruneRepoEntry {
 
 // ─── status ────────────────────────────────────────────────────────────────
 
+/// Stable daemon-startup state exposed by [`StatusReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonInitializationState {
+    Initializing,
+    Ready,
+}
+
+/// Ordered startup phase. The seven work phases are followed by the terminal
+/// [`Self::Ready`] state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonInitializationPhase {
+    SocketBound,
+    RepositoryLifecycle,
+    JobManager,
+    ReconcileRecovery,
+    WatcherBarrier,
+    ReconcilePrime,
+    PeriodicScheduler,
+    Ready,
+}
+
+impl DaemonInitializationPhase {
+    pub const TOTAL_PHASES: u8 = 7;
+
+    /// Number of work phases completed before this phase became current.
+    #[must_use]
+    pub const fn completed_phases(self) -> u8 {
+        match self {
+            Self::SocketBound => 0,
+            Self::RepositoryLifecycle => 1,
+            Self::JobManager => 2,
+            Self::ReconcileRecovery => 3,
+            Self::WatcherBarrier => 4,
+            Self::ReconcilePrime => 5,
+            Self::PeriodicScheduler => 6,
+            Self::Ready => Self::TOTAL_PHASES,
+        }
+    }
+}
+
+/// Closed, path-free detail vocabulary for the current startup operation.
+///
+/// Keeping this as an enum prevents repository paths, backend errors, or other
+/// free text from crossing the control-socket confidentiality boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonInitializationDetail {
+    OpeningStorage,
+    SweepingRepositories,
+    RestoringJobs,
+    StartingJobWorkers,
+    RecoveringReconcileAttempts,
+    BindingRuntimeManagers,
+    ArmingRegisteredWatchers,
+    RecordingStartupGenerations,
+    StartingPeriodicReconcile,
+}
+
+/// One monotonic daemon-startup observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonInitializationStatus {
+    pub state: DaemonInitializationState,
+    pub phase: DaemonInitializationPhase,
+    pub completed_phases: u8,
+    pub total_phases: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<DaemonInitializationDetail>,
+}
+
+impl DaemonInitializationStatus {
+    #[must_use]
+    pub const fn initializing(
+        phase: DaemonInitializationPhase,
+        detail: Option<DaemonInitializationDetail>,
+    ) -> Self {
+        assert!(!matches!(phase, DaemonInitializationPhase::Ready));
+        Self {
+            state: DaemonInitializationState::Initializing,
+            phase,
+            completed_phases: phase.completed_phases(),
+            total_phases: DaemonInitializationPhase::TOTAL_PHASES,
+            detail,
+        }
+    }
+
+    #[must_use]
+    pub const fn ready() -> Self {
+        Self {
+            state: DaemonInitializationState::Ready,
+            phase: DaemonInitializationPhase::Ready,
+            completed_phases: DaemonInitializationPhase::TOTAL_PHASES,
+            total_phases: DaemonInitializationPhase::TOTAL_PHASES,
+            detail: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self.state, DaemonInitializationState::Ready)
+    }
+}
+
+impl Default for DaemonInitializationStatus {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
 /// Result of the `status` control method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
@@ -191,6 +301,10 @@ pub struct StatusReport {
     pub daemon_version: String,
     /// Daemon uptime in whole seconds.
     pub uptime_secs: u64,
+    /// Startup progress. Missing on pre-0.8.0 daemon responses, which imply
+    /// ready because those daemons bound sockets only after initialization.
+    #[serde(default)]
+    pub initialization: DaemonInitializationStatus,
     /// Registered repositories known to the daemon.
     pub repos: Vec<RepoStatus>,
 }
@@ -306,6 +420,65 @@ impl SnapshotStatus {
 mod status_tests {
     use super::*;
     use crate::common::SourceTier;
+
+    #[test]
+    fn daemon_initialization_progress_is_monotonic_with_fixed_total() {
+        let phases = [
+            DaemonInitializationPhase::SocketBound,
+            DaemonInitializationPhase::RepositoryLifecycle,
+            DaemonInitializationPhase::JobManager,
+            DaemonInitializationPhase::ReconcileRecovery,
+            DaemonInitializationPhase::WatcherBarrier,
+            DaemonInitializationPhase::ReconcilePrime,
+            DaemonInitializationPhase::PeriodicScheduler,
+            DaemonInitializationPhase::Ready,
+        ];
+
+        let completed = phases
+            .iter()
+            .map(|phase| phase.completed_phases())
+            .collect::<Vec<_>>();
+        assert_eq!(completed, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(completed.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(DaemonInitializationPhase::TOTAL_PHASES, 7);
+
+        let status = DaemonInitializationStatus::initializing(
+            DaemonInitializationPhase::WatcherBarrier,
+            Some(DaemonInitializationDetail::ArmingRegisteredWatchers),
+        );
+        assert!(!status.is_ready());
+        assert_eq!(status.total_phases, 7);
+        assert_eq!(status.completed_phases, 4);
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({
+                "state": "initializing",
+                "phase": "watcher_barrier",
+                "completed_phases": 4,
+                "total_phases": 7,
+                "detail": "arming_registered_watchers"
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_status_payload_defaults_initialization_to_ready() {
+        let report: StatusReport = serde_json::from_value(serde_json::json!({
+            "daemon_version": "0.7.1",
+            "uptime_secs": 3,
+            "repos": []
+        }))
+        .unwrap();
+
+        assert!(report.initialization.is_ready());
+        assert_eq!(
+            report.initialization.phase,
+            DaemonInitializationPhase::Ready
+        );
+        assert_eq!(report.initialization.completed_phases, 7);
+        assert_eq!(report.initialization.total_phases, 7);
+        assert!(report.initialization.detail.is_none());
+    }
 
     #[test]
     fn snapshot_status_serializes_enrichment_matrix() {

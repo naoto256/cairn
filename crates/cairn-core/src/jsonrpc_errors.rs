@@ -23,6 +23,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
         Error::FileNotIndexed { .. } => error_code::FILE_NOT_INDEXED,
         Error::AmbiguousSource { .. } => error_code::AMBIGUOUS_SOURCE,
         Error::SnapshotStale { .. } => error_code::SNAPSHOT_STALE,
+        Error::DaemonInitializing { .. } => error_code::DAEMON_INITIALIZING,
         Error::Internal(_) => error_code::INTERNAL_ERROR,
         _ => error_code::INTERNAL_ERROR,
     };
@@ -112,6 +113,37 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             "qualified": qualified,
             "candidates": candidates,
             "candidates_truncated": candidates_truncated,
+        }));
+    }
+    if let Error::DaemonInitializing { initialization } = err
+        && let Some(error) = response.error.as_mut()
+    {
+        error.data = Some(json!({
+            "initialization": initialization,
+            "diagnostics": [Diagnostic {
+                code: DiagnosticCode::DaemonInitializing,
+                severity: DiagnosticSeverity::Info,
+                message: "The daemon is still initializing and has not published its ready resources.".into(),
+                language: None,
+                analyzer_id: None,
+                repo: None,
+                file: None,
+                details: Some(json!({
+                    "phase": initialization.phase,
+                    "completed_phases": initialization.completed_phases,
+                    "total_phases": initialization.total_phases,
+                    "detail": initialization.detail,
+                })),
+            }],
+            "hints": [Hint {
+                code: HintCode::DaemonNotReady,
+                message: "Retry after `cairn ctl daemon status` reports ready.".into(),
+                action: None,
+                tool: None,
+                params: None,
+                drop_params: Vec::new(),
+                target: None,
+            }],
         }));
     }
     response
@@ -270,5 +302,33 @@ mod tests {
         assert_eq!(data["candidates"][0]["line_start"], 7);
         assert_eq!(data["candidates_truncated"], true);
         assert!(!data.to_string().contains("blob_sha"));
+    }
+
+    #[test]
+    fn daemon_initializing_error_has_typed_code_and_closed_progress_data() {
+        use cairn_proto::control::{
+            DaemonInitializationDetail, DaemonInitializationPhase, DaemonInitializationStatus,
+        };
+
+        let response = error_from(
+            RequestId::Number(1),
+            &Error::DaemonInitializing {
+                initialization: DaemonInitializationStatus::initializing(
+                    DaemonInitializationPhase::WatcherBarrier,
+                    Some(DaemonInitializationDetail::ArmingRegisteredWatchers),
+                ),
+            },
+        );
+        let error = response.error.unwrap();
+
+        assert_eq!(error.code, error_code::DAEMON_INITIALIZING);
+        let data = error.data.unwrap();
+        assert_eq!(data["initialization"]["state"], "initializing");
+        assert_eq!(data["initialization"]["phase"], "watcher_barrier");
+        assert_eq!(data["initialization"]["completed_phases"], 4);
+        assert_eq!(data["initialization"]["total_phases"], 7);
+        assert_eq!(data["diagnostics"][0]["code"], "daemon_initializing");
+        assert_eq!(data["hints"][0]["code"], "daemon_not_ready");
+        assert!(!data.to_string().contains('/'));
     }
 }
