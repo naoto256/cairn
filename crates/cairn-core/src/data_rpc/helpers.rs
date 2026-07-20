@@ -176,6 +176,22 @@ where
         let mut analyzers = Vec::new();
         let mut repo_wide_analyzers = Vec::new();
         for mut snapshot in captured {
+            // First-pass leases are released before result finalization. Reacquire here so an
+            // all-repository query skips a repo that entered Removing between passes, while an
+            // explicitly requested repo retains the typed unavailable error contract.
+            let _lease = match &lifecycle {
+                Some(lifecycle) if enumerate_all => {
+                    let Some(lease) =
+                        lifecycle.acquire_for_enumeration(&snapshot.entry.repo_hash)?
+                    else {
+                        skipped_unavailable = true;
+                        continue;
+                    };
+                    Some(lease)
+                }
+                Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&snapshot.entry.repo_hash)?),
+                None => None,
+            };
             let store_path = cas_data_dir.store_db_path(&snapshot.entry.repo_hash);
             let conn = cas_store::open_existing(&store_path)?;
             analyzers.extend(
@@ -1418,6 +1434,88 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, Error::RepositoryUnavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn second_pass_skips_repo_that_started_removal_after_capture() {
+        let mut fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        drop(index);
+        let lifecycle =
+            crate::lifecycle::RepoLifecycleManager::new(fixture.ctx.cas_data_dir.clone());
+        lifecycle.startup_sweep().await.unwrap();
+        fixture.ctx.lifecycle = Some(lifecycle.clone());
+
+        let runtime = tokio::runtime::Handle::current();
+        let repo_hash = entry.repo_hash.clone();
+        let result = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: None,
+                anchor: None,
+                branch: None,
+                method_name: "second-pass enumeration skip test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            |_entry, _conn, _snapshot| Ok(vec![1_u8]),
+            |_| BTreeSet::new(),
+            move |_| {
+                runtime
+                    .block_on(lifecycle.begin_removal_and_wait(&repo_hash))
+                    .unwrap();
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.items, vec![1]);
+        assert!(result.skipped_unavailable);
+        assert!(result.tier3_status.this_query.analyzers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_pass_removal_keeps_explicit_repo_unavailable_error() {
+        let mut fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        drop(index);
+        let lifecycle =
+            crate::lifecycle::RepoLifecycleManager::new(fixture.ctx.cas_data_dir.clone());
+        lifecycle.startup_sweep().await.unwrap();
+        fixture.ctx.lifecycle = Some(lifecycle.clone());
+
+        let runtime = tokio::runtime::Handle::current();
+        let repo_hash = entry.repo_hash.clone();
+        let error = query_one_or_all_snapshots(
+            &fixture.ctx,
+            SnapshotQueryRequest {
+                requested_repo: Some("demo".into()),
+                anchor: None,
+                branch: None,
+                method_name: "second-pass explicit removal test",
+                effective_limit: 10,
+                verbose_tier3: false,
+                exact_file: None,
+            },
+            |_entry, _conn, _snapshot| Ok(vec![1_u8]),
+            |_| BTreeSet::new(),
+            move |_| {
+                runtime
+                    .block_on(lifecycle.begin_removal_and_wait(&repo_hash))
+                    .unwrap();
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::RepositoryUnavailable { .. }));
     }
 
     #[test]
