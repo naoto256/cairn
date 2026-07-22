@@ -114,7 +114,7 @@ impl ControlMethod for RegisterRepo {
                 // Legacy constructor used by focused tests. Production
                 // publishes aliases through RepoLifecycleManager.
                 let mut idx = cas_registry::open(&index_path)?;
-                let tx = idx.transaction()?;
+                let tx = idx.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 cas_registry::upsert(&tx, &alias, &canonical_str, &repo_hash_for_index, now_ns)?;
                 tx.commit()?;
             }

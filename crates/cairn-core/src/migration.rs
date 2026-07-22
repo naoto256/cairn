@@ -10,7 +10,7 @@
 //! migration goes badly, the worst case is deleting the file and
 //! re-indexing.
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tracing::debug;
 
 use crate::Result;
@@ -127,7 +127,8 @@ pub fn open_with_migrations(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut conn = Connection::open(path)?;
+    let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let mut conn = Connection::open_with_flags(path, flags)?;
     apply_standard_pragmas(&conn)?;
     apply(&mut conn, migrations)?;
     Ok(conn)
@@ -226,6 +227,37 @@ mod tests {
             .unwrap();
         // In-memory DBs can report "memory" instead of WAL; on disk they'd be WAL.
         assert!(mode == "wal" || mode == "memory");
+    }
+
+    #[test]
+    fn managed_open_reports_busy_snapshot_extended_code() {
+        const MIGRATIONS: &[Migration] = &[Migration {
+            version: 1,
+            sql: "CREATE TABLE writes (value INTEGER);",
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extended-codes.db");
+        let mut reader = open_with_migrations(&path, MIGRATIONS).unwrap();
+        let writer = open_with_migrations(&path, MIGRATIONS).unwrap();
+
+        let snapshot = reader.transaction().unwrap();
+        snapshot
+            .query_row("SELECT COUNT(*) FROM writes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        writer
+            .execute("INSERT INTO writes (value) VALUES (1)", [])
+            .unwrap();
+
+        let error = snapshot
+            .execute("INSERT INTO writes (value) VALUES (2)", [])
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error().map(|error| error.extended_code),
+            Some(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT)
+        );
     }
 
     #[test]

@@ -123,6 +123,22 @@ pub enum Error {
 }
 
 impl Error {
+    /// Primary SQLite result code, when this error came from SQLite.
+    pub(crate) fn sqlite_error_code(&self) -> Option<rusqlite::ffi::ErrorCode> {
+        match self {
+            Self::Sqlite(error) => error.sqlite_error_code(),
+            _ => None,
+        }
+    }
+
+    /// Extended SQLite result code, when this error came from SQLite.
+    pub(crate) fn sqlite_extended_code(&self) -> Option<i32> {
+        match self {
+            Self::Sqlite(error) => error.sqlite_error().map(|code| code.extended_code),
+            _ => None,
+        }
+    }
+
     /// Convert a blocking task join failure into a server-side error.
     ///
     /// The detail is logged for diagnosis, but callers only see the sanitized
