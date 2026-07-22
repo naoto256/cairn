@@ -14,7 +14,12 @@ impl JobManager {
             let pool_group = dispatch.pool_group;
             let key = dispatch.key.clone();
             if let Err(err) = self.run_job(dispatch).await {
-                warn!(error = %err, "analyzer job failed");
+                warn!(
+                    error = %err,
+                    sqlite_code = ?err.sqlite_error_code(),
+                    sqlite_extended_code = ?err.sqlite_extended_code(),
+                    "analyzer job failed"
+                );
             }
             self.notify_worker_finished(job_id, pool_group, key);
         }

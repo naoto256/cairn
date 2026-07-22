@@ -382,6 +382,8 @@ impl RepoLifecycleManager {
                     warn!(
                         repo_hash = %intent.repo_hash(),
                         error = %err,
+                        sqlite_code = ?err.sqlite_error_code(),
+                        sqlite_extended_code = ?err.sqlite_extended_code(),
                         "repository removal deferred; durable request retained"
                     );
                     if self.shutting_down.load(Ordering::SeqCst) {
@@ -441,7 +443,7 @@ impl RepoLifecycleManager {
                     return Ok(());
                 }
             }
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::mark_removal_requested(&tx, &repo_hash, intent.reason(), now_ns())?;
             tx.commit()?;
             // Persist the intent before closing admission. If gate closure
@@ -464,7 +466,7 @@ impl RepoLifecycleManager {
 
         let event_id = {
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let event_id = cas_registry::delete_repository_with_event(&tx, &repo_hash, now_ns())?
                 .ok_or_else(|| {
                 Error::Internal(format!("missing removal request for {repo_hash}"))
@@ -482,7 +484,7 @@ impl RepoLifecycleManager {
         let repo_dir = self.cas_data_dir.repo_dir(repo_hash);
         let cleanup = std::fs::remove_dir_all(&repo_dir);
         let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-        let tx = index.transaction()?;
+        let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         match cleanup {
             Ok(()) => {
                 cas_registry::mark_store_cleanup_complete(&tx, event_id)?;
@@ -641,7 +643,7 @@ impl RepoLifecycleManager {
                     state: "removing",
                 });
             }
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::upsert_repository(&tx, &repo_hash, &root_path, registered_at_ns)?;
             tx.commit()?;
             existing.is_none()
@@ -694,7 +696,7 @@ impl RepoLifecycleManager {
             } else {
                 target.persistent
             });
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::upsert(
                 &tx,
                 alias,
@@ -788,7 +790,7 @@ impl RepoLifecycleManager {
                 Error::Internal("repository lifecycle transition mutex poisoned".into())
             })?;
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::mark_removal_requested(
                 &tx,
                 &permit.repo_hash,
@@ -824,7 +826,7 @@ impl RepoLifecycleManager {
             let remaining = cas_registry::count_aliases_for_repo(&index, &entry.repo_hash)?;
             drop(index);
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if remaining > 1 {
                 cas_registry::delete(&tx, alias)?;
                 tx.commit()?;
@@ -910,7 +912,7 @@ impl RepoLifecycleManager {
             }
         }
         let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-        let tx = index.transaction()?;
+        let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         cas_registry::prune_completed_removal_events(&tx, 100)?;
         tx.commit()?;
         Ok(report)
@@ -925,7 +927,7 @@ impl RepoLifecycleManager {
             let repo_dir = self.cas_data_dir.repo_dir(&event.repo_hash);
             let cleanup = std::fs::remove_dir_all(&repo_dir);
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             match cleanup {
                 Ok(()) => {
                     cas_registry::mark_store_cleanup_complete(&tx, event.event_id)?;
@@ -953,7 +955,7 @@ impl RepoLifecycleManager {
         gate.begin_removal()?;
         let event_id = {
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::mark_removal_requested(&tx, &repo.repo_hash, reason, now_ns())?;
             let event_id =
                 cas_registry::delete_repository_with_event(&tx, &repo.repo_hash, now_ns())?
@@ -966,7 +968,7 @@ impl RepoLifecycleManager {
         let repo_dir = self.cas_data_dir.repo_dir(&repo.repo_hash);
         let cleanup = std::fs::remove_dir_all(&repo_dir);
         let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-        let tx = index.transaction()?;
+        let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         match cleanup {
             Ok(()) => {
                 cas_registry::mark_store_cleanup_complete(&tx, event_id)?;

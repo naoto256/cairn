@@ -13,7 +13,7 @@ use cairn_proto::jsonrpc::{
     serialize_response as serialize,
 };
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{Error, Result, jsonrpc_errors};
 
@@ -62,7 +62,7 @@ where
         }
     };
     debug!(method = %req.method, plane, "JSON-RPC request");
-    serialize(&dispatch_request(methods, ctx, req).await)
+    serialize(&dispatch_request(plane, methods, ctx, req).await)
 }
 
 /// Parse and dispatch one data-plane request, injecting daemon-side timing into
@@ -89,11 +89,12 @@ where
         }
     };
     debug!(method = %req.method, plane, "JSON-RPC request");
-    serialize(&dispatch_request_with_result_timing(methods, ctx, req).await)
+    serialize(&dispatch_request_with_result_timing(plane, methods, ctx, req).await)
 }
 
 /// Dispatch a parsed request against `methods`.
 pub(crate) async fn dispatch_request<Ctx, M>(
+    plane: &'static str,
     methods: &HashMap<&'static str, Box<M>>,
     ctx: &Ctx,
     req: Request,
@@ -112,7 +113,10 @@ where
     let params = req.params.clone().unwrap_or(Value::Null);
     match method.dispatch(ctx, params).await {
         Ok(value) => ok_resp(id, value),
-        Err(err) => jsonrpc_errors::error_from(id, &err),
+        Err(err) => {
+            log_sqlite_failure(plane, method.name(), &err);
+            jsonrpc_errors::error_from(id, &err)
+        }
     }
 }
 
@@ -120,6 +124,7 @@ where
 /// results. The measurement starts immediately before the method body runs so
 /// it captures daemon work rather than client/socket round-trip latency.
 pub(crate) async fn dispatch_request_with_result_timing<Ctx, M>(
+    plane: &'static str,
     methods: &HashMap<&'static str, Box<M>>,
     ctx: &Ctx,
     req: Request,
@@ -142,8 +147,25 @@ where
             inject_timing(&mut value, start.elapsed());
             ok_resp(id, value)
         }
-        Err(err) => jsonrpc_errors::error_from(id, &err),
+        Err(err) => {
+            log_sqlite_failure(plane, method.name(), &err);
+            jsonrpc_errors::error_from(id, &err)
+        }
     }
+}
+
+fn log_sqlite_failure(plane: &'static str, method: &'static str, err: &Error) {
+    let Some(extended_code) = err.sqlite_extended_code() else {
+        return;
+    };
+    error!(
+        plane,
+        method,
+        error = %err,
+        sqlite_code = ?err.sqlite_error_code(),
+        sqlite_extended_code = extended_code,
+        "SQLite-backed RPC method failed"
+    );
 }
 
 fn inject_timing(value: &mut Value, elapsed: std::time::Duration) {
@@ -211,6 +233,7 @@ mod tests {
     async fn dispatch_request_reports_unknown_method() {
         let methods = method_table(&[echo_ctor as fn() -> Box<dyn RpcMethod<()>>]);
         let response = dispatch_request(
+            "test",
             &methods,
             &(),
             Request {
@@ -229,6 +252,7 @@ mod tests {
     async fn dispatch_injects_timing_into_data_plane_response() {
         let methods = method_table(&[echo_ctor as fn() -> Box<dyn RpcMethod<()>>]);
         let response = dispatch_request_with_result_timing(
+            "test",
             &methods,
             &(),
             Request {

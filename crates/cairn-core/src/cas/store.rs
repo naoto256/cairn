@@ -24,7 +24,9 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
 /// [`Error::StoreNotFound`] when the database is absent, or the underlying
 /// filesystem / SQLite / migration error.
 pub fn open_existing(path: &std::path::Path) -> Result<Connection> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
     let mut conn = match Connection::open_with_flags(path, flags) {
         Ok(conn) => conn,
         Err(open_err) => match std::fs::metadata(path) {

@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::Command;
 
 use cairn_lang_api::{LanguageBackend, all_backends, pick_backend_for_path};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tracing::debug;
 
 use crate::Result;
@@ -335,7 +335,7 @@ where
     )?;
     let blobs_parsed = parse_progress.fresh;
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let worktree_id = upsert_worktree(&tx, worktree_path, now_ns)?;
     let tentative_anchor = AnchorName::tentative(worktree_id);
     let prior_tentative = anchor::resolve(&tx, &tentative_anchor)?;

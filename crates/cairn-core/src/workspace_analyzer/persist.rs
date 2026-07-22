@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use cairn_proto::RefKind;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::Result;
 use crate::cas::kind_conv::ref_kind_to_str;
@@ -24,7 +24,7 @@ pub(super) fn persist_resolved_refs(
     parser_id: &str,
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for source in ref_sources_to_clear(analyzer_id, tier_prefix) {
         tx.execute(
             "DELETE FROM refs
@@ -214,7 +214,7 @@ pub(super) fn persist_resolutions(
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
     let source = format!("{tier_prefix}-{analyzer_id}");
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // v11 DELETE expansion (Layer 2 of the cross-manifest defense
     // documented on this function): remove rows owned by this
     // (source, manifest) pair *and* any leftover legacy NULL row
@@ -638,4 +638,81 @@ fn enclosing_symbol_for_ref(
             |r| r.get(0),
         )
         .optional()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    use cairn_lang_rust as _;
+
+    use super::*;
+    use crate::cas::store;
+    use crate::register::register_repo;
+    use crate::testutil::init_repo;
+
+    type PersistFn =
+        fn(&mut Connection, ManifestId, &str, &str, &str, &WorkspaceFacts) -> Result<usize>;
+
+    #[test]
+    fn register_serializes_with_analyzer_persistence_under_writer_contention() {
+        assert_register_and_persist_serialize(persist_resolved_refs);
+        assert_register_and_persist_serialize(persist_resolutions);
+    }
+
+    fn assert_register_and_persist_serialize(persist: PersistFn) {
+        let (repo, _) = init_repo(&[("README.txt", "contention fixture\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("store.sqlite");
+
+        let mut setup = store::open(&db_path).unwrap();
+        let seeded = register_repo(&mut setup, repo.path(), 1).unwrap();
+        drop(setup);
+
+        let mut register_conn = store::open_existing(&db_path).unwrap();
+        let mut persist_conn = store::open_existing(&db_path).unwrap();
+        let mut blocker = store::open_existing(&db_path).unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let register_barrier = Arc::clone(&barrier);
+        let repo_path = repo.path().to_path_buf();
+        let register = thread::spawn(move || {
+            register_barrier.wait();
+            register_repo(&mut register_conn, &repo_path, 2)
+        });
+
+        let persist_barrier = Arc::clone(&barrier);
+        let manifest_id = seeded.tentative_manifest;
+        let persist_handle = thread::spawn(move || {
+            persist_barrier.wait();
+            persist(
+                &mut persist_conn,
+                manifest_id,
+                "contention-test",
+                "tier3",
+                "rust-v1",
+                &WorkspaceFacts::default(),
+            )
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(100));
+        blocker_tx.commit().unwrap();
+
+        let register_result = register.join().unwrap();
+        let persist_result = persist_handle.join().unwrap();
+        assert!(
+            register_result.is_ok(),
+            "register failed under concurrent persistence: {register_result:?}"
+        );
+        assert!(
+            persist_result.is_ok(),
+            "analyzer persistence failed under concurrent registration: {persist_result:?}"
+        );
+    }
 }

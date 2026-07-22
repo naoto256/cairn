@@ -158,7 +158,7 @@ fn prune_jobs_in_store(
         return Ok((deleted_runs_count, job_index.count_present(&job_ids)));
     }
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let deleted = tx.execute(
         &format!("DELETE FROM workspace_analysis_runs WHERE {ORPHAN_TERMINAL_RUNS_WHERE}"),
         [],
