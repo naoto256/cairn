@@ -4,7 +4,9 @@
 //! capacity (default 16, override via `CAIRN_LSP_POOL_MAX_ENTRIES`,
 //! range `1..=64`; invalid/0 → default; >64 → clamp + warn), and
 //! acquires each entry under a RAII lease that prevents eviction
-//! while in use. Full lifecycle contract:
+//! while in use. Ready entries idle for 10 minutes are swept every
+//! 60 seconds; `CAIRN_LSP_IDLE_TTL_SECS` overrides the TTL and `0`
+//! disables time-based sweeping. Full lifecycle contract:
 //!
 //! - Acquire: existing Ready key → bump lease + LRU; existing
 //!   Evicting key → [`Error::PoolDraining`] (same-key acquire may
@@ -19,6 +21,10 @@
 //!   poisons the pool globally — no other key can spawn a
 //!   replacement while a possibly-live orphan may still hold
 //!   resources.
+//! - Idle sweep: a wall-clock timestamp is refreshed on acquire and
+//!   lease release. Expired Ready entries with no active leases use
+//!   the same `Evicting` reservation and fail-closed termination
+//!   handling as capacity LRU.
 //! - Force-shutdown: transitions `Running → Draining`, rejects new
 //!   acquisitions, iterates cleanup with a per-entry timeout, and
 //!   transitions back to `Running` on complete success; if any entry
@@ -35,12 +41,13 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::task::JoinHandle;
+use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{debug, warn};
 
 use super::client::LspProcessControl;
@@ -49,6 +56,10 @@ use super::{Error, LspClient, Position, Result, Url};
 const DEFAULT_POOL_CAPACITY: usize = 16;
 const MAX_POOL_CAPACITY: usize = 64;
 const POOL_CAPACITY_ENV: &str = "CAIRN_LSP_POOL_MAX_ENTRIES";
+const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+const IDLE_TTL_ENV: &str = "CAIRN_LSP_IDLE_TTL_SECS";
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const IDLE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 type ClientWork<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
@@ -170,6 +181,7 @@ pub struct LspClientPool {
     runtime: Runtime,
     registry: Arc<StdMutex<PoolRegistry>>,
     capacity: NonZeroUsize,
+    _idle_sweeper: Option<JoinHandle<()>>,
 }
 
 struct PoolRegistry {
@@ -200,6 +212,7 @@ struct PoolRecord {
     entry: Arc<PoolEntry>,
     active_leases: usize,
     last_used: u64,
+    last_used_at: Instant,
     state: RecordState,
 }
 
@@ -264,7 +277,10 @@ impl Drop for PoolLease {
             // by poisoning the pool so no further acquisitions
             // can proceed until the daemon restarts.
             match record.active_leases.checked_sub(1) {
-                Some(new) => record.active_leases = new,
+                Some(new) => {
+                    record.active_leases = new;
+                    record.last_used_at = Instant::now();
+                }
                 None => {
                     warn!(
                         language = %self.key.language,
@@ -372,6 +388,35 @@ fn parse_capacity_env() -> NonZeroUsize {
     capacity_from_env_value(std::env::var(POOL_CAPACITY_ENV).ok().as_deref())
 }
 
+/// Resolve the idle TTL environment override. `None` means the
+/// sweeper is disabled, which is the explicit contract for zero.
+fn idle_ttl_from_env_value(raw: Option<&str>) -> Option<Duration> {
+    let Some(raw) = raw else {
+        return Some(DEFAULT_IDLE_TTL);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(DEFAULT_IDLE_TTL);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(seconds) => Some(Duration::from_secs(seconds)),
+        Err(_) => {
+            warn!(
+                env = IDLE_TTL_ENV,
+                value = %raw,
+                default_secs = DEFAULT_IDLE_TTL.as_secs(),
+                "invalid lsp pool idle TTL; using default"
+            );
+            Some(DEFAULT_IDLE_TTL)
+        }
+    }
+}
+
+fn parse_idle_ttl_env() -> Option<Duration> {
+    idle_ttl_from_env_value(std::env::var(IDLE_TTL_ENV).ok().as_deref())
+}
+
 /// Aggregated per-entry outcomes for `force_shutdown_all`. Split
 /// into regular-error and termination-unproven-error slots so an
 /// unproven signal that arrived after a regular protocol error is
@@ -436,25 +481,59 @@ impl LspClientPool {
     /// Returns an LSP protocol error if the dedicated Tokio runtime
     /// cannot be created.
     pub fn new() -> Result<Self> {
-        Self::with_capacity(parse_capacity_env())
+        Self::with_config(parse_capacity_env(), parse_idle_ttl_env())
     }
 
+    #[cfg(test)]
     fn with_capacity(capacity: NonZeroUsize) -> Result<Self> {
+        Self::with_config(capacity, Some(DEFAULT_IDLE_TTL))
+    }
+
+    fn with_config(capacity: NonZeroUsize, idle_ttl: Option<Duration>) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .thread_name("cairn-lsp-pool")
             .build()
             .map_err(|e| Error::Protocol(format!("lsp pool runtime: {e}")))?;
-        debug!(capacity = capacity.get(), "lsp pool initialized");
+        let registry = Arc::new(StdMutex::new(PoolRegistry {
+            mode: PoolMode::Running,
+            entries: HashMap::new(),
+            access_seq: 0,
+        }));
+        let idle_sweeper = idle_ttl.map(|idle_ttl| {
+            let registry = Arc::clone(&registry);
+            runtime.spawn(async move {
+                let mut interval = interval(IDLE_SWEEP_INTERVAL);
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                // Tokio intervals tick immediately once. Consume that
+                // tick so the first real sweep occurs after 60 seconds.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = Self::sweep_idle_once(
+                        &registry,
+                        Instant::now(),
+                        idle_ttl,
+                        IDLE_SHUTDOWN_TIMEOUT,
+                    )
+                    .await
+                    {
+                        warn!(%error, "lsp pool: idle sweep failed");
+                    }
+                }
+            })
+        });
+        debug!(
+            capacity = capacity.get(),
+            idle_ttl_secs = idle_ttl.map(|ttl| ttl.as_secs()),
+            "lsp pool initialized"
+        );
         Ok(Self {
             runtime,
-            registry: Arc::new(StdMutex::new(PoolRegistry {
-                mode: PoolMode::Running,
-                entries: HashMap::new(),
-                access_seq: 0,
-            })),
+            registry,
             capacity,
+            _idle_sweeper: idle_sweeper,
         })
     }
 
@@ -558,6 +637,7 @@ impl LspClientPool {
                         .ok_or_else(|| Error::Protocol("pool lease counter overflow".into()))?;
                     record.active_leases = bumped_leases;
                     record.last_used = bumped_seq;
+                    record.last_used_at = Instant::now();
                     return Ok(PoolLease {
                         key,
                         entry: Arc::clone(&record.entry),
@@ -580,6 +660,7 @@ impl LspClientPool {
                             entry: Arc::clone(&entry),
                             active_leases: 1,
                             last_used: bumped_seq,
+                            last_used_at: Instant::now(),
                             state: RecordState::Ready,
                         },
                     );
@@ -651,6 +732,111 @@ impl LspClientPool {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    /// Reserve every expired idle entry under the registry lock,
+    /// then stop the reserved entries concurrently outside it.
+    /// Keeping each record as `Evicting` until termination is proven
+    /// preserves the same no-replacement invariant as capacity LRU.
+    async fn sweep_idle_once(
+        registry: &Arc<StdMutex<PoolRegistry>>,
+        now: Instant,
+        idle_ttl: Duration,
+        entry_timeout: Duration,
+    ) -> Result<usize> {
+        let victims = {
+            let mut reg = registry
+                .lock()
+                .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
+            if reg.mode != PoolMode::Running {
+                return Ok(0);
+            }
+            let keys = reg
+                .entries
+                .iter()
+                .filter(|(_, record)| {
+                    record.state == RecordState::Ready
+                        && record.active_leases == 0
+                        && now.saturating_duration_since(record.last_used_at) > idle_ttl
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .map(|key| {
+                    let record = reg
+                        .entries
+                        .get_mut(&key)
+                        .expect("idle sweep key just discovered");
+                    record.state = RecordState::Evicting;
+                    debug!(
+                        language = %key.language,
+                        analyzer = %key.analyzer_id,
+                        idle_secs = now.saturating_duration_since(record.last_used_at).as_secs(),
+                        "lsp pool: reserving expired idle entry for sweep"
+                    );
+                    (key, Arc::clone(&record.entry))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let victim_count = victims.len();
+        let outcomes =
+            futures::future::join_all(victims.into_iter().map(|(key, entry)| async move {
+                let result = entry.shutdown_bounded(entry_timeout).await;
+                (key, entry, result)
+            }))
+            .await;
+
+        let mut first_err = None;
+        let mut reg = registry
+            .lock()
+            .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
+        for (key, entry, result) in outcomes {
+            let still_reserved = reg.entries.get(&key).is_some_and(|record| {
+                record.state == RecordState::Evicting && Arc::ptr_eq(&record.entry, &entry)
+            });
+            match result {
+                Ok(()) => {
+                    if still_reserved {
+                        reg.entries.remove(&key);
+                    }
+                }
+                Err(error) if error.is_termination_unproven() => {
+                    warn!(
+                        language = %key.language,
+                        analyzer = %key.analyzer_id,
+                        %error,
+                        "lsp pool: idle sweep could not prove child termination"
+                    );
+                    // Final daemon shutdown owns the terminal state.
+                    // Otherwise keep the placeholder and fail closed.
+                    if reg.mode != PoolMode::Stopped {
+                        reg.mode = PoolMode::Poisoned;
+                    }
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if still_reserved {
+                        reg.entries.remove(&key);
+                    }
+                    warn!(
+                        language = %key.language,
+                        analyzer = %key.analyzer_id,
+                        %error,
+                        "lsp pool: idle sweep completed with shutdown error"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(error) => Err(error),
+            None => Ok(victim_count),
         }
     }
 
@@ -934,6 +1120,10 @@ impl LspClientPool {
 #[derive(Default)]
 struct PoolEntry {
     state: Mutex<PoolEntryState>,
+    /// Serializes normal, idle-sweep, and final shutdown paths for
+    /// this entry. Final shutdown may race a reserved eviction, but
+    /// the child process must never receive concurrent stop attempts.
+    shutdown_gate: Mutex<()>,
     /// Child-process control is deliberately independent from `state`. Normal
     /// work holds `state` across an analyzer pass, but final daemon shutdown
     /// must still be able to kill and reap the child to unblock that pass.
@@ -1117,6 +1307,7 @@ impl PoolEntry {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        let _shutdown_guard = self.shutdown_gate.lock().await;
         let mut state = self.state.lock().await;
         state.opened_documents.clear();
         let result = match state.client.take() {
@@ -1132,18 +1323,22 @@ impl PoolEntry {
     /// kills and reaps the child. Dropping the pool record later discards any
     /// document state still held by a pass that is unwinding.
     async fn shutdown_bounded(&self, entry_timeout: Duration) -> Result<()> {
-        let control = {
-            let mut slot = self
-                .process_control
-                .lock()
-                .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
-            slot.stopping = true;
-            slot.control.clone()
+        let shutdown = async {
+            let _shutdown_guard = self.shutdown_gate.lock().await;
+            let control = {
+                let mut slot = self
+                    .process_control
+                    .lock()
+                    .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+                slot.stopping = true;
+                slot.control.clone()
+            };
+            let Some(control) = control else {
+                return Ok(());
+            };
+            control.stop_and_terminate().await
         };
-        let Some(control) = control else {
-            return Ok(());
-        };
-        match timeout(entry_timeout, control.stop_and_terminate()).await {
+        match timeout(entry_timeout, shutdown).await {
             Ok(result) => result,
             Err(_) => Err(Error::ChildTerminationFailed(format!(
                 "bounded final shutdown exceeded {}ms",
