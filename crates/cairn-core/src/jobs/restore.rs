@@ -209,7 +209,7 @@ impl JobManager {
         }
         if !new_ambiguous_ids.is_empty() {
             let retired_at = now_ns();
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::insert_ambiguous_ids(&tx, &new_ambiguous_ids, retired_at)?;
             tx.commit()?;
         }

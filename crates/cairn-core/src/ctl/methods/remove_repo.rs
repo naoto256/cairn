@@ -36,7 +36,7 @@ impl ControlMethod for RemoveRepo {
             let Some(entry) = cas_registry::lookup_by_alias(&index, &alias)? else {
                 return Ok(false);
             };
-            let tx = index.transaction()?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::delete(&tx, &alias)?;
             tx.commit()?;
 

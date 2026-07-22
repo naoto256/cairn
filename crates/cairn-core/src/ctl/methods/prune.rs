@@ -84,7 +84,7 @@ fn prune_store(conn: &mut Connection, current_parser_ids: &BTreeSet<String>) -> 
         ));
     }
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let placeholders = std::iter::repeat_n("?", current_parser_ids.len())
         .collect::<Vec<_>>()
         .join(", ");

@@ -991,6 +991,8 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 generation,
                 forced,
                 error = %err,
+                sqlite_code = ?err.sqlite_error_code(),
+                sqlite_extended_code = ?err.sqlite_extended_code(),
                 "reconcile attempt failed"
             ),
         }
@@ -1091,6 +1093,8 @@ async fn run_attempt(
             repo_hash = %repo_hash,
             generation,
             error = %err,
+            sqlite_code = ?err.sqlite_error_code(),
+            sqlite_extended_code = ?err.sqlite_extended_code(),
             "reconcile: mark_attempt_start rejected; another worker or stale state — skipping"
         );
         return Err(err);
