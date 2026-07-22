@@ -319,6 +319,26 @@ fn capacity_invalid_string_falls_back_to_default() {
     assert_eq!(cap(Some("-abc")), DEFAULT_POOL_CAPACITY);
 }
 
+#[test]
+fn idle_ttl_defaults_overrides_and_zero_disables_sweeper() {
+    assert_eq!(idle_ttl_from_env_value(None), Some(DEFAULT_IDLE_TTL));
+    assert_eq!(
+        idle_ttl_from_env_value(Some(" 30 ")),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(idle_ttl_from_env_value(Some("0")), None);
+    assert_eq!(
+        idle_ttl_from_env_value(Some("invalid")),
+        Some(DEFAULT_IDLE_TTL)
+    );
+
+    let disabled = LspClientPool::with_config(NonZeroUsize::new(1).unwrap(), None).unwrap();
+    assert!(
+        disabled._idle_sweeper.is_none(),
+        "TTL=0 must not spawn an idle sweep task"
+    );
+}
+
 // ─── Force-shutdown outcome classifier ─────────────────────
 
 fn elapsed_outcome() -> std::result::Result<Result<()>, tokio::time::error::Elapsed> {
@@ -430,15 +450,108 @@ fn pool_existing_key_reuse_does_not_grow() {
     let key = test_key(1);
     let l1 = acquire(&pool, key.clone()).unwrap();
     assert_eq!(pool.len(), 1);
+    age_record(&pool, &key, Duration::from_secs(10));
+    let aged_at = pool.registry.lock().unwrap().entries[&key].last_used_at;
     let l2 = acquire(&pool, key.clone()).unwrap();
     // Two leases on the same key must share a single record.
     assert_eq!(pool.len(), 1);
     assert!(Arc::ptr_eq(&l1.entry, &l2.entry));
     assert_eq!(pool.active_leases(&key), Some(2));
+    assert!(pool.registry.lock().unwrap().entries[&key].last_used_at > aged_at);
+    age_record(&pool, &key, Duration::from_secs(10));
+    let aged_at = pool.registry.lock().unwrap().entries[&key].last_used_at;
     drop(l1);
     assert_eq!(pool.active_leases(&key), Some(1));
+    assert!(pool.registry.lock().unwrap().entries[&key].last_used_at > aged_at);
     drop(l2);
     assert_eq!(pool.active_leases(&key), Some(0));
+}
+
+fn age_record(pool: &LspClientPool, key: &PoolKey, age: Duration) {
+    pool.registry
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(key)
+        .unwrap()
+        .last_used_at = Instant::now() - age;
+}
+
+fn sweep_idle(pool: &LspClientPool, ttl: Duration, timeout: Duration) -> Result<usize> {
+    pool.runtime.block_on(LspClientPool::sweep_idle_once(
+        &pool.registry,
+        Instant::now(),
+        ttl,
+        timeout,
+    ))
+}
+
+#[test]
+fn idle_sweep_evicts_entry_older_than_ttl() {
+    let pool = pool(2);
+    let key = test_key(10);
+    drop(acquire(&pool, key.clone()).unwrap());
+    age_record(&pool, &key, Duration::from_secs(11));
+
+    assert_eq!(
+        sweep_idle(&pool, Duration::from_secs(10), Duration::from_millis(50)).unwrap(),
+        1
+    );
+    assert_eq!(pool.len(), 0);
+}
+
+#[test]
+fn idle_sweep_preserves_entry_with_active_lease() {
+    let pool = pool(2);
+    let key = test_key(11);
+    let lease = acquire(&pool, key.clone()).unwrap();
+    age_record(&pool, &key, Duration::from_secs(11));
+
+    assert_eq!(
+        sweep_idle(&pool, Duration::from_secs(10), Duration::from_millis(50)).unwrap(),
+        0
+    );
+    assert_eq!(pool.active_leases(&key), Some(1));
+    drop(lease);
+}
+
+#[test]
+fn final_shutdown_does_not_run_entry_shutdown_concurrently_with_idle_sweep() {
+    let pool = Arc::new(pool(1));
+    let key = test_key(12);
+    drop(acquire(&pool, key.clone()).unwrap());
+    age_record(&pool, &key, Duration::from_secs(11));
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+
+    // Hold the per-entry shutdown gate so the sweep can reserve the
+    // record but cannot begin process cleanup. Final shutdown must
+    // wait behind the same gate and honor its own bound.
+    let gate = pool.runtime.block_on(entry.shutdown_gate.lock());
+    let sweep_pool = Arc::clone(&pool);
+    let sweep = std::thread::spawn(move || {
+        sweep_pool.runtime.block_on(LspClientPool::sweep_idle_once(
+            &sweep_pool.registry,
+            Instant::now(),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        ))
+    });
+    assert!(wait_for_record_state(
+        &pool,
+        &key,
+        RecordState::Evicting,
+        Duration::from_secs(1)
+    ));
+
+    let shutdown_err = pool
+        .shutdown_all_bounded(Duration::from_millis(20))
+        .unwrap_err();
+    assert!(shutdown_err.is_termination_unproven());
+    assert_eq!(pool.mode(), PoolMode::Stopped);
+
+    drop(gate);
+    assert_eq!(sweep.join().unwrap().unwrap(), 1);
+    assert_eq!(pool.mode(), PoolMode::Stopped);
 }
 
 #[test]
