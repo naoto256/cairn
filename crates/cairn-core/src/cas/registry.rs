@@ -1134,21 +1134,21 @@ pub fn prime_startup_generations(tx: &Transaction<'_>, now_ns: i64) -> Result<Ve
 /// Conditionally record a low-frequency full reconcile.
 ///
 /// A periodic generation is added only when the repository is active, clean,
-/// idle, and its last successful scan is at least `max_clean_age_ns` old. The
+/// idle, and its last successful scan is at least `due_age_ns` old. The
 /// predicate and bump execute under the caller's transaction, preventing a
 /// watcher request racing this check from losing or duplicating work.
 pub fn increment_periodic_generation_if_due(
     tx: &Transaction<'_>,
     repo_hash: &str,
     now_ns: i64,
-    max_clean_age_ns: i64,
+    due_age_ns: i64,
 ) -> Result<Option<i64>> {
-    if max_clean_age_ns < 0 {
+    if due_age_ns < 0 {
         return Err(crate::Error::InvalidArgument(
-            "periodic reconcile max age must be non-negative".into(),
+            "periodic reconcile due age must be non-negative".into(),
         ));
     }
-    let cutoff = now_ns.saturating_sub(max_clean_age_ns);
+    let cutoff = now_ns.saturating_sub(due_age_ns);
     let due: bool = tx
         .query_row(
             "SELECT r.removal_requested_at_ns IS NULL
@@ -1907,6 +1907,32 @@ mod tests {
             increment_periodic_generation_if_due(&tx, "h", 200, 30).unwrap(),
             None,
             "a durable dirty gap prevents periodic generation stacking"
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn periodic_generation_can_be_due_before_freshness_expiry() {
+        const SECOND_NS: i64 = 1_000_000_000;
+
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", SECOND_NS).unwrap();
+        mark_attempt_start(&tx, "h", 1, 2 * SECOND_NS).unwrap();
+        mark_attempt_success(&tx, "h", 1, 100 * SECOND_NS).unwrap();
+
+        assert_eq!(
+            increment_periodic_generation_if_due(&tx, "h", 124 * SECOND_NS, 25 * SECOND_NS,)
+                .unwrap(),
+            None,
+            "a scan younger than the margin-adjusted due age is not due"
+        );
+        assert_eq!(
+            increment_periodic_generation_if_due(&tx, "h", 126 * SECOND_NS, 25 * SECOND_NS,)
+                .unwrap(),
+            Some(2),
+            "the scan is due before the 30-second freshness horizon expires"
         );
         tx.commit().unwrap();
     }
