@@ -23,8 +23,8 @@ use crate::manifest::{self, ManifestEntry, ManifestId};
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::{
     ANALYZER_STALL_TIMEOUT, AnalyzerProgress, AnalyzerRunRequest, RunRecord, RunStatus,
-    all_workspace_analyzers, config_hash, expected_analyzers_for_manifest, mark_run,
-    run_one_workspace_analyzer_with_timeout,
+    WorkspaceAnalyzer, all_workspace_analyzers, config_hash, expected_analyzers_for_manifest,
+    mark_run, run_one_workspace_analyzer_with_timeout,
 };
 use crate::{Error, Result};
 
@@ -205,6 +205,7 @@ pub struct EnqueueReindex<'a> {
     pub manifest_id: ManifestId,
     pub entries: &'a [ManifestEntry],
     pub now_ns: i64,
+    pub analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
 }
 
 /// Why a full-repo reindex is being enqueued.
@@ -561,14 +562,14 @@ impl JobManager {
             manifest_id,
             entries,
             now_ns,
+            analyzers,
         } = request;
         // Reserve a contiguous run of ids from the daemon-global
-        // allocator, one per expected analyzer. Same rationale as
+        // allocator, one per analyzer selected by registration. Same rationale as
         // `enqueue_analyzer_run`: per-store allocation would reissue
         // ids already active in other stores. `_at_least` folds the
         // `now_ns` floor into the CAS so the allocator's counter
         // always exceeds the ids we just handed out.
-        let analyzers = expected_analyzers_for_manifest(conn, manifest_id)?;
         let mut jobs = Vec::new();
         let first_id = self.allocate_job_id_range_at_least(analyzers.len(), now_ns)?;
         for (job_id, analyzer) in (first_id..).zip(analyzers) {

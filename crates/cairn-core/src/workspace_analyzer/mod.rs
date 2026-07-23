@@ -106,9 +106,7 @@ use crate::manifest::ManifestId;
 #[cfg(test)]
 use crate::workspace_analyzer::persist::{persist_resolutions, persist_resolved_refs};
 #[cfg(test)]
-use crate::workspace_analyzer::run::{
-    run_workspace_analyzers, run_workspace_analyzers_with_timeout,
-};
+use crate::workspace_analyzer::run::run_workspace_analyzers_with_timeout;
 
 mod expected;
 mod header_detect;
@@ -120,8 +118,8 @@ mod staleness;
 
 pub use expected::expected_analyzers_for_manifest;
 pub(crate) use expected::{
-    check_workspace_analyzer_current_succeeded, expected_parse_units, is_c_family_header_path,
-    manifest_parser_ids, pick_backend_with_fallbacks,
+    expected_parse_units, is_c_family_header_path, manifest_parser_ids,
+    pick_backend_with_fallbacks, workspace_analyzers_needing_rerun,
 };
 pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
@@ -130,7 +128,7 @@ pub use lsp_pass::{
 pub use run::run_registered_workspace_analyzers;
 pub(crate) use run::{
     ANALYZER_STALL_TIMEOUT, AnalyzerRunRequest, RunRecord, RunStatus, config_hash, mark_run,
-    run_one_workspace_analyzer_with_timeout,
+    run_one_workspace_analyzer_with_timeout, run_workspace_analyzers,
 };
 pub use staleness::{
     ParserStaleRevision, StaleRevision, StalenessSummary, check_revision_staleness_and_enqueue,
@@ -554,6 +552,41 @@ mod tests {
     #[distributed_slice(WORKSPACE_ANALYZERS)]
     static FAKE_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
         || Box::new(FakeWorkspaceAnalyzer);
+
+    struct SecondFakeWorkspaceAnalyzer;
+
+    impl WorkspaceAnalyzer for SecondFakeWorkspaceAnalyzer {
+        fn id(&self) -> &'static str {
+            "second-fake-workspace"
+        }
+
+        fn revision(&self) -> u32 {
+            11
+        }
+
+        fn language(&self) -> &'static str {
+            "fake-two"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "second-fake-parser"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    #[allow(unsafe_code)]
+    #[distributed_slice(WORKSPACE_ANALYZERS)]
+    static SECOND_FAKE_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
+        || Box::new(SecondFakeWorkspaceAnalyzer);
 
     struct SuccessfulRustAnalyzer {
         facts: WorkspaceFacts,
