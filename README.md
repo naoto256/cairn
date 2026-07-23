@@ -94,6 +94,10 @@ Debian / Ubuntu installs include a user systemd unit:
 systemctl --user enable --now cairn.service
 ```
 
+The packaged service definitions request a 4096 file-descriptor soft limit.
+Direct daemon launches also raise the soft limit to 4096 when the process hard
+limit allows it.
+
 ### Claude Code and Codex plugin
 
 Install the Cairn plugin in your agent host after the binary is on
@@ -235,6 +239,11 @@ publishes normal query access only after lifecycle recovery, watcher arming,
 startup reconciliation, and the periodic scheduler are all ready.
 
 **Environment variables** (all optional):
+
+- `CAIRN_RECONCILE_MAX_CONCURRENCY` — maximum number of repository
+  reconcile attempts that may perform registration I/O concurrently.
+  Default `8`; valid range `1..=64`. Invalid, zero, or out-of-range
+  values fall back to the default.
 
 - `CAIRN_LSP_POOL_MAX_ENTRIES` — hard cap on the number of live
   LSP child processes the daemon keeps around. Default `16`.

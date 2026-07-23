@@ -18,6 +18,9 @@
 //!   (`attempt_generation IS NULL` + affected-rows == 1). A racing
 //!   request that loses the mutex is a no-op wake — the running
 //!   worker sees the newer `desired_generation` and re-loops.
+//! - At most `CAIRN_RECONCILE_MAX_CONCURRENCY` attempts run across
+//!   all repositories. Workers acquire the global permit before
+//!   the first attempt write and release it after finalization.
 //! - The runtime map is a coalesce aid only; the DB is the source
 //!   of truth. Dropping and rebuilding the map on restart is safe.
 //!
@@ -36,7 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::cas::registry::{self as cas_registry, WatcherState};
@@ -49,6 +52,44 @@ use crate::register::{
     register_repo_reconcile_enqueue_analyzers,
 };
 use crate::{Error, Result};
+
+const RECONCILE_MAX_CONCURRENCY_ENV: &str = "CAIRN_RECONCILE_MAX_CONCURRENCY";
+const DEFAULT_RECONCILE_MAX_CONCURRENCY: usize = 8;
+const MAX_RECONCILE_MAX_CONCURRENCY: usize = 64;
+
+fn reconcile_max_concurrency_from_env_value(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_RECONCILE_MAX_CONCURRENCY;
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<usize>() {
+        Ok(value @ 1..=MAX_RECONCILE_MAX_CONCURRENCY) => value,
+        _ => {
+            let classification = match trimmed.parse::<usize>() {
+                Ok(_) => "out_of_range",
+                Err(_)
+                    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    "overflow"
+                }
+                Err(_) => "invalid",
+            };
+            warn!(
+                env = RECONCILE_MAX_CONCURRENCY_ENV,
+                default = DEFAULT_RECONCILE_MAX_CONCURRENCY,
+                classification,
+                "invalid reconcile concurrency; using default"
+            );
+            DEFAULT_RECONCILE_MAX_CONCURRENCY
+        }
+    }
+}
+
+fn reconcile_max_concurrency() -> usize {
+    reconcile_max_concurrency_from_env_value(
+        std::env::var(RECONCILE_MAX_CONCURRENCY_ENV).ok().as_deref(),
+    )
+}
 
 /// Why the reconcile driver was woken. Recorded for logs and
 /// bookkeeping; does not alter the state-machine transition rules
@@ -228,6 +269,7 @@ pub struct RepoReconcileManager {
     lifecycle: Option<Arc<RepoLifecycleManager>>,
     clock: Arc<dyn Clock>,
     retry: RetryPolicy,
+    attempt_permits: Arc<Semaphore>,
     runtimes: Mutex<HashMap<String, RepoRuntime>>,
     shutdown: Arc<Notify>,
     shutting_down: std::sync::atomic::AtomicBool,
@@ -302,12 +344,32 @@ impl RepoReconcileManager {
         clock: Arc<dyn Clock>,
         retry: RetryPolicy,
     ) -> Arc<Self> {
+        Self::with_config_and_lifecycle_and_attempt_concurrency(
+            cas_data_dir,
+            job_manager,
+            lifecycle,
+            clock,
+            retry,
+            reconcile_max_concurrency(),
+        )
+    }
+
+    fn with_config_and_lifecycle_and_attempt_concurrency(
+        cas_data_dir: Arc<CasDataDir>,
+        job_manager: Option<Arc<JobManager>>,
+        lifecycle: Option<Arc<RepoLifecycleManager>>,
+        clock: Arc<dyn Clock>,
+        retry: RetryPolicy,
+        attempt_concurrency: usize,
+    ) -> Arc<Self> {
+        debug_assert!((1..=MAX_RECONCILE_MAX_CONCURRENCY).contains(&attempt_concurrency));
         Arc::new(Self {
             cas_data_dir,
             job_manager,
             lifecycle,
             clock,
             retry,
+            attempt_permits: Arc::new(Semaphore::new(attempt_concurrency)),
             runtimes: Mutex::new(HashMap::new()),
             shutdown: Arc::new(Notify::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -320,6 +382,24 @@ impl RepoReconcileManager {
             #[cfg(test)]
             test_register_hook: std::sync::Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn with_config_and_attempt_concurrency(
+        cas_data_dir: Arc<CasDataDir>,
+        job_manager: Option<Arc<JobManager>>,
+        clock: Arc<dyn Clock>,
+        retry: RetryPolicy,
+        attempt_concurrency: usize,
+    ) -> Arc<Self> {
+        Self::with_config_and_lifecycle_and_attempt_concurrency(
+            cas_data_dir,
+            job_manager,
+            None,
+            clock,
+            retry,
+            attempt_concurrency,
+        )
     }
 
     /// Install a test-only register injector. Returns the
@@ -964,7 +1044,53 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
 
         let generation = state.desired_generation;
         let forced = force_pending;
+        // Arm shutdown observation before checking the flag so a notify
+        // cannot be lost between the check and the semaphore wait.
+        let shutdown = mgr.shutdown.notified();
+        tokio::pin!(shutdown);
+        shutdown.as_mut().enable();
+        if mgr.shutting_down.load(Ordering::SeqCst) {
+            let mut runtimes = mgr.lock_runtimes();
+            if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                rt.worker_running = false;
+            }
+            return;
+        }
+        let permit = tokio::select! {
+            permit = mgr.attempt_permits.clone().acquire_owned() => {
+                match permit {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            repo_hash = %repo_hash,
+                            "reconcile attempt semaphore closed; worker exiting"
+                        );
+                        let mut runtimes = mgr.lock_runtimes();
+                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                            rt.worker_running = false;
+                        }
+                        return;
+                    }
+                }
+            }
+            _ = shutdown => {
+                let mut runtimes = mgr.lock_runtimes();
+                if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                    rt.worker_running = false;
+                }
+                return;
+            }
+        };
+        if mgr.shutting_down.load(Ordering::SeqCst) {
+            drop(permit);
+            let mut runtimes = mgr.lock_runtimes();
+            if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                rt.worker_running = false;
+            }
+            return;
+        }
         let attempt_res = run_attempt(&mgr, &repo_hash, generation, forced).await;
+        drop(permit);
         #[cfg(test)]
         mgr.test_attempts_started.fetch_add(1, Ordering::SeqCst);
         match attempt_res {

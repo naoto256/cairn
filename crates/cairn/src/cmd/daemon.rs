@@ -24,6 +24,11 @@ use cairn_proto::control::{DaemonInitializationDetail, DaemonInitializationPhase
 use clap::Args as ClapArgs;
 use tokio::sync::Notify;
 use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
+
+#[cfg(unix)]
+const DAEMON_NOFILE_TARGET: u64 = 4096;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -39,6 +44,7 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
+    raise_nofile_soft_limit();
     let paths = match args.runtime_dir {
         Some(p) => SocketPaths::with_runtime_dir(p),
         None => SocketPaths::from_platform_default()?,
@@ -82,6 +88,49 @@ pub async fn run(args: Args) -> Result<()> {
     daemon_result?;
     initialization_result
 }
+
+#[cfg(unix)]
+fn nofile_raise_target(current: Option<u64>, maximum: Option<u64>) -> Option<u64> {
+    let target = maximum.map_or(DAEMON_NOFILE_TARGET, |hard| hard.min(DAEMON_NOFILE_TARGET));
+    match current {
+        Some(current) if current < target => Some(target),
+        Some(_) | None => None,
+    }
+}
+
+#[cfg(unix)]
+fn raise_nofile_soft_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let limit = getrlimit(Resource::Nofile);
+    let Some(target) = nofile_raise_target(limit.current, limit.maximum) else {
+        return;
+    };
+    match setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(target),
+            maximum: limit.maximum,
+        },
+    ) {
+        Ok(()) => info!(
+            previous = ?limit.current,
+            current = target,
+            hard = ?limit.maximum,
+            "raised daemon file-descriptor soft limit"
+        ),
+        Err(err) => warn!(
+            previous = ?limit.current,
+            target,
+            hard = ?limit.maximum,
+            error = %err,
+            "failed to raise daemon file-descriptor soft limit; continuing"
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_soft_limit() {}
 
 fn join_initialization(
     result: std::result::Result<Result<()>, tokio::task::JoinError>,
@@ -279,6 +328,15 @@ mod tests {
     use super::*;
     use cairn_core::cas::registry as cas_registry;
     use cairn_core::paths::{CasDataDir, path_hash};
+
+    #[cfg(unix)]
+    #[test]
+    fn nofile_target_raises_only_to_available_headroom() {
+        assert_eq!(nofile_raise_target(Some(256), Some(8192)), Some(4096));
+        assert_eq!(nofile_raise_target(Some(256), Some(1024)), Some(1024));
+        assert_eq!(nofile_raise_target(Some(4096), Some(8192)), None);
+        assert_eq!(nofile_raise_target(None, None), None);
+    }
 
     #[test]
     fn init_job_manager_propagates_restore_failure() {
