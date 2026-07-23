@@ -21,6 +21,7 @@ ExecStart=%h/.cargo/bin/cairn daemon
 Restart=on-failure
 RestartSec=5s
 Environment=RUST_LOG=info
+LimitNOFILE=4096
 
 # The daemon only touches per-user paths under XDG_DATA_HOME and
 # XDG_RUNTIME_DIR; nothing system-wide. Run with no extra privileges.

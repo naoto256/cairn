@@ -5,11 +5,13 @@
 //! required. See [`super`] for the concurrency contract that
 //! these tests exercise.
 
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::timeout;
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::anchor::{self, AnchorName};
 use crate::cas::registry as cas_registry;
@@ -19,7 +21,7 @@ use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
 use crate::reconcile::{
     Clock, PeriodicReconcilePolicy, ReconcileTrigger, RepoReconcileManager, RetryPolicy,
-    TestRegisterHookFn,
+    TestRegisterHookFn, reconcile_max_concurrency_from_env_value,
 };
 use crate::register::ReconcilePublicationReceipt;
 use crate::testutil::init_repo;
@@ -83,6 +85,36 @@ struct GateInner {
     hook_lock: std::sync::Mutex<()>,
 }
 
+#[derive(Clone, Default)]
+struct CapturedLog {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl CapturedLog {
+    fn contents(&self) -> String {
+        String::from_utf8(self.bytes.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 impl FakeRegister {
     fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -121,7 +153,8 @@ impl FakeRegister {
                     forced,
                 };
                 this.calls.lock().unwrap().push(call);
-                if let Some(gate) = this.gate.lock().unwrap().clone() {
+                let gate = this.gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
                     gate.entered.fetch_add(1, Ordering::SeqCst);
                     gate.notify_test.notify_waiters();
                     let mut guard = gate.hook_lock.lock().unwrap();
@@ -208,6 +241,23 @@ fn build_manager(cas: Arc<CasDataDir>, clock: Arc<ManualClock>) -> Arc<RepoRecon
     )
 }
 
+fn build_manager_with_concurrency(
+    cas: Arc<CasDataDir>,
+    clock: Arc<ManualClock>,
+    attempt_concurrency: usize,
+) -> Arc<RepoReconcileManager> {
+    RepoReconcileManager::with_config_and_attempt_concurrency(
+        cas,
+        None,
+        clock,
+        RetryPolicy {
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+        },
+        attempt_concurrency,
+    )
+}
+
 async fn wait_for(mut cond: impl FnMut() -> bool, ms: u64, label: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
     while tokio::time::Instant::now() < deadline {
@@ -217,6 +267,160 @@ async fn wait_for(mut cond: impl FnMut() -> bool, ms: u64, label: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for {label}");
+}
+
+#[test]
+fn reconcile_concurrency_env_accepts_only_configured_range() {
+    assert_eq!(reconcile_max_concurrency_from_env_value(None), 8);
+    assert_eq!(reconcile_max_concurrency_from_env_value(Some("1")), 1);
+    assert_eq!(reconcile_max_concurrency_from_env_value(Some(" 8 ")), 8);
+    assert_eq!(reconcile_max_concurrency_from_env_value(Some("64")), 64);
+    assert_eq!(reconcile_max_concurrency_from_env_value(Some("0")), 8);
+    assert_eq!(reconcile_max_concurrency_from_env_value(Some("65")), 8);
+    assert_eq!(
+        reconcile_max_concurrency_from_env_value(Some("not-a-number")),
+        8
+    );
+}
+
+#[test]
+fn reconcile_concurrency_warning_does_not_log_raw_env_value() {
+    let output = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(output.clone())
+        .finish();
+    let sensitive = "secret-token-value";
+
+    tracing::subscriber::with_default(subscriber, || {
+        assert_eq!(reconcile_max_concurrency_from_env_value(Some(sensitive)), 8);
+    });
+
+    let captured = output.contents();
+    assert!(
+        captured.contains("CAIRN_RECONCILE_MAX_CONCURRENCY"),
+        "warning must identify the configuration key"
+    );
+    assert!(
+        captured.contains("classification=\"invalid\""),
+        "warning must retain a non-sensitive failure classification"
+    );
+    assert!(
+        !captured.contains(sensitive),
+        "warning must not persist the raw environment value"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_attempts_serialize_with_one_permit() {
+    let (_t, cas) = fresh_cas();
+    for n in 0..3 {
+        seed_repo(
+            &cas,
+            &format!("repo-{n}"),
+            &format!("/repo-{n}"),
+            &format!("hash-{n}"),
+        );
+    }
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 1);
+    let register = FakeRegister::new();
+    let gate = register.install_gate();
+    mgr.set_test_register_hook(register.as_hook());
+
+    for n in 0..3 {
+        mgr.request_dirty_by_alias(format!("repo-{n}"), ReconcileTrigger::StartupFullReconcile)
+            .await
+            .unwrap();
+    }
+
+    gate.wait_for_entry(500).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        gate.entered.load(Ordering::SeqCst),
+        1,
+        "only one attempt may enter while the first holds the permit"
+    );
+
+    gate.release();
+    wait_for(|| register.call_count() == 3, 2_000, "all attempts").await;
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn reconcile_attempts_use_at_most_two_permits() {
+    let (_t, cas) = fresh_cas();
+    for n in 0..4 {
+        seed_repo(
+            &cas,
+            &format!("repo-{n}"),
+            &format!("/repo-{n}"),
+            &format!("hash-{n}"),
+        );
+    }
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 2);
+    let register = FakeRegister::new();
+    let gate = register.install_gate();
+    mgr.set_test_register_hook(register.as_hook());
+
+    for n in 0..4 {
+        mgr.request_dirty_by_alias(format!("repo-{n}"), ReconcileTrigger::StartupFullReconcile)
+            .await
+            .unwrap();
+    }
+
+    wait_for(
+        || gate.entered.load(Ordering::SeqCst) == 2,
+        2_000,
+        "two concurrent attempts",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        gate.entered.load(Ordering::SeqCst),
+        2,
+        "additional attempts must wait for a permit"
+    );
+
+    gate.release();
+    wait_for(|| register.call_count() == 4, 2_000, "all attempts").await;
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn shutdown_wakes_workers_waiting_for_attempt_permits() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "first", "/first", "first-hash");
+    seed_repo(&cas, "second", "/second", "second-hash");
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 1);
+    let register = FakeRegister::new();
+    let gate = register.install_gate();
+    mgr.set_test_register_hook(register.as_hook());
+
+    mgr.request_dirty_by_alias("first".to_string(), ReconcileTrigger::StartupFullReconcile)
+        .await
+        .unwrap();
+    gate.wait_for_entry(500).await;
+    mgr.request_dirty_by_alias("second".to_string(), ReconcileTrigger::StartupFullReconcile)
+        .await
+        .unwrap();
+
+    let shutdown_mgr = mgr.clone();
+    let shutdown_task =
+        tokio::spawn(async move { shutdown_mgr.shutdown(Duration::from_secs(2)).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        gate.entered.load(Ordering::SeqCst),
+        1,
+        "a permit waiter must not begin an attempt during shutdown"
+    );
+
+    gate.release();
+    timeout(Duration::from_secs(2), shutdown_task)
+        .await
+        .expect("shutdown must wake permit waiters")
+        .expect("shutdown task must not panic");
+    assert_eq!(register.call_count(), 1);
 }
 
 // ─── MF-1: durable-before-debounce ────────────────────────────
