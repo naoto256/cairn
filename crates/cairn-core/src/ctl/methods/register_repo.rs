@@ -11,6 +11,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
+use super::ack_with_queued_analyzer_jobs;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::lifecycle::RegistrationReconcilePolicy;
 use crate::paths::path_hash;
@@ -201,14 +202,7 @@ impl ControlMethod for RegisterRepo {
             Some(error) => Ack::with_alias_and_watcher_failed(args.alias.clone(), error),
             None => Ack::with_alias(args.alias.clone()),
         };
-        let mut value = serde_json::to_value(ack).unwrap();
-        if let serde_json::Value::Object(obj) = &mut value {
-            obj.insert(
-                "jobs".into(),
-                serde_json::to_value(&outcome.analyzer_jobs).unwrap(),
-            );
-        }
-        Ok(value)
+        Ok(ack_with_queued_analyzer_jobs(ack, &outcome.analyzer_jobs))
     }
 }
 

@@ -456,6 +456,9 @@ pub struct ListJobsResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEntry {
+    /// Daemon-assigned job id, serialized as a decimal string to preserve
+    /// precision in JSON clients.
+    #[serde(with = "crate::job_id_serde")]
     pub job_id: i64,
     pub alias: String,
     pub analyzer_id: String,
@@ -1745,10 +1748,34 @@ mod tests {
             rate: Some(4.0),
         };
         let serialized = serde_json::to_value(entry).unwrap();
-        assert_eq!(serialized["job_id"], 7);
+        assert_eq!(serialized["job_id"], "7");
         assert_eq!(serialized["state"], "running");
         assert_eq!(serialized["scheduler_state"], "running");
         assert!(serialized.get("pool_group").is_none());
+    }
+
+    #[test]
+    fn job_entry_large_job_id_round_trips_exactly() {
+        const JOB_ID: i64 = 1_784_679_083_389_822_001;
+
+        let entry = JobEntry {
+            job_id: JOB_ID,
+            alias: "cairn".into(),
+            analyzer_id: "rust-analyzer-lsp".into(),
+            state: "running".into(),
+            scheduler_state: "running".into(),
+            pool_group: None,
+            queued_ms: 1,
+            pool_wait_ms: 0,
+            run_ms: 2,
+            progress_ticks: 3,
+            rate: None,
+        };
+
+        let serialized = serde_json::to_value(entry).unwrap();
+        assert_eq!(serialized["job_id"], JOB_ID.to_string());
+        let round_trip: JobEntry = serde_json::from_value(serialized).unwrap();
+        assert_eq!(round_trip.job_id, JOB_ID);
     }
 
     #[test]
