@@ -420,7 +420,7 @@ fn begin_shutdown_cancels_active_progress_and_rejects_new_admission() {
 }
 
 #[test]
-fn enqueue_reindex_queues_only_expected_manifest_analyzers() {
+fn enqueue_reindex_queues_only_selected_analyzers() {
     let data = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
@@ -437,10 +437,21 @@ fn enqueue_reindex_queues_only_expected_manifest_analyzers() {
         "unknown-sha",
         "unknown-parser",
     );
+    insert_manifest_parser(
+        &conn,
+        manifest_id,
+        "src/second.rs",
+        "second-sha",
+        "second-fake-parser",
+    );
 
-    let expected_ids = expected_analyzers_for_manifest(&conn, manifest_id)
+    let analyzers = expected_analyzers_for_manifest(&conn, manifest_id)
         .unwrap()
         .into_iter()
+        .filter(|analyzer| analyzer.id() == "fake-workspace")
+        .collect::<Vec<_>>();
+    let expected_ids = analyzers
+        .iter()
         .map(|analyzer| analyzer.id().to_string())
         .collect::<Vec<_>>();
 
@@ -453,6 +464,7 @@ fn enqueue_reindex_queues_only_expected_manifest_analyzers() {
             manifest_id,
             entries: &[],
             now_ns: 1,
+            analyzers,
         })
         .unwrap();
 
@@ -470,7 +482,7 @@ fn enqueue_reindex_queues_only_expected_manifest_analyzers() {
         .unwrap();
     assert_eq!(
         db_count, 1,
-        "reindex now creates jobs only for expected analyzers instead of recording no-match skips"
+        "reindex must create jobs only for the analyzer subset selected by registration"
     );
 }
 
