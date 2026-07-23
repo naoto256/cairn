@@ -21,7 +21,7 @@ use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
 use crate::reconcile::{
     Clock, PeriodicReconcilePolicy, ReconcileTrigger, RepoReconcileManager, RetryPolicy,
-    TestRegisterHookFn, reconcile_max_concurrency_from_env_value,
+    TestLoadStateHookFn, TestRegisterHookFn, reconcile_max_concurrency_from_env_value,
 };
 use crate::register::ReconcilePublicationReceipt;
 use crate::testutil::init_repo;
@@ -132,13 +132,7 @@ impl FakeRegister {
         *self.fail_always.lock().unwrap() = Some(msg.to_string());
     }
     fn install_gate(&self) -> Arc<GateInner> {
-        let gate = Arc::new(GateInner {
-            entered: AtomicUsize::new(0),
-            release: AtomicBool::new(false),
-            notify_test: tokio::sync::Notify::new(),
-            notify_hook: std::sync::Condvar::new(),
-            hook_lock: std::sync::Mutex::new(()),
-        });
+        let gate = GateInner::new();
         *self.gate.lock().unwrap() = Some(gate.clone());
         gate
     }
@@ -155,13 +149,7 @@ impl FakeRegister {
                 this.calls.lock().unwrap().push(call);
                 let gate = this.gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
-                    gate.entered.fetch_add(1, Ordering::SeqCst);
-                    gate.notify_test.notify_waiters();
-                    let mut guard = gate.hook_lock.lock().unwrap();
-                    while !gate.release.load(Ordering::SeqCst) {
-                        guard = gate.notify_hook.wait(guard).unwrap();
-                    }
-                    drop(guard);
+                    gate.enter_and_wait();
                 }
                 if let Some(msg) = this.fail_next.lock().unwrap().take() {
                     return Err(crate::Error::Internal(msg));
@@ -176,6 +164,25 @@ impl FakeRegister {
 }
 
 impl GateInner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+            notify_test: tokio::sync::Notify::new(),
+            notify_hook: std::sync::Condvar::new(),
+            hook_lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn enter_and_wait(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.notify_test.notify_waiters();
+        let mut guard = self.hook_lock.lock().unwrap();
+        while !self.release.load(Ordering::SeqCst) {
+            guard = self.notify_hook.wait(guard).unwrap();
+        }
+    }
+
     async fn wait_for_entry(&self, timeout_ms: u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         while self.entered.load(Ordering::SeqCst) == 0 {
@@ -421,6 +428,175 @@ async fn shutdown_wakes_workers_waiting_for_attempt_permits() {
         .expect("shutdown must wake permit waiters")
         .expect("shutdown task must not panic");
     assert_eq!(register.call_count(), 1);
+}
+
+#[tokio::test]
+async fn state_loads_are_bounded_before_index_open() {
+    let (_t, cas) = fresh_cas();
+    for n in 0..24 {
+        seed_repo(
+            &cas,
+            &format!("repo-{n}"),
+            &format!("/repo-{n}"),
+            &format!("hash-{n}"),
+        );
+    }
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 2);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    let load_gate = GateInner::new();
+    let load_gate_hook = load_gate.clone();
+    let load_hook: TestLoadStateHookFn = Arc::new(move |_| {
+        load_gate_hook.enter_and_wait();
+        Ok(())
+    });
+    mgr.set_test_load_state_hook(load_hook);
+
+    for n in 0..24 {
+        mgr.request_dirty_by_alias(format!("repo-{n}"), ReconcileTrigger::StartupFullReconcile)
+            .await
+            .unwrap();
+    }
+
+    wait_for(
+        || load_gate.entered.load(Ordering::SeqCst) == 2,
+        2_000,
+        "two concurrent pre-open state loads",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        load_gate.entered.load(Ordering::SeqCst),
+        2,
+        "workers must acquire a permit before reaching the index open"
+    );
+
+    load_gate.release();
+    wait_for(|| register.call_count() == 24, 4_000, "all attempts").await;
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn idle_exit_releases_state_load_permit() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "idle", "/idle", "idle-hash");
+    seed_repo(&cas, "active", "/active", "active-hash");
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 1);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    let idle_loaded = Arc::new(AtomicBool::new(false));
+    let idle_loaded_hook = idle_loaded.clone();
+    let load_hook: TestLoadStateHookFn = Arc::new(move |repo_hash| {
+        if repo_hash == "idle-hash" {
+            idle_loaded_hook.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    mgr.set_test_load_state_hook(load_hook);
+
+    assert!(mgr.wake_or_spawn("idle-hash", Some("idle".to_string())));
+    wait_for(
+        || idle_loaded.load(Ordering::SeqCst),
+        500,
+        "idle state load",
+    )
+    .await;
+    mgr.request_dirty_by_alias("active".to_string(), ReconcileTrigger::StartupFullReconcile)
+        .await
+        .unwrap();
+
+    wait_for(|| register.call_count() == 1, 1_000, "active attempt").await;
+    assert_eq!(register.calls()[0].repo_hash, "active-hash");
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn retry_backoff_releases_state_load_permit() {
+    const SECOND_NS: i64 = 1_000_000_000;
+
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "backoff", "/backoff", "backoff-hash");
+    seed_repo(&cas, "active", "/active", "active-hash");
+    let clock = ManualClock::new(SECOND_NS);
+    let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+    let tx = index.transaction().unwrap();
+    cas_registry::increment_desired_generation(&tx, "backoff-hash", clock.now_ns()).unwrap();
+    cas_registry::mark_attempt_start(&tx, "backoff-hash", 1, clock.now_ns()).unwrap();
+    cas_registry::mark_attempt_failure(
+        &tx,
+        "backoff-hash",
+        1,
+        "retry later",
+        clock.now_ns() + 60 * SECOND_NS,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(index);
+
+    let mgr = build_manager_with_concurrency(cas, clock, 1);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    let backoff_loaded = Arc::new(AtomicBool::new(false));
+    let backoff_loaded_hook = backoff_loaded.clone();
+    let load_hook: TestLoadStateHookFn = Arc::new(move |repo_hash| {
+        if repo_hash == "backoff-hash" {
+            backoff_loaded_hook.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    mgr.set_test_load_state_hook(load_hook);
+
+    assert!(mgr.wake_or_spawn("backoff-hash", Some("backoff".to_string())));
+    wait_for(
+        || backoff_loaded.load(Ordering::SeqCst),
+        500,
+        "backoff state load",
+    )
+    .await;
+    mgr.request_dirty_by_alias("active".to_string(), ReconcileTrigger::StartupFullReconcile)
+        .await
+        .unwrap();
+
+    wait_for(|| register.call_count() == 1, 1_000, "active attempt").await;
+    assert_eq!(register.calls()[0].repo_hash, "active-hash");
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn load_error_releases_state_load_permit() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "failing", "/failing", "failing-hash");
+    seed_repo(&cas, "active", "/active", "active-hash");
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 1);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    let failing_loaded = Arc::new(AtomicBool::new(false));
+    let failing_loaded_hook = failing_loaded.clone();
+    let load_hook: TestLoadStateHookFn = Arc::new(move |repo_hash| {
+        if repo_hash == "failing-hash" {
+            failing_loaded_hook.store(true, Ordering::SeqCst);
+            return Err(crate::Error::Internal(
+                "injected state load failure".to_string(),
+            ));
+        }
+        Ok(())
+    });
+    mgr.set_test_load_state_hook(load_hook);
+
+    assert!(mgr.wake_or_spawn("failing-hash", Some("failing".to_string())));
+    wait_for(
+        || failing_loaded.load(Ordering::SeqCst),
+        500,
+        "failing state load",
+    )
+    .await;
+    mgr.request_dirty_by_alias("active".to_string(), ReconcileTrigger::StartupFullReconcile)
+        .await
+        .unwrap();
+
+    wait_for(|| register.call_count() == 1, 1_000, "active attempt").await;
+    assert_eq!(register.calls()[0].repo_hash, "active-hash");
+    mgr.shutdown(Duration::from_secs(2)).await;
 }
 
 // ─── MF-1: durable-before-debounce ────────────────────────────

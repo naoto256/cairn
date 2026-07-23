@@ -260,6 +260,11 @@ impl RepoRuntime {
 pub type TestRegisterHookFn =
     std::sync::Arc<dyn Fn(&str, &str, i64, bool) -> Result<()> + Send + Sync + 'static>;
 
+/// Injectable pre-open hook for tests that need to observe or fail
+/// `load_state` before it opens `index.db`.
+#[cfg(test)]
+pub type TestLoadStateHookFn = std::sync::Arc<dyn Fn(&str) -> Result<()> + Send + Sync + 'static>;
+
 /// Central reindex state-machine driver — one instance per
 /// daemon. See the module-level docs for the concurrency
 /// contract.
@@ -289,6 +294,10 @@ pub struct RepoReconcileManager {
     /// `Result<()>`. Left `None` in production.
     #[cfg(test)]
     test_register_hook: std::sync::Mutex<Option<TestRegisterHookFn>>,
+    /// Test-only state-load injector. Runs after the global permit is
+    /// acquired but before `index.db` is opened.
+    #[cfg(test)]
+    test_load_state_hook: std::sync::Mutex<Option<TestLoadStateHookFn>>,
 }
 
 impl RepoReconcileManager {
@@ -381,6 +390,8 @@ impl RepoReconcileManager {
             test_attempts_started: AtomicI64::new(0),
             #[cfg(test)]
             test_register_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_load_state_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -413,6 +424,20 @@ impl RepoReconcileManager {
     #[cfg(test)]
     fn take_test_register_hook_snapshot(&self) -> Option<TestRegisterHookFn> {
         self.test_register_hook.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_test_load_state_hook(
+        &self,
+        hook: TestLoadStateHookFn,
+    ) -> Option<TestLoadStateHookFn> {
+        let mut guard = self.test_load_state_hook.lock().unwrap();
+        guard.replace(hook)
+    }
+
+    #[cfg(test)]
+    fn take_test_load_state_hook_snapshot(&self) -> Option<TestLoadStateHookFn> {
+        self.test_load_state_hook.lock().unwrap().clone()
     }
 
     /// Record durable dirty intent for `repo_hash` and wake the
@@ -947,105 +972,9 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let observed_seq = {
-            let rt = mgr.lock_runtimes();
-            rt.get(&repo_hash).map(|r| r.request_seq).unwrap_or(0)
-        };
-
-        let state = match load_state(&mgr, &repo_hash).await {
-            Ok(Some(state)) => state,
-            Ok(None) => {
-                debug!(
-                    repo_hash = %repo_hash,
-                    "reconcile worker: repo row gone; exiting"
-                );
-                let mut runtimes = mgr.lock_runtimes();
-                if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                    rt.worker_running = false;
-                }
-                return;
-            }
-            Err(err) => {
-                warn!(
-                    repo_hash = %repo_hash,
-                    error = %err,
-                    "reconcile worker: failed to load state; retrying after delay"
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
-                    _ = mgr.shutdown.notified() => {
-                        let mut runtimes = mgr.lock_runtimes();
-                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                            rt.worker_running = false;
-                        }
-                        return;
-                    }
-                }
-            }
-        };
-
-        // Interrupted attempt survived from a prior run — the
-        // startup-recovery path clears it before spawning
-        // workers, but during normal steady-state a concurrent
-        // process should never leave `attempt_generation` set.
-        // Log loudly and re-notify so recovery can pick it up.
-        if state.attempt_generation.is_some() {
-            warn!(
-                repo_hash = %repo_hash,
-                attempt = ?state.attempt_generation,
-                "reconcile worker: in-flight attempt observed at loop head; \
-                 not starting a new one until recovery clears it"
-            );
-            tokio::select! {
-                _ = notified => continue,
-                _ = mgr.shutdown.notified() => {
-                    let mut runtimes = mgr.lock_runtimes();
-                    if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                        rt.worker_running = false;
-                    }
-                    return;
-                }
-            }
-        }
-
-        let force_pending = state.force_generation > state.applied_generation;
-        if state.desired_generation <= state.applied_generation {
-            // No work. Try to exit; if a request landed in the
-            // race window, loop back.
-            if mgr.try_finalize_exit(&repo_hash, observed_seq) {
-                debug!(repo_hash = %repo_hash, "reconcile worker idle-exit");
-                return;
-            }
-            continue;
-        }
-
-        // A manual force request clears any pre-existing retry deadline when
-        // it records the new generation, bypassing backoff exactly once. A
-        // failed forced attempt installs a fresh deadline, and that deadline
-        // remains authoritative while the same force generation is pending.
-        if let Some(retry_at) = state.next_retry_at_ns {
-            let now = mgr.clock.now_ns();
-            if retry_at > now {
-                let sleep_ns = retry_at.saturating_sub(now);
-                let sleep = Duration::from_nanos(u64::try_from(sleep_ns).unwrap_or(u64::MAX));
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep) => continue,
-                    _ = notified => continue,
-                    _ = mgr.shutdown.notified() => {
-                        let mut runtimes = mgr.lock_runtimes();
-                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                            rt.worker_running = false;
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        let generation = state.desired_generation;
-        let forced = force_pending;
-        // Arm shutdown observation before checking the flag so a notify
-        // cannot be lost between the check and the semaphore wait.
+        // Bound state inspection as well as the attempt itself: opening one
+        // index connection per worker before acquiring this permit can exhaust
+        // the daemon's file-descriptor headroom during startup fan-out.
         let shutdown = mgr.shutdown.notified();
         tokio::pin!(shutdown);
         shutdown.as_mut().enable();
@@ -1089,6 +1018,109 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             }
             return;
         }
+
+        let observed_seq = {
+            let rt = mgr.lock_runtimes();
+            rt.get(&repo_hash).map(|r| r.request_seq).unwrap_or(0)
+        };
+
+        let state = match load_state(&mgr, &repo_hash).await {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                drop(permit);
+                debug!(
+                    repo_hash = %repo_hash,
+                    "reconcile worker: repo row gone; exiting"
+                );
+                let mut runtimes = mgr.lock_runtimes();
+                if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                    rt.worker_running = false;
+                }
+                return;
+            }
+            Err(err) => {
+                drop(permit);
+                warn!(
+                    repo_hash = %repo_hash,
+                    error = %err,
+                    "reconcile worker: failed to load state; retrying after delay"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    _ = mgr.shutdown.notified() => {
+                        let mut runtimes = mgr.lock_runtimes();
+                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                            rt.worker_running = false;
+                        }
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Interrupted attempt survived from a prior run — the
+        // startup-recovery path clears it before spawning
+        // workers, but during normal steady-state a concurrent
+        // process should never leave `attempt_generation` set.
+        // Log loudly and re-notify so recovery can pick it up.
+        if state.attempt_generation.is_some() {
+            drop(permit);
+            warn!(
+                repo_hash = %repo_hash,
+                attempt = ?state.attempt_generation,
+                "reconcile worker: in-flight attempt observed at loop head; \
+                 not starting a new one until recovery clears it"
+            );
+            tokio::select! {
+                _ = notified => continue,
+                _ = mgr.shutdown.notified() => {
+                    let mut runtimes = mgr.lock_runtimes();
+                    if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                        rt.worker_running = false;
+                    }
+                    return;
+                }
+            }
+        }
+
+        let force_pending = state.force_generation > state.applied_generation;
+        if state.desired_generation <= state.applied_generation {
+            drop(permit);
+            // No work. Try to exit; if a request landed in the
+            // race window, loop back.
+            if mgr.try_finalize_exit(&repo_hash, observed_seq) {
+                debug!(repo_hash = %repo_hash, "reconcile worker idle-exit");
+                return;
+            }
+            continue;
+        }
+
+        // A manual force request clears any pre-existing retry deadline when
+        // it records the new generation, bypassing backoff exactly once. A
+        // failed forced attempt installs a fresh deadline, and that deadline
+        // remains authoritative while the same force generation is pending.
+        if let Some(retry_at) = state.next_retry_at_ns {
+            let now = mgr.clock.now_ns();
+            if retry_at > now {
+                let sleep_ns = retry_at.saturating_sub(now);
+                let sleep = Duration::from_nanos(u64::try_from(sleep_ns).unwrap_or(u64::MAX));
+                drop(permit);
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep) => continue,
+                    _ = notified => continue,
+                    _ = mgr.shutdown.notified() => {
+                        let mut runtimes = mgr.lock_runtimes();
+                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                            rt.worker_running = false;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        let generation = state.desired_generation;
+        let forced = force_pending;
         let attempt_res = run_attempt(&mgr, &repo_hash, generation, forced).await;
         drop(permit);
         #[cfg(test)]
@@ -1140,7 +1172,13 @@ async fn load_state(
 ) -> Result<Option<cas_registry::RepoReconcileState>> {
     let cas_data_dir = mgr.cas_data_dir.clone();
     let hash = repo_hash.to_string();
+    #[cfg(test)]
+    let test_hook = mgr.take_test_load_state_hook_snapshot();
     tokio::task::spawn_blocking(move || -> Result<_> {
+        #[cfg(test)]
+        if let Some(hook) = test_hook {
+            hook(&hash)?;
+        }
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
         cas_registry::get_reconcile_state(&index, &hash)
     })
