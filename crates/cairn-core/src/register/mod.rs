@@ -31,6 +31,8 @@ use crate::jobs::{EnqueueReindex, JobManager, QueuedAnalyzerJob};
 use crate::manifest::{
     self, ManifestEntry, ManifestId, ManifestKind, PathHint, WorktreeFilePayload,
 };
+#[cfg(test)]
+use crate::workspace_analyzer::config_hash;
 use crate::workspace_analyzer::{
     WorkspaceAnalyzer, all_workspace_analyzers, is_c_family_header_path,
     pick_backend_with_fallbacks, run_workspace_analyzers, workspace_analyzers_needing_rerun,
@@ -435,12 +437,13 @@ where
     // drift slip through.
     // Gate #3 (per-analyzer currency): when the manifest and Tier-1
     // facts are unchanged, run only expected analyzers whose row is
-    // missing, non-succeeded, or at a stale revision. A permanently
-    // failing analyzer must not amplify into re-running every healthy
-    // analyzer on each watcher tick. Changed inputs still run the full
-    // registered set so newly applicable analyzers are not missed.
+    // missing, non-succeeded, at a stale revision, or at a stale
+    // configuration hash. A permanently failing analyzer must not
+    // amplify into re-running every healthy analyzer on each watcher
+    // tick. Changed inputs still run the full registered set so newly
+    // applicable analyzers are not missed.
     let analyzers_to_run = if entries_unchanged && blobs_parsed == 0 {
-        workspace_analyzers_needing_rerun(conn, tentative)?
+        workspace_analyzers_needing_rerun(conn, tentative, worktree_path)?
     } else {
         all_workspace_analyzers()
     };
@@ -858,17 +861,29 @@ mod tests {
 
     fn insert_analyzer_run(
         conn: &Connection,
+        repo_root: &Path,
         manifest_id: ManifestId,
         analyzer_id: &str,
         analyzer_revision: u32,
         status: &str,
     ) {
+        let analyzer = all_workspace_analyzers()
+            .into_iter()
+            .find(|analyzer| analyzer.id() == analyzer_id)
+            .unwrap();
+        let config_hash = config_hash(repo_root, analyzer.config_paths());
         conn.execute(
             "INSERT INTO workspace_analysis_runs
                (manifest_id, analyzer_id, analyzer_revision, config_hash,
                 status, started_at_ns)
-             VALUES (?1, ?2, ?3, 'cfg', ?4, 10)",
-            params![manifest_id.0, analyzer_id, analyzer_revision, status],
+             VALUES (?1, ?2, ?3, ?4, ?5, 10)",
+            params![
+                manifest_id.0,
+                analyzer_id,
+                analyzer_revision,
+                config_hash,
+                status
+            ],
         )
         .unwrap();
     }
@@ -1092,6 +1107,7 @@ mod tests {
         attach_test_analyzer_parsers(&conn, first.tentative_manifest);
         insert_analyzer_run(
             &conn,
+            repo.path(),
             first.tentative_manifest,
             "fake-workspace",
             7,
@@ -1099,6 +1115,7 @@ mod tests {
         );
         insert_analyzer_run(
             &conn,
+            repo.path(),
             first.tentative_manifest,
             "second-fake-workspace",
             11,
@@ -1136,6 +1153,7 @@ mod tests {
         attach_test_analyzer_parsers(&conn, first.tentative_manifest);
         insert_analyzer_run(
             &conn,
+            repo.path(),
             first.tentative_manifest,
             "fake-workspace",
             7,
@@ -1143,6 +1161,7 @@ mod tests {
         );
         insert_analyzer_run(
             &conn,
+            repo.path(),
             first.tentative_manifest,
             "second-fake-workspace",
             11,
@@ -1156,6 +1175,68 @@ mod tests {
 
         assert!(second.skip_analyzers_for_unchanged_manifest);
         assert_eq!(second.tentative_manifest, first.tentative_manifest);
+    }
+
+    #[test]
+    fn config_only_change_reruns_only_affected_analyzer() {
+        let repo = init_rust_repo(&[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            ("Cargo.toml", "[package]\nname = 'before'\n"),
+        ]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let mut calls = Vec::new();
+
+        let first = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            1,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "succeeded",
+        );
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "succeeded",
+        );
+
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname = 'after'\n",
+        )
+        .unwrap();
+        let second = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            2,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+        assert_eq!(second.blobs_parsed, 0);
+        assert_eq!(calls[1], ["fake-workspace"]);
+        assert!(!second.skip_analyzers_for_unchanged_manifest);
     }
 
     #[test]
