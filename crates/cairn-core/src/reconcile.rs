@@ -1002,7 +1002,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     }
                 }
             }
-            _ = shutdown => {
+            _ = shutdown.as_mut() => {
                 let mut runtimes = mgr.lock_runtimes();
                 if let Some(rt) = runtimes.get_mut(&repo_hash) {
                     rt.worker_running = false;
@@ -1024,7 +1024,16 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             rt.get(&repo_hash).map(|r| r.request_seq).unwrap_or(0)
         };
 
-        let state = match load_state(&mgr, &repo_hash).await {
+        let state_result = load_state(&mgr, &repo_hash).await;
+        if mgr.shutting_down.load(Ordering::SeqCst) {
+            drop(permit);
+            let mut runtimes = mgr.lock_runtimes();
+            if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                rt.worker_running = false;
+            }
+            return;
+        }
+        let state = match state_result {
             Ok(Some(state)) => state,
             Ok(None) => {
                 drop(permit);
@@ -1047,7 +1056,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
-                    _ = mgr.shutdown.notified() => {
+                    _ = shutdown.as_mut() => {
                         let mut runtimes = mgr.lock_runtimes();
                         if let Some(rt) = runtimes.get_mut(&repo_hash) {
                             rt.worker_running = false;
@@ -1073,7 +1082,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             );
             tokio::select! {
                 _ = notified => continue,
-                _ = mgr.shutdown.notified() => {
+                _ = shutdown.as_mut() => {
                     let mut runtimes = mgr.lock_runtimes();
                     if let Some(rt) = runtimes.get_mut(&repo_hash) {
                         rt.worker_running = false;
@@ -1108,7 +1117,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 tokio::select! {
                     _ = tokio::time::sleep(sleep) => continue,
                     _ = notified => continue,
-                    _ = mgr.shutdown.notified() => {
+                    _ = shutdown.as_mut() => {
                         let mut runtimes = mgr.lock_runtimes();
                         if let Some(rt) = runtimes.get_mut(&repo_hash) {
                             rt.worker_running = false;
