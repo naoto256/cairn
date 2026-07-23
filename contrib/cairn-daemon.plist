@@ -35,6 +35,12 @@
         <false/>
     </dict>
 
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>

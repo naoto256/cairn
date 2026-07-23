@@ -52,6 +52,11 @@ versions follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- **Daemon startup now preserves file-descriptor headroom.** Repository
+  reconcile attempts are globally bounded (default 8, configurable with
+  `CAIRN_RECONCILE_MAX_CONCURRENCY`), service units request a 4096-file soft
+  limit, and direct daemon launches raise that limit when permitted.
+
 - **Source lookup now fails closed on physical ambiguity and verifies fallback
   bytes.** `get_symbol_source` no longer returns an arbitrary first row when a
   qualified name identifies multiple physical declarations. It returns

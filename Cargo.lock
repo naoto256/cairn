@@ -170,6 +170,7 @@ dependencies = [
  "cairn-proto",
  "clap",
  "linkme",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -206,6 +207,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
