@@ -57,12 +57,14 @@
 //! new Tier-1 fact must also bump its own `revision()` so the
 //! staleness scan re-runs it once new Tier-1 facts land.
 //!
-//! ### `config_hash` is not part of the auto-rerun stale criterion
+//! ### `config_hash` participates in register-time currency
 //! `workspace_analysis_runs.config_hash` distinguishes runs for the
 //! same `(manifest_id, analyzer_id, analyzer_revision)` across config
-//! edits, but the auto-rerun scan keys on `analyzer_revision` only —
-//! a config change without a revision bump is **not** treated as
-//! stale (config edits already drive their own re-queue elsewhere).
+//! edits. An unchanged-manifest registration compares the stored hash
+//! with the current files from [`WorkspaceAnalyzer::config_paths`] and
+//! targets that analyzer for re-run on mismatch. The daemon-startup
+//! scanner remains revision-only; filesystem events drive registration,
+//! whose currency check closes the config-only edit path.
 //!
 //! ### Rollback case (`<` is the only comparison)
 //! Staleness uses `persisted_rev < expected_rev`. A build whose
@@ -535,6 +537,10 @@ mod tests {
 
         fn parser_id(&self) -> &'static str {
             "fake-parser"
+        }
+
+        fn config_paths(&self) -> &'static [&'static str] {
+            &["Cargo.toml"]
         }
 
         fn analyze_workspace(
