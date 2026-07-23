@@ -431,6 +431,97 @@ async fn shutdown_wakes_workers_waiting_for_attempt_permits() {
 }
 
 #[tokio::test]
+async fn shutdown_during_state_load_skips_attempt_and_drains_worker() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "loading", "/loading", "loading-hash");
+    let mgr = build_manager_with_concurrency(cas, ManualClock::new(1_000), 1);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    let load_gate = GateInner::new();
+    let load_gate_hook = load_gate.clone();
+    let load_hook: TestLoadStateHookFn = Arc::new(move |_| {
+        load_gate_hook.enter_and_wait();
+        Ok(())
+    });
+    mgr.set_test_load_state_hook(load_hook);
+
+    mgr.request_dirty_by_alias(
+        "loading".to_string(),
+        ReconcileTrigger::StartupFullReconcile,
+    )
+    .await
+    .unwrap();
+    load_gate.wait_for_entry(500).await;
+
+    let shutdown_mgr = mgr.clone();
+    let shutdown_task =
+        tokio::spawn(async move { shutdown_mgr.shutdown(Duration::from_secs(2)).await });
+    wait_for(
+        || mgr.shutting_down.load(Ordering::SeqCst),
+        500,
+        "shutdown flag",
+    )
+    .await;
+    assert!(
+        !shutdown_task.is_finished(),
+        "shutdown must wait for the blocked state load"
+    );
+
+    load_gate.release();
+    timeout(Duration::from_secs(2), shutdown_task)
+        .await
+        .expect("shutdown must drain the state-loading worker")
+        .expect("shutdown task must not panic");
+    assert_eq!(
+        register.call_count(),
+        0,
+        "shutdown during state load must not start a register attempt"
+    );
+}
+
+#[tokio::test]
+async fn in_flight_attempt_wait_releases_state_load_permit() {
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "waiting", "/waiting", "waiting-hash");
+    seed_repo(&cas, "active", "/active", "active-hash");
+    let clock = ManualClock::new(1_000);
+    let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+    let tx = index.transaction().unwrap();
+    cas_registry::increment_desired_generation(&tx, "waiting-hash", clock.now_ns()).unwrap();
+    cas_registry::mark_attempt_start(&tx, "waiting-hash", 1, clock.now_ns()).unwrap();
+    tx.commit().unwrap();
+    drop(index);
+
+    let mgr = build_manager_with_concurrency(cas, clock, 1);
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+    let waiting_loaded = Arc::new(AtomicBool::new(false));
+    let waiting_loaded_hook = waiting_loaded.clone();
+    let load_hook: TestLoadStateHookFn = Arc::new(move |repo_hash| {
+        if repo_hash == "waiting-hash" {
+            waiting_loaded_hook.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    mgr.set_test_load_state_hook(load_hook);
+
+    assert!(mgr.wake_or_spawn("waiting-hash", Some("waiting".to_string())));
+    wait_for(
+        || waiting_loaded.load(Ordering::SeqCst),
+        500,
+        "in-flight attempt state load",
+    )
+    .await;
+    mgr.request_dirty_by_alias("active".to_string(), ReconcileTrigger::StartupFullReconcile)
+        .await
+        .unwrap();
+
+    wait_for(|| register.call_count() == 1, 1_000, "active attempt").await;
+    assert_eq!(register.calls()[0].repo_hash, "active-hash");
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
 async fn state_loads_are_bounded_before_index_open() {
     let (_t, cas) = fresh_cas();
     for n in 0..24 {
