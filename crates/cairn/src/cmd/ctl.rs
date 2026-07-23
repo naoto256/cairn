@@ -9,8 +9,8 @@
 use anyhow::{Context, Result, anyhow};
 use cairn_core::sockets::SocketPaths;
 use cairn_proto::control::{
-    DoctorReport, DoctorStatus, JobSummary, JobsCancelResult, JobsListResult, JobsPruneResult,
-    PruneResult, StatusReport,
+    DoctorReport, DoctorStatus, JobSummary, JobsCancelArgs, JobsCancelResult, JobsListResult,
+    JobsPruneResult, PruneResult, StatusReport,
 };
 use cairn_proto::jsonrpc::Response;
 use cairn_proto::methods::ListReposResult;
@@ -307,7 +307,10 @@ fn route_jobs_command(command: JobsCommand) -> CtlInvocation {
         },
         JobsCommand::Cancel { job_id, json } => CtlInvocation {
             json_output: json,
-            ..control_invocation("jobs.cancel", json!({"job_id": job_id}))
+            ..control_invocation(
+                "jobs.cancel",
+                serde_json::to_value(JobsCancelArgs { job_id }).unwrap(),
+            )
         },
         JobsCommand::Prune {
             repo,
@@ -417,11 +420,25 @@ fn render(method: &str, resp: &Response, render_hint: RenderHint) {
     }
     if let Some(jobs) = value.get("jobs").and_then(Value::as_array) {
         println!("queued {} analyzer job(s)", jobs.len());
-        for job in jobs {
+        for line in format_queued_job_lines(jobs) {
+            println!("{line}");
+        }
+        return;
+    }
+    println!("ok");
+}
+
+fn format_queued_job_lines(jobs: &[Value]) -> Vec<String> {
+    jobs.iter()
+        .map(|job| {
             let id = job
                 .get("job_id")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
+                .and_then(|value| match value {
+                    Value::String(id) => Some(id.clone()),
+                    Value::Number(id) => id.as_i64().map(|_| id.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "0".into());
             let analyzer = job
                 .get("analyzer_id")
                 .and_then(Value::as_str)
@@ -430,11 +447,9 @@ fn render(method: &str, resp: &Response, render_hint: RenderHint) {
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("<unknown>");
-            println!("job {id}: {analyzer} -> {state}");
-        }
-        return;
-    }
-    println!("ok");
+            format!("job {id}: {analyzer} -> {state}")
+        })
+        .collect()
 }
 
 async fn wait_for_jobs(
@@ -789,6 +804,48 @@ mod tests {
         assert_eq!(
             invocation.render_hint,
             RenderHint::JobsPrune { dry_run: true }
+        );
+    }
+
+    #[test]
+    fn jobs_cancel_routes_job_id_as_decimal_string() {
+        let invocation = route_ctl_command(CtlCommand::Jobs {
+            command: JobsCommand::Cancel {
+                job_id: 1_784_679_083_389_822_001,
+                json: false,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(invocation.socket, CtlSocket::Control);
+        assert_eq!(invocation.method, "jobs.cancel");
+        assert_eq!(
+            invocation.params,
+            serde_json::json!({"job_id": "1784679083389822001"})
+        );
+    }
+
+    #[test]
+    fn queued_job_render_preserves_string_ids_and_accepts_legacy_numbers() {
+        let lines = format_queued_job_lines(&[
+            serde_json::json!({
+                "job_id": "1784679083389822001",
+                "analyzer_id": "rust-analyzer-lsp",
+                "state": "queued"
+            }),
+            serde_json::json!({
+                "job_id": 7,
+                "analyzer_id": "pyright-lsp",
+                "state": "queued"
+            }),
+        ]);
+
+        assert_eq!(
+            lines,
+            [
+                "job 1784679083389822001: rust-analyzer-lsp -> queued",
+                "job 7: pyright-lsp -> queued"
+            ]
         );
     }
 

@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
+use super::ack_with_queued_analyzer_jobs;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::reconcile::ReconcileTrigger;
 use crate::register::{
@@ -109,14 +110,10 @@ impl ControlMethod for ReindexRepo {
             blobs_parsed = outcome.blobs_parsed,
             "reindex_repo complete (inline fallback)"
         );
-        let mut value = serde_json::to_value(Ack::with_alias(args.alias)).unwrap();
-        if let Value::Object(obj) = &mut value {
-            obj.insert(
-                "jobs".into(),
-                serde_json::to_value(&outcome.analyzer_jobs).unwrap(),
-            );
-        }
-        Ok(value)
+        Ok(ack_with_queued_analyzer_jobs(
+            Ack::with_alias(args.alias),
+            &outcome.analyzer_jobs,
+        ))
     }
 }
 
