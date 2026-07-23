@@ -28,29 +28,26 @@ pub fn expected_analyzers_for_manifest(
         .collect())
 }
 
-/// Returns `true` iff **every** expected analyzer for `manifest_id` has a
-/// `workspace_analysis_runs` row whose `analyzer_revision` matches the
-/// linked-in build's current `revision()` **and** whose `status` is
-/// `succeeded`.
+/// Returns the expected analyzers whose facts are not current for
+/// `manifest_id`.
 ///
-/// Used by `register_repo_inner` as one of three independent gates that
-/// decide whether the workspace analyzer pass can be skipped on a
-/// re-register where the tentative manifest is byte-identical. Queued /
-/// running / failed / skipped / cancelled / timed_out rows all force a
-/// re-run — only an outright `succeeded` row at the current revision
-/// counts as "facts current", because any other state can leave the
-/// resolutions table either empty or partially populated.
+/// An analyzer needs a re-run when its `workspace_analysis_runs` row is
+/// missing, its revision differs from the linked-in `revision()`, or its
+/// status is anything other than `succeeded`. Queued / running / failed /
+/// skipped / cancelled / timed_out rows therefore all force that analyzer
+/// to re-run, because any of those states can leave its resolutions empty
+/// or partially populated.
 ///
 /// If `expected_analyzers_for_manifest` is empty (no language we analyze
-/// at workspace tier appears in the manifest), the answer is trivially
-/// `true` — there is no pass to run, so there is nothing to skip past.
-pub(crate) fn check_workspace_analyzer_current_succeeded(
+/// at workspace tier appears in the manifest), the returned vector is
+/// empty.
+pub(crate) fn workspace_analyzers_needing_rerun(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
-) -> Result<bool> {
+) -> Result<Vec<Box<dyn WorkspaceAnalyzer>>> {
     let expected = expected_analyzers_for_manifest(conn, manifest_id)?;
     if expected.is_empty() {
-        return Ok(true);
+        return Ok(Vec::new());
     }
 
     let mut existing: HashMap<String, (i64, String)> = HashMap::new();
@@ -73,19 +70,16 @@ pub(crate) fn check_workspace_analyzer_current_succeeded(
         }
     }
 
-    for analyzer in &expected {
-        let Some((revision, status)) = existing.get(analyzer.id()) else {
-            return Ok(false);
-        };
-        if status != "succeeded" {
-            return Ok(false);
-        }
-        let revision = u32::try_from(*revision).unwrap_or(u32::MAX);
-        if revision != analyzer.revision() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(expected
+        .into_iter()
+        .filter(|analyzer| {
+            let Some((revision, status)) = existing.get(analyzer.id()) else {
+                return true;
+            };
+            let revision = u32::try_from(*revision).unwrap_or(u32::MAX);
+            status != "succeeded" || revision != analyzer.revision()
+        })
+        .collect())
 }
 
 pub(crate) fn manifest_parser_ids(
@@ -261,61 +255,81 @@ mod tests {
         .unwrap();
     }
 
+    fn rerun_ids(conn: &rusqlite::Connection, manifest_id: ManifestId) -> Vec<String> {
+        let mut ids = workspace_analyzers_needing_rerun(conn, manifest_id)
+            .unwrap()
+            .into_iter()
+            .map(|analyzer| analyzer.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     /// Vacuous case: a manifest whose parsers don't match any
-    /// registered analyzer (e.g. a pure rust manifest in this crate's
-    /// test build, since no rust analyzer is linked here) returns
-    /// `true` — there is no pass to skip past.
+    /// registered analyzer returns an empty re-run set.
     #[test]
-    fn check_workspace_analyzer_current_succeeded_is_vacuously_true_when_no_expected() {
+    fn workspace_analyzers_needing_rerun_is_empty_when_no_analyzer_is_expected() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
         // unknown-parser has no registered analyzer.
         insert_manifest_parser(&conn, ManifestId(1), "u-sha", "unknown-parser");
 
-        let ok = check_workspace_analyzer_current_succeeded(&conn, ManifestId(1)).unwrap();
-        assert!(ok);
+        assert!(rerun_ids(&conn, ManifestId(1)).is_empty());
     }
 
-    /// Happy path: every expected analyzer has a `succeeded` row at
-    /// the current revision. Returns `true`.
+    /// Happy path: every expected analyzer succeeded at its current
+    /// revision, so the re-run set is empty.
     #[test]
-    fn check_workspace_analyzer_current_succeeded_accepts_succeeded_at_current_revision() {
+    fn workspace_analyzers_needing_rerun_is_empty_when_all_are_current() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
         insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+        insert_manifest_parser(&conn, ManifestId(1), "second-sha", "second-fake-parser");
         // fake-workspace.revision() == 7 in workspace_analyzer/mod.rs tests.
         insert_run(&conn, ManifestId(1), "fake-workspace", 7, "succeeded");
+        insert_run(
+            &conn,
+            ManifestId(1),
+            "second-fake-workspace",
+            11,
+            "succeeded",
+        );
 
-        let ok = check_workspace_analyzer_current_succeeded(&conn, ManifestId(1)).unwrap();
-        assert!(ok);
+        assert!(rerun_ids(&conn, ManifestId(1)).is_empty());
     }
 
-    /// Row absent: an expected analyzer with no run row returns
-    /// `false`. The first-ever register on a manifest hits this arm.
+    /// Row absent: only the expected analyzer without a run row is
+    /// returned.
     #[test]
-    fn check_workspace_analyzer_current_succeeded_rejects_missing_row() {
+    fn workspace_analyzers_needing_rerun_returns_only_missing_row() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
         insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+        insert_manifest_parser(&conn, ManifestId(1), "second-sha", "second-fake-parser");
+        insert_run(&conn, ManifestId(1), "fake-workspace", 7, "succeeded");
 
-        let ok = check_workspace_analyzer_current_succeeded(&conn, ManifestId(1)).unwrap();
-        assert!(!ok);
+        assert_eq!(rerun_ids(&conn, ManifestId(1)), ["second-fake-workspace"]);
     }
 
-    /// R2 must-fix #2 pin: revision stale → `false`. Models the case
-    /// where the analyzer's linked-in `revision()` bumped between runs
-    /// (the targeted scenario for the v0.7.0 auto-reindex feature) and
-    /// the existing `succeeded` row references the prior revision.
+    /// Revision stale: only the analyzer whose linked-in revision
+    /// advanced is returned.
     #[test]
-    fn check_workspace_analyzer_current_succeeded_rejects_stale_revision() {
+    fn workspace_analyzers_needing_rerun_returns_only_stale_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
         insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+        insert_manifest_parser(&conn, ManifestId(1), "second-sha", "second-fake-parser");
         // fake-workspace.revision() == 7; persisted row is at 6.
         insert_run(&conn, ManifestId(1), "fake-workspace", 6, "succeeded");
+        insert_run(
+            &conn,
+            ManifestId(1),
+            "second-fake-workspace",
+            11,
+            "succeeded",
+        );
 
-        let ok = check_workspace_analyzer_current_succeeded(&conn, ManifestId(1)).unwrap();
-        assert!(!ok);
+        assert_eq!(rerun_ids(&conn, ManifestId(1)), ["fake-workspace"]);
     }
 
     /// R2 must-fix #2 pin: queued / running / failed / skipped /
@@ -324,7 +338,7 @@ mod tests {
     /// table either empty or partially populated, so it must not
     /// masquerade as up-to-date.
     #[test]
-    fn check_workspace_analyzer_current_succeeded_rejects_non_succeeded_status() {
+    fn workspace_analyzers_needing_rerun_returns_only_non_succeeded_status() {
         for status in [
             "queued",
             "running",
@@ -338,8 +352,11 @@ mod tests {
             insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
             insert_run(&conn, ManifestId(1), "fake-workspace", 7, status);
 
-            let ok = check_workspace_analyzer_current_succeeded(&conn, ManifestId(1)).unwrap();
-            assert!(!ok, "status {status:?} must NOT count as 'facts current'");
+            assert_eq!(
+                rerun_ids(&conn, ManifestId(1)),
+                ["fake-workspace"],
+                "status {status:?} must require that analyzer to re-run"
+            );
         }
     }
 

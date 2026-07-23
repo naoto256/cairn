@@ -32,8 +32,8 @@ use crate::manifest::{
     self, ManifestEntry, ManifestId, ManifestKind, PathHint, WorktreeFilePayload,
 };
 use crate::workspace_analyzer::{
-    check_workspace_analyzer_current_succeeded, is_c_family_header_path,
-    pick_backend_with_fallbacks, run_registered_workspace_analyzers,
+    WorkspaceAnalyzer, all_workspace_analyzers, is_c_family_header_path,
+    pick_backend_with_fallbacks, run_workspace_analyzers, workspace_analyzers_needing_rerun,
 };
 
 /// Outcome of a successful `register_repo` call.
@@ -47,11 +47,11 @@ pub struct RegisterOutcome {
     /// `true` iff the workspace analyzer pass was skipped because the
     /// tentative manifest entries were byte-identical to the prior
     /// tentative, no blobs were re-parsed by the pre-publication parse pass,
-    /// and every expected analyzer already has a `succeeded` run row
-    /// at the current `analyzer_revision`. All three gates must hold
-    /// — entries-unchanged alone is not enough to skip (it would let
-    /// a parser_revision bump leave the resolutions table stale under
-    /// a reused `manifest_id`).
+    /// and no expected analyzer needs a re-run. An expected analyzer needs a
+    /// re-run when its row is absent, non-succeeded, or at a stale revision.
+    /// All three gates must hold — entries-unchanged alone is not enough to
+    /// skip (it would let a parser_revision bump leave the resolutions table
+    /// stale under a reused `manifest_id`).
     pub skip_analyzers_for_unchanged_manifest: bool,
     pub analyzer_jobs: Vec<QueuedAnalyzerJob>,
     /// Number of `(blob, parser)` pairs that were parsed fresh
@@ -122,9 +122,9 @@ pub fn register_repo(
         worktree_path,
         now_ns,
         true,
-        |conn, repo_root, manifest_id, entries, now_ns| {
+        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
             let _inserted =
-                run_registered_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns)?;
+                run_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns, analyzers)?;
             Ok(Vec::new())
         },
     )
@@ -145,9 +145,9 @@ pub(crate) fn register_repo_force_analyzers(
         worktree_path,
         now_ns,
         false,
-        |conn, repo_root, manifest_id, entries, now_ns| {
+        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
             let _inserted =
-                run_registered_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns)?;
+                run_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns, analyzers)?;
             Ok(Vec::new())
         },
     )
@@ -166,7 +166,7 @@ pub(crate) fn register_repo_enqueue_analyzers(
         worktree_path,
         now_ns,
         true,
-        |conn, repo_root, manifest_id, entries, now_ns| {
+        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
             job_manager.enqueue_reindex(EnqueueReindex {
                 conn,
                 alias,
@@ -175,6 +175,7 @@ pub(crate) fn register_repo_enqueue_analyzers(
                 manifest_id,
                 entries,
                 now_ns,
+                analyzers,
             })
         },
     )
@@ -193,7 +194,7 @@ pub(crate) fn register_repo_force_analyzers_enqueue(
         worktree_path,
         now_ns,
         false,
-        |conn, repo_root, manifest_id, entries, now_ns| {
+        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
             job_manager.enqueue_reindex(EnqueueReindex {
                 conn,
                 alias,
@@ -202,6 +203,7 @@ pub(crate) fn register_repo_force_analyzers_enqueue(
                 manifest_id,
                 entries,
                 now_ns,
+                analyzers,
             })
         },
     )
@@ -220,7 +222,7 @@ pub(crate) fn register_repo_reconcile_enqueue_analyzers(
             generation: request.generation,
             forced: request.forced,
         },
-        |conn, repo_root, manifest_id, entries, now_ns| {
+        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
             job_manager.enqueue_reindex(EnqueueReindex {
                 conn,
                 alias: request.alias,
@@ -229,6 +231,7 @@ pub(crate) fn register_repo_reconcile_enqueue_analyzers(
                 manifest_id,
                 entries,
                 now_ns,
+                analyzers,
             })
         },
     )
@@ -246,9 +249,9 @@ pub(crate) fn register_repo_reconcile(
         worktree_path,
         now_ns,
         RegistrationPublication::Reconcile { generation, forced },
-        |conn, repo_root, manifest_id, entries, now_ns| {
+        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
             let _inserted =
-                run_registered_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns)?;
+                run_workspace_analyzers(conn, repo_root, manifest_id, entries, now_ns, analyzers)?;
             Ok(Vec::new())
         },
     )
@@ -267,6 +270,7 @@ where
         &Path,
         ManifestId,
         &[ManifestEntry],
+        Vec<Box<dyn WorkspaceAnalyzer>>,
         i64,
     ) -> Result<Vec<QueuedAnalyzerJob>>,
 {
@@ -294,6 +298,7 @@ where
         &Path,
         ManifestId,
         &[ManifestEntry],
+        Vec<Box<dyn WorkspaceAnalyzer>>,
         i64,
     ) -> Result<Vec<QueuedAnalyzerJob>>,
 {
@@ -428,28 +433,27 @@ where
     // Order matters: parsing must finish before publication and before the
     // skip decision. Running it after would observe a post-skip state and let
     // drift slip through.
-    // Gate #3 (analyzer revision current): every expected analyzer
-    // has a `succeeded` workspace_analysis_runs row at the current
-    // linked-in `revision()`. queued / running / failed / skipped /
-    // cancelled / timed_out all count as "not current" so a
-    // half-finished pass cannot masquerade as up-to-date — the
-    // misleading-state symptom that motivated this fix.
-    let analyzer_current = if entries_unchanged && blobs_parsed == 0 {
-        check_workspace_analyzer_current_succeeded(conn, tentative)?
+    // Gate #3 (per-analyzer currency): when the manifest and Tier-1
+    // facts are unchanged, run only expected analyzers whose row is
+    // missing, non-succeeded, or at a stale revision. A permanently
+    // failing analyzer must not amplify into re-running every healthy
+    // analyzer on each watcher tick. Changed inputs still run the full
+    // registered set so newly applicable analyzers are not missed.
+    let analyzers_to_run = if entries_unchanged && blobs_parsed == 0 {
+        workspace_analyzers_needing_rerun(conn, tentative)?
     } else {
-        // Skip the DB probe when the cheap gates already disqualify
-        // skipping. Saves the SELECT in the common churn path.
-        false
+        all_workspace_analyzers()
     };
 
     let skip_analyzers_for_unchanged_manifest =
-        entries_unchanged && blobs_parsed == 0 && analyzer_current;
+        entries_unchanged && blobs_parsed == 0 && analyzers_to_run.is_empty();
 
-    let analyzer_jobs = if skip_analyzers_for_unchanged_manifest {
+    let analyzer_jobs = if analyzers_to_run.is_empty() {
         debug!(
             repo = %worktree_path.display(),
             manifest_id = tentative.0,
-            "workspace analyzer pass skipped; facts current"
+            skip_analyzers_for_unchanged_manifest,
+            "workspace analyzer pass skipped; no analyzers selected"
         );
         Vec::new()
     } else {
@@ -458,10 +462,17 @@ where
             manifest_id = tentative.0,
             entries_unchanged,
             blobs_parsed,
-            analyzer_current,
-            "workspace analyzer pass forced"
+            analyzers = analyzers_to_run.len(),
+            "workspace analyzer pass scheduled"
         );
-        run_analyzers(conn, worktree_path, tentative, &tentative_entries, now_ns)?
+        run_analyzers(
+            conn,
+            worktree_path,
+            tentative,
+            &tentative_entries,
+            analyzers_to_run,
+            now_ns,
+        )?
     };
 
     Ok(RegisterOutcome {
@@ -818,6 +829,50 @@ mod tests {
             .unwrap()
     }
 
+    fn analyzer_ids(analyzers: Vec<Box<dyn WorkspaceAnalyzer>>) -> Vec<String> {
+        let mut ids = analyzers
+            .into_iter()
+            .map(|analyzer| analyzer.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn attach_test_analyzer_parsers(conn: &Connection, manifest_id: ManifestId) {
+        let blob_sha: String = conn
+            .query_row(
+                "SELECT blob_sha FROM manifest_entries WHERE manifest_id = ?1 LIMIT 1",
+                [manifest_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for parser_id in ["fake-parser", "second-fake-parser"] {
+            conn.execute(
+                "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+                 VALUES (?1, ?2, 1, 0)",
+                params![blob_sha, parser_id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn insert_analyzer_run(
+        conn: &Connection,
+        manifest_id: ManifestId,
+        analyzer_id: &str,
+        analyzer_revision: u32,
+        status: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns)
+             VALUES (?1, ?2, ?3, 'cfg', ?4, 10)",
+            params![manifest_id.0, analyzer_id, analyzer_revision, status],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn end_to_end_register_persists_anchors_and_blobs() {
         let repo = init_rust_repo(&[(
@@ -938,7 +993,7 @@ mod tests {
                 generation: 8,
                 forced: false,
             },
-            |_, _, _, _, _| Err(crate::Error::Internal("enqueue failed".into())),
+            |_, _, _, _, _, _| Err(crate::Error::Internal("enqueue failed".into())),
         )
         .unwrap_err();
 
@@ -955,7 +1010,7 @@ mod tests {
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
         let analyzer_runs = Cell::new(0);
 
-        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -969,7 +1024,7 @@ mod tests {
 
         fs::write(repo.path().join("src/lib.rs"), "pub fn new() {}\n").unwrap();
         fs::write(repo.path().join(".gitignore"), [0xff]).unwrap();
-        let err = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+        let err = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -998,12 +1053,12 @@ mod tests {
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
         let analyzer_runs = Cell::new(0);
 
-        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
         .unwrap();
-        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -1013,6 +1068,130 @@ mod tests {
         assert!(second.skip_analyzers_for_unchanged_manifest);
         assert_eq!(second.tentative_manifest, first.tentative_manifest);
         assert_eq!(analyzer_runs.get(), 1);
+    }
+
+    #[test]
+    fn unchanged_manifest_reruns_only_failed_analyzer() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let expected_all = analyzer_ids(all_workspace_analyzers());
+        let mut calls = Vec::new();
+
+        let first = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            1,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "succeeded",
+        );
+        insert_analyzer_run(
+            &conn,
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "failed",
+        );
+
+        let second = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            2,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls[0], expected_all);
+        assert_eq!(calls[1], ["second-fake-workspace"]);
+        assert!(!second.skip_analyzers_for_unchanged_manifest);
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+    }
+
+    #[test]
+    fn unchanged_manifest_with_all_analyzers_current_runs_none() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _, _| {
+            Ok(Vec::new())
+        })
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "succeeded",
+        );
+        insert_analyzer_run(
+            &conn,
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "succeeded",
+        );
+
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
+            panic!("all current analyzers must be skipped")
+        })
+        .unwrap();
+
+        assert!(second.skip_analyzers_for_unchanged_manifest);
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+    }
+
+    #[test]
+    fn changed_manifest_runs_all_analyzers() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn before() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let expected_all = analyzer_ids(all_workspace_analyzers());
+        let mut calls = Vec::new();
+
+        register_repo_inner(
+            &mut conn,
+            repo.path(),
+            1,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        fs::write(repo.path().join("src/lib.rs"), "pub fn after() {}\n").unwrap();
+        let second = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            2,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, [expected_all.clone(), expected_all]);
+        assert!(!second.skip_analyzers_for_unchanged_manifest);
     }
 
     /// F-A regression: when blobs were re-parsed (e.g. parser_revision
@@ -1033,7 +1212,7 @@ mod tests {
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
         let analyzer_runs = Cell::new(0);
 
-        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -1047,7 +1226,7 @@ mod tests {
         // parser output → CAS invalidation → blobs_parsed > 0.
         conn.execute("DELETE FROM blobs", []).unwrap();
 
-        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -1094,7 +1273,7 @@ mod tests {
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
         let analyzer_runs = Cell::new(0);
 
-        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _| {
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -1109,7 +1288,7 @@ mod tests {
         // is unchanged.
         conn.execute("DELETE FROM blobs", []).unwrap();
 
-        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _| {
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
@@ -1141,12 +1320,12 @@ mod tests {
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
         let analyzer_runs = Cell::new(0);
 
-        let first = register_repo_inner(&mut conn, repo.path(), 1, false, |_, _, _, _, _| {
+        let first = register_repo_inner(&mut conn, repo.path(), 1, false, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })
         .unwrap();
-        let second = register_repo_inner(&mut conn, repo.path(), 2, false, |_, _, _, _, _| {
+        let second = register_repo_inner(&mut conn, repo.path(), 2, false, |_, _, _, _, _, _| {
             analyzer_runs.set(analyzer_runs.get() + 1);
             Ok(Vec::new())
         })

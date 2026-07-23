@@ -47,8 +47,7 @@ pub fn run_registered_workspace_analyzers(
     )
 }
 
-#[cfg(test)]
-pub(super) fn run_workspace_analyzers(
+pub(crate) fn run_workspace_analyzers(
     conn: &mut Connection,
     repo_root: &Path,
     manifest_id: ManifestId,
