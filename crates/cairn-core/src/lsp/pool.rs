@@ -328,12 +328,21 @@ fn capacity_from_env_value(raw: Option<&str>) -> NonZeroUsize {
     if let Some(rest) = trimmed.strip_prefix('-') {
         // `-` alone or `-<non-digit>` → non-numeric; `-<digits>` →
         // negative. Both are user errors that fall back to default.
-        let label = if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
-            "lsp pool capacity must be > 0; using default"
+        let (label, reason) = if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+            (
+                "lsp pool capacity must be > 0; using default",
+                "out_of_range",
+            )
         } else {
-            "invalid lsp pool capacity; using default"
+            ("invalid lsp pool capacity; using default", "invalid")
         };
-        warn!(env = POOL_CAPACITY_ENV, value = %raw, default = DEFAULT_POOL_CAPACITY, "{}", label);
+        warn!(
+            env = POOL_CAPACITY_ENV,
+            default = DEFAULT_POOL_CAPACITY,
+            reason,
+            "{}",
+            label
+        );
         return default;
     }
     // Non-negative. Parse as `u128` so very large positive values
@@ -346,8 +355,8 @@ fn capacity_from_env_value(raw: Option<&str>) -> NonZeroUsize {
         Err(_) if all_digits => {
             warn!(
                 env = POOL_CAPACITY_ENV,
-                value = %raw,
                 max = MAX_POOL_CAPACITY,
+                reason = "overflow",
                 "lsp pool capacity exceeds max; clamping"
             );
             return max;
@@ -355,8 +364,8 @@ fn capacity_from_env_value(raw: Option<&str>) -> NonZeroUsize {
         Err(_) => {
             warn!(
                 env = POOL_CAPACITY_ENV,
-                value = %raw,
                 default = DEFAULT_POOL_CAPACITY,
+                reason = "invalid",
                 "invalid lsp pool capacity; using default"
             );
             return default;
@@ -365,8 +374,8 @@ fn capacity_from_env_value(raw: Option<&str>) -> NonZeroUsize {
     if parsed == 0 {
         warn!(
             env = POOL_CAPACITY_ENV,
-            value = %raw,
             default = DEFAULT_POOL_CAPACITY,
+            reason = "out_of_range",
             "lsp pool capacity must be > 0; using default"
         );
         return default;
@@ -374,8 +383,8 @@ fn capacity_from_env_value(raw: Option<&str>) -> NonZeroUsize {
     if parsed > MAX_POOL_CAPACITY as u128 {
         warn!(
             env = POOL_CAPACITY_ENV,
-            value = %raw,
             max = MAX_POOL_CAPACITY,
+            reason = "out_of_range",
             "lsp pool capacity exceeds max; clamping"
         );
         return max;
@@ -402,10 +411,15 @@ fn idle_ttl_from_env_value(raw: Option<&str>) -> Option<Duration> {
         Ok(0) => None,
         Ok(seconds) => Some(Duration::from_secs(seconds)),
         Err(_) => {
+            let reason = if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+                "overflow"
+            } else {
+                "invalid"
+            };
             warn!(
                 env = IDLE_TTL_ENV,
-                value = %raw,
                 default_secs = DEFAULT_IDLE_TTL.as_secs(),
+                reason,
                 "invalid lsp pool idle TTL; using default"
             );
             Some(DEFAULT_IDLE_TTL)
