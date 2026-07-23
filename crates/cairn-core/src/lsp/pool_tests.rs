@@ -1,5 +1,37 @@
 use super::*;
 use crate::lsp::Error;
+use std::io::{self, Write};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct CapturedLog {
+    bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CapturedLog {
+    fn contents(&self) -> String {
+        String::from_utf8(self.bytes.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 #[cfg(unix)]
 struct FakeProbeBinary {
@@ -337,6 +369,33 @@ fn idle_ttl_defaults_overrides_and_zero_disables_sweeper() {
         disabled._idle_sweeper.is_none(),
         "TTL=0 must not spawn an idle sweep task"
     );
+}
+
+#[test]
+fn pool_env_warnings_do_not_log_raw_values() {
+    let output = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(output.clone())
+        .finish();
+    let sensitive_capacity = "sensitive-capacity-token";
+    let sensitive_ttl = "sensitive-ttl-token";
+
+    tracing::subscriber::with_default(subscriber, || {
+        assert_eq!(cap(Some(sensitive_capacity)), DEFAULT_POOL_CAPACITY);
+        assert_eq!(
+            idle_ttl_from_env_value(Some(sensitive_ttl)),
+            Some(DEFAULT_IDLE_TTL)
+        );
+    });
+
+    let captured = output.contents();
+    assert!(captured.contains(POOL_CAPACITY_ENV));
+    assert!(captured.contains(IDLE_TTL_ENV));
+    assert!(captured.contains("reason=\"invalid\""));
+    assert!(!captured.contains(sensitive_capacity));
+    assert!(!captured.contains(sensitive_ttl));
 }
 
 // ─── Force-shutdown outcome classifier ─────────────────────
