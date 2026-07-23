@@ -1112,6 +1112,47 @@ async fn mf6_recover_interrupted_attempts_waits_for_startup_prime_before_wake() 
     assert!(s.last_error.is_none() || s.last_error.as_deref() == Some(""));
 }
 
+#[test]
+fn periodic_policy_default_becomes_due_one_poll_before_expiry() {
+    let policy = PeriodicReconcilePolicy::default();
+
+    assert_eq!(policy.due_margin, policy.poll_interval);
+    assert_eq!(policy.due_age().unwrap(), Duration::from_secs(25 * 60));
+}
+
+#[test]
+fn periodic_policy_zero_margin_preserves_the_legacy_due_age() {
+    let policy = PeriodicReconcilePolicy {
+        poll_interval: Duration::from_secs(5 * 60),
+        max_clean_age: Duration::from_secs(30 * 60),
+        due_margin: Duration::ZERO,
+    };
+
+    assert_eq!(policy.due_age().unwrap(), policy.max_clean_age);
+}
+
+#[test]
+fn periodic_policy_rejects_invalid_due_margins() {
+    let margin_below_poll = PeriodicReconcilePolicy {
+        poll_interval: Duration::from_secs(5 * 60),
+        max_clean_age: Duration::from_secs(30 * 60),
+        due_margin: Duration::from_secs(4 * 60),
+    };
+    assert!(margin_below_poll.due_age().is_err());
+
+    let margin_consumes_max_age = PeriodicReconcilePolicy {
+        due_margin: Duration::from_secs(30 * 60),
+        ..margin_below_poll
+    };
+    assert!(margin_consumes_max_age.due_age().is_err());
+
+    let margin_leaves_less_than_half = PeriodicReconcilePolicy {
+        due_margin: Duration::from_secs(16 * 60),
+        ..margin_below_poll
+    };
+    assert!(margin_leaves_less_than_half.due_age().is_err());
+}
+
 #[tokio::test]
 async fn periodic_scheduler_delays_first_tick_and_stops_on_shutdown() {
     let (_t, cas) = fresh_cas();
@@ -1131,6 +1172,7 @@ async fn periodic_scheduler_delays_first_tick_and_stops_on_shutdown() {
     mgr.start_periodic_reconcile(PeriodicReconcilePolicy {
         poll_interval: Duration::from_millis(100),
         max_clean_age: Duration::from_nanos(1),
+        due_margin: Duration::ZERO,
     })
     .unwrap();
 
@@ -1158,6 +1200,7 @@ async fn periodic_scheduler_shutdown_is_observed_before_first_poll() {
     mgr.start_periodic_reconcile(PeriodicReconcilePolicy {
         poll_interval: Duration::from_secs(60),
         max_clean_age: Duration::from_secs(60),
+        due_margin: Duration::ZERO,
     })
     .unwrap();
 
