@@ -15,8 +15,9 @@ use crate::cas::registry::{self as cas_registry, RepoReconcileState, WatcherStat
 use crate::manifest::ManifestId;
 use crate::{Error, Result};
 
-/// Shared freshness horizon. The periodic reconciler uses the same duration,
-/// so a healthy daemon schedules a full scan before a clean snapshot expires.
+/// Shared freshness horizon. The default periodic reconciler becomes due one
+/// poll interval before this limit, so a healthy daemon schedules a full scan
+/// before a clean snapshot expires.
 pub const MAX_CURRENT_SNAPSHOT_AGE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

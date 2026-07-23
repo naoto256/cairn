@@ -152,13 +152,47 @@ pub struct StartupPrimeOutcome {
 pub struct PeriodicReconcilePolicy {
     pub poll_interval: Duration,
     pub max_clean_age: Duration,
+    /// Lead time before `max_clean_age`; zero preserves the legacy threshold.
+    pub due_margin: Duration,
+}
+
+impl PeriodicReconcilePolicy {
+    fn due_age(&self) -> Result<Duration> {
+        if self.poll_interval.is_zero() || self.max_clean_age.is_zero() {
+            return Err(Error::InvalidArgument(
+                "periodic reconcile durations must be non-zero".into(),
+            ));
+        }
+        if self.due_margin.is_zero() {
+            return Ok(self.max_clean_age);
+        }
+        if self.due_margin < self.poll_interval {
+            return Err(Error::InvalidArgument(
+                "periodic reconcile due margin must be zero or at least the poll interval".into(),
+            ));
+        }
+        if self.due_margin >= self.max_clean_age {
+            return Err(Error::InvalidArgument(
+                "periodic reconcile due margin must be less than max clean age".into(),
+            ));
+        }
+        let due_age = self.max_clean_age - self.due_margin;
+        if due_age < self.max_clean_age / 2 {
+            return Err(Error::InvalidArgument(
+                "periodic reconcile due margin must leave at least half the max clean age".into(),
+            ));
+        }
+        Ok(due_age)
+    }
 }
 
 impl Default for PeriodicReconcilePolicy {
     fn default() -> Self {
+        let poll_interval = Duration::from_secs(5 * 60);
         Self {
-            poll_interval: Duration::from_secs(5 * 60),
+            poll_interval,
             max_clean_age: crate::freshness::MAX_CURRENT_SNAPSHOT_AGE,
+            due_margin: poll_interval,
         }
     }
 }
@@ -628,11 +662,7 @@ impl RepoReconcileManager {
         self: &Arc<Self>,
         policy: PeriodicReconcilePolicy,
     ) -> Result<()> {
-        if policy.poll_interval.is_zero() || policy.max_clean_age.is_zero() {
-            return Err(Error::InvalidArgument(
-                "periodic reconcile durations must be non-zero".into(),
-            ));
-        }
+        let due_age = policy.due_age()?;
         let mut slot = self
             .periodic_task
             .lock()
@@ -655,7 +685,7 @@ impl RepoReconcileManager {
                         let Some(manager) = weak.upgrade() else {
                             return;
                         };
-                        manager.run_periodic_cycle(policy.max_clean_age).await;
+                        manager.run_periodic_cycle(due_age).await;
                     }
                 }
             }
@@ -663,7 +693,7 @@ impl RepoReconcileManager {
         Ok(())
     }
 
-    async fn run_periodic_cycle(self: &Arc<Self>, max_clean_age: Duration) {
+    async fn run_periodic_cycle(self: &Arc<Self>, due_age: Duration) {
         let cas_data_dir = self.cas_data_dir.clone();
         let repos = match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
@@ -691,7 +721,7 @@ impl RepoReconcileManager {
                 return;
             }
             match self
-                .request_periodic_if_due(repo_hash.clone(), max_clean_age)
+                .request_periodic_if_due(repo_hash.clone(), due_age)
                 .await
             {
                 Ok(Some(generation)) => info!(
@@ -716,13 +746,13 @@ impl RepoReconcileManager {
     async fn request_periodic_if_due(
         self: &Arc<Self>,
         repo_hash: String,
-        max_clean_age: Duration,
+        due_age: Duration,
     ) -> Result<Option<i64>> {
         let _lease = match &self.lifecycle {
             Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(&repo_hash)?),
             None => None,
         };
-        let max_clean_age_ns = i64::try_from(max_clean_age.as_nanos()).unwrap_or(i64::MAX);
+        let due_age_ns = i64::try_from(due_age.as_nanos()).unwrap_or(i64::MAX);
         let now_ns = self.clock.now_ns();
         let cas_data_dir = self.cas_data_dir.clone();
         let repo_hash_task = repo_hash.clone();
@@ -733,7 +763,7 @@ impl RepoReconcileManager {
                 &tx,
                 &repo_hash_task,
                 now_ns,
-                max_clean_age_ns,
+                due_age_ns,
             )?;
             tx.commit()?;
             Ok(generation)
