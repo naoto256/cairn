@@ -9,6 +9,10 @@ pub mod blob;
 pub mod hash;
 pub mod kind_conv;
 pub mod parse;
+// Exception to the per-repo scope above: `registry` owns the
+// daemon-global `index.db` (repository identity, aliases, durable
+// reconcile state), a physically separate database from the per-repo
+// stores under `repos/`.
 pub mod registry;
 pub mod schema;
 pub mod store;

@@ -1,3 +1,18 @@
+//! Per-language enrichment reporting for status surfaces.
+//!
+//! Builds the [`LanguageEnrichment`] matrix that `status` and
+//! `list_repos` attach to a snapshot: for each language visible in a
+//! manifest, whether analysis capability exists (`has_analyzer`) and
+//! whether analyzed facts are actually recorded for this snapshot
+//! (`tier`). This is read-only reporting over the fact tables — it
+//! never triggers analysis and writes nothing.
+//!
+//! `tier` is derived solely from `blobs.analyzer_id`, i.e. per-blob
+//! Tier-2 analyzer runs. A registered workspace analyzer (Tier-2.5/3)
+//! counts toward `has_analyzer` but never upgrades `tier`, even after
+//! its runs complete — run lifecycle/status is tracked in
+//! `workspace_analysis_runs` and the resolved facts themselves land
+//! in `refs` / `resolutions`, none of which this module consults.
 use std::collections::HashSet;
 
 use cairn_lang_api::LanguageBackend;
@@ -8,6 +23,19 @@ use crate::Result;
 use crate::workspace_analyzer::all_workspace_analyzers;
 
 /// Build the per-language enrichment matrix for one manifest.
+///
+/// Returns one entry per distinct display language, sorted by name.
+/// Multiple `parser_id`s can map to one language, so entries merge:
+/// `Semantic` wins `tier` and `has_analyzer` is OR-ed across the
+/// group.
+///
+/// `has_analyzer` is capability — a Tier-2 or workspace analyzer is
+/// registered for the parser. `tier` is realized state — `Semantic`
+/// iff at least one manifest blob carries this backend's
+/// `analyzer_id`.
+///
+/// # Errors
+/// SQLite failures reading the store.
 pub(crate) fn collect_enrichment(
     conn: &Connection,
     manifest_id: i64,
@@ -23,6 +51,10 @@ pub(crate) fn collect_enrichment(
     let parser_ids = stmt
         .query_map(params![manifest_id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // (parser_id, analyzer_id) pairs of registered workspace
+    // analyzers. Only the parser_id side is matched below:
+    // registration alone counts as capability, whether or not the
+    // analyzer has ever run.
     let workspace_analyzer_ids = all_workspace_analyzers()
         .into_iter()
         .map(|a| (a.parser_id(), a.id()))
@@ -30,6 +62,9 @@ pub(crate) fn collect_enrichment(
 
     let mut out: Vec<LanguageEnrichment> = Vec::with_capacity(parser_ids.len());
     for parser_id in parser_ids {
+        // A parser_id with no live backend (e.g. rows left behind by
+        // a removed or renamed backend) still gets an entry; its
+        // display name is derived from the id itself.
         let backend = backends
             .iter()
             .find(|b| b.parser_id() == parser_id)
@@ -46,6 +81,8 @@ pub(crate) fn collect_enrichment(
             SourceTier::Syntactic
         };
 
+        // Merge parser_ids sharing a display language: tier is
+        // sticky-Semantic, capability accumulates.
         if let Some(existing) = out.iter_mut().find(|e| e.language == language) {
             if matches!(tier, SourceTier::Semantic) {
                 existing.tier = SourceTier::Semantic;
@@ -63,6 +100,10 @@ pub(crate) fn collect_enrichment(
     Ok(out)
 }
 
+/// Best-effort display name for a `parser_id` that has no live
+/// backend: strip the `tree-sitter-` prefix and the `@version`
+/// suffix (`tree-sitter-rust@1.2.3` → `rust`); anything else passes
+/// through unchanged.
 fn short_lang_name(parser_id: &str) -> String {
     parser_id
         .strip_prefix("tree-sitter-")
@@ -70,6 +111,12 @@ fn short_lang_name(parser_id: &str) -> String {
         .map_or_else(|| parser_id.to_string(), str::to_string)
 }
 
+/// Whether any blob in the manifest records a Tier-2 analyzer run
+/// for this `(parser_id, analyzer_id)` pair (via `blobs.analyzer_id`).
+/// `Ok(false)` when the backend declares no analyzer. One analyzed
+/// blob is enough to report the whole language slice as `Semantic`;
+/// per-blob analyzer-revision freshness is deliberately not checked
+/// here (see the [`LanguageEnrichment`] docs in `cairn-proto`).
 fn manifest_has_analyzer_run(
     conn: &Connection,
     manifest_id: i64,

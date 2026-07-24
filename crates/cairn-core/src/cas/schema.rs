@@ -18,6 +18,23 @@
 
 use crate::migration::Migration;
 
+/// Forward-only migration chain for the per-repo store.
+///
+/// Contract (partly enforced by `crate::migration::apply`, partly
+/// convention):
+///
+/// - Versions are strictly ascending (`apply` panics otherwise) and
+///   progress is recorded in `PRAGMA user_version`; entries are
+///   append-only — never renumber.
+/// - A shipped migration's SQL is frozen: deployed stores have
+///   already recorded its version as applied, so editing it would
+///   silently fork old installs from new ones. Fixes land as a new
+///   version.
+/// - Every `ON DELETE` action below relies on `foreign_keys = ON`,
+///   which SQLite does not persist; both store openers re-apply it
+///   per connection via `apply_standard_pragmas`.
+/// - The SQL blocks run through `execute_batch`, so commentary
+///   inside them must use SQL `--` comments.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -176,6 +193,11 @@ CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
 END;
 "#,
     },
+    // v2: stamp the Tier-2 semantic analyzer (if any) that contributed
+    // to a stored parse. `cas::blob::reuse_or_compute` requires an
+    // exact identity match against the backend's current analyzer, so
+    // an analyzer appearing, disappearing, or bumping its revision
+    // all force a re-parse. NULL/NULL means "no analyzer ran".
     Migration {
         version: 2,
         sql: r#"
@@ -194,6 +216,10 @@ ALTER TABLE blobs ADD COLUMN analyzer_revision INTEGER;
 DELETE FROM blobs WHERE parser_id LIKE '%@%';
 "#,
     },
+    // v4: one row per (manifest_id, analyzer_id) recording the latest
+    // Tier-2.5 / Tier-3 workspace-analysis attempt. See the
+    // `workspace_analyzer` module doc for the analyzer_revision
+    // staleness contract.
     Migration {
         version: 4,
         sql: r#"
@@ -215,6 +241,10 @@ CREATE INDEX idx_workspace_analysis_runs_status
     ON workspace_analysis_runs(status);
 "#,
     },
+    // v5: align run status with the job-system lifecycle (queued /
+    // cancelled / timed_out), link runs to their job row, and add a
+    // cooperative cancellation flag. SQLite cannot alter a CHECK
+    // constraint in place, hence the create-copy-drop-rename rebuild.
     Migration {
         version: 5,
         sql: r#"
