@@ -95,7 +95,11 @@ fn run_find_references(
     manifest_id: ManifestId,
     args: &FindReferencesArgs,
 ) -> Result<Vec<ReferenceHit>> {
+    // `None` picks the default page of 100. `.max(1)` guards against
+    // `Some(0)` emitting `LIMIT 0` (SQLite: no rows).
     let limit = args.limit.unwrap_or(100).max(1);
+    // Convert the wire-typed `RefKind` filter to the on-disk string
+    // representation once so the closure below can bind it directly.
     let kind_str = args.kind.map(ref_kind_to_str);
 
     // Both directions JOIN `manifest_entries` so refs are scoped to
@@ -121,9 +125,19 @@ fn run_find_references(
     //
     // SQL fragments derived from the registered workspace-tier prefixes; they
     // expand when a new tier (e.g. Tier-2.5) joins WORKSPACE_TIER_PREFIXES.
+    // Three separate `source_rank_case_sql` / `source_is_workspace_tier_sql`
+    // expansions because the outer `refs` (`r.source`), the CTE
+    // interior (`source`), and the noise-filter EXISTS subquery
+    // (`t.source`) all live in different scopes with different column
+    // aliases. Precomputing them keeps the format! templating readable.
     let source_rank_r = source_rank_case_sql("r.source");
     let resolution_source_rank = source_rank_case_sql("source");
     let workspace_tier_t = source_is_workspace_tier_sql("t.source");
+    // Closure so incoming/outgoing share this SQL body — they differ
+    // only in `where_col` (`enc.qualified` vs `r.target_name` /
+    // `r.target_qualified`), the pinned `value`, the enclosing-symbol
+    // JOIN semantics (INNER for outgoing, LEFT for incoming), and the
+    // outgoing-only "resolved callee" noise filter below.
     let run = |where_col: &str, value: &str, outgoing: bool| -> Result<Vec<ReferenceHit>> {
         let mut sql = String::from(
             "WITH best_resolution AS (
@@ -224,6 +238,15 @@ fn run_find_references(
         }
         sql.push(')');
         if !args.include_noise {
+            // Two-part noise cut. `dedup_rank = 1` keeps one row per
+            // physical byte range (highest tier wins, with a
+            // qualified-target tiebreak). The AND NOT clause drops
+            // stale lower-tier duplicates that emit a zero byte range
+            // (marker for "no token range recorded"), but only when a
+            // workspace-tier row on the same `(line, kind,
+            // target_name, enclosing_id)` tuple already exists to
+            // supersede them — hence
+            // `has_workspace_tier_same_line_target_name`.
             sql.push_str(" WHERE dedup_rank = 1");
             sql.push_str(
                 " AND NOT (
@@ -234,6 +257,10 @@ fn run_find_references(
                 )",
             );
         }
+        // Deterministic per-page ordering: file, then line, then
+        // in-line byte offset, then tier rank as a final tiebreaker so
+        // include_noise mode keeps the higher-tier row above the
+        // lower-tier row when both survive.
         sql.push_str(" ORDER BY path, line, byte_start, source_rank");
         sql.push_str(&format!(" LIMIT {limit}"));
 

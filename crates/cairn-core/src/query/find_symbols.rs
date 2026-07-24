@@ -1,3 +1,19 @@
+//! `find_symbols` — workspace-scoped symbol lookup by name / kind /
+//! container / path prefix.
+//!
+//! Reads directly from Tier-1 `symbols` and does not consult the
+//! resolution layer: this query answers "where is X declared?" rather
+//! than "what does X resolve to?". Rows are scoped to blobs visible
+//! from the anchor's manifest via `manifest_entries`, and to
+//! `scope = 'top_level'` so nested (function-local) declarations do
+//! not surface as workspace-addressable hits — the file-structure
+//! view in [`crate::query::get_outline`] keeps them.
+//!
+//! `SourceTier` (Syntactic vs Semantic) is derived from
+//! `blobs.analyzer_id`: any non-NULL analyzer stamp on the parsed
+//! blob promotes the row to Semantic, matching the Tier-2 native
+//! enricher convention documented in
+//! [`crate::workspace_analyzer`].
 use cairn_lang_api::Visibility;
 use cairn_proto::common::{SourceTier, SymbolKind};
 use rusqlite::{Connection, ToSql};
@@ -76,11 +92,26 @@ fn run_find_symbols(
     manifest_id: ManifestId,
     args: &FindSymbolsArgs,
 ) -> Result<Vec<SymbolHit>> {
+    // Default page of 50 (workspace-lookup pages are typically smaller
+    // than reference / import listings). `.max(1)` guards against a
+    // caller-supplied `Some(0)` becoming `LIMIT 0` (SQLite: no rows).
     let limit = args.limit.unwrap_or(50).max(1);
 
     // Base query: pull symbols whose blob_sha is in the manifest's
     // entry set, joined to manifest_entries so we can return the
     // file path the blob was mounted at.
+    //
+    // The `language` CASE reverse-engineers the human-readable
+    // language name from `parser_id`:
+    // `tree-sitter-<lang>[@<revision>]` produces `<lang>` (index 13
+    // is one past the "tree-sitter-" prefix in SQLite's 1-indexed
+    // `substr`); non-tree-sitter parser ids pass through unchanged;
+    // and blobs with no analyzer stamp emit NULL so the ORDER BY
+    // below can push them to the tail.
+    //
+    // The `s.scope = 'top_level'` filter is the workspace-vs-file
+    // view split: nested (function-local) declarations are indexed
+    // for outline / navigation but must not surface here.
     let mut sql = String::from(
         "SELECT s.id, s.name, s.qualified, s.kind, s.signature, s.visibility,
                  me.path, s.line_start, s.blob_sha, s.parser_id,
@@ -111,6 +142,13 @@ fn run_find_symbols(
         && !q.is_empty()
     {
         if args.fuzzy {
+            // FTS5 path: `symbols_fts` is the content-synced virtual
+            // table declared in `cas/schema.rs` (unicode61,
+            // `remove_diacritics=0`). Bare whitespace tokens are
+            // AND-ed, `"..."` quotes a phrase, and prefix matching
+            // requires an explicit trailing `*` in `q` — none of
+            // which we translate for the caller here; the raw string
+            // reaches SQLite unchanged.
             sql.push_str(
                 " AND s.id IN (
                       SELECT rowid FROM symbols_fts
@@ -119,6 +157,11 @@ fn run_find_symbols(
             );
             bound.push(Box::new(q.to_string()));
         } else {
+            // Exact path: match on either the bare name or the fully
+            // qualified name so callers can pass whichever form they
+            // have without stringifying language-specific separators.
+            // Both columns are indexed (`idx_symbols_name`,
+            // `idx_symbols_qualified`).
             sql.push_str(" AND (s.name = ?  OR s.qualified = ?)");
             bound.push(Box::new(q.to_string()));
             bound.push(Box::new(q.to_string()));
@@ -133,6 +176,12 @@ fn run_find_symbols(
     if let Some(c) = args.container.as_deref()
         && !c.is_empty()
     {
+        // Two-separator container filter: `::` covers Rust-style
+        // qualified names, `.` covers dotted FQNs (Python / Java /
+        // Kotlin / Swift / C# / JS). PHP `\` namespaces are not
+        // handled by this filter today; a caller wanting members of
+        // `App\Models` has to fall back to `query` (exact FQN) or
+        // `path_prefix` (colocated namespaces).
         sql.push_str(" AND (s.qualified LIKE ? OR s.qualified LIKE ?)");
         bound.push(Box::new(format!("{c}::%")));
         bound.push(Box::new(format!("{c}.%")));
@@ -140,9 +189,16 @@ fn run_find_symbols(
     if let Some(p) = args.path_prefix.as_deref()
         && !p.is_empty()
     {
+        // `LIKE '<p>%'` with an unescaped user prefix: `%` and `_`
+        // inside `p` are interpreted as LIKE metacharacters. Callers
+        // controlling the prefix should sanitise if they need
+        // literal matching.
         sql.push_str(" AND me.path LIKE ?");
         bound.push(Box::new(format!("{p}%")));
     }
+    // `language IS NULL` first so blobs without an analyzer stamp (in
+    // practice: no language attribution) sort to the end rather than
+    // ahead of alphabetically-earlier known languages.
     sql.push_str(" ORDER BY language IS NULL, language, me.path, s.line_start LIMIT ?");
     bound.push(Box::new(i64::from(limit)));
 

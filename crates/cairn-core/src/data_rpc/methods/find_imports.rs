@@ -34,6 +34,13 @@ impl DataMethod for FindImports {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
+        // `find_imports` is the one method here whose `file` arg is
+        // an exact repo-relative path (not a prefix). Passing it as
+        // `exact_file` makes the shared executor gate on manifest
+        // membership: repos that don't contain this path in the
+        // pinned manifest are skipped (an explicit-repo request
+        // surfaces a `file_not_indexed` freshness issue instead of
+        // silently returning empty).
         let exact_file = args.file.clone();
 
         let execution = query_one_or_all_snapshots(

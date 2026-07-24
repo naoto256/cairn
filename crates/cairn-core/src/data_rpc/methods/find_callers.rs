@@ -20,6 +20,14 @@ use crate::{Error, Result};
 
 pub struct FindCallers;
 
+/// Per-snapshot scan output. `Hit` is a real call site (with its
+/// parser id captured for tier-3 status filtering). `TsxDefinition`
+/// is a sentinel emitted once per snapshot when the queried name has
+/// no callers *and* is defined in a `.tsx` / `.jsx` file — JSX
+/// component usage (`<Foo />`) records as an `instantiate` ref, not
+/// a `call`, so an empty caller result on a JSX component would
+/// otherwise mislead. The sentinel survives the finalize dedup and
+/// the tail turns it into the `TsxCallersUseInstantiate` hint.
 enum CallerScanItem {
     Hit(Box<CallHit>, String),
     TsxDefinition,
@@ -93,6 +101,10 @@ impl DataMethod for FindCallers {
                 }))
             },
             |items: &mut Vec<CallerScanItem>| {
+                // Collapse per-snapshot TsxDefinition markers so at
+                // most one survives across all scanned repos — the
+                // downstream hint fires on any positive signal and
+                // the marker itself never appears in the wire result.
                 let mut saw_marker = false;
                 items.retain(|item| match item {
                     CallerScanItem::TsxDefinition if saw_marker => false,
@@ -141,6 +153,11 @@ impl DataMethod for FindCallers {
         let (diagnostics, mut hints) =
             build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
         if freshness_issues.is_empty() && items.is_empty() && tsx_definition {
+            // A JSX-component definition was actually found. Strip
+            // the generic "relax filter" / "widen scope" advice —
+            // both are red herrings for a JSX component — and steer
+            // the caller to `find_references kind=instantiate` where
+            // JSX usage does appear.
             hints.retain(|hint| {
                 !matches!(
                     hint.code,
@@ -186,6 +203,11 @@ pub(super) fn into_call_hit(
     }
 }
 
+/// Uppercase-initial identifier check — the React/JSX convention
+/// that distinguishes a component tag (`<Foo />`) from a lowercase
+/// HTML element. Used only to gate the TSX-definition probe below;
+/// non-JSX callers with uppercase names simply pay one extra lookup
+/// that produces no rows.
 fn is_component_name(name: &str) -> bool {
     name.chars().next().is_some_and(char::is_uppercase)
 }
@@ -202,6 +224,11 @@ fn tsx_component_usage_hint() -> Hint {
     }
 }
 
+/// Ask the pinned snapshot whether `name` is defined in a
+/// `.tsx` / `.jsx` file. The match compares against `name` and the
+/// last segment of `qualified` so nested declarations (e.g.
+/// `Module::Foo`) still qualify. Only used to gate the JSX-usage
+/// hint after an empty caller scan.
 fn symbol_defined_in_jsx_snapshot(
     conn: &rusqlite::Connection,
     anchor: &crate::anchor::AnchorName,

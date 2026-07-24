@@ -1,4 +1,18 @@
 //! `get_outline` — per-file symbol structure on top of the CAS store.
+//!
+//! Two modes share this handler:
+//! - `file` selects one repo-relative path and returns its
+//!   outline items in file order.
+//! - `path` selects a directory prefix and returns items across
+//!   every file under it, subject to `max_depth` and the `kind`
+//!   filter.
+//!
+//! At least one of the two must be provided (both-unset is rejected
+//! with `InvalidArgument`); when both are present, `file` wins and
+//! `path` is ignored. Scope resolution and per-snapshot query
+//! execution both flow through [`query_one_or_all_snapshots`], so
+//! the alias-enumeration / lifecycle-skip / freshness-revalidation
+//! semantics documented there apply here unchanged.
 
 use cairn_proto::common::SourceTier;
 use cairn_proto::methods::{OutlineArgs, OutlineItem, OutlineResult};
@@ -35,8 +49,14 @@ impl DataMethod for GetOutline {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let file = args.file.clone();
+        // Passing `file` as the query's `exact_file` lets the
+        // snapshot helper record `file_not_indexed` when the path
+        // is absent from the selected manifest — without this hint
+        // an empty result looks the same as "file has no symbols".
         let exact_file = file.clone();
         let path = args.path.clone();
+        // Default 200, clamp to [1, 1000] before the query so the
+        // probe helper below can't overflow past a sane ceiling.
         let effective_limit = args.pagination.limit.unwrap_or(200).clamp(1, 1000);
         let kind_filter_set = args.kind.is_some();
         let filter = OutlineFilter {
@@ -57,6 +77,13 @@ impl DataMethod for GetOutline {
             },
             move |_entry, conn, snapshot| -> Result<Vec<(OutlineItem, String)>> {
                 if let Some(file) = file.as_deref() {
+                    // Defensive legacy fallback: the enclosing read
+                    // transaction pins the anchor, so `AnchorNotFound`
+                    // is ordinarily unreachable here. Folding to an
+                    // empty result keeps a stray occurrence from
+                    // failing the whole enumeration; the kind filter
+                    // is applied in Rust rather than pushed into the
+                    // query.
                     let raw = match query::get_outline(conn, &snapshot.anchor, file, None) {
                         Ok(r) => r,
                         Err(Error::AnchorNotFound { .. }) => Vec::new(),
@@ -74,6 +101,9 @@ impl DataMethod for GetOutline {
                 }
 
                 let path = path.as_deref().expect("validated path when file is absent");
+                // `limit_with_probe` asks the query for `limit + 1`
+                // so the snapshot helper can decide whether the row
+                // set was truncated by the cap.
                 let raw = match query::get_outline_under_path(
                     conn,
                     &snapshot.anchor,
@@ -150,6 +180,12 @@ impl DataMethod for GetOutline {
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(GetOutline);
 
+/// Convert a query-layer outline row into the wire type. The
+/// `source_tier` on the returned item is fixed to `Syntactic`
+/// because `get_outline` alone does not yet carry per-fact
+/// source-tier metadata through the CAS query layer; the sibling
+/// `find_symbols` path already inspects `blobs.analyzer_id` to
+/// promote items to `Semantic`.
 fn into_wire_item(q: QueryOutlineItem) -> OutlineItem {
     OutlineItem {
         file: q.file,

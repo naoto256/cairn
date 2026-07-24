@@ -1,3 +1,13 @@
+//! `get_outline` / `get_outline_under_path` — file-structure view of
+//! declared symbols.
+//!
+//! Complementary to [`crate::query::find_symbols`]: outline is the
+//! per-file view, so it includes nested (function-local) declarations
+//! that `find_symbols` filters out — see the `scope_outline_tests`
+//! module below and `find_symbols::scope_filter_tests` for the
+//! contrast. Reads directly from Tier-1 `symbols`; the resolution
+//! layer is not consulted (outlines describe declarations, not
+//! cross-file edges).
 use cairn_proto::common::SymbolKind;
 use rusqlite::{Connection, OptionalExtension, ToSql};
 
@@ -36,6 +46,12 @@ pub fn get_outline(
             name: anchor.as_str().to_string(),
         })?;
 
+    // `manifest_entries` PK is `(manifest_id, path)`, so this is an
+    // index-driven point lookup for the blob mounted at `file` in
+    // the anchor's manifest. A missing entry returns `Ok(vec![])`
+    // rather than an error — the caller sees "no outline for this
+    // path" as an empty response, matching the fact that a file the
+    // manifest never indexed simply has no rows to list.
     let blob_sha: Option<String> = conn
         .query_row(
             "SELECT blob_sha FROM manifest_entries
@@ -48,6 +64,10 @@ pub fn get_outline(
         return Ok(Vec::new());
     };
 
+    // Single-blob outline: `WHERE blob_sha = ?1` hits
+    // `idx_symbols_blob (blob_sha, parser_id)`. No `scope` filter —
+    // outlines intentionally include nested (function-local)
+    // declarations, unlike `find_symbols`.
     let mut sql = String::from(
         "SELECT name, qualified, kind, signature, doc, line_start, parser_id
            FROM symbols
@@ -110,6 +130,13 @@ pub fn get_outline_under_path(
         })?;
     let limit = limit.max(1);
 
+    // `substr(me.path, 1, length(?2)) = ?2` is a literal-safe prefix
+    // check: unlike `me.path LIKE ?2 || '%'`, no `%` / `_` in `?2`
+    // is interpreted as a metacharacter, so a caller passing
+    // `crates/cairn-core/` cannot accidentally widen the match.
+    // Because the LHS is a function call over `me.path`, this
+    // predicate is a residual filter for the SQLite planner rather
+    // than an indexable range; `LIMIT` bounds the fan-out.
     let mut sql = String::from(
         "SELECT me.path, s.name, s.qualified, s.kind, s.signature, s.doc, s.line_start,
                 s.parser_id
@@ -134,10 +161,20 @@ pub fn get_outline_under_path(
         // (depth = 1 → no further slashes; depth = 2 → at most one, etc.)
         // We compare strings rather than counting in SQL: substring length
         // minus its '/'-stripped length is the slash count.
+        //
+        // Rebinds `?2` (the path_prefix), so the caller's `?2` slot
+        // stays consistent across every clause that references it —
+        // this is safe because we bind `path_prefix` once and reuse
+        // its parameter position; SQLite dereferences `?2` at
+        // execution time, not per-fragment.
         sql.push_str(
             " AND length(substr(me.path, length(?2) + 1))
                - length(replace(substr(me.path, length(?2) + 1), '/', '')) <= ?",
         );
+        // `depth = 0` is treated as `depth = 1` (no allowed slashes)
+        // via `saturating_sub`: users asking for "no descent" and
+        // "one level" get the same list. Documented, not enforced —
+        // callers already default to `None` when they want no cap.
         let allowed = depth.saturating_sub(1);
         bound.push(Box::new(i64::from(allowed)));
     }

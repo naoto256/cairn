@@ -3,6 +3,22 @@
 //! Resolves an anchor to a `manifest_id`, then joins indexed facts against
 //! `manifest_entries` filtered by that manifest so each query is scoped to one
 //! snapshot's visible blobs.
+//!
+//! Two query shapes coexist:
+//!
+//! * **Resolution-aware** — `find_impls`, `find_imports`, and
+//!   `find_references` LEFT JOIN the Tier-1/Tier-2 fact tables (`refs`,
+//!   `imports`, `implementations`) against `resolutions` rows written by
+//!   Tier-2-direct / Tier-2.5 / Tier-3 passes. A `best_resolution` CTE
+//!   picks the highest-ranked row per site via
+//!   [`crate::workspace_analyzer::source_rank_case_sql`] and the queries
+//!   surface a `kind_source` provenance string (either the resolution
+//!   `source` when covered, or the sentinel `KIND_SOURCE_FACT`
+//!   (`"tier2-fact"`) when only the fact row is available).
+//! * **Fact-only** — `find_symbols`, `get_outline`, and
+//!   `get_symbol_source` read directly from the fact tables; they
+//!   describe declarations rather than cross-file edges, so there is no
+//!   resolution layer to consult.
 
 mod find_impls;
 mod find_imports;
