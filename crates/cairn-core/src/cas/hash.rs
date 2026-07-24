@@ -4,6 +4,9 @@
 //! "\0" || content)`. Reproducing that format here lets a cairn blob
 //! sha equal the git blob sha for the same bytes — opens the door to
 //! zero-copy reuse from git's object store later.
+//!
+//! SHA-1 serves as an identity / dedup key here; cairn does not
+//! rely on it as an authentication boundary.
 
 use sha1::{Digest, Sha1};
 

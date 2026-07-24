@@ -37,6 +37,10 @@ pub fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
     apply_with_pending_hook(conn, migrations, || {})
 }
 
+/// Body of [`apply`] with a test seam: `before_lock` runs after the
+/// optimistic pending-set read but before the Immediate transaction,
+/// letting a test hold several openers at the same stale observation
+/// to exercise the under-lock refresh below.
 fn apply_with_pending_hook(
     conn: &mut Connection,
     migrations: &[Migration],
@@ -106,6 +110,9 @@ pub fn apply_standard_pragmas(conn: &Connection) -> Result<()> {
     // small and finish long before the timeout.
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // NORMAL is safe under WAL: a power cut can lose the most
+    // recent commits but never corrupts the DB, and it skips an
+    // fsync per commit.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
@@ -127,6 +134,9 @@ pub fn open_with_migrations(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // EXRESCODE turns on extended result codes so callers can
+    // distinguish e.g. SQLITE_BUSY_SNAPSHOT (a retryable snapshot
+    // conflict) from a plain SQLITE_BUSY lock timeout.
     let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_EXRESCODE;
     let mut conn = Connection::open_with_flags(path, flags)?;
     apply_standard_pragmas(&conn)?;

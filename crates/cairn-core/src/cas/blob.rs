@@ -35,9 +35,17 @@ pub struct ParsedData {
 /// entry exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobMeta {
+    /// Tier-1 backend revision at parse time. A mismatch with the
+    /// linked-in backend's revision marks the entry stale (see
+    /// [`reuse_or_compute`]); forgetting to bump the revision on an
+    /// emission change is the classic stale-facts trap.
     pub parser_revision: u32,
+    /// Caller-supplied parse timestamp in nanoseconds (callers pin
+    /// it in fixture tests, so it need not be wall-clock "now").
     pub parsed_at_ns: i64,
+    /// `None` when no semantic analyzer participated in the parse.
     pub analyzer_id: Option<String>,
+    /// Set together with `analyzer_id`; `None` iff it is `None`.
     pub analyzer_revision: Option<u32>,
 }
 
@@ -45,6 +53,11 @@ pub struct BlobMeta {
 /// `blobs` row, the symbols, refs (syntactic + semantic merged),
 /// imports (likewise), and applies any `doc_overrides`. Caller owns
 /// the transaction; this function does not commit.
+///
+/// `analyzer` records which semantic analyzer `(id, revision)`, if
+/// any, ran for this parse; it is persisted on the `blobs` row so
+/// [`reuse_or_compute`] can treat an analyzer change (bump, removal,
+/// addition) as staleness, independently of `parser_revision`.
 ///
 /// # Errors
 /// Any SQLite error encountered while writing, or row-id conversion
@@ -179,6 +192,9 @@ pub fn lookup(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result<Opti
 /// / impls). Caller owns the transaction; the FK CASCADE handles the
 /// cleanup once the blob row is gone.
 ///
+/// Returns the count of `blobs` rows removed — 0 or 1, since
+/// `(blob_sha, parser_id)` is the table's unique key.
+///
 /// # Errors
 /// SQLite errors.
 pub fn delete(tx: &Transaction<'_>, blob_sha: &str, parser_id: &str) -> Result<usize> {
@@ -242,6 +258,10 @@ where
     Ok(true)
 }
 
+/// Exact analyzer-identity match. `expected = None` only matches a
+/// row with no analyzer recorded, so an analyzer disappearing (or
+/// newly appearing) forces a recompute just like a revision bump —
+/// see `reuse_or_compute_reparses_when_analyzer_disappears`.
 fn analyzer_matches(meta: &BlobMeta, expected: Option<(&str, u32)>) -> bool {
     match expected {
         Some((id, revision)) => {
@@ -253,6 +273,10 @@ fn analyzer_matches(meta: &BlobMeta, expected: Option<(&str, u32)>) -> bool {
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
+/// Insert one symbol row and return its rowid (used by the caller to
+/// wire `parent_id` / `enclosing_id`). `source` is fixed to
+/// "syntactic": symbol rows only originate from the Tier-1 pass; the
+/// semantic layer patches docs but never adds symbols.
 fn insert_symbol(
     tx: &Transaction<'_>,
     blob_sha: &str,
@@ -264,6 +288,8 @@ fn insert_symbol(
     let visibility_str = sym.visibility.map(visibility_to_str);
     let line_start = i64::from(sym.line_range.start);
     let line_end = i64::from(sym.line_range.end);
+    // usize→i64 conversions saturate to i64::MAX instead of erroring;
+    // only offsets past 2^63 bytes (unrealistic) are affected.
     let byte_start = i64::try_from(sym.byte_range.start).unwrap_or(i64::MAX);
     let byte_end = i64::try_from(sym.byte_range.end).unwrap_or(i64::MAX);
     let body_start = sym.body_start.map(|b| i64::try_from(b).unwrap_or(i64::MAX));
@@ -298,6 +324,9 @@ fn insert_symbol(
     Ok(tx.last_insert_rowid())
 }
 
+/// Insert one ref row. `source` labels the emitting layer
+/// ("syntactic" | "semantic"); both layers' refs share the table, so
+/// the label is the only way to tell them apart afterwards.
 fn insert_ref(
     tx: &Transaction<'_>,
     blob_sha: &str,
@@ -541,6 +570,11 @@ fn insert_import(
     Ok(())
 }
 
+/// Resolve a ref's enclosing symbol to a within-blob rowid: prefer
+/// the positional `enclosing_idx` (syntactic refs share the symbol
+/// index space), fall back to the qualified-name map (semantic refs
+/// carry `enclosing_qualified` instead). `None` means the ref is
+/// stored without an enclosing symbol, not dropped.
 fn resolve_enclosing(
     r: &RefFact,
     symbol_ids: &[i64],

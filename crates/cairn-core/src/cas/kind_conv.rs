@@ -17,6 +17,12 @@
 use cairn_lang_api::{SymbolScope, Visibility};
 use cairn_proto::common::{RefKind, SymbolKind, TypeRole};
 
+// The `*_to_str` outputs below are an on-disk format: rows keep
+// whatever tag the writing binary used, and a renamed tag would
+// silently demote those rows to the reverse function's fallback
+// (Other / Call / Private / Nested / None) rather than error. Treat
+// every tag as frozen once shipped; adding new variants is fine.
+//
 // ─── SymbolKind ────────────────────────────────────────────────────────────
 
 #[must_use]

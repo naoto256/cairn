@@ -5,6 +5,10 @@
 //! one `manifest_id`. The query layer resolves an anchor to a
 //! manifest, then resolves the manifest's `(path, blob_sha)` pairs
 //! to blob-keyed parsed data.
+//!
+//! Tentative anchors may additionally carry a `reconcile_generation`
+//! receipt proving which reconcile attempt published them; see
+//! [`set_reconciled`].
 
 use std::path::Path;
 
@@ -71,6 +75,9 @@ impl AnchorName {
     }
 }
 
+/// Wraps a raw stored/wire name without validation; unrecognized
+/// shapes are representable and [`AnchorName::kind`] reports them
+/// as `None`.
 impl From<String> for AnchorName {
     fn from(s: String) -> Self {
         Self(s)
@@ -150,6 +157,8 @@ pub(crate) fn order_key(internal: &str) -> (u8, String) {
     }
 }
 
+/// Parsed counterpart of [`AnchorName`], produced by
+/// [`AnchorName::kind`]. Deliberately has no catch-all variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorKind {
     Branch(String),
@@ -163,6 +172,7 @@ pub enum AnchorKind {
 pub struct Anchor {
     pub name: AnchorName,
     pub manifest_id: ManifestId,
+    /// Publication time in nanoseconds since the Unix epoch.
     pub last_updated_ns: i64,
     /// Reconcile generation that atomically published this tentative
     /// anchor. `None` means the publication is not freshness-verified.
@@ -319,6 +329,9 @@ pub fn resolve_tentative_manifest_id(
     conn: &Connection,
     repo_root: &Path,
 ) -> Result<Option<ManifestId>> {
+    // Exact string match against `worktrees.path`. Registration
+    // stores the root via the same lossy conversion and does not
+    // canonicalize, so callers must pass the identical root form.
     let path_str = repo_root.to_string_lossy().to_string();
     let worktree_id: Option<i64> = conn
         .query_row(
@@ -340,6 +353,7 @@ pub fn resolve_tentative_manifest_id(
     Ok(manifest_id.map(ManifestId))
 }
 
+/// Shared row mapper; column order must match every `SELECT` above.
 fn row_to_anchor(r: &rusqlite::Row<'_>) -> rusqlite::Result<Anchor> {
     Ok(Anchor {
         name: AnchorName(r.get::<_, String>(0)?),

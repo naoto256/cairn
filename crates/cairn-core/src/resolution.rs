@@ -118,6 +118,12 @@ impl std::str::FromStr for SemanticKind {
 /// `target_symbol_id == None` encodes "site observed, target
 /// unresolved" — useful for Tier-2.5 passes that want to record that
 /// they looked without committing to a definition they couldn't pin.
+///
+/// Site addressing follows the CAS keying convention:
+/// `(site_blob_sha, site_parser_id)` names one parse unit (a
+/// composite FK to `blobs`, so rows cascade-delete with their owning
+/// blob), and the byte offsets index into that blob's content,
+/// matching the fact-layer span convention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
     /// `None` for unsaved rows; `Some` for rows read back from SQLite.
