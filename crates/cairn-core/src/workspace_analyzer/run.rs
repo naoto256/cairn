@@ -1,3 +1,15 @@
+//! Workspace analyzer run driver: run lifecycle, stall watchdog, and
+//! `workspace_analysis_runs` persistence.
+//!
+//! One run row exists per `(manifest_id, analyzer_id)` and is
+//! upserted in place through `queued -> {skipped / failed at
+//! preflight, or running -> terminal}`: an empty selection goes
+//! `queued -> skipped` and a materialization failure goes
+//! `queued -> failed`, neither passing through `running`. The stall
+//! watchdog treats
+//! the analyzer's progress ticks as a liveness beacon: a run is
+//! stopped only when the beacon stops advancing, never for total
+//! elapsed time (see [`ANALYZER_STALL_TIMEOUT`]).
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -17,7 +29,11 @@ use super::{AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFile, all_workspace_an
 // beyond the old 600s wall-clock cap, so only stop when the analyzer-side
 // progress beacon itself stalls.
 pub(crate) const ANALYZER_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+// After a stall fires and the worker has been asked to cancel, wait
+// this long for it to produce a result before leaking the thread.
 const ANALYZER_STALL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+// Bound on the forced global LSP pool shutdown performed after a
+// stall, so the cleanup itself cannot hang the runner.
 const ANALYZER_STALL_LSP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run registered workspace analyzers over a manifest and persist
@@ -47,6 +63,9 @@ pub fn run_registered_workspace_analyzers(
     )
 }
 
+/// Variant of [`run_registered_workspace_analyzers`] taking an
+/// explicit analyzer list instead of the linker registry, with the
+/// default stall timeout.
 pub(crate) fn run_workspace_analyzers(
     conn: &mut Connection,
     repo_root: &Path,
@@ -66,6 +85,16 @@ pub(crate) fn run_workspace_analyzers(
     )
 }
 
+/// Run each analyzer in `analyzers` sequentially over one manifest.
+///
+/// Each analyzer's run row is first upserted as `Queued`, then driven
+/// through [`run_one_workspace_analyzer_with_timeout`]. Analyzer
+/// failures become terminal statuses on the run row; an `Err` from
+/// this function is an infrastructure error (SQLite / persistence)
+/// and aborts the loop, leaving later analyzers unattempted for this
+/// call.
+///
+/// Returns the total number of refs inserted across all analyzers.
 pub(super) fn run_workspace_analyzers_with_timeout(
     conn: &mut Connection,
     repo_root: &Path,
@@ -114,6 +143,13 @@ pub(super) fn run_workspace_analyzers_with_timeout(
     Ok(inserted)
 }
 
+/// Inputs for one analyzer invocation over one manifest.
+///
+/// `job_id` is `None` when the run is not driven by the job
+/// scheduler; [`mark_run`]'s upsert then preserves any `job_id`
+/// already stored on the row (COALESCE). `progress` is `None` for
+/// callers without external cancellation; the runner substitutes a
+/// default handle that is never cancelled.
 pub(crate) struct AnalyzerRunRequest<'a> {
     pub(crate) analyzer: Box<dyn WorkspaceAnalyzer>,
     pub(crate) repo_root: &'a Path,
@@ -125,6 +161,8 @@ pub(crate) struct AnalyzerRunRequest<'a> {
     pub(crate) progress: Option<AnalyzerProgress>,
 }
 
+/// Outcome of one analyzer invocation, mirroring the terminal status
+/// and error text that were stamped onto the run row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AnalyzerExecution {
     pub status: RunStatus,
@@ -132,6 +170,20 @@ pub(crate) struct AnalyzerExecution {
     pub error: Option<String>,
 }
 
+/// Drive one analyzer through its full run lifecycle over one
+/// manifest and record the outcome.
+///
+/// Status flow: `Skipped` when no manifest entry was indexed under
+/// the analyzer's parser; `Failed` when materialized input is
+/// required and any selected file is unreadable; otherwise `Running`,
+/// then one of `Succeeded` / `Failed` / `Skipped` / `TimedOut` /
+/// `Cancelled`. Every `Ok` return has already upserted the matching
+/// terminal status via [`mark_run`] before returning.
+///
+/// # Errors
+/// Returns `Err` only for SQLite / persistence failures; the run row
+/// is then left at whatever status was last recorded, which can be
+/// the non-terminal `Running`.
 pub(crate) fn run_one_workspace_analyzer_with_timeout(
     conn: &mut Connection,
     request: AnalyzerRunRequest<'_>,
@@ -152,6 +204,10 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
     let tier_prefix = analyzer.tier_prefix();
     let config_hash = config_hash(repo_root, analyzer.config_paths());
     let files = workspace_files_for(conn, parser_id, repo_root, entries)?;
+    // An empty selection is legitimate non-applicability (e.g. a
+    // Kotlin analyzer over a Ruby-only repo): record `Skipped`, not
+    // `Failed`, so the revision-drift scanner treats it as quiescence
+    // rather than an operator-facing error.
     if files.is_empty() {
         mark_run(
             conn,
@@ -223,6 +279,9 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         files
     };
 
+    // Mark `Running`. `mark_run` stores NULL finished_at_ns for the
+    // non-terminal statuses, so the row reads as in-flight from here
+    // until one of the terminal upserts below overwrites it.
     mark_run(
         conn,
         RunRecord {
@@ -239,6 +298,9 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
     )?;
 
     let progress = progress.unwrap_or_default();
+    // Cancellation checkpoint before the worker thread is spawned: a
+    // cancel requested while the run sat queued terminates it here
+    // without ever invoking the analyzer.
     if progress.is_cancelled() {
         let message = "analyzer cancelled";
         mark_run(
@@ -269,6 +331,10 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         analyzer_stall_timeout,
         progress.clone(),
     ) {
+        // A cancel that lands while the analyzer is executing wins
+        // over its result: both `Ok` facts and `Err` are discarded
+        // here and nothing is persisted. The stall path never reaches
+        // this arm — it returns `TimedOut`, not `Completed`.
         AnalyzerRun::Completed(_) if progress.is_cancelled() => {
             let message = "analyzer cancelled";
             mark_run(
@@ -292,6 +358,10 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             })
         }
         AnalyzerRun::Completed(Ok(facts)) => {
+            // Persist refs and resolutions before stamping
+            // `Succeeded`; a persistence error propagates as `Err`
+            // and leaves the row at `Running` rather than falsely
+            // marking the run successful.
             let inserted_refs = persist_resolved_refs(
                 conn,
                 manifest_id,
@@ -330,6 +400,12 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         }
         AnalyzerRun::Completed(Err(err)) => {
             let message = err.to_string();
+            // Error-to-status classification (current behaviour):
+            // transient LSP content-modified and analyzer-unavailable
+            // (missing binary / unsuitable workspace) both record
+            // `Skipped` with the message as the reason; every other
+            // error records `Failed`. Either way persistence is not
+            // invoked, so prior facts for this run key stay intact.
             let status = if is_content_modified_error(&err) {
                 debug!(
                     analyzer_id,
@@ -367,6 +443,10 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 error: Some(message),
             })
         }
+        // Stall: no completion and no progress tick for a full
+        // window. The worker was already cancelled and a bounded LSP
+        // pool force-shutdown was attempted inside
+        // `analyze_workspace_with_timeout` (failures are logged).
         AnalyzerRun::TimedOut { timeout } => {
             let message = format!("analyzer stalled: no progress for {}s", timeout.as_secs());
             warn!(
@@ -397,11 +477,26 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
     }
 }
 
+/// How one analyzer worker finished, as seen by the stall watchdog.
 enum AnalyzerRun {
+    /// The worker returned; carries the analyzer's own result.
     Completed(Result<super::WorkspaceFacts>),
+    /// A stall window elapsed with no completion and no progress
+    /// tick; `timeout` is the window that fired.
     TimedOut { timeout: Duration },
 }
 
+/// Run the analyzer on a dedicated thread under a stall watchdog.
+///
+/// `timeout` is a stall window, not a total-runtime cap: each time
+/// the window elapses the watchdog compares the progress tick counter
+/// against its last snapshot and keeps waiting if it advanced, so a
+/// run that ticks regularly can exceed the window indefinitely. On a
+/// stall the run is asked to stop via `progress.cancel()`, given
+/// `ANALYZER_STALL_JOIN_TIMEOUT` to wind down, and a bounded
+/// force-shutdown of the global LSP pool is attempted (failures are
+/// logged); a worker that still does not finish is leaked rather
+/// than joined.
 fn analyze_workspace_with_timeout(
     analyzer: Box<dyn WorkspaceAnalyzer>,
     repo_root: &Path,
@@ -423,6 +518,10 @@ fn analyze_workspace_with_timeout(
     loop {
         match rx.recv_timeout(timeout) {
             Ok(result) => return AnalyzerRun::Completed(result),
+            // A full window elapsed with no result. Ticks are only
+            // inspected at window boundaries, so a genuine stall is
+            // detected between one and two windows after the last
+            // observed tick.
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let current_progress = progress.snapshot();
                 if current_progress != last_progress {
@@ -435,11 +534,17 @@ fn analyze_workspace_with_timeout(
                     last_progress = current_progress;
                     continue;
                 }
+                // Beacon did not advance for a full window: ask the
+                // worker to stop, give it a short grace period, then
+                // reclaim the shared LSP pool.
                 progress.cancel();
                 let _ = cleanup_stalled_analyzer_worker(worker, &rx);
                 cleanup_stalled_analyzer_resources();
                 return AnalyzerRun::TimedOut { timeout };
             }
+            // Sender dropped without a message: the worker thread
+            // panicked inside `analyze_workspace`. Surface it as a
+            // completed-with-error run rather than unwinding.
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return AnalyzerRun::Completed(Err(Error::InvalidArgument(
                     "workspace analyzer worker disconnected".to_string(),
@@ -449,6 +554,12 @@ fn analyze_workspace_with_timeout(
     }
 }
 
+/// Give a cancelled worker a bounded grace period to finish.
+///
+/// If it produces a result (discarded) or drops its sender within
+/// `ANALYZER_STALL_JOIN_TIMEOUT`, join it; otherwise return without
+/// joining, deliberately leaking the thread so a hung analyzer cannot
+/// block the runner.
 fn cleanup_stalled_analyzer_worker(
     worker: std::thread::JoinHandle<()>,
     rx: &mpsc::Receiver<Result<super::WorkspaceFacts>>,
@@ -459,6 +570,9 @@ fn cleanup_stalled_analyzer_worker(
     }
 }
 
+/// After a stall, attempt a bounded force-shutdown of the global LSP
+/// pool (`ANALYZER_STALL_LSP_SHUTDOWN_TIMEOUT`) to unwedge a stuck
+/// language server; failures are logged and the runner continues.
 fn cleanup_stalled_analyzer_resources() {
     test_observe_stalled_analyzer_cleanup();
     if let Err(err) =
@@ -486,10 +600,16 @@ fn test_observe_stalled_analyzer_cleanup() {}
 static STALLED_ANALYZER_CLEANUP_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::Mutex::new(None);
 
+/// LSP `ContentModified`: the server saw its input change while a
+/// request was in flight. The caller records `Skipped` for this.
 fn is_content_modified_error(err: &Error) -> bool {
     matches!(err, Error::Lsp(lsp_err) if lsp_err.is_content_modified())
 }
 
+/// The analyzer could not run in this environment at all: the LSP
+/// binary is not installed, or the workspace lacks the project files
+/// the server needs. The caller records `Skipped` with the message
+/// as the operator-facing reason.
 fn is_analyzer_unavailable_error(err: &Error) -> bool {
     matches!(
         err,
@@ -498,18 +618,34 @@ fn is_analyzer_unavailable_error(err: &Error) -> bool {
     )
 }
 
+/// Lifecycle status persisted in `workspace_analysis_runs.status`
+/// (string form via [`Self::as_str`]).
+///
+/// `Queued` and `Running` are the only non-terminal states; every
+/// other status stamps `finished_at_ns` when written by [`mark_run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStatus {
+    /// Run row created; the analyzer has not started yet.
     Queued,
+    /// Analyzer invocation in flight. Also what a run interrupted by
+    /// an infrastructure error remains at.
     Running,
+    /// Analyzer completed and its facts were persisted.
     Succeeded,
+    /// Analyzer error, or a required input file was unreadable.
     Failed,
+    /// Legitimately not run: no matching files, transient LSP
+    /// content-modified, or analyzer unavailable on this host.
     Skipped,
+    /// Stall watchdog fired: no progress beacon advance for a full
+    /// window.
     TimedOut,
+    /// Stopped in response to `AnalyzerProgress::cancel`.
     Cancelled,
 }
 
 impl RunStatus {
+    /// Stable persisted name; round-trips with [`Self::from_str`].
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -522,6 +658,8 @@ impl RunStatus {
         }
     }
 
+    /// Inverse of [`Self::as_str`]; `None` for unrecognised strings
+    /// (e.g. a status written by a newer binary).
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
             "queued" => Some(Self::Queued),
@@ -535,6 +673,8 @@ impl RunStatus {
         }
     }
 
+    /// True for statuses that end a run — exactly the ones for which
+    /// [`mark_run`] stamps `finished_at_ns`.
     pub(crate) fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -543,6 +683,13 @@ impl RunStatus {
     }
 }
 
+/// One upsert payload for [`mark_run`], keyed by
+/// `(manifest_id, analyzer_id)`.
+///
+/// `finished_at_ns` is only persisted for terminal statuses; for
+/// `Queued` / `Running` it is written as NULL regardless of the value
+/// carried here. A `None` `job_id` preserves whatever job id the row
+/// already holds (COALESCE in the upsert).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RunRecord<'a> {
     pub(crate) manifest_id: ManifestId,
@@ -556,7 +703,17 @@ pub(crate) struct RunRecord<'a> {
     pub(crate) job_id: Option<i64>,
 }
 
+/// Upsert the run row for `(manifest_id, analyzer_id)`.
+///
+/// Successive transitions of the same run overwrite the row in place
+/// — there is one row per run key, not one per attempt, so only the
+/// latest status is observable.
+///
+/// # Errors
+/// Returns the underlying SQLite error.
 pub(crate) fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
+    // Non-terminal statuses persist NULL finished_at_ns even though
+    // the record carries a value.
     let finished = match run.status {
         RunStatus::Queued | RunStatus::Running => None,
         RunStatus::Succeeded
@@ -597,6 +754,10 @@ pub(crate) fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
 /// blob was indexed under the analyzer's Tier-1 parser. This reuses
 /// the indexer's backend dispatch (extension and shebang detection)
 /// instead of maintaining a parallel extension table here.
+///
+/// `worktree_path` is `None` for entries that are indexed but not
+/// present on disk at selection time; input materialization treats
+/// that as unreadable, while LSP-class analyzers may still proceed.
 pub(crate) fn workspace_files_for(
     conn: &Connection,
     parser_id: &str,
@@ -745,6 +906,14 @@ pub(crate) fn format_unreadable_error(
     format!("{total} of {selected_count} workspace files unreadable: {head}{tail}",)
 }
 
+/// SHA-1 fingerprint of the analyzer's config files, stored as
+/// `workspace_analysis_runs.config_hash` for run-currency checks.
+///
+/// Hashes `rel_path NUL bytes NUL` for each expanded config path
+/// that currently exists and is readable; missing or unreadable
+/// files are silently omitted, so deleting a config file also
+/// changes the hash. Not a security boundary — a collision only
+/// risks a missed re-run.
 pub(crate) fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
     let mut hasher = Sha1::new();
     for rel in expanded_config_paths(repo_root, config_paths) {
@@ -759,6 +928,8 @@ pub(crate) fn config_hash(repo_root: &Path, config_paths: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Expand analyzer-declared config paths, resolving glob patterns
+/// against the current worktree; literal paths pass through as-is.
 fn expanded_config_paths(repo_root: &Path, config_paths: &[&str]) -> Vec<String> {
     let mut expanded = Vec::new();
     for rel in config_paths {
@@ -774,6 +945,11 @@ fn expanded_config_paths(repo_root: &Path, config_paths: &[&str]) -> Vec<String>
     expanded
 }
 
+/// Expand one glob pattern (e.g. `*.csproj`, `dir/*.toml`) against
+/// the worktree. Only the file-name component may carry glob meta;
+/// patterns with meta in a parent component, or whose directory
+/// cannot be read, expand to nothing. Matches are sorted so
+/// `config_hash` is stable across directory-listing orders.
 fn expand_config_glob(repo_root: &Path, rel: &str) -> Vec<String> {
     let pattern_path = Path::new(rel);
     let Some(file_pattern) = pattern_path.file_name().and_then(|name| name.to_str()) else {
@@ -806,10 +982,14 @@ fn expand_config_glob(repo_root: &Path, rel: &str) -> Vec<String> {
     matches
 }
 
+/// A config path is treated as a glob iff it contains `*` or `?`.
 fn has_glob_meta(pattern: &str) -> bool {
     pattern.contains(['*', '?'])
 }
 
+/// Minimal `*` / `?` matcher: `*` matches any run of bytes
+/// (including none), `?` matches exactly one byte. Byte-wise, so a
+/// single `?` does not span a multi-byte UTF-8 character.
 fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
     wildcard_matches_bytes(pattern.as_bytes(), candidate.as_bytes())
 }

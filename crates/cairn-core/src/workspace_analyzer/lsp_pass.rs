@@ -23,9 +23,16 @@ use crate::{Error, Result};
 use super::path::location_to_repo_path;
 use super::{AnalyzerProgress, ResolvedRef, WorkspaceFacts, WorkspaceFile};
 
+/// Total request budget per definition site, shared across every
+/// retry flavour (content-modified, empty-definition, file-not-found).
 const MAX_DEFINITION_ATTEMPTS: usize = 3;
+/// Maximum in-flight `textDocument/definition` requests per document
+/// (the `buffer_unordered` width of the site pipeline).
 const DEFINITION_PIPELINE_CONCURRENCY: usize = 16;
+/// Fixed delay before the single always-on content-modified retry.
 const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Initial backoff for the opt-in empty-definition and
+/// file-not-found retries; doubled after each sleep.
 const TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
 /// One identifier a language crate wants resolved via
@@ -221,6 +228,21 @@ pub fn run_lsp_multi_kind_definition_pass(
     .map_err(Error::Lsp)
 }
 
+/// Per-file driver for a single-kind pass: read the file from the
+/// worktree, extract definition sites, sync the document once,
+/// resolve every site concurrently, and append repo-mapped
+/// [`ResolvedRef`]s to `facts`.
+///
+/// Degradation, from softest to hardest:
+/// - files without a `worktree_path` are skipped (nothing on disk
+///   for the language server to open);
+/// - a failed definition request skips only that site (counted and
+///   logged by the batch collector);
+/// - out-of-repo definition targets are kept with
+///   `target_path = None`; the persist layer decides their fate;
+/// - a failed `textDocument/didClose` only logs a warning;
+/// - a file read error, document sync failure, or cancellation
+///   aborts the whole pass.
 #[allow(clippy::too_many_arguments)]
 async fn collect_resolved_refs(
     client: &mut PooledLsp<'_>,
@@ -302,6 +324,11 @@ async fn collect_resolved_refs(
     Ok(())
 }
 
+/// Multi-kind variant of `collect_resolved_refs`: runs every
+/// collector over the file, tags each extracted site with its
+/// collector's ref kind, and issues a single document sync for all
+/// kinds combined. Degradation behaviour matches the single-kind
+/// driver.
 #[allow(clippy::too_many_arguments)]
 async fn collect_multi_kind_resolved_refs(
     client: &mut PooledLsp<'_>,
@@ -399,18 +426,23 @@ async fn collect_multi_kind_resolved_refs(
     Ok(())
 }
 
+/// A site paired with the definition locations the server returned
+/// (post-filtering; never empty once stored in a batch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedDefinitionSite {
     site: DefinitionSite,
     locations: Vec<Location>,
 }
 
+/// A definition site tagged with the ref kind of the collector that
+/// produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DefinitionRequestSite {
     ref_kind: RefKind,
     site: DefinitionSite,
 }
 
+/// [`ResolvedDefinitionSite`] plus the originating collector's kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedMultiKindDefinitionSite {
     ref_kind: RefKind,
@@ -418,12 +450,16 @@ struct ResolvedMultiKindDefinitionSite {
     locations: Vec<Location>,
 }
 
+/// Outcome of resolving one document's sites: successfully resolved
+/// sites plus a count of sites whose definition request failed.
 #[derive(Debug, Default)]
 struct DefinitionBatch {
     resolved: Vec<ResolvedDefinitionSite>,
     error_count: usize,
 }
 
+/// [`DefinitionBatch`] with per-kind error attribution for the
+/// multi-kind debug log line.
 #[derive(Debug, Default)]
 struct MultiKindDefinitionBatch {
     resolved: Vec<ResolvedMultiKindDefinitionSite>,
@@ -431,6 +467,14 @@ struct MultiKindDefinitionBatch {
     error_counts_by_kind: Vec<(RefKind, usize)>,
 }
 
+/// Resolve every site through `definition` with bounded concurrency,
+/// then re-sort by source position so batch output is deterministic
+/// regardless of completion order. Failed sites are counted, logged,
+/// and dropped; sites resolving to zero locations (after the optional
+/// requested-site filter) are dropped silently. Cancellation is
+/// observed per attempt inside the retry wrapper, so a cancelled
+/// batch fails its remaining sites fast and the caller's post-batch
+/// check aborts the pass.
 async fn collect_definition_site_locations<F, Fut>(
     sites: Vec<DefinitionSite>,
     definition: F,
@@ -506,6 +550,9 @@ where
     batch
 }
 
+/// Multi-kind sibling of `collect_definition_site_locations`; the
+/// extra ref-kind sort key keeps output deterministic when several
+/// collectors emit sites at the same source position.
 async fn collect_multi_kind_definition_site_locations<F, Fut>(
     sites: Vec<DefinitionRequestSite>,
     definition: F,
@@ -586,6 +633,11 @@ where
     batch
 }
 
+/// Apply the opt-in "server echoed the use-site back" filter: when
+/// `suppress` is set, drop target locations that point at any
+/// requested site in the same document. The match is a heuristic on
+/// (same URI, same range start), so a genuine definition that
+/// coincides with a requested site is suppressed too.
 fn filter_requested_site_locations(
     locations: Vec<Location>,
     uri: &Url,
@@ -601,6 +653,8 @@ fn filter_requested_site_locations(
         .collect()
 }
 
+/// True when the location starts exactly at one of the requested
+/// sites in the same document. Only the range start is compared.
 fn is_requested_site_location(
     location: &Location,
     uri: &Url,
@@ -612,6 +666,22 @@ fn is_requested_site_location(
             .any(|site| location.range.start == site.position)
 }
 
+/// Issue one site's definition request with the retry ladder shared
+/// by all LSP passes, under a single [`MAX_DEFINITION_ATTEMPTS`]
+/// budget:
+///
+/// - content-modified responses: eligible for one retry after a
+///   fixed delay when attempt budget remains (always on);
+/// - empty location lists: eligible for one retry with backoff when
+///   `retry_empty_definition` is set and attempt budget remains,
+///   otherwise returned as-is;
+/// - "file not found" errors: retried with doubling backoff while
+///   the budget lasts, when `retry_file_not_found` is set;
+/// - any other error is terminal.
+///
+/// Exhausting the budget yields `Ok(vec![])`: the site is treated as
+/// unresolved rather than failing the pass. Cancellation is checked
+/// before each attempt.
 async fn definition_with_retry_from<F, Fut>(
     mut definition: F,
     policy: DefinitionRetryPolicy,
@@ -674,6 +744,9 @@ fn analyzer_cancelled_error() -> Error {
     Error::Internal("workspace analyzer cancelled".into())
 }
 
+/// Servers report the transient "file not found" condition without a
+/// dedicated error code, so match on the message substring at both
+/// the protocol and response-error levels.
 fn is_file_not_found(err: &crate::lsp::Error) -> bool {
     matches!(err, crate::lsp::Error::Protocol(message) if message.contains("file not found"))
         || matches!(
@@ -682,6 +755,11 @@ fn is_file_not_found(err: &crate::lsp::Error) -> bool {
         )
 }
 
+/// Adapt crate errors to the pool closure's `lsp::Error` signature.
+/// Non-LSP failures (worktree file reads, cancellation) are wrapped
+/// as `Protocol` strings; the public entry points then wrap the
+/// result back into [`Error::Lsp`], so those causes lose their
+/// original error variant on the way out.
 fn core_error_to_lsp(err: Error) -> crate::lsp::Error {
     match err {
         Error::Lsp(err) => err,
@@ -705,6 +783,8 @@ fn format_kind_counts(counts: &[(RefKind, usize)]) -> String {
         .join(",")
 }
 
+/// Fixed ordering used only as a sort tie-break so multi-kind batch
+/// output is deterministic; the numbers carry no semantic priority.
 fn ref_kind_sort_key(kind: RefKind) -> u8 {
     match kind {
         RefKind::Call => 0,

@@ -15,6 +15,19 @@
 //!    disk.
 //! 6. Sets `HEAD`, `branch/<name>` (if on a branch), and
 //!    `tentative/<worktree_id>` anchors to the right manifests.
+//!
+//! Phasing: the tree/worktree scans and the Tier-1 parse pass run
+//! before the manifest/anchor publication transaction opens. Each
+//! parsed blob commits in its own short IMMEDIATE transaction inside
+//! `cas::blob::reuse_or_compute`, so a scan that fails midway leaves
+//! behind warm content-addressed cache entries — the new
+//! manifest/anchor is simply not published yet, though an existing
+//! `(blob_sha, parser_id)` unit may have been refreshed in place.
+//! Manifest rows, anchors, and the worktree row
+//! are then published together in a single IMMEDIATE transaction,
+//! and the workspace analyzer pass is chosen after commit by the
+//! Gate #1/#2/#3 decision documented inline in
+//! `register_repo_inner_with_publication`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -55,6 +68,8 @@ pub struct RegisterOutcome {
     /// skip (it would let a parser_revision bump leave the resolutions table
     /// stale under a reused `manifest_id`).
     pub skip_analyzers_for_unchanged_manifest: bool,
+    /// Analyzer jobs enqueued by the `*_enqueue_*` entry points;
+    /// always empty for the inline-run variants.
     pub analyzer_jobs: Vec<QueuedAnalyzerJob>,
     /// Number of `(blob, parser)` pairs that were parsed fresh
     /// (= not reused from a prior call).
@@ -72,6 +87,11 @@ pub struct ReconcilePublicationReceipt {
     pub generation: i64,
 }
 
+/// Inputs for one reconcile-manager-owned registration attempt.
+/// `generation` is the durable attempt generation stamped on the
+/// tentative anchor at publication; `forced` opts out of the
+/// unchanged-tentative dedupe so an explicit reindex rebuilds the
+/// tentative manifest even when the worktree is unchanged.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReconcileRegistration<'a> {
     pub alias: &'a str,
@@ -82,6 +102,10 @@ pub(crate) struct ReconcileRegistration<'a> {
     pub forced: bool,
 }
 
+/// How the tentative anchor gets published: `Direct` for the plain
+/// register entry points, `Reconcile` when the reconcile manager
+/// owns the attempt and its generation must land atomically with
+/// the anchor write.
 #[derive(Debug, Clone, Copy)]
 enum RegistrationPublication {
     Direct { dedupe_unchanged_tentative: bool },
@@ -89,6 +113,9 @@ enum RegistrationPublication {
 }
 
 impl RegistrationPublication {
+    /// Whether Gate #1 (unchanged-tentative manifest reuse) may
+    /// apply. A forced reconcile opts out so explicit reindex
+    /// requests always republish a fresh tentative manifest.
     fn dedupe_unchanged_tentative(self) -> bool {
         match self {
             Self::Direct {
@@ -98,6 +125,8 @@ impl RegistrationPublication {
         }
     }
 
+    /// Attempt generation to stamp on the tentative anchor; present
+    /// only for reconcile publications.
     fn generation(self) -> Option<i64> {
         match self {
             Self::Direct { .. } => None,
@@ -155,6 +184,9 @@ pub(crate) fn register_repo_force_analyzers(
     )
 }
 
+/// Register a worktree, handing analyzer work to the `JobManager`
+/// instead of running it inline; the queued jobs are returned in
+/// `RegisterOutcome::analyzer_jobs`.
 pub(crate) fn register_repo_enqueue_analyzers(
     conn: &mut Connection,
     alias: &str,
@@ -183,6 +215,9 @@ pub(crate) fn register_repo_enqueue_analyzers(
     )
 }
 
+/// Forced-reindex variant of the enqueue path: like
+/// `register_repo_force_analyzers`, it does not dedupe an unchanged
+/// tentative manifest.
 pub(crate) fn register_repo_force_analyzers_enqueue(
     conn: &mut Connection,
     alias: &str,
@@ -211,6 +246,9 @@ pub(crate) fn register_repo_force_analyzers_enqueue(
     )
 }
 
+/// Reconcile-owned registration that enqueues analyzer jobs and
+/// stamps the attempt generation on the tentative anchor within the
+/// same publication transaction.
 pub(crate) fn register_repo_reconcile_enqueue_analyzers(
     conn: &mut Connection,
     request: ReconcileRegistration<'_>,
@@ -239,6 +277,8 @@ pub(crate) fn register_repo_reconcile_enqueue_analyzers(
     )
 }
 
+/// Reconcile-owned registration that runs analyzers inline rather
+/// than enqueueing jobs.
 pub(crate) fn register_repo_reconcile(
     conn: &mut Connection,
     worktree_path: &Path,
@@ -259,6 +299,8 @@ pub(crate) fn register_repo_reconcile(
     )
 }
 
+/// Direct-publication adapter kept for the entry points and tests
+/// that pass `dedupe_unchanged_tentative` as a bool.
 fn register_repo_inner<F>(
     conn: &mut Connection,
     worktree_path: &Path,
@@ -287,6 +329,14 @@ where
     )
 }
 
+/// Core registration pipeline shared by every `register_repo_*`
+/// entry point.
+///
+/// The `run_analyzers` callback executes only after the publication
+/// transaction commits; if it fails, the error propagates but the
+/// already-published anchors (including any reconcile generation
+/// stamp) remain durable — pinned by
+/// `analyzer_failure_after_publication_leaves_durable_receipt`.
 fn register_repo_inner_with_publication<F>(
     conn: &mut Connection,
     worktree_path: &Path,
@@ -306,6 +356,9 @@ where
 {
     let dedupe_unchanged_tentative = publication.dedupe_unchanged_tentative();
     let backends = all_backends();
+    // Manifest inclusion filter: files a Tier-1 backend claims by
+    // path, C-family headers (content-routed to c/cpp/objc later),
+    // and executables (shebang-fallback candidates).
     let include = |hint: &PathHint<'_>| {
         if pick_backend_for_path(&backends, hint.path).is_some() {
             return true;
@@ -342,6 +395,11 @@ where
     )?;
     let blobs_parsed = parse_progress.fresh;
 
+    // BEGIN IMMEDIATE acquires SQLite's write lock up front, so the
+    // read-then-write sequence below (resolve the prior tentative,
+    // compare entries, republish anchors) cannot interleave with a
+    // commit from another writer, and no mid-transaction lock
+    // upgrade is needed.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let worktree_id = upsert_worktree(&tx, worktree_path, now_ns)?;
     let tentative_anchor = AnchorName::tentative(worktree_id);
@@ -402,12 +460,18 @@ where
     if let Some(name) = &branch {
         anchor::set(&tx, &AnchorName::branch(name), committed, now_ns)?;
     }
+    // Drop branch/tag anchors whose git ref was deleted since the
+    // last register, so removed refs stop resolving.
     prune_stale_ref_anchors(
         &tx,
         "branch/",
         &live_ref_names(worktree_path, "refs/heads")?,
     )?;
     prune_stale_ref_anchors(&tx, "tag/", &live_ref_names(worktree_path, "refs/tags")?)?;
+    // Reconcile publications write the attempt generation onto the
+    // anchor row itself, so the generation stamp becomes durable
+    // atomically with the anchor move; the receipt mirrors what was
+    // just written.
     let publication_receipt = match publication.generation() {
         Some(generation) => {
             anchor::set_reconciled(&tx, &tentative_anchor, tentative, now_ns, generation)?;
@@ -448,6 +512,10 @@ where
         all_workspace_analyzers()
     };
 
+    // The operative skip is `analyzers_to_run.is_empty()`; the flag
+    // labels an empty selection as a dedupe skip only for unchanged
+    // inputs — an unchanged manifest with no expected analyzers also
+    // satisfies it.
     let skip_analyzers_for_unchanged_manifest =
         entries_unchanged && blobs_parsed == 0 && analyzers_to_run.is_empty();
 
@@ -493,12 +561,23 @@ where
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
+/// Dedup and freshness accounting for the pre-publication parse
+/// pass.
 #[derive(Default)]
 struct ParseProgress {
+    /// `(blob_sha, parser_id)` pairs already visited in this call,
+    /// so a blob shared by the committed and tentative manifests
+    /// parses at most once per parser.
     seen: HashSet<(String, String)>,
+    /// Pairs whose parse actually ran (not reused from a prior
+    /// call); non-zero vetoes the analyzer skip via Gate #2.
     fresh: usize,
 }
 
+/// Parse one worktree file streamed out of
+/// `manifest::capture_worktree`. Backend choice tries the path match
+/// first, then content-based fallbacks (shebang sniffing, C-family
+/// header routing); files with no backend stay manifest-only.
 fn parse_worktree_payload(
     conn: &mut Connection,
     backends: &[Box<dyn LanguageBackend>],
@@ -521,6 +600,13 @@ fn parse_worktree_payload(
     )
 }
 
+/// Parse committed-manifest blobs not already covered by the
+/// worktree pass, reading content via `git cat-file`.
+///
+/// The path-matched branch consults the dedup set before spawning
+/// git so blobs shared with the worktree cost no subprocess; the
+/// fallback branch must read the bytes first because backend
+/// selection there depends on the content.
 fn parse_committed_entries(
     conn: &mut Connection,
     repo_root: &Path,
@@ -565,6 +651,11 @@ fn parse_committed_entries(
     Ok(())
 }
 
+/// Parse already-loaded bytes for one manifest entry unless this
+/// `(blob_sha, parser_id)` pair was handled earlier in the pass.
+/// `reuse_or_compute` skips the parse only when a stored row matches
+/// the current parser revision and analyzer identity exactly, so a
+/// revision bump or analyzer change recomputes.
 fn parse_borrowed(
     conn: &mut Connection,
     entry: &ManifestEntry,
@@ -610,6 +701,9 @@ impl ParseProgress {
     }
 }
 
+/// Insert-or-fetch the worktree row keyed by its path string.
+/// Idempotent: re-registration keeps the original
+/// `registered_at_ns`.
 fn upsert_worktree(tx: &rusqlite::Transaction<'_>, path: &Path, now_ns: i64) -> Result<i64> {
     let path_str = path.to_string_lossy().to_string();
     if let Some(id) = tx
@@ -629,12 +723,17 @@ fn upsert_worktree(tx: &rusqlite::Transaction<'_>, path: &Path, now_ns: i64) -> 
     Ok(tx.last_insert_rowid())
 }
 
+/// Current branch name, or `None` when HEAD is detached
+/// (`git symbolic-ref` exits non-zero).
 fn detect_branch(repo_root: &Path) -> Option<String> {
     let raw = run_git_capture(repo_root, &["symbolic-ref", "--quiet", "HEAD"]).ok()?;
     // raw looks like `refs/heads/main`
     raw.strip_prefix("refs/heads/").map(str::to_string)
 }
 
+/// Names of refs currently under `namespace` (e.g. `refs/heads`),
+/// with the two leading path components stripped to match the
+/// anchor naming (`branch/<name>`, `tag/<name>`).
 fn live_ref_names(repo_root: &Path, namespace: &str) -> Result<HashSet<String>> {
     let refs = run_git_capture(
         repo_root,
@@ -647,6 +746,8 @@ fn live_ref_names(repo_root: &Path, namespace: &str) -> Result<HashSet<String>> 
         .collect())
 }
 
+/// Delete anchors under `prefix` whose backing git ref no longer
+/// exists; returns how many were removed.
 fn prune_stale_ref_anchors(
     tx: &rusqlite::Transaction<'_>,
     prefix: &str,
@@ -665,6 +766,9 @@ fn prune_stale_ref_anchors(
     Ok(pruned)
 }
 
+/// Run a git subcommand in `repo_root`, returning trimmed stdout.
+/// Both spawn failures and non-zero exits map to
+/// `Error::InvalidArgument` (the latter carrying git's stderr).
 fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -683,6 +787,8 @@ fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Strict 40-char lowercase-hex check: the allowlist gate applied
+/// before a blob name is passed on a git command line.
 fn is_git_sha1(blob_sha: &str) -> bool {
     blob_sha.len() == 40
         && blob_sha
@@ -690,6 +796,8 @@ fn is_git_sha1(blob_sha: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Read a blob's raw content from the git object database via
+/// `git cat-file -p`.
 pub(crate) fn git_cat_file(repo_root: &Path, blob_sha: &str) -> Result<Vec<u8>> {
     if !is_git_sha1(blob_sha) {
         // Manifest blob IDs are process input at the RPC/register
