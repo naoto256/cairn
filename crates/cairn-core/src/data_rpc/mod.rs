@@ -73,6 +73,13 @@ pub static DATA_METHODS: [fn() -> Box<dyn DataMethod>] = [..];
 
 /// Shared state each [`DataMethod`] gets at dispatch time. Holds the
 /// per-repo CAS root used by every method to open the right store.
+///
+/// `lifecycle` is `Option` so tests and any narrow call site that
+/// bypasses the daemon runtime can construct a `DataCtx` without
+/// standing up a full [`RepoLifecycleManager`]. In production the
+/// daemon always wires one in via [`DataRpc::with_lifecycle`]; helpers
+/// that see `None` fall back to running without per-repo activity
+/// leases.
 #[derive(Clone)]
 pub struct DataCtx {
     pub cas_data_dir: Arc<CasDataDir>,
@@ -101,11 +108,19 @@ pub struct DataRpc {
 }
 
 impl DataRpc {
+    /// Construct a handler without lifecycle wiring. Suitable for
+    /// standalone tests and for early boot paths that have not yet
+    /// built a [`RepoLifecycleManager`]; production daemons use
+    /// [`Self::with_lifecycle`] instead.
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Self {
         Self::with_lifecycle(cas_data_dir, None)
     }
 
+    /// Construct a handler with an optional lifecycle manager. When
+    /// present, data methods that fan out over repositories acquire
+    /// per-repo activity leases so a `Removing` repository is skipped
+    /// (or fails with `RepositoryUnavailable` for explicit requests).
     #[must_use]
     pub fn with_lifecycle(
         cas_data_dir: Arc<CasDataDir>,

@@ -1,4 +1,25 @@
 //! `list_repos` — lightweight registered repository inventory.
+//!
+//! One row per registered alias, joined with per-repository
+//! metadata (languages, snapshot counts, aggregate status). The
+//! iteration walks [`cas_registry::list_all`] and does not
+//! deduplicate by `repo_hash`: a repository with N aliases produces
+//! N `RepoListEntry` rows with identical repo-level fields but the
+//! alias-specific slot filled per row.
+//!
+//! Every call is treated as an enumeration — the optional `query`
+//! is only a substring filter over `alias` / `root_path`, so the
+//! lifecycle path always uses `acquire_for_enumeration` and drops
+//! Removing owners with `partial_truncated("repo_unavailable")`
+//! rather than raising. That contrasts with [`super::repo_status`],
+//! which asks about exactly one repo and propagates
+//! `RepositoryUnavailable` instead.
+//!
+//! The snapshot summary is computed in two passes: an inside-tx
+//! read picks a candidate current snapshot and gathers per-manifest
+//! counts, and a post-commit revalidation adjusts current-snapshot
+//! status if the manifest went stale between reads (see
+//! [`revalidate_status_snapshot`] and [`apply_current_freshness`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -45,7 +66,14 @@ impl DataMethod for ListRepos {
                 let entries = cas_registry::list_all(&index)?;
                 let mut out = Vec::with_capacity(entries.len());
                 let mut skipped_unavailable = false;
+                // `list_all` returns alias rows; a repository with
+                // multiple aliases appears in the loop once per alias
+                // and produces one `RepoListEntry` per pass. No
+                // dedup by `repo_hash` happens on this path.
                 for entry in entries {
+                    // `query` is a plain substring filter over the
+                    // alias and canonical root path — no glob, no
+                    // regex, no case folding.
                     if let Some(query) = args.query.as_deref()
                         && !entry.alias.contains(query)
                         && !entry.root_path.contains(query)
@@ -67,6 +95,9 @@ impl DataMethod for ListRepos {
                     let mut conn =
                         cas_store::open_existing(&cas_data_dir.store_db_path(&entry.repo_hash))?;
                     let tx = conn.transaction()?;
+                    // Pass 1: pick the current snapshot and derive
+                    // per-manifest counts under one read tx so an
+                    // anchor move cannot mix rows from two manifests.
                     let selected = select_status_snapshot(
                         &index,
                         &tx,
@@ -75,6 +106,10 @@ impl DataMethod for ListRepos {
                     )?;
                     let mut snapshot_summary = collect_repo_snapshot_summary(&tx, &backends)?;
                     tx.commit()?;
+                    // Pass 2: re-validate against the reconcile state
+                    // post-commit — if the manifest has since gone
+                    // stale, `apply_current_freshness` overrides the
+                    // in-tx status label and the aggregate.
                     let current_freshness = revalidate_status_snapshot(
                         &index,
                         &conn,
@@ -98,6 +133,9 @@ impl DataMethod for ListRepos {
                         current_symbol_count: snapshot_summary.summary.current_symbol_count,
                     });
                 }
+                // `limit` is a post-collection cap only — no paging
+                // cursor is emitted, so the truncated tail is lost
+                // for this call.
                 let capped = if let Some(limit) = args.pagination.limit {
                     let limit = limit as usize;
                     if out.len() > limit {
@@ -116,6 +154,9 @@ impl DataMethod for ListRepos {
 
         Ok(serde_json::to_value(ListReposResult {
             repos,
+            // Skip-unavailable outranks cap-truncation: an unknown
+            // number of rows were dropped, which is a stronger claim
+            // than "the tail past `limit` is missing".
             completeness: if skipped_unavailable {
                 cairn_proto::Completeness::partial_truncated("repo_unavailable")
             } else if capped {
@@ -133,6 +174,9 @@ impl DataMethod for ListRepos {
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(ListRepos);
 
+/// Snapshot-level view of one repository — shared source of truth
+/// for `list_repos` inventory rows and the fuller `repo_status`
+/// response, so their aggregate counts cannot drift.
 #[derive(Debug, Clone)]
 pub(super) struct RepoSnapshotSummary {
     pub(super) languages: Vec<String>,
@@ -215,6 +259,17 @@ pub(super) fn collect_repo_snapshot_summary(
     })
 }
 
+/// Resolve a filesystem path back to the innermost registered
+/// alias whose canonical root is a prefix of `path`.
+///
+/// Canonicalization is best-effort — if `path` does not exist yet
+/// (e.g. it names a file the user is about to create), the raw
+/// path is used and the prefix check runs against it directly.
+/// When several registered roots are prefixes (nested repos), the
+/// longest match wins; for equal-length roots the strict `>`
+/// comparison deterministically keeps the first row in `alias`
+/// order returned by `list_all`. `Ok(None)` means no registered
+/// root contains this path.
 pub(super) fn resolve_repo_by_path(
     index: &rusqlite::Connection,
     path: &Path,
@@ -236,6 +291,15 @@ pub(super) fn resolve_repo_by_path(
     Ok(best)
 }
 
+/// Group `anchors` rows by `manifest_id` and derive one snapshot
+/// record per group.
+///
+/// Multiple anchor names can point at the same manifest (HEAD plus
+/// a branch, or several branches at the same commit); their names
+/// are folded into the snapshot's `branches` list. The record is
+/// ordered by [`anchor::order_key`] of its first internal name so
+/// HEAD-style snapshots sort ahead of branch-only ones
+/// deterministically.
 fn collect_snapshot_records(
     conn: &rusqlite::Connection,
     backends: &[Box<dyn LanguageBackend>],
@@ -345,6 +409,10 @@ fn count_manifest_symbols(conn: &rusqlite::Connection, manifest_id: i64) -> Resu
         .unwrap_or(0))
 }
 
+/// Count workspace-analyzer runs in `queued`/`running` state that
+/// are still attached to a live anchor. Matches the filter shape
+/// used by [`super::list_jobs`] so the two surfaces agree on what
+/// counts as "an active job for this repo".
 fn count_active_jobs(conn: &rusqlite::Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM workspace_analysis_runs
@@ -356,6 +424,11 @@ fn count_active_jobs(conn: &rusqlite::Connection) -> Result<i64> {
     )?)
 }
 
+/// Collapse per-snapshot statuses plus active-job count into a
+/// single aggregate label. Precedence, worst-first:
+/// `Error` (no snapshots or any `missing`) > `Indexing` (active
+/// job or any `reconciling`) > `Partial` (any `stale` /
+/// `no_analyzer`) > `Ready`.
 fn derive_aggregate_status(
     snapshots: &[RepoSnapshotEntry],
     active_jobs: i64,
@@ -382,6 +455,14 @@ fn derive_aggregate_status(
     }
 }
 
+/// Pick a candidate current snapshot for inventory / status.
+///
+/// Delegates to [`freshness::evaluate_snapshot`] with no explicit
+/// anchor / branch, so the default anchor picked by
+/// `anchor::resolve_explicit_or_default` is used. A repository
+/// whose default anchor is not yet published returns `Ok(None)`
+/// instead of the raw `AnchorNotFound`, so it still appears in the
+/// inventory as "missing current snapshot".
 pub(super) fn select_status_snapshot(
     index: &rusqlite::Connection,
     store: &rusqlite::Connection,
@@ -395,6 +476,11 @@ pub(super) fn select_status_snapshot(
     }
 }
 
+/// Post-commit freshness re-check for the snapshot chosen by
+/// [`select_status_snapshot`]. When there was no candidate to
+/// begin with, synthesise a stale verdict with
+/// `MissingTentative` so the caller can still emit the
+/// downgraded status.
 pub(super) fn revalidate_status_snapshot(
     index: &rusqlite::Connection,
     store: &rusqlite::Connection,
@@ -410,6 +496,16 @@ pub(super) fn revalidate_status_snapshot(
     }
 }
 
+/// Downgrade the current-snapshot slot of a summary when its
+/// post-commit freshness turned stale.
+///
+/// A non-stale verdict is a no-op. Otherwise the `current` label
+/// is overwritten, the matching entry inside `snapshots` (looked
+/// up by branch label, which is what `current.anchor` holds) is
+/// updated in place, the ready/stale counts are recomputed, and
+/// the aggregate is bumped down: any `reconciling` becomes
+/// `Indexing`; a `stale` downgrades `Ready` to `Partial` but does
+/// not touch existing `Indexing` / `Partial` / `Error` verdicts.
 pub(super) fn apply_current_freshness(
     summary: &mut RepoSnapshotSummary,
     freshness: SnapshotFreshness,
@@ -444,6 +540,11 @@ pub(super) fn apply_current_freshness(
     };
 }
 
+/// Per-snapshot status label. In order of check:
+/// `empty` (no files in the manifest), `ready` (has symbols),
+/// `stale` (analyzer exists for some language but no symbols
+/// landed yet), else `no_analyzer` (no analyzer registered for any
+/// language present).
 fn derive_status(file_count: i64, symbol_count: i64, enrichment: &[LanguageEnrichment]) -> String {
     if file_count == 0 {
         return "empty".into();

@@ -1,4 +1,29 @@
 //! Shared blocking helpers for data-RPC methods.
+//!
+//! Every snapshot-scoped symbol/navigation method (find_symbols,
+//! get_outline, find_references, ...) routed through this helper
+//! drives the same pipeline via [`query_one_or_all_snapshots`];
+//! `list_repos` / `list_jobs` / `repo_status` build their own
+//! per-repo pipelines instead:
+//!
+//! 1. Resolve one snapshot per repository via
+//!    [`freshness::evaluate_snapshot`] inside the same SQLite read
+//!    transaction that will run the query SQL, so an anchor move
+//!    mid-query cannot mix rows from two manifests.
+//! 2. Optionally verify that a required exact file is a member of the
+//!    resolved manifest, run the caller's query closure against the
+//!    pinned manifest, then commit the read transaction.
+//! 3. Reopen the store on a fresh connection and call
+//!    [`freshness::revalidate_snapshot`]; a changed durable
+//!    fingerprint replaces the initial verdict.
+//! 4. Build tier-3 status limited to the parser ids the returned rows
+//!    actually touch, then compose diagnostics and hints so snapshot
+//!    uncertainty outranks speculative empty-result advice.
+//!
+//! Multi-repository queries acquire per-repo leases individually so a
+//! single `Removing` repository does not fail an unscoped scan;
+//! explicitly requested repositories keep the strict "acquire or
+//! error" contract of `acquire_by_repo_hash`.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,12 +48,25 @@ use crate::{Error, Result};
 
 use super::DataCtx;
 
+/// One repository-level reason a snapshot could not be trusted for the
+/// current query. `repo` is the alias (or `"*"` for the aggregate
+/// "not indexed by any known repository" marker); `reason` is either a
+/// [`SnapshotStaleReason`](crate::freshness) label or the sentinel
+/// `"file_not_indexed"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueryFreshnessIssue {
     pub(crate) repo: String,
     pub(crate) reason: &'static str,
 }
 
+/// Aggregated outcome of a query fan-out over one or more repositories.
+///
+/// `items` is the caller-shaped rows, already trimmed to the requested
+/// limit. `capped` reflects whether truncation happened at any layer,
+/// `skipped_unavailable` whether an enumerating scan silently skipped a
+/// repository that could not be leased, and `freshness_issues` collects
+/// per-repository staleness / membership problems seen either at
+/// evaluation or during post-query revalidation.
 #[derive(Debug)]
 pub(crate) struct SnapshotQueryResult<T> {
     pub(crate) items: Vec<T>,
@@ -38,6 +76,10 @@ pub(crate) struct SnapshotQueryResult<T> {
     pub(crate) freshness_issues: Vec<QueryFreshnessIssue>,
 }
 
+/// Parameters shared by every snapshot-scoped RPC. `requested_repo`
+/// unset means "enumerate every registered repository" and switches the
+/// engine into lease-skipping mode; `anchor`/`branch` follow
+/// [`freshness::evaluate_snapshot`]'s resolution rules.
 pub(crate) struct SnapshotQueryRequest {
     pub(crate) requested_repo: Option<String>,
     pub(crate) anchor: Option<String>,
@@ -50,6 +92,10 @@ pub(crate) struct SnapshotQueryRequest {
     pub(crate) exact_file: Option<String>,
 }
 
+/// Bookkeeping the query engine carries across its two passes: what
+/// repository was successfully queried and against which manifest, so
+/// tier-3 status assembly and freshness revalidation can find the same
+/// store again on a fresh connection.
 struct CapturedSnapshot {
     entry: cas_registry::AliasEntry,
     selected: EvaluatedSnapshot,
@@ -86,6 +132,9 @@ where
     let method_name = request.method_name;
     tokio::task::spawn_blocking(move || -> Result<SnapshotQueryResult<T>> {
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+        // Enumeration mode makes lease acquisition, missing-anchor
+        // handling and file-not-indexed reporting soft-fail per repo;
+        // an explicit request keeps them hard.
         let enumerate_all = request.requested_repo.is_none();
         let aliases = match request.requested_repo.as_deref() {
             Some(name) => {
@@ -106,6 +155,9 @@ where
         let mut freshness_issues = Vec::new();
         let mut exact_member_found = false;
         for entry in aliases {
+            // Enumeration acquires per-repo so a single Removing owner
+            // does not fail the whole scan; explicit requests keep the
+            // typed RepositoryUnavailable error.
             let _lease = match &lifecycle {
                 Some(lifecycle) if enumerate_all => {
                     let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)? else {
@@ -119,6 +171,9 @@ where
             };
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let mut conn = cas_store::open_existing(&store_path)?;
+            // One read transaction covers snapshot selection, membership
+            // check and the query SQL. That is what pins the response to
+            // a single manifest even if an anchor moves mid-query.
             let tx = conn.transaction()?;
             let selected = match freshness::evaluate_snapshot(
                 &index,
@@ -129,10 +184,16 @@ where
                 system_now_ns(),
             ) {
                 Ok(snapshot) => snapshot,
+                // A repo that has no matching anchor (e.g. explicit
+                // branch present in only some repos) is silently skipped
+                // in enumeration mode; explicit requests bubble the
+                // error to the caller.
                 Err(Error::AnchorNotFound { .. }) if enumerate_all => continue,
                 Err(error) => return Err(error),
             };
             if let Some(file) = request.exact_file.as_deref() {
+                // Membership is answered inside the same read
+                // transaction, so it cannot disagree with the SQL below.
                 let member = tx.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM manifest_entries
@@ -142,6 +203,9 @@ where
                     |row| row.get::<_, bool>(0),
                 )?;
                 if !member {
+                    // For a specific repo, the miss is the query's
+                    // answer. For an enumerating scan, a single miss is
+                    // not evidence — defer to the aggregate check below.
                     if !enumerate_all {
                         freshness_issues.push(QueryFreshnessIssue {
                             repo: entry.alias.clone(),
@@ -162,6 +226,9 @@ where
             out.extend(hits);
             captured.push(CapturedSnapshot { entry, selected });
         }
+        // Aggregate marker: no repository in the fan-out carries this
+        // path. Reported once with the `*` alias so callers can
+        // distinguish it from a per-repo miss.
         if enumerate_all && request.exact_file.is_some() && !exact_member_found {
             freshness_issues.push(QueryFreshnessIssue {
                 repo: "*".into(),
@@ -169,8 +236,14 @@ where
             });
         }
 
+        // Caller-supplied merging / sorting / de-duplication may drop
+        // rows; re-apply the request cap so the cross-repo total obeys
+        // the same limit each per-repo pass already honoured.
         finalize(&mut out);
         capped |= trim_to_requested_limit(&mut out, request.effective_limit);
+        // Only tier-3 analyzers whose parser touched a surviving row
+        // matter for query-scoped status; the finalize step above may
+        // have removed rows whose analyzers are otherwise irrelevant.
         let relevant_parser_ids = parser_ids_for_items(&out);
 
         let mut analyzers = Vec::new();
@@ -209,6 +282,10 @@ where
                         .analyzers,
                 );
             }
+            // Phase 2 of the freshness two-phase protocol: reread the
+            // durable fingerprint on a fresh connection. Only default
+            // current-worktree snapshots participate; explicit anchors
+            // short-circuit to `Explicit` inside `revalidate_snapshot`.
             snapshot.selected.freshness = freshness::revalidate_snapshot(
                 &index,
                 &conn,
@@ -232,6 +309,10 @@ where
             tier3_status =
                 tier3_status.with_repo_wide(TierStatusBody::from_analyzers(repo_wide_analyzers));
         }
+        // Any freshness issue — stale reason or missing file membership —
+        // downgrades `ready` on both slices. Consumers reading tier3
+        // readiness cannot conclude "index up to date" while a snapshot
+        // guarantee has been lost.
         if !freshness_issues.is_empty() {
             tier3_status.this_query.ready = false;
             if let Some(repo_wide) = &mut tier3_status.repo_wide {
@@ -251,6 +332,10 @@ where
     .map_err(|error| Error::internal_task_panic(method_name, error))?
 }
 
+/// Wall-clock read used to time freshness evaluation and revalidation.
+/// A clock jump before `UNIX_EPOCH` (impossible on a sane host) falls
+/// back to `0`; an overflow past `i64::MAX` saturates. Both callers
+/// use `saturating_sub` to tolerate the resulting non-monotonicity.
 pub(crate) fn system_now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -258,10 +343,16 @@ pub(crate) fn system_now_ns() -> i64 {
         .unwrap_or(0)
 }
 
+/// Fetch one extra row beyond the caller-requested limit so
+/// [`trim_to_requested_limit`] can distinguish "exactly at the limit"
+/// (complete) from "more available" (cap-truncated).
 pub(crate) fn limit_with_probe(effective_limit: u32) -> u32 {
     effective_limit.saturating_add(1)
 }
 
+/// Truncate `rows` down to the caller-requested limit. Returns `true`
+/// when at least one row was dropped, which the pipeline forwards as
+/// the cap-truncated completeness signal.
 pub(crate) fn trim_to_requested_limit<T>(rows: &mut Vec<T>, effective_limit: u32) -> bool {
     let requested = effective_limit as usize;
     if rows.len() > requested {
@@ -272,6 +363,10 @@ pub(crate) fn trim_to_requested_limit<T>(rows: &mut Vec<T>, effective_limit: u32
     }
 }
 
+/// Completeness for tools that do not participate in freshness
+/// revalidation. `repo_unavailable` takes priority over `cap` because
+/// a skipped repository is a stronger uncertainty than a truncated but
+/// complete-within-scope result.
 pub(crate) fn completeness_for_scan(capped: bool, skipped_unavailable: bool) -> Completeness {
     if skipped_unavailable {
         Completeness::partial_truncated(PartialReason::from("repo_unavailable"))
@@ -282,6 +377,10 @@ pub(crate) fn completeness_for_scan(capped: bool, skipped_unavailable: bool) -> 
     }
 }
 
+/// Snapshot-aware variant of [`completeness_for_scan`]. Any freshness
+/// issue — stale reason or missing file membership — outranks both
+/// `repo_unavailable` and `cap`, since a snapshot guarantee is a
+/// broader failure than a per-repo skip or a row-count cap.
 pub(crate) fn completeness_for_snapshot_scan(
     capped: bool,
     skipped_unavailable: bool,
@@ -294,6 +393,10 @@ pub(crate) fn completeness_for_snapshot_scan(
     }
 }
 
+/// Every input the diagnostic/hint builders need without carrying the
+/// raw parameter struct of each tool. Callers assemble this once and
+/// hand it to [`build_diagnostics`] / [`build_hints`] /
+/// [`build_snapshot_aware_feedback`].
 #[derive(Clone, Copy)]
 pub(crate) struct EmissionContext<'a> {
     pub(crate) tool: QueryToolKind,
@@ -303,6 +406,9 @@ pub(crate) struct EmissionContext<'a> {
     pub(crate) query_args: QueryArgsView<'a>,
 }
 
+/// Which query tool produced the result. Selects the copy and the
+/// relax-drop candidate list in [`tool_metadata`], and gates a couple
+/// of tool-specific hints (e.g. `GetOutline` for directory outlines).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryToolKind {
     FindSymbols,
@@ -316,6 +422,11 @@ pub(crate) enum QueryToolKind {
     FindImports,
 }
 
+/// The subset of caller arguments the hint builders inspect: whether a
+/// given filter was set, and the string value of the identifier-like
+/// filters (repo/container/path/file). Boolean fields flag "the caller
+/// explicitly narrowed by this parameter"; the value itself is not
+/// needed to advise dropping it.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct QueryArgsView<'a> {
     pub(crate) repo: Option<&'a str>,
@@ -329,6 +440,9 @@ pub(crate) struct QueryArgsView<'a> {
 }
 
 impl QueryArgsView<'_> {
+    /// Which of the tool's declared relax-drop candidates the caller
+    /// actually set. Only these can be suggested for removal — dropping
+    /// a filter that was never set would be noise.
     fn filter_drop_params(&self, metadata: &ToolHintMetadata) -> Vec<String> {
         let mut params = Vec::new();
         for candidate in metadata.relax_drop_candidates {
@@ -354,17 +468,27 @@ impl QueryArgsView<'_> {
         !self.filter_drop_params(metadata).is_empty()
     }
 
+    /// `get_outline` with `path` set and `file` unset — a directory
+    /// walk that gets a dedicated cap hint because narrowing by
+    /// `max_depth` or `kind` is usually more helpful than raising
+    /// `limit`.
     fn is_directory_outline(&self) -> bool {
         self.path.is_some_and(|value| !value.is_empty()) && self.file.is_none()
     }
 }
 
+/// Static copy per tool: the wire name, the noun to use when narrating
+/// counts, and the ordered list of filters worth suggesting for
+/// removal when the result is empty.
 struct ToolHintMetadata {
     tool: &'static str,
     result_noun: &'static str,
     relax_drop_candidates: &'static [&'static str],
 }
 
+/// Per-tool hint copy and relax-drop candidate ordering. Kept in one
+/// place so the wire strings stay consistent with the JSON-RPC method
+/// names advertised by each [`DataMethod`].
 fn tool_metadata(kind: QueryToolKind) -> ToolHintMetadata {
     match kind {
         QueryToolKind::FindSymbols => ToolHintMetadata {
@@ -415,6 +539,13 @@ fn tool_metadata(kind: QueryToolKind) -> ToolHintMetadata {
     }
 }
 
+/// Diagnostics that describe *why* a response is incomplete or degraded.
+///
+/// Partial completeness with a `Cap` reason is deliberately not emitted
+/// as an error diagnostic — it is a normal outcome surfaced as a hint
+/// instead. Every other partial reason becomes a `QueryFailedPartial`
+/// error, and each analyzer status the caller's rows depend on is
+/// mapped through [`diagnostic_for_analyzer`].
 pub(crate) fn build_diagnostics(ctx: &EmissionContext<'_>) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     if let Completeness::Partial { reason, .. } = ctx.completeness
@@ -444,6 +575,12 @@ pub(crate) fn build_diagnostics(ctx: &EmissionContext<'_>) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// Actionable next-step hints for the calling agent. Emits, in order:
+/// cap-relief advice when truncation happened, an indexing-in-progress
+/// notice while tier-3 analyzers are queued or running, empty-result
+/// advice (relax filters, try fuzzy, widen repo scope) that the
+/// snapshot-aware layer may later suppress, and a per-repo reindex
+/// nudge when a tier-3 run was expected but not recorded.
 pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
     let mut hints = Vec::new();
     let analyzers = &ctx.tier3_status.this_query.analyzers;
@@ -580,6 +717,21 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
 
 /// Build query feedback while giving snapshot uncertainty priority over
 /// speculative empty-result advice. Cap and analyzer signals remain visible.
+///
+/// When `freshness_issues` is empty this returns the default builders
+/// unchanged. Otherwise it re-shapes the output so a caller does not
+/// see conflicting advice — e.g. "your snapshot is stale" alongside
+/// "try dropping this filter, it might match more rows":
+///
+/// * The generic `QueryFailedPartial` diagnostic is replaced by one
+///   `FileNotIndexedOrSnapshotStale` per issue, tagged with the repo
+///   alias (omitted for the `*` aggregate).
+/// * Empty-result hints (relax/fuzzy/widen) are dropped because rows
+///   truly missing from an untrusted snapshot say nothing about the
+///   real filter shape.
+/// * Cap-relief hints are re-derived from a synthesised cap context
+///   and prepended below the freshness advisory so the caller still
+///   learns the result was truncated.
 pub(crate) fn build_snapshot_aware_feedback(
     ctx: &EmissionContext<'_>,
     freshness_issues: &[QueryFreshnessIssue],
@@ -591,6 +743,8 @@ pub(crate) fn build_snapshot_aware_feedback(
         return (diagnostics, hints);
     }
 
+    // The freshness advisory is the precise story; drop the generic
+    // "partial" diagnostic that would otherwise repeat it in weaker form.
     diagnostics.retain(|diagnostic| diagnostic.code != DiagnosticCode::QueryFailedPartial);
     diagnostics.extend(freshness_issues.iter().map(|issue| Diagnostic {
         code: DiagnosticCode::FileNotIndexedOrSnapshotStale,
@@ -602,6 +756,9 @@ pub(crate) fn build_snapshot_aware_feedback(
         file: ctx.query_args.file.map(str::to_string),
         details: Some(json!({ "reason": issue.reason })),
     }));
+    // Empty-result advice assumes the row set reflects the query.
+    // Under an untrusted snapshot it may just mean "we could not see
+    // the rows"; suppress the whole family.
     hints.retain(|hint| {
         !matches!(
             hint.code,
@@ -610,6 +767,9 @@ pub(crate) fn build_snapshot_aware_feedback(
                 | HintCode::EmptyResultWidenScope
         )
     });
+    // Cap advice is snapshot-independent: rebuild it against a
+    // synthesised `Cap` completeness so it survives even when the
+    // outer completeness is `file_not_indexed_or_snapshot_stale`.
     if capped {
         let cap = Completeness::partial_truncated(PartialReason::Cap);
         let cap_ctx = EmissionContext {
@@ -623,6 +783,8 @@ pub(crate) fn build_snapshot_aware_feedback(
             )
         }));
     }
+    // Lead with the freshness advisory so agents see the "wait or
+    // reindex" step before anything else.
     hints.insert(
         0,
         Hint {
@@ -643,6 +805,11 @@ pub(crate) fn build_snapshot_aware_feedback(
     (diagnostics, hints)
 }
 
+/// Map one tier analyzer status onto a wire diagnostic, or `None` when
+/// the analyzer is in a healthy state (`Ready`) or expresses no
+/// problem the query should surface (`NotApplicable`, `Queued`,
+/// `Running` are handled by hints instead). Falls through to a canned
+/// message when the analyzer omitted its own free-form reason.
 fn diagnostic_for_analyzer(analyzer: &TierAnalyzerStatus) -> Option<Diagnostic> {
     let (code, severity, fallback_message) = match (analyzer.state, analyzer.reason_code) {
         (AnalyzerState::Missing, Some(ReasonCode::NotRecorded)) => (
@@ -698,6 +865,9 @@ fn diagnostic_for_analyzer(analyzer: &TierAnalyzerStatus) -> Option<Diagnostic> 
     })
 }
 
+/// Collect parser ids into a sorted, unique set, discarding any empty
+/// strings. Callers use it to distil "which analyzers actually matter
+/// for this response" from a possibly noisy per-row iterator.
 pub(crate) fn parser_id_filter<I>(parser_ids: I) -> BTreeSet<String>
 where
     I: IntoIterator<Item = String>,
@@ -708,6 +878,9 @@ where
         .collect::<BTreeSet<_>>()
 }
 
+/// Repo-wide tier-3 status: every analyzer expected for the manifest,
+/// regardless of whether any returned row depends on it. Used for the
+/// `repo_wide` slice in verbose responses.
 pub(crate) fn compute_tier_status(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
@@ -722,6 +895,9 @@ pub(crate) fn compute_tier_status(
     ))
 }
 
+/// Query-scoped tier-3 status: only analyzers whose parser id appears
+/// in `parser_ids`. Passing `None` widens back to every analyzer the
+/// manifest expects, matching [`compute_tier_status`].
 pub(crate) fn compute_tier_status_for_parser_ids(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
@@ -746,6 +922,12 @@ fn compute_tier_status_with_analyzers(
     ))
 }
 
+/// Core tier-3 status assembler. Walks the expected analyzer list,
+/// projects each run row into a [`TierAnalyzerStatus`], and back-fills
+/// a `NotApplicable` entry for any relevant parser id the manifest
+/// contains but no analyzer covers. The double intersection with
+/// `manifest_parser_ids` and `relevant_parser_ids` is what limits
+/// output to "expected here AND useful for this response".
 fn compute_tier_status_body_with_analyzers(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
@@ -754,6 +936,9 @@ fn compute_tier_status_body_with_analyzers(
 ) -> Result<TierStatusBody> {
     let manifest_parser_ids = manifest_parser_ids(conn, manifest_id)?;
     let manifest_parser_ids_sorted = manifest_parser_ids.iter().cloned().collect::<BTreeSet<_>>();
+    // `None` here is the "no query-scope filter" signal: fall back to
+    // every parser id the manifest carries so repo-wide callers see
+    // the full picture.
     let relevant_parser_ids = relevant_parser_ids.unwrap_or(&manifest_parser_ids_sorted);
     let mut described_parser_ids = BTreeSet::new();
     let mut statuses = Vec::new();
@@ -764,6 +949,9 @@ fn compute_tier_status_body_with_analyzers(
 
     for analyzer in analyzers {
         let parser_id = analyzer.parser_id();
+        // Skip analyzers whose parser is absent from the manifest or
+        // outside the query scope; we only describe analyzers the
+        // caller can act on.
         if !manifest_parser_ids.contains(parser_id) || !relevant_parser_ids.contains(parser_id) {
             continue;
         }
@@ -785,6 +973,11 @@ fn compute_tier_status_body_with_analyzers(
         ));
     }
 
+    // Back-fill parser ids that appear in the manifest and matter for
+    // this response but that no registered analyzer covers. Emitting
+    // `NotApplicable` here is what lets callers tell "we have no
+    // analyzer for this language" apart from "the analyzer ran but
+    // reported nothing".
     for parser_id in relevant_parser_ids {
         if !manifest_parser_ids.contains(parser_id) || described_parser_ids.contains(parser_id) {
             continue;
@@ -803,6 +996,11 @@ fn compute_tier_status_body_with_analyzers(
     Ok(TierStatusBody::from_analyzers(statuses))
 }
 
+/// Translate one `workspace_analysis_runs` row into a wire status,
+/// applying two priority rules: an absent row is always
+/// `Missing/NotScheduled`, and a revision mismatch always wins over
+/// the row's status (a run that succeeded against an old analyzer
+/// revision is treated as `Stale`, not `Ready`).
 fn analyzer_status_from_run(
     analyzer_id: &str,
     language: &str,
@@ -819,6 +1017,8 @@ fn analyzer_status_from_run(
             reason: Some("expected analyzer was not scheduled for this manifest".into()),
         };
     };
+    // Revision precedes status: a `succeeded` row against an outdated
+    // analyzer revision is not `Ready`, it is `Stale`.
     if revision != i64::from(expected_revision) {
         return TierAnalyzerStatus {
             id: Some(analyzer_id.into()),
@@ -853,6 +1053,12 @@ fn analyzer_status_from_run(
     }
 }
 
+/// Coarse pattern classifier that promotes free-form analyzer error
+/// text into a structured `ReasonCode`. The substring checks are
+/// case-insensitive and deliberately generous: an unrecognised message
+/// falls back to `Unknown` (or `None` when the run actually succeeded
+/// but no code was provided) so a new failure mode never crashes the
+/// dispatch.
 fn reason_code_for_error(status: &str, error: Option<&str>) -> Option<ReasonCode> {
     let Some(error) = error else {
         return (status != "succeeded").then_some(ReasonCode::Unknown);
@@ -873,6 +1079,11 @@ fn reason_code_for_error(status: &str, error: Option<&str>) -> Option<ReasonCode
     }
 }
 
+/// Best-effort human-readable language label for a `tree-sitter-*`
+/// parser id: strip the `tree-sitter-` prefix, normalise the `md`
+/// shortcut to `markdown`, and drop the `-ng` next-generation
+/// grammar suffix. Purely cosmetic — parser ids remain the identity
+/// used everywhere else.
 fn language_from_parser_id(parser_id: &str) -> String {
     let language = parser_id.strip_prefix("tree-sitter-").unwrap_or(parser_id);
     if language == "md" {

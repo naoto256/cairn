@@ -1,4 +1,23 @@
 //! `repo_status` — detailed status for one registered repository.
+//!
+//! Exactly one of `repo` (alias) or `path` (filesystem prefix)
+//! must be supplied; [`validate_repo_status_args`] rejects both-set
+//! and both-unset with `InvalidParams`. Path lookups delegate to
+//! `list_repos::resolve_repo_by_path` and inherit its
+//! longest-prefix-wins policy.
+//!
+//! Unlike [`super::list_repos`], this method is scoped to a single
+//! repository and uses `RepoLifecycleManager::acquire_by_repo_hash`,
+//! so a Removing owner surfaces the typed `RepositoryUnavailable`
+//! error rather than being silently skipped.
+//!
+//! The response bundles per-manifest snapshot counts (shared with
+//! `list_repos` via `RepoSnapshotSummary`), a Tier-3 status block,
+//! and the durable reconcile state (`RepoReconcileStatus`) that
+//! the data-plane response exposes for hint emission. A missing
+//! `repo_reconcile_state` row is treated as registry corruption
+//! and fails closed — every registration seeds this row, and its
+//! FK cascade keeps it aligned with the repository lifecycle.
 
 use cairn_lang_api::all_backends;
 use cairn_proto::common::{
@@ -46,6 +65,8 @@ impl DataMethod for RepoStatus {
                         })?,
                     _ => unreachable!("validated above"),
                 };
+            // Single-repo path: a Removing owner raises
+            // `RepositoryUnavailable` here rather than being skipped.
             let _lease = match &lifecycle {
                 Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
                 None => None,
@@ -65,6 +86,11 @@ impl DataMethod for RepoStatus {
                 crate::data_rpc::helpers::system_now_ns(),
             )?;
             let mut summary = collect_repo_snapshot_summary(&tx, &backends)?;
+            // Tier-3 status is scoped to the current manifest — an
+            // "this repo, this snapshot" view. When `verbose_tier3`
+            // is set, `repo_wide` mirrors the same body (no wider
+            // aggregation here because `repo_status` is
+            // already single-repo).
             let mut tier3_status = match summary.current_manifest_id {
                 Some(manifest_id) => {
                     let status = compute_tier_status(&tx, manifest_id)?;
@@ -93,6 +119,9 @@ impl DataMethod for RepoStatus {
                 crate::data_rpc::helpers::system_now_ns(),
             )?;
             apply_current_freshness(&mut summary, current_freshness);
+            // A stale current snapshot forces Tier-3 not-ready even
+            // when every analyzer row itself reads clean — the
+            // manifest they attest to is no longer current.
             if current_freshness.is_stale() {
                 tier3_status.this_repo.ready = false;
                 if let Some(repo_wide) = &mut tier3_status.repo_wide {
@@ -148,6 +177,17 @@ impl DataMethod for RepoStatus {
     }
 }
 
+/// Derive user-facing hints from a materialised
+/// [`RepoStatusEntry`].
+///
+/// Hints are emitted in a fixed order (stale-snapshot,
+/// Tier-3-indexing, then the reconcile-family: watcher-failed,
+/// attempt-in-progress OR reconcile-pending, retry-wait). The
+/// pending/attempt pair is mutually exclusive by construction —
+/// the attempt hint fires iff a worker is actively running the
+/// gap, so the informational pending hint is suppressed to avoid
+/// telling the user to "wait" for something that is already
+/// running.
 fn repo_status_hints(repo: &RepoStatusEntry) -> Vec<Hint> {
     let mut hints = Vec::new();
     if repo.current.status == "stale" {
@@ -188,7 +228,7 @@ fn repo_status_hints(repo: &RepoStatusEntry) -> Vec<Hint> {
         });
     }
 
-    // PR3 Phase 4 hints from durable reconcile state.
+    // Hints from durable reconcile state.
     if let Some(r) = &repo.reconcile {
         if r.watcher_state == "failed" {
             hints.push(Hint {
@@ -233,6 +273,9 @@ fn repo_status_hints(repo: &RepoStatusEntry) -> Vec<Hint> {
                 target: Some(repo.alias.clone()),
             });
         }
+        // Emit only when a retry is actually scheduled AND at least
+        // one prior attempt failed, so the message can quote
+        // `last_error` truthfully.
         if r.retry_scheduled && r.consecutive_failures > 0 {
             hints.push(Hint {
                 code: HintCode::ReconcileRetryWait,
@@ -253,6 +296,10 @@ fn repo_status_hints(repo: &RepoStatusEntry) -> Vec<Hint> {
     hints
 }
 
+/// Enforce the "exactly one of `repo` or `path`" contract. The
+/// caller in [`RepoStatus::dispatch`] relies on this so the match
+/// on the two together can use `unreachable!()` for the
+/// both-set / both-unset arms.
 fn validate_repo_status_args(args: &RepoStatusArgs) -> Result<()> {
     match (args.scope.repo.as_ref(), args.path.as_ref()) {
         (Some(_), None) | (None, Some(_)) => Ok(()),
@@ -418,7 +465,7 @@ mod tests {
         }
     }
 
-    // ─── PR3 Phase 4 wire/data MF suite ───────────────────────────
+    // ─── wire/data mapping suite ───────────────────────────────────
 
     fn reconcile_entry_with_state(state: RepoReconcileStatus) -> RepoStatusEntry {
         let mut e = repo_status_entry("ready", TierStatusBody::ready());

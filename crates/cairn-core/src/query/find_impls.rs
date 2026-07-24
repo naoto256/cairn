@@ -114,6 +114,10 @@ pub fn find_supertypes(
     run(conn, anchor, "i.type_qualified", &args.name, args.limit)
 }
 
+// Shared driver for `find_subtypes` / `find_supertypes`. `where_col`
+// pins which side of the impl edge the caller is searching on
+// (`i.interface_qualified` for subtypes, `i.type_qualified` for
+// supertypes); everything else is symmetric.
 fn run(
     conn: &Connection,
     anchor: &AnchorName,
@@ -125,6 +129,10 @@ fn run(
         anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
             name: anchor.as_str().to_string(),
         })?;
+    // `None` picks the default page of 100. The `.max(1)` floor
+    // protects a caller that passed `Some(0)` from an emitted
+    // `LIMIT 0` (SQLite: no rows) — it's promoted to 1 rather than
+    // silently returning an empty set.
     let limit = limit.unwrap_or(100).max(1);
 
     // The resolution-layer join is filtered to `kind = 'type'` because
@@ -136,6 +144,23 @@ fn run(
     // tier2-direct fallback from a stale rebuild), we pick the one
     // with the lowest source rank via ROW_NUMBER() in a CTE rather
     // than a correlated subquery so the JOIN stays index-friendly.
+    //
+    // The `manifest_id = ?1 OR manifest_id IS NULL` filter honors
+    // schema v11's dual scoping (see `cas/schema.rs` v11 migration):
+    // workspace-aware rows (Tier-2.5 / Tier-3) carry an explicit
+    // `manifest_id`, while blob-scoped rows (Tier-2 direct) carry
+    // NULL and are valid for every manifest containing the blob.
+    // The `CASE WHEN manifest_id = ?1 THEN 0 ELSE 1` tie-breaker in
+    // the ORDER BY prefers a manifest-scoped row over a blob-scoped
+    // row when both are present at the same site.
+    //
+    // The site LEFT JOIN matches on `interface_byte_start` /
+    // `interface_byte_end` (added in schema v8). Legacy rows written
+    // before v8 — and rows from backends that don't emit token
+    // ranges (e.g. Rust's proc-macro2 line/col only) — carry NULL
+    // there, so the JOIN can never find a resolution and the query
+    // transparently falls back to `implementations.kind` with
+    // `kind_source = "tier2-fact"`.
     let source_rank = source_rank_case_sql("source");
     let mut sql = format!(
         "WITH best_resolution AS (

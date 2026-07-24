@@ -40,6 +40,9 @@ impl DataMethod for FindCallees {
             symbol: args.name.clone(),
             direction: ReferenceDirection::Outgoing,
             kind: Some(RefKind::Call),
+            // Drop unresolved call sites: a Call ref that failed to
+            // resolve a target isn't a real callee. Covered by the
+            // `omits_unresolved_method_calls` test.
             include_noise: false,
             limit: Some(limit_with_probe(effective_limit)),
         };
@@ -93,6 +96,11 @@ impl DataMethod for FindCallees {
             tier3_status: &tier3_status,
             query_args: QueryArgsView {
                 repo: args.scope.repo.as_deref(),
+                // `fuzzy: true` marks fuzzy as already engaged so the
+                // shared empty-result hint doesn't suggest a fuzzy
+                // toggle that this API doesn't expose. `kind` is inert
+                // here (FindCallees' `relax_drop_candidates` is empty)
+                // but is set for parity with sister methods.
                 fuzzy: true,
                 kind: true,
                 container: None,
