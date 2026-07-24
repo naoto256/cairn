@@ -10,7 +10,7 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.8.0**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.8.1**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
 
