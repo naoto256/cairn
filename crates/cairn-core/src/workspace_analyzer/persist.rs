@@ -1,3 +1,35 @@
+//! CAS persistence for workspace-analyzer facts.
+//!
+//! Two writers live here, one per fact shape:
+//! [`persist_resolved_refs`] lands LSP-resolved definition sites in
+//! the `refs` table, and [`persist_resolutions`] lands
+//! resolution-layer rows in the `resolutions` table.
+//!
+//! # Transaction boundary
+//!
+//! Each persist call is one IMMEDIATE transaction covering both the
+//! source-scoped DELETE and every INSERT. Readers never observe a
+//! half-swapped fact set, and a crash mid-persist leaves the previous
+//! rows intact. IMMEDIATE starts the write transaction up front, so a
+//! persist serializes against a concurrent `register_repo` instead of
+//! failing mid-transaction (see the contention test below).
+//!
+//! # Coexistence with Tier-1 rows
+//!
+//! Analyzer rows never overwrite Tier-1 output. Rows are partitioned
+//! by the `source` column: Tier-1 parse output uses `"syntactic"` /
+//! `"semantic"`, while every row written here carries
+//! `<tier_prefix>-<analyzer_id>`. The delete-then-insert pattern only
+//! clears this analyzer's own source string (plus one legacy alias),
+//! so Tier-1 facts and sibling analyzers' facts are untouched.
+//!
+//! # parser_id handling
+//!
+//! Facts attach to `(blob_sha, parser_id)` parse units. A fact is
+//! persisted only when its source blob has a Tier-1 row under the
+//! caller's expected `parser_id` (see `parser_for_blob`); otherwise
+//! it is silently skipped, so analyzer output can never dangle from a
+//! parse unit that does not exist.
 use std::path::Path;
 
 use cairn_proto::RefKind;
@@ -16,6 +48,25 @@ use super::{ResolutionKind, WorkspaceFacts, WorkspaceResolution};
 /// Remove this compatibility path after the 0.5.0 migration window closes.
 const LEGACY_RUST_REF_SOURCE: &str = "tier3-rust-analyzer";
 
+/// Persist LSP-resolved definition sites as `refs` rows for one
+/// manifest.
+///
+/// Runs one IMMEDIATE transaction that first deletes this analyzer's
+/// previous rows (every source in `ref_sources_to_clear`, restricted
+/// to blobs in this manifest) and then inserts the new facts, so a
+/// reindex replaces rather than accumulates.
+///
+/// Per-fact skip conditions (skipped facts are simply not inserted):
+/// - `source_path` has no blob in this manifest;
+/// - the source blob has no Tier-1 parse row under `parser_id`;
+/// - `target_path` is `None`, i.e. no in-repo target path could be
+///   derived (target outside the repo root, a non-file or malformed
+///   URI, or a path-mapping failure);
+/// - no function-like symbol encloses the target location, unless
+///   the ref is an Import (see the header-level fallback below).
+///
+/// `line` is stored 1-based (LSP positions are 0-based). Returns the
+/// number of rows inserted.
 pub(super) fn persist_resolved_refs(
     conn: &mut Connection,
     manifest_id: ManifestId,
@@ -108,10 +159,14 @@ pub(super) fn persist_resolved_refs(
     Ok(inserted)
 }
 
+/// `refs.source` tag for one analyzer, e.g. `"tier3-gopls-lsp"`.
 fn ref_source(tier_prefix: &str, analyzer_id: &str) -> String {
     format!("{tier_prefix}-{analyzer_id}")
 }
 
+/// Source tags whose previous rows must be cleared before insert:
+/// the analyzer's current tag plus, for rust-analyzer only, the
+/// 0.1.x alias (see [`LEGACY_RUST_REF_SOURCE`]).
 fn ref_sources_to_clear(analyzer_id: &str, tier_prefix: &str) -> Vec<String> {
     let mut sources = vec![ref_source(tier_prefix, analyzer_id)];
     if analyzer_id == "rust-analyzer-lsp" {
@@ -567,6 +622,8 @@ fn path_for_symbol_id(
         .optional()?)
 }
 
+/// Blob SHA recorded for `path` in this manifest, or `None` when the
+/// path is not part of the manifest snapshot.
 fn blob_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
@@ -578,6 +635,10 @@ fn blob_for_path(conn: &Connection, manifest_id: ManifestId, path: &str) -> Resu
         .optional()?)
 }
 
+/// Existence check for the Tier-1 parse unit: echoes `parser_id`
+/// back when the blob has a `blobs` row under it, `None` otherwise.
+/// `None` means the analyzer's language backend never parsed this
+/// blob, so its facts have no parse unit to attach to.
 fn parser_for_blob(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
@@ -590,6 +651,12 @@ fn parser_for_blob(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result
         .optional()?)
 }
 
+/// Map an LSP target location to the smallest enclosing
+/// function-like symbol (`function` / `method` / `test`) in the
+/// target blob, matched by 1-based line containment. Returns
+/// `(qualified, name)`, or `None` when the location falls outside
+/// every function-like symbol (e.g. file-level or type-level
+/// targets).
 fn target_symbol_for_location(
     conn: &Connection,
     manifest_id: ManifestId,
@@ -616,6 +683,9 @@ fn target_symbol_for_location(
         .optional()?)
 }
 
+/// Smallest function-like symbol whose byte range contains the
+/// source site, used to fill `refs.enclosing_id`. `None` (a
+/// top-level site) is legal and persists as NULL.
 fn enclosing_symbol_for_ref(
     conn: &Connection,
     blob_sha: &str,

@@ -1,3 +1,25 @@
+//! Expectation computation shared by registration, the daemon-startup
+//! staleness scanner, and doctor.
+//!
+//! Two "what should exist for this manifest?" surfaces live here:
+//!
+//!   - Tier-3 analyzers: `expected_analyzers_for_manifest` (identity
+//!     filter over the linked-in registry) and its register-path
+//!     currency refinement `workspace_analyzers_needing_rerun`.
+//!   - Tier-1 parse rows: `expected_parse_units`, the
+//!     `(blob_sha, parser_id, parser_revision)` triples the current
+//!     backend set implies for the manifest entries.
+//!
+//! Keeping both computations in one module concentrates the shared
+//! expected-set computation used by auto-recovery (startup scan),
+//! registration, and the operator surface (doctor); the currency
+//! policies layered on top differ per path (startup is
+//! revision-only, registration is config-aware).
+//!
+//! Contract note: `workspace_analyzers_needing_rerun` includes
+//! `config_hash` in its currency check; the startup scanner in
+//! `staleness` is revision-only. See the `crate::workspace_analyzer`
+//! module doc for that split.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -77,10 +99,17 @@ pub(crate) fn workspace_analyzers_needing_rerun(
     Ok(expected
         .into_iter()
         .filter(|analyzer| {
+            // Rerun condition 1: no run row at all for this analyzer.
             let Some((revision, status, stored_hash)) = existing.get(analyzer.id()) else {
                 return true;
             };
+            // Defensive clamp mirroring the staleness scanner: the
+            // column is INTEGER but writers bound it to u32.
             let revision = u32::try_from(*revision).unwrap_or(u32::MAX);
+            // Conditions 2-4: non-succeeded status, revision-stale,
+            // config-stale. The revision test is `!=` (not the
+            // startup scanner's rollback-safe `<`): on this path a
+            // revision rollback also forces a rerun.
             status != "succeeded"
                 || revision != analyzer.revision()
                 || stored_hash != &config_hash(repo_root, analyzer.config_paths())
@@ -88,6 +117,13 @@ pub(crate) fn workspace_analyzers_needing_rerun(
         .collect())
 }
 
+/// Distinct `parser_id`s persisted in `blobs` for the entries of
+/// `manifest_id`.
+///
+/// This reads what was actually parsed, not what the current backend
+/// set would parse: an entry whose blob has no `blobs` row
+/// contributes nothing here. `expected_parse_units` is the
+/// backend-driven counterpart that covers exactly that gap.
 pub(crate) fn manifest_parser_ids(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
@@ -131,6 +167,12 @@ pub(crate) fn pick_backend_with_fallbacks<'a>(
     pick_backend_for_shebang(backends, first_line)
 }
 
+/// UTF-8 first line of `content`, read from a 256-byte window.
+///
+/// The cap keeps shebang sniffing O(1) on large blobs; a first line
+/// longer than the window is truncated at the window edge. Invalid
+/// UTF-8 (including a multi-byte char split by the cap) yields
+/// `None`, which the caller treats as "no shebang".
 fn read_first_line(content: &[u8]) -> Option<&str> {
     let window = &content[..content.len().min(256)];
     let end = window
@@ -202,6 +244,9 @@ pub(crate) fn expected_parse_units(
     Ok(units)
 }
 
+/// Append one expected unit, de-duplicating on
+/// `(blob_sha, parser_id)`: the same blob reachable through several
+/// manifest paths yields a single unit.
 fn push_unit(
     units: &mut Vec<ExpectedParseUnit>,
     seen: &mut HashSet<(String, String)>,

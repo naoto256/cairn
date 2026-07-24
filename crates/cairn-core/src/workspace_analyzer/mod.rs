@@ -142,11 +142,17 @@ pub use staleness::{
 /// Future analyzer crates or modules contribute constructors with
 /// `#[distributed_slice(WORKSPACE_ANALYZERS)]`, mirroring the language
 /// backend and JSON-RPC method registries.
+// `unsafe_code` is denied workspace-wide; linkme's distributed_slice
+// expands to `#[link_section]` attributes that trip that lint, hence
+// the targeted allow (see the crate-root note in lib.rs).
 #[allow(unsafe_code)]
 #[distributed_slice]
 pub static WORKSPACE_ANALYZERS: [fn() -> Box<dyn WorkspaceAnalyzer>] = [..];
 
 /// Collect every registered workspace analyzer.
+///
+/// Each call invokes every registered constructor, so callers receive
+/// fresh analyzer instances rather than shared state.
 #[must_use]
 pub fn all_workspace_analyzers() -> Vec<Box<dyn WorkspaceAnalyzer>> {
     WORKSPACE_ANALYZERS.iter().map(|ctor| ctor()).collect()
@@ -158,6 +164,10 @@ pub fn all_workspace_analyzers() -> Vec<Box<dyn WorkspaceAnalyzer>> {
 /// advancing.
 #[derive(Debug, Default)]
 struct AnalyzerProgressState {
+    // Relaxed ordering is used at every access site: `ticks` is only
+    // compared against a prior snapshot to detect change, and
+    // `cancelled` is an advisory flag the analyzer polls, so neither
+    // is relied on to publish other memory.
     ticks: AtomicU64,
     cancelled: AtomicBool,
 }
@@ -171,8 +181,14 @@ pub struct AnalyzerProgress {
     observer: Option<AnalyzerProgressObserver>,
 }
 
+/// Callback invoked synchronously from [`AnalyzerProgress::tick`], on
+/// the ticking thread, with the post-increment tick count. The job
+/// worker installs one to mirror analyzer liveness into per-job
+/// runtime metrics.
 pub(crate) type AnalyzerProgressObserver = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 
+// Manual impl: `observer` is a bare `Fn` trait object without `Debug`,
+// so the struct cannot derive it; show counter snapshots instead.
 impl std::fmt::Debug for AnalyzerProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnalyzerProgress")
@@ -184,6 +200,9 @@ impl std::fmt::Debug for AnalyzerProgress {
 }
 
 impl AnalyzerProgress {
+    /// Build a progress handle that forwards every tick to `observer`
+    /// in addition to bumping the shared counter. The observer runs
+    /// inline on the ticking thread, so it must stay cheap.
     #[must_use]
     pub(crate) fn with_observer(observer: AnalyzerProgressObserver) -> Self {
         Self {
@@ -207,6 +226,10 @@ impl AnalyzerProgress {
         self.state.ticks.load(Ordering::Relaxed)
     }
 
+    /// Set the advisory cancellation flag. Called by the stall
+    /// detector once ticks stop advancing and by JobManager
+    /// shutdown/cancel paths. This only requests a stop: the running
+    /// analyzer keeps going until it polls [`Self::is_cancelled`].
     pub(crate) fn cancel(&self) {
         self.state.cancelled.store(true, Ordering::Relaxed);
     }
@@ -278,6 +301,10 @@ pub fn source_rank_case_sql(column: &str) -> String {
 /// Builds an SQL predicate matching any workspace-tier provenance prefix.
 ///
 /// `column` is interpolated as-is; only pass a static identifier.
+///
+/// The result is a bare `OR` chain with no outer parentheses; callers
+/// embedding it next to `AND` must wrap it (`AND (<predicate>)`), as
+/// the `find_references` queries do.
 #[must_use]
 pub fn source_is_workspace_tier_sql(column: &str) -> String {
     WORKSPACE_TIER_PREFIXES
@@ -432,6 +459,10 @@ pub struct WorkspaceFile {
 /// found no facts of that kind, not that downstream persistence should infer
 /// defaults.
 pub struct WorkspaceFacts {
+    /// Definition edges emitted by LSP-class (Tier-3) analyzers.
+    /// Persisted into the `refs` table with a
+    /// `<tier_prefix>-<analyzer_id>` source string; see
+    /// `crate::workspace_analyzer::persist`.
     pub resolved_refs: Vec<ResolvedRef>,
     /// Resolution-layer rows emitted by Tier-2.5+ analyzers. Persisted into the
     /// `resolutions` table by [`crate::workspace_analyzer::persist`]. Empty by
