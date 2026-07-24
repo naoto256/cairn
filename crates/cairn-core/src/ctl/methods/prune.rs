@@ -1,4 +1,18 @@
 //! `prune` — remove blob rows for parser IDs no current backend owns.
+//!
+//! The set of "current" parser IDs is collected from
+//! [`all_backends`] at call time, so the pruning is only ever as
+//! accurate as the daemon build. As a hard safety valve,
+//! [`prune_store`] refuses to run when that set is empty: a
+//! misconfigured or backend-less daemon would otherwise wipe every
+//! blob in every store.
+//!
+//! Enumeration honours the lifecycle gate. When the caller targets
+//! a specific alias the handler uses the strict per-repo lease
+//! (`RepoLifecycleManager::acquire_by_repo_hash`) so a `Removing`
+//! repo surfaces as an error; when it enumerates everything it uses
+//! `acquire_for_enumeration` and silently skips repos mid-removal
+//! instead of failing the whole batch.
 
 use std::collections::BTreeSet;
 

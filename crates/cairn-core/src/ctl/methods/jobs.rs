@@ -1,4 +1,36 @@
 //! `jobs.list` / `jobs.cancel` / `jobs.prune` — manage background analyzer jobs.
+//!
+//! All three verbs require the daemon to have been built with a
+//! [`JobManager`]; a missing manager is surfaced as
+//! `Error::InvalidArgument("job manager unavailable")` (JSON-RPC
+//! `-32602` INVALID_PARAMS), not `INTERNAL_ERROR`, so a client
+//! probing a stripped-down daemon can distinguish "not configured"
+//! from an actual crash.
+//!
+//! Only `jobs.prune` wraps its work in `spawn_blocking`; `jobs.list`
+//! and `jobs.cancel` invoke synchronous SQLite calls directly on
+//! the async runtime. `jobs.list` enumerates every registered
+//! alias's store before applying a final `limit`, and `jobs.cancel`
+//! walks every store when the `JobIndex` fast-path misses — under a
+//! contended DB either can stall the reactor thread.
+//!
+//! Semantics of `jobs.cancel` (see [`JobManager::cancel`]):
+//!
+//! - A queued row is flipped to `cancelled` synchronously and the
+//!   result reports `cancelled=true`.
+//! - A running row only has `cancel_requested=1` recorded plus an
+//!   in-process signal to its `AnalyzerProgress`; the reply carries
+//!   `cancelled=false` and the analyzer finishes its current
+//!   request before observing the flag. Callers that need a
+//!   synchronous stop must poll after the ack.
+//! - An already-terminal row is a no-op with `cancelled=false`.
+//! - An unknown `job_id` becomes
+//!   `Error::InvalidArgument("unknown job id: ...")` — JSON-RPC
+//!   `-32602` INVALID_PARAMS, not `-32603`.
+//!
+//! [`JobManager::cancel`]: crate::jobs::JobManager::cancel
+//!
+//! [`JobManager`]: crate::jobs::JobManager
 
 use cairn_proto::control::{
     JobsCancelArgs, JobsCancelResult, JobsListArgs, JobsListResult, JobsPruneArgs,
@@ -102,6 +134,13 @@ impl ControlMethod for JobsPrune {
         let Some(manager) = &ctx.job_manager else {
             return Err(Error::InvalidArgument("job manager unavailable".into()));
         };
+        // Clone the `Arc` into the blocking task; the sweep touches
+        // SQLite on every store so it always runs off-reactor. When
+        // `args.repo` is `None` the manager enumerates every
+        // registered repo under the lifecycle enumeration lease,
+        // silently skipping any that are `Removing`; an explicit
+        // unknown alias becomes `Error::RepoNotFound` → JSON-RPC
+        // `-32001`. `dry_run` counts matching rows without deleting.
         let manager = manager.clone();
         let result = tokio::task::spawn_blocking(move || {
             manager.prune_jobs(args.repo.as_deref(), args.dry_run.unwrap_or(false))

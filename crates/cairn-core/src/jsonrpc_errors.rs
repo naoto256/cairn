@@ -1,4 +1,37 @@
 //! Shared mapping from core errors to JSON-RPC error envelopes.
+//!
+//! # Code assignment
+//!
+//! Client-input errors ([`Error::InvalidParams`],
+//! [`Error::InvalidArgument`], [`Error::AnchorNotFound`]) map to the
+//! standard [`error_code::INVALID_PARAMS`] (-32602). Typed lookup
+//! failures use Cairn's implementation-defined codes in the
+//! JSON-RPC 2.0 server-error range: [`error_code::REPO_NOT_FOUND`]
+//! (-32001), [`error_code::FILE_NOT_INDEXED`] (-32002),
+//! [`error_code::AMBIGUOUS_SOURCE`] (-32003),
+//! [`error_code::SNAPSHOT_STALE`] (-32004), and
+//! [`error_code::DAEMON_INITIALIZING`] (-32005). Every remaining
+//! variant — I/O, SQLite, scan failure, repository unavailability,
+//! store-not-found, job-manager shutdown, shutdown-deadline, LSP,
+//! schema corruption — collapses to the standard
+//! [`error_code::INTERNAL_ERROR`] (-32603) through the catch-all arm.
+//!
+//! # Message sanitization
+//!
+//! Only [`Error::Internal`] has its wire `message` replaced with a
+//! fixed `"internal error"` string. Every other variant is currently
+//! emitted unsanitized: its [`std::fmt::Display`] form is copied
+//! into the JSON-RPC `message` verbatim. That includes potentially
+//! sensitive detail — [`Error::StoreNotFound`] and [`Error::Io`]
+//! interpolate absolute paths, [`Error::Lsp`] carries raw backend
+//! text — and the wrapping code here does not filter it.
+//!
+//! # Structured `data`
+//!
+//! A subset of typed errors attach a structured `data` payload —
+//! hints, diagnostics, completeness signals, or candidate lists —
+//! so agent clients can retry or recover programmatically instead
+//! of parsing prose.
 
 use cairn_proto::jsonrpc::{
     RequestId, Response, error_code, error_response as jsonrpc_error_response,
@@ -10,11 +43,23 @@ use serde_json::json;
 
 use crate::Error;
 
+/// Build a JSON-RPC error [`Response`] for `err`, echoing `id`
+/// verbatim. Chooses the wire code from the typed variant,
+/// sanitizes only the [`Error::Internal`] message (see the module
+/// docs), and attaches a structured `data` payload for the
+/// error variants that carry hint / diagnostic content.
 pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
+    // Message: only `Internal(_)` is sanitized. Every other variant
+    // returns its `Display` string as-is, so keep those messages
+    // caller-facing.
     let msg = match err {
         Error::Internal(_) => "internal error".to_string(),
         _ => err.to_string(),
     };
+    // Code: client-input errors → INVALID_PARAMS (-32602); each
+    // typed lookup failure → its implementation-defined code in
+    // the -32001..-32005 band; everything else falls through the
+    // wildcard arm to INTERNAL_ERROR (-32603).
     let code = match err {
         Error::InvalidParams(_) | Error::InvalidArgument(_) | Error::AnchorNotFound { .. } => {
             error_code::INVALID_PARAMS
@@ -28,6 +73,8 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
         _ => error_code::INTERNAL_ERROR,
     };
     let mut response = jsonrpc_error_response(id, code, msg);
+    // RepoNotFound: attach a single actionable hint pointing the
+    // caller at `register_repo` for the missing alias.
     if let Error::RepoNotFound { alias } = err
         && let Some(error) = response.error.as_mut()
     {
@@ -43,6 +90,9 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             }]
         }));
     }
+    // FileNotIndexed: mark the response as partially truncated and
+    // attach a wait-for-index diagnostic + hint so agents can retry
+    // after reconciliation rather than treating this as a hard miss.
     if let Error::FileNotIndexed { repo, file, reason } = err
         && let Some(error) = response.error.as_mut()
     {
@@ -74,6 +124,10 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             "reason": reason,
         }));
     }
+    // SnapshotStale: same wait-for-index shape as FileNotIndexed but
+    // for non-file lookups. `data.file` is deliberately absent — no
+    // synthetic target is manufactured (see the regression test in
+    // this module).
     if let Error::SnapshotStale { repo, reason } = err
         && let Some(error) = response.error.as_mut()
     {
@@ -102,6 +156,10 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             "reason": reason,
         }));
     }
+    // AmbiguousSource: enumerate the matching declarations so the
+    // caller can narrow via `repo`, `file`, or `line`. The candidate
+    // list is bounded upstream; `candidates_truncated` records
+    // whether that bound was reached.
     if let Error::AmbiguousSource {
         qualified,
         candidates,
@@ -115,6 +173,10 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             "candidates_truncated": candidates_truncated,
         }));
     }
+    // DaemonInitializing: mirror the phase-progress snapshot into
+    // `data` (state, phase, completed / total, detail) so callers
+    // can render progress and decide when to retry instead of
+    // polling blind.
     if let Error::DaemonInitializing { initialization } = err
         && let Some(error) = response.error.as_mut()
     {
