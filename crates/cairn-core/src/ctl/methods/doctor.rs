@@ -1,4 +1,28 @@
 //! `doctor` — environment / dependency / registry sanity checks.
+//!
+//! The report is a flat vector of
+//! [`cairn_proto::control::DoctorCheck`] items produced by four
+//! families of probes, always emitted in this order so consumers see
+//! a stable prefix:
+//!
+//! 1. Environment coherence — linked language backends, workspace
+//!    analyzer registration, data-directory writability, and Tier-3
+//!    LSP binary discovery.
+//! 2. Registered repositories — per-alias root-present and watcher
+//!    checks (early-out with a single `Warn` when the registry is
+//!    empty).
+//! 3. Per-alias CAS store probes — tentative snapshot, analyzer /
+//!    parser revision drift, post-drift rerun health, and current
+//!    Tier-3 run status.
+//! 4. Reconcile-state health (deduped by `repo_hash`) plus
+//!    incomplete- and recent-removal history from index.db.
+//!
+//! Most non-`Pass` branches fill a remediation string keyed on
+//! `alias` where applicable, so the CLI can print an actionable next
+//! command without cross-referencing docs; a few checks intentionally
+//! omit it (linked-language-backends `Fail`, data-directory `Fail`,
+//! empty-registry `Warn`, alias-index enumeration `Fail`) because no
+//! single command fixes the condition.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +55,9 @@ const STUCK_RUN_THRESHOLD: Duration = Duration::from_secs(6 * 3600);
 
 include!(concat!(env!("OUT_DIR"), "/expected_backend_crates.rs"));
 
+/// Distributed-slice registration marker for the `doctor` control
+/// method. State-free; a fresh instance is constructed each time
+/// the dispatcher initializes.
 struct Doctor;
 
 #[async_trait::async_trait]
@@ -39,6 +66,18 @@ impl ControlMethod for Doctor {
         "doctor"
     }
 
+    /// Runs every check family in the order documented on the
+    /// module. Every DB hop (alias listing, per-store probes, and
+    /// reconcile-state read) runs under `spawn_blocking`; a
+    /// `JoinError` from any hop maps to
+    /// [`crate::Error::internal_task_panic`] and short-circuits.
+    ///
+    /// If the alias listing itself errors, families 2 / 3 / 4 all
+    /// skip and the report carries only the environment checks plus
+    /// a single `alias index readable` Fail. If the listing succeeds
+    /// but is empty, the report carries the environment checks plus
+    /// one `registered repositories` Warn and no per-alias or
+    /// reconcile-state work runs.
     async fn dispatch(&self, ctx: &CtlCtx, _params: Value) -> Result<Value> {
         let mut checks: Vec<DoctorCheck> = Vec::new();
 
@@ -182,6 +221,13 @@ fn workspace_analyzer_ids() -> Vec<&'static str> {
         .collect()
 }
 
+/// Missing root is classified as `Fail`: the alias is durably
+/// registered but any worktree-dependent operation (scan / reindex /
+/// watcher arm) will fail — CAS-backed reads over already-indexed
+/// snapshots continue to work. The remediation surfaces both
+/// recovery paths (drop the alias vs. restore the directory) because
+/// on-disk data survives when other aliases point at the same
+/// `repo_hash`.
 fn registered_repo_path_check(entry: &cas_registry::AliasEntry) -> DoctorCheck {
     let exists = Path::new(&entry.root_path).is_dir();
     doctor_check(
@@ -205,6 +251,14 @@ fn registered_repo_path_check(entry: &cas_registry::AliasEntry) -> DoctorCheck {
     )
 }
 
+/// One check per registered alias reflecting whether the
+/// `WatchManager` currently holds a live FS watcher for it. Missing
+/// coverage is `Warn`, not `Fail`: the reindex path can still
+/// recover via manual `reindex_repo` or a daemon restart, but until
+/// then future file events are blind. Existing tentative anchors
+/// are unaffected — default reads keep resolving to the tentative
+/// snapshot; only aliases with no tentative anchor at all fall back
+/// to HEAD.
 fn alias_watcher_checks(
     entries: &[cas_registry::AliasEntry],
     watch_manager: &crate::watcher::WatchManager,
@@ -236,6 +290,11 @@ fn alias_watcher_checks(
         .collect()
 }
 
+/// Result of probing one alias's CAS store, produced by
+/// [`probe_alias_stores`]. `result` carries either a fully-populated
+/// [`AliasStoreState`] or the string form of the first probe error;
+/// the outer probe never short-circuits on a single alias's failure,
+/// so downstream check families always cover every alias.
 #[derive(Debug, Clone)]
 struct AliasStoreProbe {
     alias: String,
@@ -243,6 +302,12 @@ struct AliasStoreProbe {
     result: std::result::Result<AliasStoreState, String>,
 }
 
+/// Snapshot of the per-alias CAS store used by every family-3
+/// check. Only the tentative-anchored manifest is inspected — other
+/// anchors and older manifests are not part of the doctor surface.
+/// Every `Vec` / `HashMap` field defaults to empty when the tentative
+/// anchor is absent (fresh alias never indexed) so downstream checks
+/// can treat them uniformly.
 #[derive(Debug, Clone)]
 struct AliasStoreState {
     tentative_manifest_id: Option<i64>,
@@ -273,6 +338,10 @@ struct AliasStoreState {
     expected_analyzer_revisions: HashMap<String, u32>,
 }
 
+/// One row from `workspace_analysis_runs`, projected for the
+/// checks that need it. Rows are collected per-analyzer; the
+/// `(manifest_id, analyzer_id)` PRIMARY KEY guarantees at most one
+/// row per analyzer per manifest.
 #[derive(Debug, Clone)]
 struct Tier3Run {
     analyzer_id: String,
@@ -318,6 +387,19 @@ fn probe_alias_store(
     }
 }
 
+/// Opens the alias's CAS store and materializes the fields the
+/// family-3 checks read. Pipeline:
+///
+/// 1. Existence check on `store_path` (returns `Err` if missing so
+///    the caller renders a probe-error `Fail`).
+/// 2. Read-only open via `cas_store::open_existing`.
+/// 3. Look up `worktree_id` by `root_path`. Absent → the alias has
+///    never been indexed; the tentative manifest and every
+///    downstream vector default to empty, and [`probe_manifest`] is
+///    skipped.
+/// 4. Otherwise resolve the `tentative/<worktree_id>` anchor and
+///    delegate to [`probe_manifest`] for the tier3-run rows, drift
+///    vectors, and expected-revision map.
 fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasStoreState> {
     if !store_path.exists() {
         return Err(crate::Error::InvalidArgument(format!(
@@ -369,6 +451,17 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
     })
 }
 
+/// Loads the current `workspace_analysis_runs` rows for
+/// `manifest_id` and cross-references them against the linked-in
+/// expected analyzer set to build the two drift vectors and the
+/// per-analyzer expected-revision map used later by
+/// [`parser_drift_rerun_check`].
+///
+/// A `StaleRevision` entry is pushed when either (a) the analyzer
+/// has no row yet (`current_rev = None`) or (b) the persisted
+/// revision is strictly less than the linked-in build's
+/// `revision()`. A newer persisted revision (e.g. after a binary
+/// downgrade) is not treated as stale here and is not surfaced.
 #[allow(clippy::type_complexity)]
 fn probe_manifest(
     conn: &rusqlite::Connection,
@@ -454,6 +547,12 @@ fn probe_manifest(
     ))
 }
 
+/// Three outcomes per alias: `Pass` when a tentative anchor
+/// resolves to a manifest, `Warn` when the store opened cleanly but
+/// no tentative anchor exists yet (reads still work but fall back
+/// to HEAD), and `Fail` when any store-probe step errored — store
+/// file missing / DB open failure, or downstream anchor / manifest
+/// / workspace-run / parser-revision probe error.
 fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
     probes
         .iter()
@@ -489,6 +588,11 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
         .collect()
 }
 
+/// One [`binary_check`] per Tier-3 LSP the daemon can spawn, plus
+/// the .NET SDK root probe that csharp-ls depends on. Each entry is
+/// independent — a missing binary never blocks the others — and
+/// each carries an install-hint remediation string so the operator
+/// can act without consulting external docs.
 fn tier3_binary_checks() -> Vec<DoctorCheck> {
     vec![
         rust_analyzer_binary_check(),
@@ -647,6 +751,12 @@ fn sourcekit_lsp_binary_check() -> DoctorCheck {
     )
 }
 
+/// Shared shape for Tier-3 binary probes. Resolved → `Pass` with
+/// the resolved path as detail; not resolved → `Warn` (never
+/// `Fail`). Missing Tier-3 support is a partial-capability state,
+/// not a broken daemon: the daemon still serves Tier-1 / Tier-2
+/// facts for the affected language, so promoting this to `Fail`
+/// would be misleading.
 fn binary_check(
     name: &str,
     resolved: Option<PathBuf>,
@@ -878,6 +988,29 @@ fn analyzer_rerun_health_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> 
     out
 }
 
+/// Per-analyzer companion to the alias-wide
+/// [`analyzer_rerun_health_checks`]. Matches the latest
+/// `workspace_analysis_runs` row for `stale.analyzer_id` and
+/// classifies:
+///
+/// - **No row** → `Warn` (rerun never enqueued or lost).
+/// - **`succeeded` at the expected rev** → `Fail`. Contradicts the
+///   drift detector; the `(manifest_id, analyzer_id)` PK plus the
+///   classifier's revision stamp should keep this unreachable under
+///   v0.7.0+ invariants — emitted defensively so a future refactor
+///   that breaks the invariant still surfaces.
+/// - **`succeeded` at an older rev** → `Warn` (rerun never landed).
+/// - **`failed` / `timed_out` / `cancelled`** → `Warn` (the rerun
+///   ran and errored; operator should look at the job).
+/// - **`queued` / `running` at the expected rev** → `Pass` (current
+///   rerun in flight).
+/// - **`queued` / `running` at an older rev** → `Warn`.
+///   [`crate::jobs::JobManager::enqueue_analyzer_run`] stamps the
+///   current revision on enqueue, so a stale pending row is either
+///   an old-binary residual, a `restore_from_db` relist, or a rerun
+///   that was never stamped — not an in-flight current rerun.
+/// - **Anything else** → `Warn` (unknown status; forward-compat
+///   guard for a future status the operator's build doesn't know).
 fn analyzer_drift_rerun_check(
     alias: &str,
     stale: &StaleRevision,
@@ -990,6 +1123,31 @@ fn analyzer_drift_rerun_check(
 /// `expected_analyzer_ids` and surface the worst case so an alias
 /// with a mixed picture (one analyzer succeeded, another failed) does
 /// not get misclassified as Case A on the succeeded slice.
+///
+/// Selection order (first match wins):
+///
+/// - **Case A** (`Fail`) — every expected analyzer succeeded at its
+///   current revision but parser drift remains. Silent-data-loss
+///   safety net for the reindex chain.
+/// - **Case B** (`Warn`) — at least one analyzer's rerun failed.
+/// - **Case B-like** (`Warn`) — at least one rerun is
+///   `queued` / `running` at a stale (or unknown-to-this-build)
+///   revision; the current-revision rerun has not landed.
+/// - **Case D** (`Warn`) — at least one expected analyzer has no
+///   row. Ordered before Case C so a mixed
+///   pending-current + missing-row state does not get masked by
+///   the pending Pass.
+/// - **Case D-like** (`Warn`) — at least one `succeeded` row is at
+///   a revision older than the current build's (may coexist with a
+///   pending-current row). Also ordered before Case C for the same
+///   reason.
+/// - **Case C** (`Pass`) — at least one analyzer pending at the
+///   current revision and none of the above.
+/// - **Fallback** (`Pass`) — the case matrix did not match, e.g.
+///   parser drift with no expected analyzer to cross-reference
+///   (Tier-1-only language) or a row with an unknown status string.
+///   The plain [`parser_revision_stale_checks`] `Warn` still carries
+///   the operator surface in the drift case.
 fn parser_drift_rerun_check(
     alias: &str,
     stale_parser: &[crate::workspace_analyzer::ParserStaleRevision],
@@ -1232,6 +1390,29 @@ fn tier3_run_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
         .collect()
 }
 
+/// Emits exactly one check per alias. When several conditions hold
+/// concurrently the highest-priority label wins; precedence (first
+/// match returns) is:
+///
+/// 1. No rows but at least one expected analyzer is missing →
+///    `Warn` (never indexed, or a fresh analyzer added to this
+///    build).
+/// 2. No rows and none expected → `Pass` (not applicable).
+/// 3. A `queued` / `running` row whose `started_at_ns` is older
+///    than [`STUCK_RUN_THRESHOLD`] → `Warn` (wedged).
+/// 4. Any other `queued` / `running` row → `Warn` (indexing in
+///    progress).
+/// 5. Any `failed` row → `Warn`.
+/// 6. Any `timed_out` / `cancelled` row → `Warn`.
+/// 7. A row with a status this build doesn't recognize → `Warn`
+///    (forward-compat guard).
+/// 8. Any expected analyzer with no row → `Warn` (analyzer set
+///    drift not yet reflected in the store).
+/// 9. Otherwise → `Pass`.
+///
+/// The stuck check (3) intentionally runs before the plain
+/// in-progress check (4) so a wedged worker does not hide behind
+/// "indexing in progress" forever.
 fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
     if state.tier3_runs.is_empty() {
         let missing = missing_tier3_analyzer_ids(state);
@@ -1427,6 +1608,14 @@ fn tier3_status_label(run: &Tier3Run) -> String {
     }
 }
 
+/// Cross-references the build-time `EXPECTED_BACKEND_CRATES`
+/// manifest (generated by build.rs from workspace Cargo metadata)
+/// against the runtime-linked language backends and workspace
+/// analyzers. Any expected crate whose runtime id is absent from
+/// its target registry surfaces as `Warn`, not `Fail`: dev builds
+/// legitimately omit backends (feature flags, custom `main.rs`),
+/// and the remediation names the exact import symbol that is most
+/// likely missing from `crates/cairn/src/main.rs`.
 fn backend_registration_coherence_check(
     language_backend_names: &[&str],
     workspace_analyzer_ids: &[&str],
@@ -1499,6 +1688,18 @@ const RECONCILE_DIRTY_GAP_WARN_NS: i64 = 5 * 60 * 1_000_000_000;
 /// minute in-flight typically means the worker is wedged.
 const RECONCILE_STUCK_ATTEMPT_WARN_NS: i64 = 10 * 60 * 1_000_000_000;
 
+/// Emits the reconcile-state doctor group (family 4). For every
+/// repository row in index.db it looks up the `RepoReconcileState`
+/// and delegates the label choice to [`classify_reconcile_state`],
+/// then appends per-`repo_hash` `Warn`s for any incomplete removal
+/// cleanups and, when the recent-completed-removals list is
+/// non-empty, one summary `Pass` line.
+///
+/// Aliases sharing a `repo_hash` collapse to a single label via
+/// [`format_repo_label`], so a repo with two aliases does not
+/// produce duplicate warnings. A missing `RepoReconcileState` row
+/// while a `repository` row exists is a `Fail` (index.db invariant
+/// break).
 pub(crate) fn reconcile_state_checks(cas_data_dir: &CasDataDir) -> Result<Vec<DoctorCheck>> {
     let index = cas_registry::open(&cas_data_dir.index_db_path())?;
     let repos = cas_registry::list_repositories(&index)?;
@@ -1580,6 +1781,15 @@ fn format_repo_label(repo_hash: &str, aliases: &[String]) -> String {
     }
 }
 
+/// Independent conditions — invariant violation, watcher failure,
+/// stuck attempt, retry backoff, dirty gap — can all fire in the
+/// same tick, so this returns zero or more checks rather than a
+/// single label. An invariant violation short-circuits the rest
+/// (the state is untrustworthy for the other predicates). The
+/// non-violation branches gate on per-condition thresholds
+/// ([`RECONCILE_STUCK_ATTEMPT_WARN_NS`] and
+/// [`RECONCILE_DIRTY_GAP_WARN_NS`]) so a healthy in-flight attempt
+/// or a fresh dirty gap does not raise noise.
 fn classify_reconcile_state(
     label: &str,
     state: &cas_registry::RepoReconcileState,

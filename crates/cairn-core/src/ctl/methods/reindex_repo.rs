@@ -8,6 +8,24 @@
 //! the register/analyzer enqueue asynchronously. The old
 //! synchronous inline path is retained as a fallback for
 //! reconcile-less setups (tests / degraded startup).
+//!
+//! # Wire shape
+//!
+//! Both paths return an `Ack` augmented with two extra fields:
+//!
+//! - `jobs` — always present for backwards compatibility with
+//!   pre-Phase-2 clients. On the production (reconcile-backed)
+//!   path it is an empty array, because the worker enqueues the
+//!   analyzer jobs after the ack has already gone out; on the
+//!   inline fallback it carries the numeric `job_id`s enqueued
+//!   during this call.
+//! - `reconcile` — production only. Carries `repo_hash`, the
+//!   post-bump `generation`, `forced: true`, and `scheduled` (true
+//!   iff the wake actually kicked or spawned a worker for this
+//!   generation).
+//!
+//! An unknown alias becomes `Error::RepoNotFound` (JSON-RPC
+//! `-32001`) in both paths.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,6 +87,11 @@ impl ControlMethod for ReindexRepo {
 
         // Fallback path: no reconcile driver (test / degraded
         // startup). Run inline like the pre-Phase-2 behaviour.
+        // The enqueue happens synchronously here, so — when a
+        // `JobManager` is also present — the outcome carries the
+        // enqueued job ids and the reply's `jobs` field is
+        // populated. Without a `JobManager` the analyzer callback
+        // runs inline and `jobs` degrades to an empty array.
         let cas_data_dir = ctx.cas_data_dir.clone();
         let now_ns = i64::try_from(
             SystemTime::now()

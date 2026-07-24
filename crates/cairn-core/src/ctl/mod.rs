@@ -61,16 +61,40 @@ pub static CONTROL_METHODS: [fn() -> Box<dyn ControlMethod>] = [..];
 /// Shared state each [`ControlMethod`] needs at dispatch time.
 #[derive(Clone)]
 pub struct CtlCtx {
+    /// CAS-managed data directory root; per-repo SQLite stores and
+    /// socket paths derive from this.
     pub cas_data_dir: Arc<CasDataDir>,
+    /// Fired by the `shutdown` verb to signal the daemon top-level
+    /// loop to unwind. Not consumed inside this module.
     pub shutdown: Arc<Notify>,
+    /// Filesystem watcher handle. `None` in trimmed test / bootstrap
+    /// contexts; watcher-touching verbs must gate on `Some(_)` before
+    /// dereferencing.
     pub watch_manager: Option<Arc<WatchManager>>,
+    /// Job registry used by long-running verbs (e.g. reindex). `None`
+    /// in the same trimmed contexts as `watch_manager`.
     pub job_manager: Option<Arc<JobManager>>,
+    /// Durable reindex-state driver. Manual reindex requests route
+    /// through this so their intent survives daemon restart.
     pub reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
+    /// Repository admission / removal owner. `register_repo` and
+    /// `remove_repo` route through this so persistence policy and
+    /// per-repo state stay coordinated.
     pub lifecycle: Option<Arc<RepoLifecycleManager>>,
+    /// Build version string echoed by the `status` response
+    /// (`doctor` does not read it).
     pub version: &'static str,
+    /// Monotonic startup instant; drives the uptime field reported
+    /// by `status`.
     pub started_at: Instant,
 }
 
+// The control surface exposes `ControlMethod`, but the shared
+// dispatcher in `jsonrpc_dispatch` is generic over `RpcMethod<Ctx>`.
+// This blanket forwards the two methods so a
+// `HashMap<_, Box<dyn ControlMethod>>` can be dispatched through the
+// shared helpers without redefining the trait bound at every call
+// site.
 #[async_trait::async_trait]
 impl RpcMethod<CtlCtx> for dyn ControlMethod {
     fn name(&self) -> &'static str {
@@ -160,6 +184,10 @@ impl CtlHandler {
     }
 }
 
+// One request line in, one response line out. `handle` always
+// returns `Some`, so the framing layer keeps the connection open for
+// pipelined requests — connection lifetime is driven by the
+// underlying stream, not by this handler.
 #[async_trait::async_trait]
 impl LineHandler for CtlHandler {
     async fn handle(&self, line: &str) -> Option<String> {

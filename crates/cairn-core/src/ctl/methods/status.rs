@@ -1,5 +1,28 @@
 //! `status` — daemon health + every CAS-registered repo with the
 //! anchors its store knows about.
+//!
+//! In addition to the anchors, each entry now carries an aggregate
+//! `job_summary` and the durable `reconcile` state row.
+//!
+//! The heavy work — opening each per-repo store and running the
+//! anchor/job aggregations — is wrapped in `spawn_blocking` so a
+//! status call over many repos does not stall the reactor.
+//!
+//! Enumeration is lifecycle-gated: each entry is fenced by
+//! [`RepoLifecycleManager::acquire_for_enumeration`], so a repo
+//! currently in `Removing` (or with no active gate) is silently
+//! skipped rather than raising. That matches the shape callers
+//! expect from a "snapshot of currently addressable repos".
+//!
+//! The reconcile-state row is fail-closed: if the index has a
+//! `repositories` row but no matching `repo_reconcile_state`, the
+//! handler returns `Error::Internal`, because the v4 migration
+//! seeds the state row alongside the repository row and the
+//! foreign-key `ON DELETE CASCADE` tears them down together.
+//! A missing row therefore signals index corruption.
+//!
+//! [`RepoLifecycleManager::acquire_for_enumeration`]:
+//!     crate::lifecycle::RepoLifecycleManager::acquire_for_enumeration
 
 use std::collections::BTreeMap;
 
@@ -101,6 +124,12 @@ impl ControlMethod for Status {
     }
 }
 
+/// Build the JSON-RPC error surfaced when a repositories row
+/// disappears between the aliases enumeration and the follow-up
+/// `lookup_repository` — a narrow race the caller sees as a plain
+/// `RepoNotFound` (JSON-RPC `-32001`) rather than an
+/// `Error::Internal`, since the alias is genuinely no longer
+/// registered by the time the reply is assembled.
 fn missing_status_repository(alias: &str) -> Error {
     Error::RepoNotFound {
         alias: alias.to_owned(),
@@ -115,6 +144,18 @@ struct SnapshotAcc {
     internal_names: Vec<String>,
 }
 
+/// Group all anchor rows for one store by `manifest_id`, then
+/// emit one [`ProtoSnapshotStatus`] per manifest. Two anchors that
+/// resolve to the same manifest (typically `HEAD` and its currently
+/// checked-out branch) collapse into a single entry whose `branches`
+/// vector carries both names. Entries are sorted with
+/// [`anchor::order_key`] so HEAD-backed snapshots surface first and
+/// `tentative/*` last.
+///
+/// `store_bytes` is intentionally reported on every entry rather
+/// than partitioned per-anchor — the CAS store is shared across
+/// snapshots, so the legacy per-snapshot-DB wire shape can only be
+/// approximated. See the `size_bytes` comment inline.
 fn collect_anchor_snapshots(
     conn: &rusqlite::Connection,
     store_bytes: u64,
@@ -184,6 +225,13 @@ fn collect_anchor_snapshots(
     Ok(entries.into_iter().map(|(_, e)| e).collect())
 }
 
+/// Aggregate live `workspace_analysis_runs` rows into a
+/// per-status count for the wire. Only rows with a non-null
+/// `job_id` that are still reachable from a current anchor are
+/// counted — orphaned historical rows are excluded, so the numbers
+/// reflect jobs a client can still act on. Any status the daemon
+/// does not recognise is folded into `other` so a future backend
+/// state cannot break older readers.
 fn collect_job_summary(conn: &rusqlite::Connection) -> Result<JobSummary> {
     let mut stmt = conn.prepare(
         "SELECT status, COUNT(*)

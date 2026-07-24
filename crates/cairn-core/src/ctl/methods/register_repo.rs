@@ -1,6 +1,56 @@
 //! `register_repo` — open the CAS store for a worktree, build its
 //! initial committed + tentative manifests, parse any new blobs, and
 //! seed the HEAD / branch / tentative anchors.
+//!
+//! # Lifecycle contract
+//!
+//! With a `RepoLifecycleManager` wired (production path) the
+//! handler acquires a `RegistrationPermit` before doing any work
+//! and releases it either by publishing (success) or aborting
+//! (failure). The permit fences the repo against `remove_repo` —
+//! removal may close admission, but destructive cleanup waits for
+//! this lease to drain — and does *not* serialise concurrent
+//! `register_repo` calls for the same `repo_hash`; several leases
+//! can coexist. If the repo is currently mid-removal or has a
+//! pending cleanup, `begin_registration` fails fast with
+//! `RepositoryUnavailable`.
+//!
+//! # Ordering
+//!
+//! The steps below are run in this order:
+//!
+//! 1. Canonicalise the input path and derive `repo_hash`.
+//! 2. Acquire the lifecycle permit (or none, in fallback mode).
+//! 3. Best-effort arm the watcher. A watcher failure is *not* a
+//!    registration failure — the ack simply carries the error
+//!    string via [`Ack::with_alias_and_watcher_failed`] so the
+//!    client sees a degraded but usable repo. The receipt returned
+//!    by `arm_repository_if_absent` is retained so a later abort
+//!    can precisely roll back only *this* arm.
+//! 4. On a blocking task, run the CAS scan and manifest build.
+//! 5. On success, publish the alias through the lifecycle manager
+//!    (or, in the legacy path, upsert directly), optionally wake
+//!    the reconcile driver on the just-recorded catch-up
+//!    generation, and persist the watcher state.
+//! 6. On a *pre-publication* work failure, unwind the watcher arm
+//!    first, then abort the registration permit;
+//!    [`preserve_registration_error_after_cleanup`] keeps the
+//!    original error so cleanup issues are only logged. Errors
+//!    beyond that boundary do not roll back — a
+//!    `set_watcher_state_by_repo_hash` failure after the alias is
+//!    durably published returns the error without rolling back the
+//!    already-published alias, and a publish failure whose
+//!    lifecycle abort also fails collapses into an
+//!    `Error::Internal` covering both.
+//!
+//! # Wire shape
+//!
+//! The reply is an `Ack` augmented with a `jobs` field that carries
+//! the analyzer jobs enqueued during initial scan (numeric
+//! `job_id`s). Callers that lack a `JobManager` see an empty list.
+//!
+//! [`Ack::with_alias_and_watcher_failed`]:
+//!     cairn_proto::control::Ack::with_alias_and_watcher_failed
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +69,12 @@ use crate::{Error, Result};
 
 struct RegisterRepo;
 
+/// Run a cleanup future after a registration failure and always
+/// return the *original* registration error — never the cleanup
+/// error. A cleanup failure is logged with both errors in scope so
+/// nothing is silently swallowed, but the client-facing error
+/// must remain the one that describes why the registration itself
+/// was rejected. See the paired unit test for this contract.
 async fn preserve_registration_error_after_cleanup(
     registration_error: Error,
     cleanup: impl std::future::Future<Output = Result<()>>,
@@ -95,6 +151,11 @@ impl ControlMethod for RegisterRepo {
             }
         }
 
+        // When no lifecycle manager is wired, the blocking task
+        // must also perform the alias upsert itself — otherwise the
+        // registration would succeed without ever making the alias
+        // discoverable. Production paths pass this through
+        // `RepoLifecycleManager::publish_registration` below.
         let legacy_publish = lifecycle.is_none();
         let work_result = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut conn = cas_store::open(&store_path)?;
@@ -126,6 +187,11 @@ impl ControlMethod for RegisterRepo {
         let outcome = match work_result {
             Ok(outcome) => {
                 if let (Some(lifecycle), Some(permit)) = (&ctx.lifecycle, permit) {
+                    // Only record an immediate catch-up generation
+                    // when a reconcile driver is actually there to
+                    // consume it — recording one without a worker
+                    // would leave `desired > applied` durably
+                    // pending until a later trigger picks it up.
                     let reconcile_policy = if ctx.reconcile.is_some() {
                         RegistrationReconcilePolicy::ImmediateCatchUp
                     } else {
@@ -140,6 +206,13 @@ impl ControlMethod for RegisterRepo {
                     ) {
                         Ok(publication) => publication,
                         Err(error) => {
+                            // Publish failed after the scan
+                            // succeeded — the on-disk store is
+                            // committed but the alias never
+                            // reached the index, so nothing yet
+                            // observes the watcher. Roll it back
+                            // before returning so a retry starts
+                            // from a clean state.
                             if let (Some(watch_manager), Some(receipt)) =
                                 (&ctx.watch_manager, arm_receipt.take())
                             {
@@ -148,6 +221,13 @@ impl ControlMethod for RegisterRepo {
                             return Err(error);
                         }
                     };
+                    // `catch_up_generation` is only populated when
+                    // the policy above was `ImmediateCatchUp`, i.e.
+                    // when a reconcile driver exists. The recorded
+                    // generation is already durable at this point;
+                    // this wake is the sync in-process kick that
+                    // causes the reconcile worker to notice it
+                    // without waiting for the next trigger.
                     if publication.catch_up_generation.is_some()
                         && let Some(reconcile) = &ctx.reconcile
                     {
@@ -157,6 +237,11 @@ impl ControlMethod for RegisterRepo {
                         );
                     }
                 }
+                // Persist the observed watcher state onto the
+                // reconcile row so `doctor` / `status` can report
+                // it later. Uses the exact `watcher_error` captured
+                // above so a partial arm failure is not silently
+                // upgraded to `Active`.
                 if ctx.watch_manager.is_some()
                     && let Some(reconcile) = &ctx.reconcile
                 {
@@ -171,6 +256,11 @@ impl ControlMethod for RegisterRepo {
                 outcome
             }
             Err(err) => {
+                // Scan failed. Unwind the watcher arm (a plain,
+                // in-process operation) before touching the
+                // durable lifecycle path so a further cleanup
+                // error cannot mask the original registration
+                // failure.
                 if let (Some(watch_manager), Some(receipt)) =
                     (&ctx.watch_manager, arm_receipt.take())
                 {

@@ -1,5 +1,17 @@
 //! `remove_repo` — drop the alias entry and delete the per-repo
 //! CAS store on disk.
+//!
+//! Two paths coexist: production runs through
+//! `RepoLifecycleManager::remove_alias`, which coordinates
+//! displacement of any in-flight lease before the delete lands;
+//! the legacy fallback is only taken when the daemon was built
+//! without a lifecycle (unit tests, minimal setups) and performs
+//! the deletion directly against the index. Both paths surface
+//! `Error::RepoNotFound` — mapped to JSON-RPC `-32001` — when the
+//! alias is unknown. Note that when multiple aliases share one
+//! `repo_hash`, only the label row is removed; the on-disk store
+//! is torn down solely when the alias being removed was the last
+//! one pointing at it.
 
 use cairn_proto::control::{Ack, RemoveRepoArgs};
 use linkme::distributed_slice;
@@ -21,6 +33,13 @@ impl ControlMethod for RemoveRepo {
     async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
         let args: RemoveRepoArgs = parse_params(params)?;
         if let Some(lifecycle) = &ctx.lifecycle {
+            // Production path: the lifecycle manager owns the
+            // transition mutex, the watcher unwind, and the
+            // best-effort on-disk cleanup. It returns `Ok(false)`
+            // only when the alias was not registered — the miss
+            // must become an explicit `RepoNotFound` so the client
+            // sees a stable JSON-RPC `-32001` rather than a silent
+            // success.
             if !lifecycle.remove_alias(&args.alias).await? {
                 return Err(Error::RepoNotFound {
                     alias: args.alias.clone(),
@@ -31,6 +50,10 @@ impl ControlMethod for RemoveRepo {
         let cas_data_dir = ctx.cas_data_dir.clone();
         let alias = args.alias.clone();
 
+        // Legacy fallback: no lifecycle manager, so the alias row is
+        // deleted directly under an Immediate transaction and the
+        // per-repo directory is torn down only when this was the last
+        // alias pointing at it.
         let removed = tokio::task::spawn_blocking(move || -> Result<bool> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
             let Some(entry) = cas_registry::lookup_by_alias(&index, &alias)? else {
