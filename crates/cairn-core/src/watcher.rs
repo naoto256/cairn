@@ -30,36 +30,66 @@ use crate::paths::CasDataDir;
 use crate::reconcile::{ReconcileTrigger, RepoReconcileManager};
 use crate::{Error, Result};
 
+/// Debounce interval handed to the `cairn-watch` backend: raw OS
+/// notifications are batched for this long before they surface on
+/// the event channel.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Event channel capacity. One slot gives edge-triggered semantics:
+/// `cairn-watch` sends with `try_send` and treats a full channel as
+/// an already-pending edge, so a slow dispatcher never builds a
+/// backlog — any queued event only means "the repo is dirty".
 const WATCH_EDGE_CAPACITY: usize = 1;
+/// Fixed (non-sliding) coalescing window. After the first event is
+/// received, everything arriving before the deadline collapses into
+/// a single dirty request — so a continuous event stream still
+/// yields one request per window instead of being deferred forever.
 const WATCH_COALESCE_WINDOW: Duration = Duration::from_millis(500);
+/// Initial backoff for retrying a failed
+/// `request_dirty_by_repo_hash` (e.g. the repo row does not exist
+/// yet). Doubles per attempt up to [`WATCH_REQUEST_RETRY_MAX`].
 const WATCH_REQUEST_RETRY_INITIAL: Duration = Duration::from_millis(25);
+/// Cap for the dirty-request retry backoff.
 const WATCH_REQUEST_RETRY_MAX: Duration = Duration::from_secs(1);
 
 /// Keeps one live watcher per registered `repo_hash`.
 pub struct WatchManager {
     cas_data_dir: Arc<CasDataDir>,
+    /// `None` means log-only mode: events are coalesced and logged
+    /// but never recorded as durable dirty generations.
     reconcile: Option<Arc<RepoReconcileManager>>,
     backend: WatchBackend,
     #[cfg(test)]
     fail_watcher_start: bool,
     #[cfg(test)]
     dropped_watchers: Arc<AtomicUsize>,
+    /// Monotonic arm-id source; ids are unique within this watcher
+    /// registry and never reused (see [`Self::allocate_arm_id`]).
     next_arm_id: AtomicU64,
+    /// Live watchers keyed by canonical `repo_hash`, never alias.
     watchers: Mutex<HashMap<String, RepoWatcher>>,
 }
 
+/// One live watch: the OS watcher handle plus the tokio task that
+/// drains its event channel. Dropping this stops both.
 struct RepoWatcher {
+    /// Identity token; [`WatchArmReceipt`] rollback removes a
+    /// watcher only when this id matches the receipt.
     arm_id: u64,
+    /// Held only to keep the OS watcher alive. Dropping it stops
+    /// event delivery and closes the dispatcher's channel.
     _handle: WatcherHandle,
     task: tokio::task::JoinHandle<()>,
     #[cfg(test)]
     drop_counter: Arc<AtomicUsize>,
 }
 
+/// Outcome of an arm request against the watcher registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchArmDisposition {
+    /// A watcher for the repo already existed; nothing was created
+    /// and rolling back the receipt is a no-op.
     AlreadyArmed,
+    /// A new watcher was created and published for the repo.
     Armed,
 }
 
@@ -79,12 +109,16 @@ impl WatchArmReceipt {
     }
 }
 
+/// One repo whose watcher could not be armed during startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchStartFailure {
     pub repo_hash: String,
     pub error: String,
 }
 
+/// Per-repo outcome of [`WatchManager::start_registered`]. A failed
+/// entry is already persisted as `WatcherState::Failed`; the report
+/// exists so the daemon can log/act without re-reading the DB.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WatchStartupReport {
     pub armed: Vec<String>,
@@ -95,6 +129,9 @@ impl Drop for RepoWatcher {
     fn drop(&mut self) {
         #[cfg(test)]
         self.drop_counter.fetch_add(1, Ordering::SeqCst);
+        // Abort promptly instead of waiting for the channel-closed
+        // path: the dispatcher may be sleeping inside its retry
+        // backoff, and it must not outlive the watcher entry.
         self.task.abort();
     }
 }
@@ -176,6 +213,8 @@ impl WatchManager {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
         let mut report = WatchStartupReport::default();
         for repo in cas_registry::list_repositories(&index)? {
+            // A repo with a persisted removal intent must not be
+            // re-armed; the lifecycle owner is tearing it down.
             if repo.removal_request.is_some() {
                 continue;
             }
@@ -284,6 +323,9 @@ impl WatchManager {
         Ok(())
     }
 
+    /// Create the OS watcher and spawn its dispatcher task. Does
+    /// not touch the registry map — callers decide insert versus
+    /// replace semantics after the start has already succeeded.
     fn start_watcher(
         &self,
         repo_hash: &str,
@@ -316,6 +358,11 @@ impl WatchManager {
         })
     }
 
+    /// Allocate a monotonically increasing arm id, unique within
+    /// this manager's registry. Ids are never reused: on
+    /// (practically unreachable) u64 exhaustion this errors instead
+    /// of wrapping, because a wrapped id could let a stale receipt
+    /// remove a newer watcher.
     fn allocate_arm_id(&self) -> Result<u64> {
         self.next_arm_id
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -340,6 +387,9 @@ impl WatchManager {
         self.watch_repository(repo_hash, root_path)
     }
 
+    /// Drop the watcher for `repo_hash`, stopping the OS watcher
+    /// and aborting its dispatcher task. Idempotent: unknown hashes
+    /// are a silent no-op.
     pub fn unwatch_repository(&self, repo_hash: &str) {
         if self.lock_recovering().remove(repo_hash).is_some() {
             info!(repo_hash = %repo_hash, "repo watcher stopped");
@@ -389,6 +439,9 @@ impl WatchManager {
         self.dropped_watchers.load(Ordering::SeqCst)
     }
 
+    /// Record the watcher state on the durable reconcile row.
+    /// No-op `Ok(())` when no reconcile driver is wired (log-only
+    /// managers have nowhere durable to write).
     fn persist_watcher_state(
         &self,
         repo_hash: &str,
@@ -400,6 +453,11 @@ impl WatchManager {
         })
     }
 
+    /// Best-effort failure path: persist `WatcherState::Failed`,
+    /// then bump a dirty generation so the durable gap covers
+    /// whatever changes the blinded repo can no longer observe.
+    /// Errors are logged at debug level only — the repo may simply
+    /// not be registered yet.
     fn record_watcher_failed(&self, repo_hash: &str, msg: &str) {
         if let Err(err) = self.persist_watcher_state(repo_hash, WatcherState::Failed, Some(msg)) {
             debug!(
@@ -427,6 +485,10 @@ impl WatchManager {
         });
     }
 
+    /// Lock the watcher registry, recovering from mutex poison.
+    /// Safe because every critical section performs a single
+    /// insert/remove/lookup — a panic cannot leave the map in a
+    /// half-updated state worth discarding.
     fn lock_recovering(&self) -> MutexGuard<'_, HashMap<String, RepoWatcher>> {
         self.watchers.lock().unwrap_or_else(|poisoned| {
             warn!("watch manager mutex poisoned; recovering watcher registry");
@@ -447,6 +509,9 @@ async fn dispatch_events(
         let mut event_count = 1_u64;
         let mut channel_closed = false;
         debug!(repo_hash = %repo_hash, ?first_event, "repo watcher event edge");
+        // Fixed deadline anchored to the *first* event: later events
+        // are absorbed but never extend the window, so a continuous
+        // stream cannot postpone the dirty request indefinitely.
         let deadline = tokio::time::Instant::now() + WATCH_COALESCE_WINDOW;
         loop {
             tokio::select! {
@@ -464,6 +529,8 @@ async fn dispatch_events(
             }
         }
 
+        // Log-only mode (no reconcile driver): the edge was observed
+        // and logged, nothing durable to record.
         let Some(reconcile) = reconcile.clone() else {
             if channel_closed {
                 break;
@@ -471,6 +538,10 @@ async fn dispatch_events(
             continue;
         };
 
+        // The coalesced edge must not be lost: retry with capped
+        // exponential backoff until the dirty bump lands. This
+        // covers the registration race where the repo row does not
+        // exist yet when the first filesystem event arrives.
         let mut retry_delay = WATCH_REQUEST_RETRY_INITIAL;
         loop {
             match reconcile
@@ -493,6 +564,11 @@ async fn dispatch_events(
                         retry_ms = retry_delay.as_millis(),
                         "watcher failed to record dirty request; retaining pending edge"
                     );
+                    // Sender gone means the watcher is being torn
+                    // down (or the daemon is stopping); stop
+                    // retrying rather than leak the task. Startup
+                    // reconcile priming re-covers any edge dropped
+                    // here on the next daemon run.
                     if channel_closed || rx.is_closed() {
                         return;
                     }

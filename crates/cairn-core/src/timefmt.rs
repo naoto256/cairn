@@ -21,7 +21,13 @@
 /// the raw `ns.to_string()`.
 #[must_use]
 pub fn ns_to_rfc3339_utc(ns: i64) -> String {
+    // Euclidean division keeps every remainder non-negative, so
+    // pre-epoch (negative) timestamps split into a floored day count
+    // plus an in-range time-of-day instead of a negative pair.
     let secs = ns.div_euclid(1_000_000_000);
+    // rem_euclid with a positive modulus always fits the target type,
+    // so the unwrap_or(0) fallbacks below are unreachable — kept only
+    // to keep a formatter free of panicking paths.
     let nanos = u32::try_from(ns.rem_euclid(1_000_000_000)).unwrap_or(0);
     let days = secs.div_euclid(86_400);
     let secs_of_day = u32::try_from(secs.rem_euclid(86_400)).unwrap_or(0);
@@ -39,15 +45,27 @@ pub fn ns_to_rfc3339_utc(ns: i64) -> String {
 /// Returns `None` outside [year 1, year 9999] so the formatter can fall
 /// back to a raw integer rather than emit a malformed string.
 fn civil_from_days(days: i64) -> Option<(i32, u32, u32)> {
+    // Shift the epoch to 0000-03-01. Counting years from March 1 puts
+    // the leap day last in the year, which makes the month lengths a
+    // fixed 153-day / 5-month repeating pattern.
     let z = days + 719_468;
+    // 146_097 days per 400-year Gregorian era; the branch floors the
+    // division for negative z.
     let era = if z >= 0 { z } else { z - 146_095 } / 146_097;
+    // Day-of-era in [0, 146_096], so the conversion cannot fail.
     let doe = u32::try_from(z - era * 146_097).ok()?;
+    // Year-of-era in [0, 399], correcting for the 4 / 100 / 400-year
+    // leap rules.
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let mut y = i64::from(yoe) + era * 400;
+    // Day-of-year counted from March 1, in [0, 365].
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    // March-based month index in [0, 11]; (153 * mp + 2) / 5 is the
+    // day offset of that month's first day.
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    // January and February belong to the next civil year.
     if m <= 2 {
         y += 1;
     }

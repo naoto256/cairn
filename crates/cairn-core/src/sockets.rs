@@ -20,16 +20,24 @@ use tokio::net::UnixListener;
 use crate::{Error, Result};
 
 const APP_NAME: &str = "cairn";
+// Owner-only permission bits: rwx for the runtime directory (it must
+// be enterable), rw for the socket nodes themselves.
 const RUNTIME_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
+// umask(2) is process-global, not per-thread: serialize bind-time
+// umask swaps so concurrent binds (e.g. parallel tests) cannot
+// observe or clobber each other's mask.
 #[cfg(all(unix, not(target_os = "macos")))]
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Resolved location of the two daemon sockets.
 #[derive(Debug, Clone)]
 pub struct SocketPaths {
+    /// Parent directory of both sockets; the 0700 access boundary.
     pub runtime_dir: PathBuf,
+    /// Data-plane socket (`cairn.sock`).
     pub cairn: PathBuf,
+    /// Management socket (`control.sock`).
     pub control: PathBuf,
 }
 
@@ -61,6 +69,10 @@ impl SocketPaths {
     /// Create the runtime directory if missing and verify that it is
     /// owned by the current uid with permissions 0700. Stale socket
     /// files from a previous run are removed.
+    ///
+    /// Any existing socket node is treated as stale and unlinked, so
+    /// callers must have established that no live daemon is serving
+    /// these paths before calling.
     ///
     /// # Errors
     /// Filesystem failures.
@@ -106,6 +118,9 @@ fn create_secure_runtime_dir(p: &Path) -> Result<()> {
     // and never "repair" an already-existing insecure directory.
     match std::fs::DirBuilder::new().mode(RUNTIME_DIR_MODE).create(p) {
         Ok(()) => {
+            // DirBuilder's mode is filtered through the process umask;
+            // the explicit chmod pins the fresh directory at exactly
+            // 0700 regardless of the inherited mask.
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(RUNTIME_DIR_MODE))?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -114,6 +129,12 @@ fn create_secure_runtime_dir(p: &Path) -> Result<()> {
     validate_runtime_dir_security(p, rustix::process::geteuid().as_raw())
 }
 
+/// Reject the runtime directory unless it is a real (non-symlink)
+/// directory owned by `expected_uid` with mode exactly 0700.
+///
+/// `symlink_metadata` deliberately does not follow symlinks, so a
+/// link planted at the path cannot redirect the check to a target
+/// that would pass while the sockets land somewhere else.
 #[cfg(unix)]
 fn validate_runtime_dir_security(p: &Path, expected_uid: u32) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -168,6 +189,10 @@ fn bind_socket_private(path: &Path) -> Result<UnixListener> {
 
 #[cfg(target_os = "macos")]
 fn bind_socket_private(path: &Path) -> Result<UnixListener> {
+    // No umask manipulation on macOS: socket-node modes cannot be
+    // tightened reliably here anyway (see the EPERM handling in
+    // `set_socket_file_permissions`), so the enforced 0700 runtime
+    // directory is the effective same-UID boundary on this platform.
     Ok(UnixListener::bind(path)?)
 }
 
@@ -207,6 +232,9 @@ fn set_socket_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// RAII guard that swaps the process umask and restores the previous
+/// value on drop. It holds `UMASK_LOCK` for its whole lifetime
+/// because the umask is shared by every thread in the process.
 #[cfg(all(unix, not(target_os = "macos")))]
 struct UmaskGuard {
     previous: rustix::fs::Mode,
@@ -216,6 +244,9 @@ struct UmaskGuard {
 #[cfg(all(unix, not(target_os = "macos")))]
 impl UmaskGuard {
     fn set(mask: u32) -> Self {
+        // A poisoned lock only means a previous holder panicked; that
+        // guard's Drop already restored the prior mask during unwind,
+        // so recovering the lock here is sound.
         let lock = UMASK_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -233,6 +264,7 @@ impl Drop for UmaskGuard {
     }
 }
 
+/// Unlink a stale socket path, tolerating its absence.
 fn remove_if_exists(p: &Path) -> Result<()> {
     match std::fs::remove_file(p) {
         Ok(()) => Ok(()),
