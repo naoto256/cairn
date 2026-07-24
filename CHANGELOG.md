@@ -5,6 +5,54 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.1] — 2026-07-24
+
+### Fixed
+
+- **SQLite writers acquire their lock before mixed read/write transactions.**
+  Registry registration, workspace-analyzer persistence, and lifecycle updates
+  now use immediate transactions, avoiding deferred WAL snapshot upgrades that
+  can fail without honoring the busy timeout. Extended SQLite result codes are
+  enabled so contention logs distinguish ordinary busy errors from
+  `SQLITE_BUSY_SNAPSHOT`.
+
+- **Idle LSP processes are reaped automatically.** Pool entries with no active
+  leases are shut down after ten minutes by default, using the existing bounded
+  shutdown path. `CAIRN_LSP_IDLE_TTL_SECS` overrides the TTL, and zero preserves
+  the previous no-sweeper behavior.
+
+- **Workspace analyzers rerun independently.** An unchanged manifest now
+  schedules only analyzers whose run is missing, non-succeeded, revision-stale,
+  or configuration-stale. One permanently failing analyzer no longer causes
+  every current analyzer to rerun on each watcher reconciliation.
+
+- **Daemon startup preserves file-descriptor headroom.** Repository reconcile
+  attempts are globally bounded before opening repository state (default 8,
+  configurable with `CAIRN_RECONCILE_MAX_CONCURRENCY`), service units request a
+  4096-file soft limit, and direct daemon launches raise that limit when
+  permitted. Permit acquisition remains shutdown-safe and does not block idle,
+  retry-backoff, or load-error paths.
+
+- **LSP pool configuration warnings no longer echo raw environment values.**
+  Invalid capacity and idle-TTL settings report only the variable, fallback,
+  and failure classification, preventing accidental secrets from reaching
+  persistent logs.
+
+- **Periodic reconciliation runs before freshness expires.** Clean repositories
+  become due one poll interval before the 30-minute freshness boundary by
+  default, removing the stale-status window between expiry and the next
+  five-minute scheduler tick. Margin validation prevents over-eager schedules,
+  while a zero margin retains the legacy threshold for explicit policies.
+
+### PRs
+
+- SQLite writer contention: #265
+- LSP idle TTL: #266
+- Per-analyzer currency, including configuration hashes: #267
+- Startup file-descriptor headroom and permit timing: #268, #270
+- LSP environment-warning redaction: #269
+- Freshness due margin: #272
+
 ## [0.8.0] — 2026-07-20
 
 > Compatibility: no source-code breaking changes. `get_symbol_source` has a
@@ -51,11 +99,6 @@ versions follow [SemVer](https://semver.org/).
   without turning machine-dependent performance into a CI gate.
 
 ### Fixed
-
-- **Daemon startup now preserves file-descriptor headroom.** Repository
-  reconcile attempts are globally bounded (default 8, configurable with
-  `CAIRN_RECONCILE_MAX_CONCURRENCY`), service units request a 4096-file soft
-  limit, and direct daemon launches raise that limit when permitted.
 
 - **Source lookup now fails closed on physical ambiguity and verifies fallback
   bytes.** `get_symbol_source` no longer returns an arbitrary first row when a
