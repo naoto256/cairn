@@ -57,6 +57,11 @@ const RECONCILE_MAX_CONCURRENCY_ENV: &str = "CAIRN_RECONCILE_MAX_CONCURRENCY";
 const DEFAULT_RECONCILE_MAX_CONCURRENCY: usize = 8;
 const MAX_RECONCILE_MAX_CONCURRENCY: usize = 64;
 
+/// Parse a raw `CAIRN_RECONCILE_MAX_CONCURRENCY` value into a
+/// permit count. Anything outside `1..=MAX_RECONCILE_MAX_CONCURRENCY`
+/// (including non-numeric or overflowing input) falls back to the
+/// default with a `warn!` that classifies the rejection. Split
+/// from the env read so tests can drive it with arbitrary input.
 fn reconcile_max_concurrency_from_env_value(raw: Option<&str>) -> usize {
     let Some(raw) = raw else {
         return DEFAULT_RECONCILE_MAX_CONCURRENCY;
@@ -85,6 +90,8 @@ fn reconcile_max_concurrency_from_env_value(raw: Option<&str>) -> usize {
     }
 }
 
+/// Size of the global attempt semaphore, read from the
+/// environment once at manager construction (never resized).
 fn reconcile_max_concurrency() -> usize {
     reconcile_max_concurrency_from_env_value(
         std::env::var(RECONCILE_MAX_CONCURRENCY_ENV).ok().as_deref(),
@@ -142,21 +149,39 @@ pub struct ReconcileRequestOutcome {
     pub scheduled: bool,
 }
 
+/// Result of the two-step startup sequence: interrupted-attempt
+/// recovery followed by all-repository priming.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupPrimeOutcome {
+    /// Repo hashes whose interrupted attempt was cleared by
+    /// [`RepoReconcileManager::recover_interrupted_attempts_without_wake`].
     pub recovered: Vec<String>,
+    /// `(repo_hash, generation)` pairs primed for an immediate
+    /// full reconcile.
     pub primed: Vec<(String, i64)>,
 }
 
+/// Cadence and staleness thresholds for the low-frequency full
+/// reconcile that recovers silently missed filesystem events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeriodicReconcilePolicy {
+    /// How often the scheduler scans all repositories.
     pub poll_interval: Duration,
+    /// Oldest a clean snapshot may get before a periodic
+    /// reconcile must refresh it.
     pub max_clean_age: Duration,
     /// Lead time before `max_clean_age`; zero preserves the legacy threshold.
     pub due_margin: Duration,
 }
 
 impl PeriodicReconcilePolicy {
+    /// Validate the policy and derive the clean-age threshold at
+    /// which a repository becomes due. `due_margin` pulls the
+    /// threshold ahead of `max_clean_age` so a poll landing just
+    /// before expiry still refreshes in time. `Err(InvalidArgument)`
+    /// rejects zero durations, a margin smaller than the poll
+    /// interval (it could never fire between polls), and a margin
+    /// that would more than halve the effective clean window.
     fn due_age(&self) -> Result<Duration> {
         if self.poll_interval.is_zero() || self.max_clean_age.is_zero() {
             return Err(Error::InvalidArgument(
@@ -352,6 +377,9 @@ impl RepoReconcileManager {
         )
     }
 
+    /// Production constructor when a lifecycle manager owns
+    /// repository admission and removal — requests and attempts
+    /// then take lifecycle leases before touching durable state.
     #[must_use]
     pub fn new_with_lifecycle(
         cas_data_dir: Arc<CasDataDir>,
@@ -379,6 +407,10 @@ impl RepoReconcileManager {
         Self::with_config_and_lifecycle(cas_data_dir, job_manager, None, clock, retry)
     }
 
+    /// Fully injectable constructor (clock, retry policy,
+    /// optional lifecycle). Attempt concurrency still comes from
+    /// the environment; tests that need a fixed permit count use
+    /// the private `..._and_attempt_concurrency` variant.
     #[must_use]
     pub fn with_config_and_lifecycle(
         cas_data_dir: Arc<CasDataDir>,
@@ -397,6 +429,9 @@ impl RepoReconcileManager {
         )
     }
 
+    /// Innermost constructor — every public constructor funnels
+    /// here. `attempt_concurrency` sizes the global attempt
+    /// semaphore once for the manager's lifetime.
     fn with_config_and_lifecycle_and_attempt_concurrency(
         cas_data_dir: Arc<CasDataDir>,
         job_manager: Option<Arc<JobManager>>,
@@ -507,6 +542,9 @@ impl RepoReconcileManager {
         self.request_force(repo_hash, Some(alias), trigger).await
     }
 
+    /// Resolve `alias -> repo_hash` on a blocking thread.
+    /// `Error::RepoNotFound` when the alias has no registry
+    /// entry.
     async fn resolve_alias(&self, alias: &str) -> Result<String> {
         let cas_data_dir = self.cas_data_dir.clone();
         let alias_owned = alias.to_string();
@@ -523,6 +561,13 @@ impl RepoReconcileManager {
         .map_err(|e| Error::internal_task_panic("reconcile resolve_alias", e))?
     }
 
+    /// Shared normal-priority path: durably bump
+    /// `desired_generation`, commit, and only then wake or spawn
+    /// the worker — a crash between commit and wake still leaves
+    /// the `desired > applied` gap for startup recovery. When a
+    /// lifecycle manager is wired, the lease is held across the
+    /// bump so a repository pending removal rejects the request
+    /// instead of recording work for a row about to vanish.
     async fn request_dirty(
         self: &Arc<Self>,
         repo_hash: String,
@@ -561,6 +606,12 @@ impl RepoReconcileManager {
         })
     }
 
+    /// Force path: durably bump `force_generation` together with
+    /// `desired_generation`. The registry helper also clears any
+    /// pending retry deadline, so the operator's request runs
+    /// immediately and the worker performs a forced (full
+    /// reparse) attempt. Same lease and commit-before-wake
+    /// ordering as [`Self::request_dirty`].
     async fn request_force(
         self: &Arc<Self>,
         repo_hash: String,
@@ -672,11 +723,16 @@ impl RepoReconcileManager {
                 "periodic reconcile scheduler already started".into(),
             ));
         }
+        // Weak reference: the scheduler task must not keep the
+        // manager alive; once the daemon drops its Arc the task
+        // exits on its next tick.
         let weak = Arc::downgrade(self);
         let shutdown = self.periodic_shutdown.clone();
         *slot = Some(tokio::spawn(async move {
             let start = tokio::time::Instant::now() + policy.poll_interval;
             let mut interval = tokio::time::interval_at(start, policy.poll_interval);
+            // Skip missed ticks instead of bursting: a long stall
+            // should yield one catch-up cycle, not a backlog.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -693,6 +749,11 @@ impl RepoReconcileManager {
         Ok(())
     }
 
+    /// One scheduler tick: list every repository not marked for
+    /// removal, then record a periodic generation for each one
+    /// whose clean snapshot is older than `due_age`. Per-repo
+    /// errors are logged and skipped so one bad repository cannot
+    /// starve the rest; the loop aborts once shutdown is flagged.
     async fn run_periodic_cycle(self: &Arc<Self>, due_age: Duration) {
         let cas_data_dir = self.cas_data_dir.clone();
         let repos = match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
@@ -743,6 +804,13 @@ impl RepoReconcileManager {
         }
     }
 
+    /// `Ok(None)` means not due — the repository is dirty, has an
+    /// attempt in flight, was scanned recently, or is being
+    /// removed. The due-predicate and the generation bump run in
+    /// one transaction so a racing watcher request can neither
+    /// lose nor duplicate work. `Ok(Some(generation))` is the
+    /// freshly recorded generation, with the worker already
+    /// woken.
     async fn request_periodic_if_due(
         self: &Arc<Self>,
         repo_hash: String,
@@ -852,6 +920,9 @@ impl RepoReconcileManager {
             if self.live_workers.load(Ordering::SeqCst) == 0 {
                 return;
             }
+            // Arm the idle notification BEFORE re-reading the
+            // counter so a worker draining between the check and
+            // the await cannot strand us until the timeout.
             let notified = self.workers_idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -877,6 +948,10 @@ impl RepoReconcileManager {
     /// gate blocks new requests while its lease drain waits for any
     /// already-running attempt to leave the store.
     pub fn quiesce_repository(&self, repo_hash: &str) {
+        // Dropping the runtime entry makes a live worker's next
+        // `try_finalize_exit` observe a missing entry and exit;
+        // the wake below breaks it out of any retry or notify
+        // sleep so that check happens promptly.
         let mut runtimes = self.lock_runtimes();
         if let Some(runtime) = runtimes.remove(repo_hash) {
             runtime.notify.notify_waiters();
@@ -902,6 +977,11 @@ impl RepoReconcileManager {
         if let Some(alias) = preferred_alias {
             runtime.preferred_alias = Some(alias);
         }
+        // Holding the runtimes mutex makes the running/not-running
+        // decision atomic with the request-seq bump: an exiting
+        // worker must take the same mutex in `try_finalize_exit`,
+        // so it either sees our bump and loops again, or we see
+        // `worker_running == false` here and spawn a fresh worker.
         if runtime.worker_running {
             runtime.notify.notify_one();
             true
@@ -956,6 +1036,8 @@ impl RepoReconcileManager {
     fn try_finalize_exit(&self, repo_hash: &str, observed_seq: u64) -> bool {
         let mut runtimes = self.lock_runtimes();
         let Some(rt) = runtimes.get_mut(repo_hash) else {
+            // Runtime entry gone — `quiesce_repository` removed
+            // it; nothing to clear, just exit.
             return true;
         };
         if rt.request_seq != observed_seq {
@@ -968,6 +1050,9 @@ impl RepoReconcileManager {
     }
 }
 
+/// Blocking helper shared by both watcher-state entry points.
+/// The affected-rows == 1 fail-closed contract lives in
+/// `cas_registry::set_watcher_state`.
 fn persist_watcher_state(
     cas_data_dir: &CasDataDir,
     repo_hash: &str,
@@ -987,6 +1072,10 @@ fn persist_watcher_state(
 async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: Arc<Notify>) {
     debug!(repo_hash = %repo_hash, "reconcile worker started");
     loop {
+        // Invariant: every exit path clears `worker_running` under
+        // the runtimes mutex. A path that returned without doing
+        // so would leave future requests "waking" a worker that no
+        // longer exists, wedging the repo until daemon restart.
         if mgr.shutting_down.load(Ordering::SeqCst) {
             let mut runtimes = mgr.lock_runtimes();
             if let Some(rt) = runtimes.get_mut(&repo_hash) {
@@ -1008,6 +1097,10 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         let shutdown = mgr.shutdown.notified();
         tokio::pin!(shutdown);
         shutdown.as_mut().enable();
+        // Re-check the flag after arming the shutdown future:
+        // `notify_waiters` only reaches futures that are already
+        // registered, so a notification fired before `enable()`
+        // would otherwise be missed.
         if mgr.shutting_down.load(Ordering::SeqCst) {
             let mut runtimes = mgr.lock_runtimes();
             if let Some(rt) = runtimes.get_mut(&repo_hash) {
@@ -1049,6 +1142,10 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             return;
         }
 
+        // Snapshot the request counter BEFORE reading state: a
+        // request from here on either bumps the seq (defeating
+        // the idle-exit below) or committed its durable bump
+        // early enough for the state read to observe it.
         let observed_seq = {
             let rt = mgr.lock_runtimes();
             rt.get(&repo_hash).map(|r| r.request_seq).unwrap_or(0)
@@ -1122,6 +1219,11 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             }
         }
 
+        // `force_generation` is always a value that some
+        // `desired_generation` bump also carried, so comparing it
+        // against `applied_generation` detects a not-yet-applied
+        // force request without tracking which desired value it
+        // rode in on.
         let force_pending = state.force_generation > state.applied_generation;
         if state.desired_generation <= state.applied_generation {
             drop(permit);
@@ -1138,6 +1240,11 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         // it records the new generation, bypassing backoff exactly once. A
         // failed forced attempt installs a fresh deadline, and that deadline
         // remains authoritative while the same force generation is pending.
+        //
+        // The permit is released for the wait so a backing-off
+        // repo does not occupy a global attempt slot; a notify
+        // wake (e.g. a force request that cleared the deadline)
+        // re-loops immediately to re-read state.
         if let Some(retry_at) = state.next_retry_at_ns {
             let now = mgr.clock.now_ns();
             if retry_at > now {
@@ -1158,6 +1265,13 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             }
         }
 
+        // Attempt the newest desired generation — intermediate
+        // generations are coalesced, and `mark_attempt_success`
+        // advances `applied` with MAX, so this single attempt
+        // settles every request recorded so far. The permit stays
+        // held through `run_attempt`, which includes Phase C
+        // finalization — the "release after finalization" half of
+        // the module contract.
         let generation = state.desired_generation;
         let forced = force_pending;
         let attempt_res = run_attempt(&mgr, &repo_hash, generation, forced).await;
@@ -1171,6 +1285,9 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 forced,
                 "reconcile attempt succeeded"
             ),
+            // The lifecycle owner now drives removal of this
+            // repository; the worker exits rather than racing the
+            // delete with further attempts.
             Ok(AttemptOutcome::RemovalRequested) => {
                 info!(
                     repo_hash = %repo_hash,
@@ -1199,12 +1316,21 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
     }
 }
 
+/// How a single non-erroring attempt concluded (failures travel
+/// in the `Result` instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttemptOutcome {
+    /// The attempt ran to a durable `mark_attempt_success`.
     Completed,
+    /// An ephemeral repo's root vanished; removal was handed to
+    /// the lifecycle owner and no attempt was started.
     RemovalRequested,
 }
 
+/// Read the durable reconcile row on a blocking thread.
+/// `Ok(None)` means the repository (or at least its reconcile
+/// row) no longer exists — the worker treats that as "repo
+/// removed" and exits.
 async fn load_state(
     mgr: &Arc<RepoReconcileManager>,
     repo_hash: &str,
@@ -1236,10 +1362,19 @@ async fn run_attempt(
     generation: i64,
     forced: bool,
 ) -> Result<AttemptOutcome> {
+    // Held for the whole attempt: lifecycle removal drains
+    // outstanding leases before touching the store, so the store
+    // files stay in place until this attempt finalizes.
     let _lease = match &mgr.lifecycle {
         Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(repo_hash)?),
         None => None,
     };
+    // Ephemeral-root check: a non-persistent repository whose
+    // root directory vanished is handed to the lifecycle owner
+    // for removal instead of burning an attempt that could only
+    // fail. Runs before Phase A so the durable attempt slot
+    // (`attempt_generation`) is never claimed for it — the global
+    // concurrency permit, though, is already held at this point.
     if let Some(lifecycle) = &mgr.lifecycle {
         let cas_data_dir = mgr.cas_data_dir.clone();
         let hash = repo_hash.to_string();
@@ -1278,6 +1413,10 @@ async fn run_attempt(
     let job_manager = mgr.job_manager.clone();
 
     // Phase A: mark_attempt_start on index.db (blocking).
+    // This is the on-disk half of the at-most-one-attempt
+    // contract: the WHERE clause requires a free attempt slot and
+    // `applied < generation <= desired`, and affected-rows != 1
+    // rejects the write fail-closed.
     let start_ok = {
         let cas_data_dir = cas_data_dir.clone();
         let hash = hash.clone();
@@ -1350,6 +1489,9 @@ async fn run_attempt(
     let finalize_res = tokio::task::spawn_blocking({
         let cas_data_dir = cas_data_dir.clone();
         let hash = hash.clone();
+        // Only the error text crosses into the blocking closure;
+        // the typed `register_result` is kept outside so the
+        // caller can propagate it after finalization.
         let register_result = register_result
             .as_ref()
             .map(|_| ())
@@ -1386,10 +1528,19 @@ async fn run_attempt(
     })
     .await
     .map_err(|e| Error::internal_task_panic("reconcile finalize", e))?;
+    // Finalize errors take precedence: if the success/failure
+    // transition itself could not be committed, the attempt slot
+    // stays claimed and startup recovery later clears it as an
+    // interrupted attempt.
     finalize_res?;
     register_result.map(|_| AttemptOutcome::Completed)
 }
 
+/// Phase B body: resolve the repo row and alias, open the
+/// per-repo store DB, run the register/enqueue pipeline, and
+/// verify the publication receipt against what is durably
+/// stored. Runs entirely on a blocking thread — this is the
+/// long-running part of an attempt.
 async fn run_register_work(
     cas_data_dir: Arc<CasDataDir>,
     repo_hash: String,
@@ -1432,6 +1583,11 @@ async fn run_register_work(
     .map_err(|e| Error::internal_task_panic("reconcile register work", e))?
 }
 
+/// Dispatch to the analyzer-enqueue variant when a `JobManager`
+/// is wired, else the register-only path. A register that
+/// completes without a publication receipt is an internal error:
+/// Phase C would otherwise mark success for an attempt that
+/// published nothing.
 fn run_register(
     conn: &mut rusqlite::Connection,
     request: ReconcileRegistration<'_>,
@@ -1452,6 +1608,11 @@ fn run_register(
     })
 }
 
+/// Re-read the anchor the receipt claims to have published and
+/// require the durable manifest id and reconcile generation to
+/// match. A one-shot check just before Phase C: it rejects a
+/// receipt that is already missing or mismatched at verification
+/// time (it cannot rule out clobbering after the check).
 fn verify_publication_receipt(
     conn: &rusqlite::Connection,
     receipt: &ReconcilePublicationReceipt,
@@ -1477,6 +1638,10 @@ fn verify_publication_receipt(
     Ok(())
 }
 
+/// Prefer the alias that triggered the request if it still maps
+/// to this repo; otherwise fall back to the first alias in the
+/// (already sorted) `aliases_for_repo` result. `None` only when
+/// the repo has no aliases at all.
 fn pick_alias(preferred: &Option<String>, aliases: &[String]) -> Option<String> {
     if let Some(p) = preferred
         && aliases.iter().any(|a| a == p)

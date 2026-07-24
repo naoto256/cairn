@@ -45,6 +45,12 @@ pub struct Daemon {
     pub paths: SocketPaths,
     pub data_handler: Arc<dyn LineHandler>,
     pub control_handler: Arc<dyn LineHandler>,
+    /// Shared shutdown signal. The daemon parks on `notified()`;
+    /// signal it via `notify_waiters` (the control handler's
+    /// `shutdown` RPC does). `notify_waiters` wakes only waiters
+    /// already registered — it stores no permit — so the run loop
+    /// arms its `notified()` future before serving; the transition
+    /// itself is one-way.
     pub shutdown: Arc<Notify>,
     /// Shutdown is ordered by ownership boundaries: stop accepting and drain
     /// admitted RPCs, close job admission and cancel active analyzers, reap LSP
@@ -61,9 +67,22 @@ pub struct Daemon {
     pub lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
 }
 
+/// Bound on waiting for in-flight connection tasks after an accept
+/// loop stops accepting. Applied per socket; both loops drain
+/// concurrently inside the same teardown future.
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-entry bound handed to the global LSP pool shutdown: each
+/// pooled language server gets this long to shut down cleanly.
 const LSP_ENTRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on draining the job scheduler and worker tasks after job
+/// admission is closed and active analyzer runs are cancelled.
 const JOB_MANAGER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Overall teardown budget, measured only from the shutdown
+/// notification (idle daemon lifetime never counts against it).
+/// Equals the sum of the component upper bounds — 2s connection
+/// drain + 1s lifecycle join in `run_bound` + 5s LSP pool + 2s job
+/// drain — with no slack; exceeding it yields
+/// `Error::ShutdownDeadlineExceeded`.
 const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Daemon {
@@ -129,6 +148,9 @@ impl InitializingDaemon {
         })
     }
 
+    /// Serve the startup-gated handlers until shutdown. Teardown
+    /// drives whatever the gate owns at that instant — see
+    /// `RuntimeOwnership::begin_shutdown` for the publication race.
     pub async fn run(self) -> Result<()> {
         self.run_with_shutdown_timeout(DAEMON_SHUTDOWN_TIMEOUT)
             .await
@@ -149,6 +171,12 @@ impl InitializingDaemon {
     }
 }
 
+/// Who owns the runtime resources when teardown begins.
+///
+/// `Static` is the plain [`Daemon::run`] path: the caller handed the
+/// resources over up front. `Startup` is the gated path: the bundle
+/// lives behind the [`StartupGate`] until ready publication, so
+/// teardown must race publication to claim it.
 enum RuntimeOwnership {
     Static {
         job_manager: Option<Arc<JobManager>>,
@@ -157,13 +185,21 @@ enum RuntimeOwnership {
     Startup(Arc<StartupGate>),
 }
 
+/// Resources teardown drives after the Running -> ShuttingDown
+/// transition. `None` fields simply skip that teardown stage.
 struct TeardownResources {
     job_manager: Option<Arc<JobManager>>,
     lifecycle: Option<Arc<crate::lifecycle::RepoLifecycleManager>>,
+    /// Keeps the full [`ReadyDaemon`] bundle (watcher, reconcile,
+    /// handlers) alive until the explicit `drop(resources)` at the
+    /// end of teardown, so nothing is torn down mid-drain.
     _ready: Option<ReadyDaemon>,
 }
 
 impl RuntimeOwnership {
+    /// Consume the ownership token and surface the resources this
+    /// teardown must drive. Anything not surfaced stays with its
+    /// current owner (the initializer, when publication lost).
     fn begin_shutdown(self) -> TeardownResources {
         match self {
             Self::Static {
@@ -190,6 +226,10 @@ impl RuntimeOwnership {
     }
 }
 
+/// Shared serving + teardown core for both daemon flavors: run the
+/// two accept loops until `shutdown` fires, then execute the ordered
+/// teardown under `shutdown_timeout`. Socket files are unlinked
+/// best-effort on every exit path so the next daemon can bind.
 #[allow(clippy::too_many_arguments)]
 async fn run_bound(
     paths: SocketPaths,
@@ -212,9 +252,16 @@ async fn run_bound(
         // Stop accepting first and let already-admitted RPCs finish.
         let _ = tokio::join!(&mut cairn_task, &mut ctrl_task);
         let resources = ownership.begin_shutdown();
+        // Close job admission and cancel active analyzer runs first
+        // so no new work lands while later stages drain.
         if let Some(job_manager) = &resources.job_manager {
             job_manager.begin_shutdown();
         }
+        // Bounded join only: a timeout here detaches the owner task
+        // instead of failing the teardown. Removals whose pre-delete
+        // intent already committed are resumed by the next startup
+        // sweep; a queued missing-root intent that never reached its
+        // durable commit is only re-detected by that same sweep.
         if let Some(lifecycle) = &resources.lifecycle
             && let Err(err) = lifecycle.shutdown(Duration::from_secs(1)).await
         {
@@ -235,6 +282,9 @@ async fn run_bound(
     let result = match tokio::time::timeout(shutdown_timeout, teardown).await {
         Ok(result) => result,
         Err(_) => {
+            // Budget blown: abort the accept/drain tasks outright and
+            // surface a typed error so callers can tell a deadline
+            // miss from an I/O failure.
             cairn_task.abort();
             ctrl_task.abort();
             Err(crate::Error::ShutdownDeadlineExceeded {
@@ -243,6 +293,8 @@ async fn run_bound(
         }
     };
 
+    // Dropping a UnixListener does not unlink its path; remove the
+    // socket files explicitly (best-effort) even on failed teardown.
     let _ = std::fs::remove_file(&paths.cairn);
     let _ = std::fs::remove_file(&paths.control);
     if result.is_ok() {
@@ -252,6 +304,12 @@ async fn run_bound(
 }
 
 /// Start the revision drift scan after ready publication.
+///
+/// Fire-and-forget: the scan runs on the blocking thread pool (it
+/// reads SQLite synchronously) while a detached observer task logs
+/// the outcome. Failures and panics are logged and swallowed — the
+/// daemon keeps serving, at the cost of no automatic drift recovery
+/// until the next boot. Nothing joins these tasks at shutdown.
 pub fn spawn_revision_staleness_scan(
     job_manager: Arc<JobManager>,
     reconcile: Option<Arc<crate::reconcile::RepoReconcileManager>>,
@@ -281,6 +339,10 @@ pub fn spawn_revision_staleness_scan(
 }
 
 /// Clean up a fully constructed bundle that lost the ready-publication race.
+///
+/// Mirrors the teardown ordering in `run_bound` (job admission close
+/// -> lifecycle join -> LSP pool -> job drain); the caller is the
+/// initializer, which retained ownership because shutdown won.
 pub async fn shutdown_unpublished_resources(resources: ReadyDaemon) -> Result<()> {
     resources.job_manager.begin_shutdown();
     if let Err(err) = resources.lifecycle.shutdown(Duration::from_secs(1)).await {
@@ -298,6 +360,11 @@ pub async fn shutdown_unpublished_resources(resources: ReadyDaemon) -> Result<()
     Ok(())
 }
 
+/// Accept connections on `listener` until `shutdown` fires, serving
+/// each connection on its own task.
+///
+/// The returned handle completes only after the bounded connection
+/// drain, so awaiting it means no connection task is still running.
 fn spawn_accept_loop(
     name: &'static str,
     listener: UnixListener,
@@ -305,6 +372,9 @@ fn spawn_accept_loop(
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Per-loop JoinSet: dropping or aborting this task cancels
+        // its connection tasks instead of leaking them, and shutdown
+        // can drain them with a bound.
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
@@ -333,6 +403,9 @@ fn spawn_accept_loop(
     })
 }
 
+/// Wait up to [`CONNECTION_DRAIN_TIMEOUT`] for in-flight connection
+/// tasks to finish, then abort the stragglers and await the aborts
+/// so no connection task outlives its accept loop.
 async fn drain_connections(name: &'static str, mut connections: JoinSet<()>) {
     let drained = tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, async {
         while let Some(result) = connections.join_next().await {
@@ -351,6 +424,8 @@ async fn drain_connections(name: &'static str, mut connections: JoinSet<()>) {
             timeout_secs = CONNECTION_DRAIN_TIMEOUT.as_secs(),
             "timed out draining connection tasks"
         );
+        // Await abort completion; join_next resolves promptly for
+        // aborted tasks (their cancellation JoinError is ignored).
         while connections.join_next().await.is_some() {}
     }
 }
@@ -369,6 +444,9 @@ fn test_observe_lsp_pool_shutdown() {
 #[cfg(not(test))]
 fn test_observe_lsp_pool_shutdown() {}
 
+/// Test-only hook fired just before the LSP pool shutdown call so
+/// shutdown-ordering tests can record the begin -> lsp -> drain
+/// sequence. Process-global: tests must clear it after use.
 #[cfg(test)]
 static LSP_POOL_SHUTDOWN_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::Mutex::new(None);
@@ -384,6 +462,11 @@ const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// and returns `InvalidData` if a single line exceeds the cap. Uses
 /// `Vec<u8>` so we don't pay UTF-8 validation on the hot path; the
 /// handler does its own JSON parse downstream.
+///
+/// Returns the final `buf.len()` (the caller clears `buf` between
+/// lines); the newline is included in both the buffer and the cap.
+/// On EOF any bytes read so far are returned as an unterminated
+/// final line, so 0 with an empty starting `buf` means clean EOF.
 async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -412,6 +495,13 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// Per-connection loop: read one newline-delimited request, dispatch
+/// it to the handler, write back exactly one response line.
+///
+/// Returns `Ok(())` on peer EOF or when the handler returns `None`
+/// (server-initiated close). Blank lines are skipped, not answered.
+/// Oversized or non-UTF-8 input tears this connection down with
+/// `InvalidData`; the daemon itself keeps serving other connections.
 async fn serve_one(stream: UnixStream, handler: Arc<dyn LineHandler>) -> std::io::Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -496,6 +586,9 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// Build a fully wired production resource bundle (lifecycle,
+    /// jobs, reconcile, watcher) on a fresh temp CAS dir, with the
+    /// given handlers substituted for the real RPC surfaces.
     fn ready_resources_with_handlers(
         data_handler: Arc<dyn LineHandler>,
         control_handler: Arc<dyn LineHandler>,
@@ -798,6 +891,8 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
         let events = Arc::new(Mutex::new(Vec::new()));
 
+        // Install the process-global shutdown observers; they are
+        // cleared again below so other tests are unaffected.
         {
             let events = events.clone();
             *crate::jobs::JOB_MANAGER_SHUTDOWN_OBSERVER

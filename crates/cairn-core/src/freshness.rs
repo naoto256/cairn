@@ -5,6 +5,12 @@
 //! watcher is healthy, and the tentative anchor carries the exact applied
 //! generation receipt. Explicit historical anchors remain queryable without
 //! being judged against current-worktree liveness.
+//!
+//! Queries run a two-phase protocol: [`evaluate_snapshot`] selects the
+//! snapshot and captures a [`FreshnessFingerprint`] of every durable
+//! freshness input, then [`revalidate_snapshot`] re-reads that state after
+//! query execution. Any change in between demotes the result to
+//! `ChangedDuringQuery` instead of silently mixing two snapshots.
 
 use std::time::Duration;
 
@@ -20,18 +26,43 @@ use crate::{Error, Result};
 /// before a clean snapshot expires.
 pub const MAX_CURRENT_SNAPSHOT_AGE: Duration = Duration::from_secs(30 * 60);
 
+/// Why the default current-worktree view is not fresh. Checks in
+/// `evaluate_current` run in a fixed evaluation order and the first
+/// failure wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotStaleReason {
+    /// The resolved default anchor is not a `tentative/N` anchor —
+    /// no live worktree snapshot has ever been published.
     MissingTentative,
+    /// No `repo_reconcile_state` row exists for the repo hash.
     MissingReconcileState,
+    /// A reconcile attempt currently holds `attempt_generation`;
+    /// the snapshot is about to be replaced.
     AttemptInProgress,
+    /// `desired_generation != applied_generation`: a durable dirty
+    /// intent has been recorded but not yet applied.
     GenerationGap,
+    /// Watcher is neither active nor failed (`Starting`/`Stopped`),
+    /// so filesystem changes may pass unobserved.
     WatcherInactive,
+    /// Watcher reported failure or carries a persisted error;
+    /// events may have been missed since the failure.
     WatcherFailed,
+    /// No successful reconcile is recorded (`last_success_ns` is
+    /// NULL) — nothing certifies the snapshot ever matched disk.
     NeverReconciled,
+    /// The last successful scan is older than
+    /// [`MAX_CURRENT_SNAPSHOT_AGE`].
     ScanTooOld,
+    /// The tentative anchor has no `reconcile_generation` receipt —
+    /// it was written outside the reconcile publication path.
     MissingPublicationReceipt,
+    /// The anchor's receipt generation does not equal the row's
+    /// `applied_generation`; the anchor and the reconcile state
+    /// describe different snapshots.
     PublicationGenerationMismatch,
+    /// The durable state changed between initial evaluation and
+    /// post-query revalidation.
     ChangedDuringQuery,
 }
 
@@ -53,6 +84,9 @@ impl SnapshotStaleReason {
         }
     }
 
+    /// Coarse status bucket: reasons a running daemon resolves on
+    /// its own read as "reconciling"; everything else needs outside
+    /// intervention (or time has simply run out) and reads "stale".
     #[must_use]
     pub(crate) fn status_label(self) -> &'static str {
         match self {
@@ -64,7 +98,11 @@ impl SnapshotStaleReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotFreshness {
+    /// The caller named an anchor/branch explicitly; historical
+    /// views are exempt from current-worktree liveness checks.
     Explicit,
+    /// Default current view backed by a clean reconcile row, a
+    /// healthy watcher, and a matching publication receipt.
     Fresh,
     Stale(SnapshotStaleReason),
 }
@@ -76,6 +114,9 @@ impl SnapshotFreshness {
     }
 }
 
+/// Every durable input of `evaluate_current`, captured at initial
+/// evaluation. `revalidate_snapshot` compares the whole tuple: any
+/// field changing mid-query voids the initial freshness verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FreshnessFingerprint {
     desired_generation: i64,
@@ -94,7 +135,11 @@ pub(crate) struct EvaluatedSnapshot {
     pub(crate) anchor: AnchorName,
     pub(crate) manifest_id: ManifestId,
     pub(crate) freshness: SnapshotFreshness,
+    /// True only for the bare current-worktree request (no anchor or
+    /// branch argument); only this view is judged for liveness.
     default_current: bool,
+    /// Present only for the default view and only when a reconcile
+    /// row existed at evaluation time; `None` for explicit anchors.
     fingerprint: Option<FreshnessFingerprint>,
 }
 
@@ -167,12 +212,21 @@ pub(crate) fn revalidate_snapshot(
             SnapshotStaleReason::ChangedDuringQuery,
         ));
     }
+    // Fingerprint unchanged, initially stale: preserve the original
+    // reason rather than re-deriving one against the later clock.
     if selected.freshness.is_stale() {
         return Ok(selected.freshness);
     }
+    // Fingerprint unchanged, initially fresh: the re-derived verdict
+    // still matters — the age horizon may have expired while the
+    // query ran.
     Ok(final_freshness)
 }
 
+/// Judge the default current view. Checks run from most to least
+/// fundamental; the first failure becomes the reported reason, so a
+/// repo can be simultaneously e.g. mid-attempt *and* watcher-failed
+/// but reports only `AttemptInProgress`.
 fn evaluate_current(
     anchor: &Anchor,
     state: Option<&RepoReconcileState>,
@@ -199,10 +253,15 @@ fn evaluate_current(
     let Some(last_success_ns) = state.last_success_ns else {
         return SnapshotFreshness::Stale(SnapshotStaleReason::NeverReconciled);
     };
+    // Strictly-greater: a scan exactly at the horizon is still
+    // fresh. saturating_sub tolerates clock skew where
+    // last_success_ns sits ahead of now_ns.
     let max_age_ns = i64::try_from(MAX_CURRENT_SNAPSHOT_AGE.as_nanos()).unwrap_or(i64::MAX);
     if now_ns.saturating_sub(last_success_ns) > max_age_ns {
         return SnapshotFreshness::Stale(SnapshotStaleReason::ScanTooOld);
     }
+    // The receipt is only ever written by the reconcile publication
+    // path; a direct anchor write cannot forge freshness.
     let Some(generation) = anchor.reconcile_generation else {
         return SnapshotFreshness::Stale(SnapshotStaleReason::MissingPublicationReceipt);
     };

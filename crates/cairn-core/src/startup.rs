@@ -4,6 +4,11 @@
 //! managers are ready. This gate keeps that transport availability separate
 //! from method readiness: status and shutdown remain available while every
 //! other request receives a typed initialization response.
+//!
+//! State machine: `Initializing` → `Ready` → `ShuttingDown`, with a
+//! direct `Initializing` → `ShuttingDown` edge when shutdown wins the
+//! race to `publish_ready`. Every transition is one-way; `advance`
+//! only moves the progress ordinal forward within `Initializing`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -29,17 +34,26 @@ use crate::{Error, jsonrpc_errors};
 /// The gate owns this bundle after publication. Teardown takes it back exactly
 /// once through [`StartupGate::begin_shutdown`].
 pub struct ReadyDaemon {
+    /// Serves `cairn.sock` (data-plane / query) requests once ready.
     pub data_handler: Arc<dyn LineHandler>,
+    /// Serves `control.sock` (management) requests once ready.
     pub control_handler: Arc<dyn LineHandler>,
+    // The managers below are never dispatched to by the gate itself;
+    // they ride through publication so teardown can stop background
+    // work in order after taking ownership via `begin_shutdown`.
     pub job_manager: Arc<JobManager>,
     pub reconcile: Arc<RepoReconcileManager>,
     pub lifecycle: Arc<RepoLifecycleManager>,
     pub watch_manager: Arc<WatchManager>,
 }
 
+/// Tri-state lifecycle guarded by the [`StartupGate`] mutex.
 enum StartupState {
+    /// Sockets are bound, but resources are still being constructed.
     Initializing(DaemonInitializationStatus),
+    /// Bundle published; requests dispatch to the real handlers.
     Ready(ReadyDaemon),
+    /// Terminal. The bundle has been taken (or was never published).
     ShuttingDown,
 }
 
@@ -68,6 +82,10 @@ impl StartupGate {
     }
 
     /// Advance startup progress without allowing ordinal regression.
+    ///
+    /// The `Ready` phase is rejected here: the ready transition must
+    /// carry the resource bundle through [`StartupGate::publish_ready`]
+    /// so readiness and resource visibility stay atomic.
     pub fn advance(
         &self,
         phase: DaemonInitializationPhase,
@@ -106,6 +124,9 @@ impl StartupGate {
         match &*self.state.lock().expect("startup gate poisoned") {
             StartupState::Initializing(status) => status.clone(),
             StartupState::Ready(_) => DaemonInitializationStatus::ready(),
+            // Teardown is not a wire-visible state: report ready so a
+            // late status poll does not claim initialization is still
+            // in progress. The listeners stop accepting shortly after.
             StartupState::ShuttingDown => DaemonInitializationStatus::ready(),
         }
     }
@@ -135,6 +156,8 @@ impl StartupGate {
         }
     }
 
+    /// Admission snapshot for `cairn.sock`. The handler `Arc` is
+    /// cloned out so the gate mutex is never held across `handle`.
     fn data_admission(&self) -> Admission<Arc<dyn LineHandler>> {
         match &*self.state.lock().expect("startup gate poisoned") {
             StartupState::Initializing(status) => Admission::Initializing(status.clone()),
@@ -143,6 +166,7 @@ impl StartupGate {
         }
     }
 
+    /// Admission snapshot for `control.sock`; see [`Self::data_admission`].
     fn control_admission(&self) -> Admission<Arc<dyn LineHandler>> {
         match &*self.state.lock().expect("startup gate poisoned") {
             StartupState::Initializing(status) => Admission::Initializing(status.clone()),
@@ -164,6 +188,7 @@ impl StartupGate {
     }
 }
 
+/// Per-request routing decision derived from the gate state.
 enum Admission<H> {
     Initializing(DaemonInitializationStatus),
     Ready(H),
@@ -188,6 +213,7 @@ impl LineHandler for StartupDataHandler {
         match self.gate.data_admission() {
             Admission::Ready(handler) => handler.handle(line).await,
             Admission::Initializing(status) => Some(initializing_error(line, status)),
+            // `None` makes the accept loop close the stream cleanly.
             Admission::ShuttingDown => None,
         }
     }
@@ -211,12 +237,16 @@ impl LineHandler for StartupControlHandler {
         match self.gate.control_admission() {
             Admission::Ready(handler) => handler.handle(line).await,
             Admission::Initializing(status) => Some(self.handle_initializing(line, status)),
+            // `None` makes the accept loop close the stream cleanly.
             Admission::ShuttingDown => None,
         }
     }
 }
 
 impl StartupControlHandler {
+    /// Dispatch during initialization: `status` and `shutdown` are
+    /// served locally; everything else gets the typed
+    /// `DaemonInitializing` error carrying current progress.
     fn handle_initializing(
         &self,
         line: &str,
@@ -244,6 +274,8 @@ impl StartupControlHandler {
     }
 }
 
+/// Typed `DaemonInitializing` error for a data-plane request that
+/// arrived before ready publication.
 fn initializing_error(line: &str, initialization: DaemonInitializationStatus) -> String {
     let request = match parse_request(line) {
         Ok(request) => request,
@@ -256,6 +288,8 @@ fn initializing_error(line: &str, initialization: DaemonInitializationStatus) ->
 }
 
 fn parse_request(line: &str) -> std::result::Result<Request, String> {
+    // The request id is unrecoverable from a malformed envelope, so
+    // the parse-error response carries a fixed placeholder id.
     serde_json::from_str(line).map_err(|err| {
         serialize_response(&error_response(
             RequestId::Number(0),
