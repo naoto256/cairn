@@ -12,17 +12,35 @@ use crate::lsp::Location;
 
 /// Map an LSP definition target back to a path relative to
 /// `repo_root`, or `None` when the target lives outside the repo.
+///
+/// Backslash separators in the stripped remainder are normalised to
+/// `/` so the result matches manifest-entry paths. The prefix strip
+/// is lexical: `..` segments in the decoded URI are not canonicalised
+/// away here, so callers must validate the returned path against the
+/// manifest before trusting it.
 pub(super) fn location_to_repo_path(repo_root: &Path, location: &Location) -> Option<String> {
     let path = file_uri_to_path(location.uri.as_str())?;
     let rel = path.strip_prefix(repo_root).ok()?;
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
+/// Parse a `file://` URI into a filesystem path.
+///
+/// Only the literal `file://` scheme prefix is stripped, so a URI
+/// with a non-empty authority (`file://host/x`) decodes to the
+/// relative path `host/x`, which then fails the absolute `repo_root`
+/// strip in the caller and maps to `None`. Non-`file` schemes return
+/// `None` outright.
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let path = uri.strip_prefix("file://")?;
     percent_decode(path).map(PathBuf::from)
 }
 
+/// Decode `%XX` escapes over the whole string.
+///
+/// Returns `None` for a truncated or non-hex escape, and when the
+/// decoded bytes are not valid UTF-8. All other bytes pass through
+/// unchanged.
 fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

@@ -25,12 +25,29 @@ use std::path::Path;
 
 use cairn_lang_api::LanguageBackend;
 
+/// Only the leading window of a header is scanned for language
+/// signals: includes and first declarations cluster near the top, so
+/// 64 KiB keeps detection cheap on huge generated headers. A file
+/// whose only signal sits past the limit is classified from the
+/// window alone (worst case: the C fallback).
 const C_FAMILY_HEADER_SCAN_LIMIT: usize = 64 * 1024;
 
+/// True only for a bare `.h` extension — the one header form shared
+/// by C, C++, and ObjC. Other header extensions (`.hpp`, `.hh`, …)
+/// are not ambiguous and are left to ordinary extension routing.
 pub(crate) fn is_c_family_header_path(path: &str) -> bool {
     Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("h")
 }
 
+/// Choose the backend that should index an ambiguous `.h` blob.
+///
+/// Returns `None` when the path is not a bare `.h` header (the
+/// caller falls back to ordinary routing) or when the heuristically
+/// chosen parser id has no registered backend in `backends`.
+///
+/// Detection priority is ObjC > C++ > C (see the module doc), and
+/// only the first [`C_FAMILY_HEADER_SCAN_LIMIT`] bytes of `content`
+/// participate.
 pub(crate) fn pick_c_family_header_backend<'a>(
     backends: &'a [Box<dyn LanguageBackend>],
     path: &str,
@@ -128,6 +145,11 @@ pub(crate) fn header_looks_objc(masked: &[u8], raw: &[u8]) -> bool {
     false
 }
 
+/// Cut a line at its first `//`. Byte-level and string-unaware: a
+/// `//` inside a string literal also cuts. That is acceptable for
+/// the `#import` scan this feeds, because the bytes that decide the
+/// match (`#import` plus the opening `"` / `<`) precede any `//`
+/// that could appear inside the include path.
 fn strip_line_comment(line: &[u8]) -> &[u8] {
     for i in 0..line.len().saturating_sub(1) {
         if line[i] == b'/' && line[i + 1] == b'/' {
@@ -137,6 +159,11 @@ fn strip_line_comment(line: &[u8]) -> &[u8] {
     line
 }
 
+/// C++ signal scan over the masked window; any single hit routes the
+/// header to C++. Each heuristic is shaped to stay quiet on plain C:
+/// access specifiers must be followed by `:`, `class` must not be
+/// ObjC's `@class`, and includes must name a C++-only standard
+/// header. Absence of every signal is what makes C the fallback.
 fn header_looks_cpp_masked(masked: &[u8]) -> bool {
     has_cpp_std_include(masked)
         || contains_cpp_word(masked, b"namespace")
@@ -154,9 +181,20 @@ fn header_looks_cpp_masked(masked: &[u8]) -> bool {
         || contains_access_specifier(masked, b"public")
         || contains_access_specifier(masked, b"private")
         || contains_access_specifier(masked, b"protected")
+        // `::` never appears in pre-C23 C outside comments/strings
+        // (both masked here). C23 attribute namespaces such as
+        // `[[gnu::deprecated]]` do contain it, so this shares the
+        // `nullptr` caveat above for future pure-C headers.
         || contains_subslice(masked, b"::")
 }
 
+/// Blank out comment bodies and string / char literal contents with
+/// spaces, preserving newlines so line-oriented scans still see the
+/// original line structure. An unterminated literal stops masking at
+/// the end of its line, so one stray quote cannot blank the rest of
+/// the window. Escaped quotes inside literals are handled; C++ raw
+/// string literals and backslash-newline continuations of `//`
+/// comments are not.
 fn mask_c_family_comments_and_literals(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
@@ -223,6 +261,10 @@ fn mask_c_family_comments_and_literals(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Detects `#include <name>` where `name` is on an allowlist of
+/// standard headers that exist only in C++. Shared C names
+/// (`stdio.h`, `math.h`, …) are absent by construction; headers
+/// outside the allowlist simply contribute no signal.
 fn has_cpp_std_include(masked: &[u8]) -> bool {
     masked.split(|byte| *byte == b'\n').any(|line| {
         let mut i = skip_ascii_ws(line, 0);
@@ -266,14 +308,21 @@ fn has_cpp_std_include(masked: &[u8]) -> bool {
     })
 }
 
+/// Whole-word occurrence of a C++ keyword in the masked window.
 fn contains_cpp_word(masked: &[u8], word: &[u8]) -> bool {
     find_words(masked, word).any(|_| true)
 }
 
+/// `class` counts only when not immediately preceded by `@`, so an
+/// ObjC `@class` forward declaration is not misread as C++.
 fn contains_cpp_class_keyword(masked: &[u8]) -> bool {
     find_words(masked, b"class").any(|start| start == 0 || masked[start - 1] != b'@')
 }
 
+/// `public` / `private` / `protected` count only when followed by
+/// `:` (whitespace, including a newline, may intervene). A C goto
+/// label that reuses one of these names would still match; accepted
+/// as vanishingly rare.
 fn contains_access_specifier(masked: &[u8], word: &[u8]) -> bool {
     find_words(masked, word).any(|start| {
         let after = skip_ascii_ws(masked, start + word.len());
@@ -281,6 +330,8 @@ fn contains_access_specifier(masked: &[u8], word: &[u8]) -> bool {
     })
 }
 
+/// All start offsets where `word` occurs with non-identifier bytes
+/// (or the buffer edge) on both sides.
 fn find_words<'a>(haystack: &'a [u8], word: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     haystack
         .windows(word.len())

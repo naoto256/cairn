@@ -46,6 +46,15 @@
 //! to `Err` and the daemon logs a single warning; missing tentative
 //! anchor (e.g. a brand-new alias whose first manifest hasn't built
 //! yet) is silent.
+//!
+//! ## Split with the register path (`config_hash`)
+//!
+//! This startup scanner compares **revisions only**; it never reads
+//! `workspace_analysis_runs.config_hash`. Config-only edits are
+//! caught by the register path's currency check
+//! (`workspace_analyzers_needing_rerun` in `expected`), which also
+//! compares `config_hash`. See the `crate::workspace_analyzer`
+//! module doc for the two-path contract.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -102,10 +111,22 @@ pub struct ParserStaleRevision {
 /// end of the spawn_blocking task; daemon callers use it only for logs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StalenessSummary {
+    /// Registered aliases enumerated, including ones that later
+    /// failed mid-scan.
     pub aliases_scanned: usize,
+    /// Aliases whose per-alias scan errored; each was downgraded to
+    /// a warning and the loop continued.
     pub aliases_failed: usize,
+    /// Analyzer rerun jobs actually enqueued. A coalesced or dropped
+    /// enqueue (`Ok(None)` from `enqueue_analyzer_run`) is not
+    /// counted.
     pub jobs_enqueued: usize,
+    /// Stale (old-revision) rows left alone because a queued/running
+    /// job is already converging them.
     pub active_stale: usize,
+    /// Anti-loop guard hits: terminal failures at the current
+    /// revision that were deliberately not re-enqueued (doctor
+    /// warns instead).
     pub terminal_failed_current_revision: usize,
     /// Number of aliases for which the parser-revision drift check
     /// fired (= at least one expected parse unit was missing or had
@@ -138,6 +159,8 @@ pub fn check_revision_staleness_and_enqueue(
 ) -> Result<StalenessSummary> {
     let index = cas_registry::open(&cas_data_dir.index_db_path())?;
     let entries = cas_registry::list_all(&index)?;
+    // Alias enumeration is complete; release the index handle before
+    // the potentially long per-alias loop.
     drop(index);
 
     // Expected revisions are constants from the linker-time registry;
@@ -195,6 +218,8 @@ pub fn check_revision_staleness_and_enqueue(
     Ok(summary)
 }
 
+/// One alias's slice of the scan outcome; folded into
+/// [`StalenessSummary`] by the caller.
 #[derive(Debug, Default)]
 struct PerAliasSummary {
     jobs_enqueued: usize,
@@ -212,6 +237,12 @@ struct PerAliasSummary {
     parser_drift: bool,
 }
 
+/// Scan a single alias: lifecycle admission, parser-drift pre-check,
+/// then the per-analyzer revision loop over the tentative manifest.
+///
+/// `Err` from any step is downgraded to a per-alias warning by the
+/// caller; `Ok(PerAliasSummary::default())` covers the benign skips
+/// (store file gone, no tentative manifest yet).
 fn scan_one_alias(
     cas_data_dir: &CasDataDir,
     job_manager: &JobManager,
@@ -219,6 +250,11 @@ fn scan_one_alias(
     entry: &cas_registry::AliasEntry,
     expected_revision_for: &HashMap<&'static str, u32>,
 ) -> Result<PerAliasSummary> {
+    // Lifecycle admission gate: `Err` (repository removed or being
+    // removed) surfaces as a per-alias failure at the caller, and
+    // `Ok(None)` just means no lifecycle manager is wired. The guard
+    // is bound to a variable so it stays held while this alias's
+    // store is read.
     let _lease = job_manager.acquire_repository_lease(&entry.repo_hash)?;
     let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
     if !store_path.exists() {
@@ -347,6 +383,10 @@ fn scan_one_alias(
     let mut summary = PerAliasSummary::default();
     for analyzer in &expected_for_manifest {
         let analyzer_id = analyzer.id();
+        // Both the map and `expected_for_manifest` derive from the
+        // same linked-in registry (`all_workspace_analyzers`), so the
+        // lookup should always hit; the fallback is defensive and
+        // yields the same value.
         let expected_rev = *expected_revision_for
             .get(analyzer_id)
             .unwrap_or(&analyzer.revision());
@@ -434,6 +474,17 @@ enum Decision {
     Enqueue { current_rev: Option<u32> },
 }
 
+/// Pure staleness decision for one analyzer's run row on the
+/// tentative manifest. `row` is `(analyzer_revision, status)`, or
+/// `None` when the row is absent.
+///
+/// Revision-only by design: `config_hash` currency belongs to the
+/// register path, not this startup scanner.
+///
+/// Ordering note: the in-flight (`queued` / `running`) test is only
+/// consulted inside the `current_rev < expected_rev` arm. An
+/// in-flight row at the *matching* revision falls through to `Skip`
+/// ("actively converging"), never `ActiveStale`.
 fn classify(_analyzer_id: &str, expected_rev: u32, row: Option<&(u32, String)>) -> Decision {
     let Some((current_rev, status)) = row else {
         // I1 case 2: row absent → enqueue.
@@ -602,6 +653,9 @@ pub fn compute_parser_stale_revisions(
     Ok(out)
 }
 
+/// Wall-clock nanoseconds since the Unix epoch, saturating instead
+/// of panicking: a pre-epoch clock yields 0 and an out-of-range
+/// value yields `i64::MAX`.
 fn now_ns() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     i64::try_from(
