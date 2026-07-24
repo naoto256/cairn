@@ -9,6 +9,11 @@ use crate::{Error, Result};
 /// Open (creating if necessary) the per-repo store at `path`. Applies
 /// standard pragmas and runs any pending CAS-schema migrations.
 ///
+/// Creation is reserved for the registration/admission path
+/// (`ctl::methods::register_repo`); every other caller must use
+/// [`open_existing`] so a repository mid-removal cannot be
+/// resurrected as a fresh empty store file.
+///
 /// # Errors
 /// Filesystem or SQLite failures.
 pub fn open(path: &std::path::Path) -> Result<Connection> {
@@ -24,11 +29,20 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
 /// [`Error::StoreNotFound`] when the database is absent, or the underlying
 /// filesystem / SQLite / migration error.
 pub fn open_existing(path: &std::path::Path) -> Result<Connection> {
+    // No SQLITE_OPEN_CREATE — its absence is the whole contract of
+    // this opener. EXRESCODE matches the standard opener so callers
+    // can branch on extended result codes (e.g. SQLITE_BUSY_SNAPSHOT);
+    // NO_MUTEX is rusqlite's usual single-threaded-connection mode.
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
     let mut conn = match Connection::open_with_flags(path, flags) {
         Ok(conn) => conn,
+        // SQLite's open failure does not say *why* the file could not
+        // be opened (missing vs. permissions vs. unreadable parent),
+        // so stat the path to disambiguate: only a confirmed NotFound
+        // maps to the typed StoreNotFound; anything else propagates
+        // the original SQLite error.
         Err(open_err) => match std::fs::metadata(path) {
             Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::StoreNotFound {
@@ -38,6 +52,9 @@ pub fn open_existing(path: &std::path::Path) -> Result<Connection> {
             _ => return Err(open_err.into()),
         },
     };
+    // Pragmas are per-connection, and an existing store may predate
+    // the newest schema: even read-only callers bring it current
+    // here, exactly as `open` would.
     apply_standard_pragmas(&conn)?;
     apply(&mut conn, MIGRATIONS)?;
     Ok(conn)

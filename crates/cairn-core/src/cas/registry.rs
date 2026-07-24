@@ -266,6 +266,12 @@ pub fn all_ambiguous_job_ids(conn: &Connection) -> Result<std::collections::Hash
 /// text is always valid UTF-8 for SQLite and consumer wire types.
 pub const MAX_ERROR_STRING_BYTES: usize = 4096;
 
+/// Public read shape for one alias label. `root_path` is JOINed
+/// from `repositories` at query time — the alias row itself stores
+/// only `repo_hash` — so this shape predates and survives the v4
+/// schema normalisation. Unlike `RepositoryEntry`,
+/// `registered_at_ns` here is refreshed whenever the label is
+/// re-upserted (retargeted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasEntry {
     pub alias: String,
@@ -294,21 +300,39 @@ pub struct RepositoryEntry {
     pub repo_hash: String,
     pub root_path: String,
     pub registered_at_ns: i64,
+    /// Missing-root persistence policy: `true` exempts the repo
+    /// from the startup missing-root removal sweep.
     pub persistent: bool,
+    /// Durable pre-delete intent, present while removal is in
+    /// progress (set by [`mark_removal_requested`]).
     pub removal_request: Option<RepositoryRemovalRequest>,
 }
 
 /// Durable reason for removing a canonical repository owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepositoryRemovalReason {
+    /// The canonical root is definitively gone from disk (ENOENT)
+    /// and the repository is not marked persistent. Recorded by
+    /// the startup sweep and the runtime missing-root path.
     MissingRoot,
+    /// An unregister deleted the last label referencing the
+    /// repository.
     LastAliasRemoved,
+    /// A label was re-pointed at a different repository, leaving
+    /// this one with no remaining aliases.
     AliasRetargeted,
+    /// The startup sweep found a canonical row with zero aliases
+    /// (e.g. a crash between alias delete and repository delete).
     StartupAliasless,
+    /// Registration failed after the canonical row was created;
+    /// the partially registered repository is rolled back.
     RegistrationAborted,
 }
 
 impl RepositoryRemovalReason {
+    /// Stable SQL string form; must stay in sync with the CHECK
+    /// constraints on `repositories.removal_reason` and
+    /// `repository_removal_events.reason`.
     #[must_use]
     pub fn as_db_str(self) -> &'static str {
         match self {
@@ -332,20 +356,33 @@ impl RepositoryRemovalReason {
     }
 }
 
+/// Durable pre-delete intent stored on the canonical owner row.
+/// Present iff `removal_requested_at_ns` is non-NULL. Recording
+/// the intent before any destructive step lets startup resume an
+/// interrupted removal instead of resurrecting the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryRemovalRequest {
     pub requested_at_ns: i64,
     pub reason: RepositoryRemovalReason,
 }
 
+/// Progress of the post-registry-delete store cleanup for one
+/// removal event — mirrors the `store_cleanup_state` DB column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreCleanupState {
+    /// Registry delete committed; store-directory cleanup not yet
+    /// confirmed. Retried at startup.
     Pending,
+    /// Cleanup confirmed done. Retained (bounded) for reporting.
     Complete,
+    /// Last cleanup attempt failed; `cleanup_error` carries the
+    /// truncated error text. Retried at startup like `Pending`.
     Error,
 }
 
 impl StoreCleanupState {
+    /// Stable SQL string form, matching the `store_cleanup_state`
+    /// CHECK constraint.
     #[must_use]
     pub fn as_db_str(self) -> &'static str {
         match self {
@@ -365,6 +402,11 @@ impl StoreCleanupState {
     }
 }
 
+/// One row in `repository_removal_events` — the durable audit
+/// record straddling the registry-delete / store-cleanup boundary.
+/// The canonical `repositories` row is already gone when this row
+/// exists, so `repo_hash` / `root_path` are denormalised copies
+/// kept for cleanup targeting and operator reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryRemovalEvent {
     pub event_id: i64,
@@ -379,9 +421,14 @@ pub struct RepositoryRemovalEvent {
 /// Watcher lifecycle state — mirrors the `watcher_state` DB column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatcherState {
+    /// Seeded default for a fresh reconcile row; the daemon has
+    /// not yet attempted to arm the watcher.
     Starting,
+    /// Watcher armed and delivering filesystem events.
     Active,
+    /// Arming or runtime failure; `watcher_error` carries detail.
     Failed,
+    /// Watcher intentionally not running.
     Stopped,
 }
 
@@ -722,6 +769,14 @@ pub fn delete_repository(tx: &Transaction<'_>, repo_hash: &str) -> Result<bool> 
 }
 
 /// Set the canonical lifecycle policy independently from identity upsert.
+///
+/// Persistent repositories are exempt from the startup
+/// missing-root sweep; ephemeral ones (the default) are removed
+/// once their root is definitively gone. Returns `false` when
+/// `repo_hash` has no canonical row.
+///
+/// # Errors
+/// SQLite failures.
 pub fn set_repository_persistent(
     tx: &Transaction<'_>,
     repo_hash: &str,
@@ -735,6 +790,14 @@ pub fn set_repository_persistent(
 
 /// Persist a pre-delete removal request. The first request wins so retries and
 /// duplicate detectors cannot rewrite the operator-visible reason.
+///
+/// Returns `true` only when this call installed the intent;
+/// `false` covers both an unknown `repo_hash` and an
+/// already-recorded request (the `removal_requested_at_ns IS
+/// NULL` guard in the WHERE clause).
+///
+/// # Errors
+/// SQLite failures.
 pub fn mark_removal_requested(
     tx: &Transaction<'_>,
     repo_hash: &str,
@@ -750,6 +813,9 @@ pub fn mark_removal_requested(
 }
 
 /// Repositories whose lifecycle owner must resume removal after restart.
+///
+/// # Errors
+/// SQLite failures.
 pub fn list_removal_requested(conn: &Connection) -> Result<Vec<RepositoryEntry>> {
     let mut stmt = conn.prepare(
         "SELECT repo_hash, root_path, registered_at_ns, persistent,
@@ -764,6 +830,23 @@ pub fn list_removal_requested(conn: &Connection) -> Result<Vec<RepositoryEntry>>
 
 /// Atomically create the post-registry cleanup record and delete the
 /// canonical owner. Aliases and reconcile state cascade with the delete.
+///
+/// Returns the new removal event id, or `Ok(None)` when no
+/// durable removal intent exists for `repo_hash` — deleting
+/// without a prior [`mark_removal_requested`] is refused so the
+/// audit trail always records why a repository disappeared. The
+/// event row starts in `pending` state inside the same
+/// transaction as the delete; actually removing the store
+/// directory (and flipping the event to `complete` / `error`)
+/// happens after commit.
+///
+/// # Errors
+/// - [`Error::Internal`] when the owner row vanishes between the
+///   intent check and the delete — impossible within one
+///   transaction, so it signals a corrupted registry.
+/// - SQLite failures.
+///
+/// [`Error::Internal`]: crate::Error::Internal
 pub fn delete_repository_with_event(
     tx: &Transaction<'_>,
     repo_hash: &str,
@@ -796,6 +879,13 @@ pub fn delete_repository_with_event(
 }
 
 /// Incomplete post-registry store cleanup, retained until it succeeds.
+///
+/// Includes both `pending` (cleanup never confirmed) and `error`
+/// (last attempt failed) events, oldest first, so the startup
+/// retry loop processes them in arrival order.
+///
+/// # Errors
+/// SQLite failures.
 pub fn list_incomplete_removals(conn: &Connection) -> Result<Vec<RepositoryRemovalEvent>> {
     let mut stmt = conn.prepare(
         "SELECT event_id, repo_hash, root_path, removed_at_ns, reason,
@@ -809,6 +899,12 @@ pub fn list_incomplete_removals(conn: &Connection) -> Result<Vec<RepositoryRemov
 }
 
 /// Recent completed events for doctor/operator reporting.
+///
+/// Newest first, capped at `limit`. Only rows that survived the
+/// bounded retention prune are visible.
+///
+/// # Errors
+/// SQLite failures.
 pub fn list_recent_completed_removals(
     conn: &Connection,
     limit: usize,
@@ -827,6 +923,14 @@ pub fn list_recent_completed_removals(
     Ok(rows?)
 }
 
+/// Flip a removal event to `complete` and clear any recorded
+/// cleanup error, then prune completed-event retention to the
+/// newest 100 rows so the audit table stays bounded without a
+/// separate maintenance pass. Returns `false` when `event_id`
+/// does not exist (the retention prune still runs).
+///
+/// # Errors
+/// SQLite failures.
 pub fn mark_store_cleanup_complete(tx: &Transaction<'_>, event_id: i64) -> Result<bool> {
     let changed = tx.execute(
         "UPDATE repository_removal_events
@@ -838,6 +942,14 @@ pub fn mark_store_cleanup_complete(tx: &Transaction<'_>, event_id: i64) -> Resul
     Ok(changed)
 }
 
+/// Record a failed store-cleanup attempt. The event moves to
+/// `error` state but stays in [`list_incomplete_removals`], so the
+/// next startup retries the cleanup. `error` text is truncated
+/// UTF-8-safely to [`MAX_ERROR_STRING_BYTES`]. Returns `false`
+/// when `event_id` does not exist.
+///
+/// # Errors
+/// SQLite failures.
 pub fn mark_store_cleanup_error(tx: &Transaction<'_>, event_id: i64, error: &str) -> Result<bool> {
     Ok(tx.execute(
         "UPDATE repository_removal_events
@@ -847,6 +959,13 @@ pub fn mark_store_cleanup_error(tx: &Transaction<'_>, event_id: i64, error: &str
     )? == 1)
 }
 
+/// Delete all but the newest `keep` events in `complete` state.
+/// `pending` / `error` rows are never pruned — an unconfirmed
+/// cleanup must stay visible until it succeeds. Returns the number
+/// of rows deleted.
+///
+/// # Errors
+/// SQLite failures.
 pub fn prune_completed_removal_events(tx: &Transaction<'_>, keep: usize) -> Result<usize> {
     let keep = i64::try_from(keep).unwrap_or(i64::MAX);
     Ok(tx.execute(
@@ -929,6 +1048,11 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<AliasEntry> {
     })
 }
 
+/// Fail-closed mapper for `repositories` rows: the removal-intent
+/// pair (`removal_requested_at_ns`, `removal_reason`) must be both
+/// NULL or both set. A half-written pair means a corrupted
+/// registry and surfaces as a conversion error rather than a
+/// silently dropped (or invented) removal request.
 fn row_to_repository(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryEntry> {
     let requested_at_ns: Option<i64> = r.get(4)?;
     let reason: Option<String> = r.get(5)?;
@@ -1013,6 +1137,9 @@ fn row_to_reconcile_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepoReconci
     })
 }
 
+/// Shared SELECT column list for `repo_reconcile_state` queries.
+/// The order must match the positional `r.get(n)` indices in
+/// `row_to_reconcile_state`.
 const RECONCILE_STATE_COLUMNS: &str = "repo_hash, desired_generation, applied_generation, \
      force_generation, attempt_generation, dirty_since_ns, last_attempt_ns, \
      last_success_ns, consecutive_failures, next_retry_at_ns, last_error, \
@@ -1089,6 +1216,9 @@ pub fn increment_desired_generation(
 /// this path because an old retry deadline must not delay a newly observed
 /// filesystem state. Failure counters and error text remain intact until a
 /// successful attempt clears them.
+///
+/// # Errors
+/// See [`increment_desired_generation`].
 pub fn increment_immediate_desired_generation(
     tx: &Transaction<'_>,
     repo_hash: &str,
@@ -1137,6 +1267,16 @@ pub fn prime_startup_generations(tx: &Transaction<'_>, now_ns: i64) -> Result<Ve
 /// idle, and its last successful scan is at least `due_age_ns` old. The
 /// predicate and bump execute under the caller's transaction, preventing a
 /// watcher request racing this check from losing or duplicating work.
+///
+/// Returns `Ok(None)` when not due; an unknown or
+/// removal-requested `repo_hash` also reads as not due rather
+/// than an error.
+///
+/// # Errors
+/// - [`Error::InvalidArgument`] when `due_age_ns` is negative.
+/// - See [`increment_desired_generation`].
+///
+/// [`Error::InvalidArgument`]: crate::Error::InvalidArgument
 pub fn increment_periodic_generation_if_due(
     tx: &Transaction<'_>,
     repo_hash: &str,
@@ -1197,6 +1337,8 @@ pub fn increment_force_generation(
     Ok(next)
 }
 
+/// Error constructor shared by every fail-closed transition helper
+/// whose WHERE clause + affected-rows check rejected the write.
 fn invalid_transition(context: &str) -> crate::Error {
     crate::Error::Internal(format!("reconcile state transition rejected: {context}"))
 }
@@ -1325,6 +1467,11 @@ pub fn mark_attempt_failure(
     next_retry_at_ns: i64,
 ) -> Result<()> {
     let error_trimmed = truncate_utf8(error, MAX_ERROR_STRING_BYTES);
+    // The failure counter is read then written as two statements;
+    // the caller's transaction makes the pair atomic, and the
+    // UPDATE's WHERE re-checks the attempt identity so a stale or
+    // wrong generation is rejected fail-closed instead of
+    // clobbering a newer attempt.
     let current_failures: Option<i64> = tx
         .query_row(
             "SELECT consecutive_failures FROM repo_reconcile_state

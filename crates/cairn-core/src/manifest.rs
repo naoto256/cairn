@@ -61,10 +61,17 @@ pub struct WorktreeFilePayload<'a> {
 
 /// Transient path metadata used by manifest inclusion predicates.
 pub struct PathHint<'a> {
+    /// Repo-relative path, exactly as it would be stored in the
+    /// manifest entry.
     pub path: &'a str,
+    /// From git mode `100755` on the committed path, or the Unix
+    /// `0o111` permission bits on the worktree path (always `false`
+    /// on non-Unix scans).
     pub is_executable: bool,
 }
 
+/// One parsed `git ls-tree` record, before the inclusion filter.
+/// `is_executable` only feeds the [`PathHint`]; it is not persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeEntry {
     manifest: ManifestEntry,
@@ -73,6 +80,9 @@ struct TreeEntry {
 
 /// Look up an existing committed manifest for `commit_sha`. Returns
 /// `Ok(None)` if none exists.
+///
+/// Nothing enforces uniqueness of `(kind, commit_sha)`, so repeated
+/// builds can leave duplicates; the newest `built_at_ns` row wins.
 ///
 /// # Errors
 /// SQLite failure.
@@ -175,6 +185,8 @@ where
     capture_worktree_with(worktree_path, include, consume, |path| std::fs::read(path))
 }
 
+/// Backing implementation with an injectable `read` so tests can
+/// count filesystem reads and inject I/O failures.
 fn capture_worktree_with<F, C, R>(
     worktree_path: &Path,
     include: F,
@@ -196,6 +208,8 @@ where
                 worktree_path.display()
             ))
         })?;
+        // Store repo-relative paths so worktree and committed
+        // manifests key their entries identically.
         let path = relative.to_string_lossy().into_owned();
         if !include(&PathHint {
             path: &path,
@@ -229,6 +243,9 @@ where
 
 /// Persist a fully collected manifest. Callers are responsible for completing
 /// source reads and Tier-1 parsing before opening the publication transaction.
+///
+/// Both inserts run on the caller's transaction, so a manifest never
+/// becomes visible half-populated.
 pub fn persist_manifest(
     tx: &Transaction<'_>,
     kind: ManifestKind,
@@ -306,6 +323,7 @@ pub fn delete_path(tx: &Transaction<'_>, id: ManifestId, path: &str) -> Result<(
 
 /// Remove the manifest and its entries. The caller must remove any
 /// anchors pointing at this manifest first (the FK is `RESTRICT`).
+/// Entry rows are removed by `manifest_entries` `ON DELETE CASCADE`.
 ///
 /// # Errors
 /// SQLite failure including FK violation when anchors still reference.
@@ -333,6 +351,9 @@ fn create_empty(
     Ok(ManifestId(tx.last_insert_rowid()))
 }
 
+/// Plain INSERTs: a duplicate path within one manifest violates the
+/// `(manifest_id, path)` primary key and surfaces as an error rather
+/// than silently collapsing entries.
 fn insert_entries<I: IntoIterator<Item = ManifestEntry>>(
     tx: &Transaction<'_>,
     id: ManifestId,
@@ -349,6 +370,8 @@ fn insert_entries<I: IntoIterator<Item = ManifestEntry>>(
 }
 
 fn list_git_tree(repo_root: &Path, commit_sha: &str) -> Result<Vec<TreeEntry>> {
+    // `-z` NUL-terminates records and disables C-style path quoting,
+    // so unusual path bytes reach the parser verbatim.
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -377,6 +400,8 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<TreeEntry>> {
         }
         let record = std::str::from_utf8(record)
             .map_err(|e| crate::Error::InvalidArgument(format!("non-utf8 ls-tree output: {e}")))?;
+        // Split at the first tab only: the metadata columns never
+        // contain one, while the path may.
         let Some((meta, path)) = record.split_once('\t') else {
             continue;
         };
@@ -391,6 +416,8 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<TreeEntry>> {
             // appear with -r.
             continue;
         }
+        // 100755 is the only executable blob mode; 100644 (regular)
+        // and 120000 (symlink) blobs are not executable.
         out.push(TreeEntry {
             manifest: ManifestEntry {
                 path: path.to_string(),
