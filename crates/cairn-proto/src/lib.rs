@@ -25,7 +25,6 @@
 
 pub mod common;
 pub mod control;
-pub(crate) mod job_id_serde;
 pub mod jsonrpc;
 pub mod methods;
 pub mod reconcile_status;
