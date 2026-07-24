@@ -1,3 +1,15 @@
+//! Single LSP child process: spawning, JSON-RPC request/response
+//! plumbing, readiness, bounded restarts, and shutdown.
+//!
+//! One background reader task (`reader::reader_loop`) owns stdout
+//! and resolves responses into per-request oneshot channels
+//! registered in `pending`; stdin sits behind a writer mutex.
+//! Forced teardown of an installed child is centralized in
+//! `force_terminate`, the fail-closed path when termination cannot
+//! be proven. Clean graceful shutdown reaps inline and delegates
+//! its forced fallback to `force_terminate`; availability probes
+//! and missing-stdio failures own and reap their local `Child`
+//! directly.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,6 +30,8 @@ use super::reader::{ProgressState, reader_loop};
 use super::transport::write_lsp_message;
 use super::types::{Location, LocationLink, Position, Url};
 
+// Default per-request timeout (also bounds the `--version`
+// availability probe in `start`).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 // Shutdown is short by design: after the graceful request times out,
 // the client still sends `exit` and lets process cleanup finish.
@@ -31,10 +45,23 @@ const MAX_RESTARTS: usize = 3;
 // Keep enough stderr to diagnose startup failures without surfacing an
 // unbounded server log in user-facing errors.
 const STDERR_SECTION_BYTES: usize = 1024;
+// Once truncated, keep the first HEAD and last TAIL lines (each
+// section further capped at STDERR_SECTION_BYTES) joined by the
+// omission marker.
 const STDERR_HEAD_LINES: usize = 5;
 const STDERR_TAIL_LINES: usize = 5;
 const STDERR_OMISSION_MARKER: &str = " ... ";
 
+/// Handle to one LSP server subprocess speaking JSON-RPC over
+/// stdio.
+///
+/// Shared state lives behind `Arc`s so the background reader task
+/// and `LspProcessControl` clones stay valid independently of this
+/// handle. `shutdown(self)` is the graceful exit. Dropping the
+/// client alone does not kill the child: the `Child` sits behind a
+/// shared `Arc<Mutex<..>>`, so `kill_on_drop(true)` fires only
+/// when the last owner (client or `LspProcessControl` clone)
+/// drops it, and that path skips the `shutdown`/`exit` handshake.
 pub struct LspClient {
     binary_path: Option<PathBuf>,
     args: Vec<String>,
@@ -43,12 +70,25 @@ pub struct LspClient {
     initialization_options: Value,
     timeout: Duration,
     max_restarts: usize,
+    // Lifetime respawn-attempt count; never reset, so a repeatedly
+    // crashing server stops being restarted once `max_restarts` is
+    // exhausted.
     restarts: AtomicUsize,
+    // Monotonic JSON-RPC request id source. Ids are not reused
+    // before u64 wrap-around, so a late reply to a timed-out
+    // request finds no `pending` entry and is dropped rather than
+    // resolving a newer request.
     next_id: AtomicU64,
+    // True while a transport is installed; cleared by the reader
+    // task on stdout EOF / read error and by `force_terminate`.
     alive: Arc<AtomicBool>,
+    // One-way latch: once set (shutdown or pool stop), respawns are
+    // refused with `PoolStopped`.
     stopping: Arc<AtomicBool>,
     writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
     child: Arc<Mutex<Option<Child>>>,
+    // In-flight requests by id. The reader task resolves entries;
+    // every termination path drains the map so callers cannot hang.
     pub(super) pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     progress: Arc<ProgressState>,
     stderr_tail: Arc<Mutex<StderrTail>>,
@@ -99,6 +139,9 @@ impl LspProcessControl {
             let mut writer = self.writer.lock().await;
             *writer = None;
         }
+        // Dropping the pending senders without a reply wakes every
+        // in-flight `request` with a channel-closed error, which the
+        // request path reports as `ServerExited`.
         {
             let mut pending = self.pending.lock().await;
             pending.clear();
@@ -225,6 +268,9 @@ impl LspClient {
         }
     }
 
+    /// Test-only constructor over in-memory pipes: no child process
+    /// exists, and `max_restarts` is 0 so a dead transport fails
+    /// fast instead of attempting a respawn.
     #[cfg(test)]
     pub(super) async fn start_with_io<R, W>(
         reader: R,
@@ -255,6 +301,9 @@ impl LspClient {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(Error::PoolStopped);
         }
+        // `binary_path` is `None` only for the test-only in-memory
+        // transport, which has no process to (re)spawn; report the
+        // transport as gone.
         let Some(binary_path) = &self.binary_path else {
             return Err(Error::ServerExited(None.into()));
         };
@@ -299,6 +348,10 @@ impl LspClient {
             tokio::spawn(capture_stderr(stderr, Arc::clone(&self.stderr_tail)));
         }
 
+        // Publish the child under the lock, re-checking `stopping`
+        // there: a stop that ran before the child became visible in
+        // `self.child` could not have killed it, so this path must
+        // reap it locally instead.
         {
             let mut child_slot = self.child.lock().await;
             if self.stopping.load(Ordering::SeqCst) {
@@ -308,6 +361,9 @@ impl LspClient {
             *child_slot = Some(child);
         }
         self.install_transport(stdout, stdin).await;
+        // `install_transport` re-arms `alive` and the writer. If a
+        // stop raced in after the child was published, undo that via
+        // `force_terminate` (idempotent) and report `PoolStopped`.
         if self.stopping.load(Ordering::SeqCst) {
             return Err(match self.force_terminate().await {
                 Ok(()) => Error::PoolStopped,
@@ -360,6 +416,8 @@ impl LspClient {
         self.process_control().force_terminate().await
     }
 
+    /// Snapshot the control-plane `Arc`s into a cloneable handle
+    /// usable without holding the pool entry's data-plane mutex.
     pub(crate) fn process_control(&self) -> LspProcessControl {
         LspProcessControl {
             alive: Arc::clone(&self.alive),
@@ -386,6 +444,14 @@ impl LspClient {
         });
     }
 
+    /// Run the LSP lifecycle handshake: the `initialize` request
+    /// followed by the `initialized` notification, which must
+    /// complete before other requests per the LSP spec.
+    /// Capabilities advertise only what this client relies on:
+    /// `workDoneProgress` (readiness tracking) and definition
+    /// `linkSupport`. An `initialize` failure is flattened into
+    /// [`Error::Handshake`]; a failed `initialized` notification
+    /// surfaces as the underlying transport error instead.
     async fn initialize(&self) -> Result<()> {
         let root_uri = Url::from_file_path(&self.workspace_root)?;
         let root_path = self.workspace_root.to_string_lossy();
@@ -456,6 +522,11 @@ impl LspClient {
             .await
     }
 
+    /// Readiness means: at least one `$/progress` `begin` has been
+    /// observed, no progress tokens remain active, and that state
+    /// held unchanged for `quiet_period`. The quiet period guards
+    /// against servers that end one startup progress sequence and
+    /// immediately begin another.
     pub(super) async fn wait_for_workspace_load_with_quiescence(
         &self,
         wait_timeout: Duration,
@@ -617,6 +688,12 @@ impl LspClient {
         }
     }
 
+    /// Liveness gate called before every operation. When the reader
+    /// task has marked the transport dead, transparently respawn the
+    /// server — at most `max_restarts` times over the client's
+    /// lifetime — before giving up with `ServerExited`. The counter
+    /// increments per respawn *attempt*, so failing spawns also
+    /// consume the budget.
     async fn ensure_running(&self) -> Result<()> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(Error::PoolStopped);
@@ -631,6 +708,16 @@ impl LspClient {
         self.spawn_process().await
     }
 
+    /// Send a JSON-RPC request and await its matching response.
+    ///
+    /// The oneshot receiver is registered in `pending` before the
+    /// message is written, so a fast reply cannot race the
+    /// registration. Failure shapes:
+    /// - write error or timeout: the pending entry is removed here;
+    /// - channel closed without a reply (map drained by a
+    ///   termination path): reported as `ServerExited`;
+    /// - `Err` delivered by the reader (server `error` object, or a
+    ///   fan-out replica when the reader loop dies): passed through.
     async fn request<T>(&self, method: &str, params: Value) -> Result<T>
     where
         T: DeserializeOwned,
@@ -684,6 +771,9 @@ impl LspClient {
         .await
     }
 
+    /// Serialize and frame one message onto stdin. A `None` writer
+    /// means the transport was torn down; reported as
+    /// `ServerExited` rather than a protocol error.
     async fn write_message(&self, message: &Value) -> Result<()> {
         let mut writer = self.writer.lock().await;
         let Some(writer) = writer.as_mut() else {
@@ -692,6 +782,10 @@ impl LspClient {
         write_lsp_message(writer, message).await
     }
 
+    /// Attach captured stderr to the error shapes where it aids
+    /// diagnosis (handshake failures and server exits). Other
+    /// errors pass through unchanged so stderr noise cannot obscure
+    /// e.g. a timeout classification.
     async fn with_stderr_context(&self, err: Error) -> Error {
         let stderr = self.stderr_tail.lock().await.text();
         if stderr.is_empty() {
@@ -705,6 +799,13 @@ impl LspClient {
     }
 }
 
+/// rust-analyzer-specific `initializationOptions`.
+/// `cairnConfigHash` is not interpreted by the server; it is
+/// carried as an opaque marker of the cairn config the session was
+/// started with. `serverStatusNotification` opts in to
+/// rust-analyzer's experimental status notification, which is
+/// currently only logged — readiness is decided via `$/progress`
+/// quiescence instead.
 fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
     json!({
         "cairnConfigHash": config_hash,
@@ -800,6 +901,11 @@ async fn check_binary_available(binary_path: &Path, request_timeout: Duration) -
     probe_binary(binary_path, &["--version"], request_timeout).await
 }
 
+/// Bounded capture of child stderr. Everything accumulates in
+/// `head` until the total line budget (`STDERR_HEAD_LINES` +
+/// `STDERR_TAIL_LINES`) is exceeded; from then on the capture is
+/// permanently split into a fixed head plus a rolling tail, each
+/// capped at `STDERR_SECTION_BYTES`.
 #[derive(Default)]
 pub(super) struct StderrTail {
     head: String,
@@ -823,6 +929,8 @@ impl StderrTail {
                 return;
             }
 
+            // First overflow: snapshot the whole buffer, then carve
+            // it into the fixed head and the initial rolling tail.
             self.truncated = true;
             self.tail = self.head.clone();
             trim_to_first_lines(&mut self.head, STDERR_HEAD_LINES);
@@ -853,6 +961,8 @@ impl StderrTail {
     }
 }
 
+/// Background task draining child stderr into the shared tail
+/// buffer until EOF or a read error (both mean the pipe is gone).
 async fn capture_stderr<R>(mut stderr: R, tail: Arc<Mutex<StderrTail>>)
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -926,6 +1036,12 @@ fn trim_to_last_lines(text: &mut String, max_lines: usize) {
     text.drain(..start);
 }
 
+/// Normalize a `textDocument/definition` result. Per the LSP spec
+/// the result is `Location | Location[] | LocationLink[] | null`;
+/// all shapes collapse to `Vec<Location>` (with `null` as empty).
+/// For links, `targetSelectionRange` — the range of the symbol
+/// name itself — is preferred over the broader `targetRange` when
+/// present.
 pub(super) fn parse_definition_result(value: Value) -> Result<Vec<Location>> {
     if value.is_null() {
         return Ok(Vec::new());

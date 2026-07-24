@@ -1,5 +1,21 @@
+//! Process-local runtime metrics for analyzer jobs.
+//!
+//! The CAS store persists only coarse job state; everything here —
+//! scheduler state, queue / pool-wait / run timings, progress
+//! ticks — lives in one in-memory map keyed by `JobId` and dies
+//! with the daemon. `decorate` merges an entry into a
+//! `JobSnapshot` at read time; a job with no entry (any row that
+//! predates the last restart and was not re-enqueued by
+//! `restore_from_db`) keeps all runtime-only snapshot fields
+//! `None`, meaning "not tracked by this process".
+//!
+//! Entries are inserted at enqueue time and are not removed when a
+//! job finishes: terminal entries stay readable for `jobs list`
+//! decoration until the daemon exits.
 use super::*;
 
+/// Shared handle to the per-job runtime metrics map; `Clone`
+/// copies the handle, not the map.
 #[derive(Debug, Clone, Default)]
 pub(super) struct JobRuntimeMetricsStore {
     inner: Arc<Mutex<HashMap<JobId, JobRuntimeMetrics>>>,
@@ -12,16 +28,29 @@ pub(super) struct JobRuntimeMetricsStore {
 struct JobRuntimeMetrics {
     enqueued_at_ns: i64,
     pool_group: Option<String>,
+    /// "queued" -> ("waiting_pool_group" ->) "running" -> a
+    /// terminal `RunStatus` string once `mark_finished` runs.
     scheduler_state: String,
+    /// Start of the currently open pool-wait window, if the job is
+    /// waiting behind its active pool group; folded into
+    /// `pool_wait_ms` when the window closes (run start / finish).
     pool_wait_started_at_ns: Option<i64>,
+    /// Pool-wait time from already-closed windows, in
+    /// milliseconds. `decorate` adds any still-open window on top.
     pool_wait_ms: u64,
     run_started_at_ns: Option<i64>,
     finished_at_ns: Option<i64>,
+    /// Latest cumulative tick count reported by the analyzer — an
+    /// absolute counter, not a delta.
     progress_ticks: u64,
     last_progress_at_ns: Option<i64>,
 }
 
 impl JobRuntimeMetricsStore {
+    /// Create the job's runtime record at enqueue time. An insert
+    /// for an id that already has an entry would reset it
+    /// wholesale, but job ids are allocator-unique, so in practice
+    /// each id is created here exactly once.
     pub(super) fn mark_enqueued(
         &self,
         job_id: JobId,
@@ -47,6 +76,12 @@ impl JobRuntimeMetricsStore {
             );
     }
 
+    /// Record that the scheduler observed the job blocked behind
+    /// its already-active pool group. Only the scheduler's enqueue
+    /// path calls this, so a job whose group becomes busy *after*
+    /// its own enqueue stays in state "queued" and accrues no
+    /// pool-wait time. The `or_insert_with` arm is defensive;
+    /// `mark_enqueued` normally created the entry already.
     pub(super) fn mark_waiting_pool_group(&self, job_id: JobId, pool_group: &'static str) {
         let now = now_ns();
         let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
@@ -66,6 +101,10 @@ impl JobRuntimeMetricsStore {
         entry.pool_wait_started_at_ns.get_or_insert(now);
     }
 
+    /// Dispatch-time transition: close any open pool-wait window
+    /// into `pool_wait_ms` and stamp `run_started_at_ns` once.
+    /// "running" here means handed to the worker channel — the
+    /// analyzer process itself may start slightly later.
     pub(super) fn mark_running(&self, job_id: JobId) {
         let now = now_ns();
         let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
@@ -80,6 +119,9 @@ impl JobRuntimeMetricsStore {
         }
     }
 
+    /// Overwrite the cumulative tick counter and its timestamp.
+    /// `ticks` is the analyzer's absolute progress counter, not a
+    /// delta.
     pub(super) fn mark_progress(&self, job_id: JobId, ticks: u64) {
         let now = now_ns();
         if let Some(entry) = self
@@ -93,6 +135,10 @@ impl JobRuntimeMetricsStore {
         }
     }
 
+    /// Terminal transition: `state` is the final `RunStatus`
+    /// string. Also closes any still-open pool-wait window — a job
+    /// cancelled while waiting for its group never passed through
+    /// `mark_running`.
     pub(super) fn mark_finished(&self, job_id: JobId, state: &str) {
         let now = now_ns();
         if let Some(entry) = self
@@ -111,6 +157,22 @@ impl JobRuntimeMetricsStore {
         }
     }
 
+    /// Merge this store's entry into a snapshot. No-op when the
+    /// job was never tracked by this process — the runtime-only
+    /// snapshot fields then stay `None`.
+    ///
+    /// Derived timings (each yields `None` via `duration_ms` if
+    /// the clock went backwards across the interval):
+    /// * `queued_ms` — enqueue until run start; until finish for
+    ///   jobs that never ran (e.g. cancelled while queued); or
+    ///   until `observed_at_ns` while the row still says "queued".
+    /// * `pool_wait_ms` — closed windows plus the open window up
+    ///   to `observed_at_ns`; reported whenever the job has a pool
+    ///   group, so an uncontended pooled job shows `Some(0)`.
+    /// * `run_ms` — run start until finish, or until
+    ///   `observed_at_ns` while still running.
+    /// * `progress_per_minute` — rate over `run_ms`; `None` until
+    ///   at least one tick and a positive `run_ms` exist.
     pub(super) fn decorate(&self, snapshot: &mut JobSnapshot, observed_at_ns: i64) {
         let metrics = self.inner.lock().expect("job metrics lock poisoned");
         let Some(entry) = metrics.get(&snapshot.job_id) else {

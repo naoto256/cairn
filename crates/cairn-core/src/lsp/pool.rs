@@ -53,14 +53,22 @@ use tracing::{debug, warn};
 use super::client::LspProcessControl;
 use super::{Error, LspClient, Position, Result, Url};
 
+/// Cap on live child processes when the env override is unset.
 const DEFAULT_POOL_CAPACITY: usize = 16;
+/// Ceiling for the env override; larger values clamp here with a warn.
 const MAX_POOL_CAPACITY: usize = 64;
 const POOL_CAPACITY_ENV: &str = "CAIRN_LSP_POOL_MAX_ENTRIES";
+/// Wall-clock idle TTL: Ready entries unused this long are swept.
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 const IDLE_TTL_ENV: &str = "CAIRN_LSP_IDLE_TTL_SECS";
+/// Cadence of the background idle-sweeper task.
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Per-victim bound for the sweeper's `shutdown_bounded` call, so a
+/// single wedged entry cannot stall a sweep pass indefinitely.
 const IDLE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Boxed future produced by a `with_lsp` work closure; borrows the
+/// pooled client for the lifetime of the lease.
 type ClientWork<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
 /// Registry key for one long-lived LSP server process.
@@ -178,9 +186,15 @@ impl PooledLsp<'_> {
 /// Daemon-scoped pool of long-lived LSP clients with a hard
 /// capacity, LRU eviction, and fail-closed drain/poison states.
 pub struct LspClientPool {
+    /// Dedicated single-worker runtime that owns all pool futures and
+    /// child I/O tasks, keeping `with_lsp`'s `block_on` independent
+    /// of any caller runtime.
     runtime: Runtime,
     registry: Arc<StdMutex<PoolRegistry>>,
     capacity: NonZeroUsize,
+    /// Handle of the background sweep task; `None` when the idle TTL
+    /// override disables sweeping. Never awaited or aborted — the
+    /// task stops when the pool's dedicated runtime is dropped.
     _idle_sweeper: Option<JoinHandle<()>>,
 }
 
@@ -210,8 +224,14 @@ enum PoolMode {
 
 struct PoolRecord {
     entry: Arc<PoolEntry>,
+    /// Count of outstanding `PoolLease`s. Non-zero blocks both LRU
+    /// eviction and idle sweeping of this record.
     active_leases: usize,
+    /// LRU ordinal (`access_seq` at the last acquire). Bumped on
+    /// acquire only, not on lease release.
     last_used: u64,
+    /// Wall-clock stamp for the idle TTL; refreshed on both acquire
+    /// and lease release.
     last_used_at: Instant,
     state: RecordState,
 }
@@ -262,6 +282,8 @@ impl std::fmt::Debug for PoolLease {
 
 impl Drop for PoolLease {
     fn drop(&mut self) {
+        // Drop must not panic: on std-mutex poisoning, proceed with
+        // the inner data so the lease count is still released.
         let mut reg = match self.registry.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -459,6 +481,9 @@ impl ForceShutdownOutcome {
     }
 }
 
+/// Fold per-entry force-shutdown results into the outcome slots. An
+/// `Err(Elapsed)` marks the outer timeout as fired; the error slots
+/// keep only the first error of each class.
 fn classify_force_shutdown_results(
     results: Vec<std::result::Result<Result<()>, tokio::time::error::Elapsed>>,
     entry_timeout: Duration,
@@ -553,6 +578,10 @@ impl LspClientPool {
 
     /// Borrow a long-lived LSP client for `key`, lazily spawning it
     /// when needed according to `spawn_spec`.
+    ///
+    /// Blocks the calling thread on the pool's dedicated runtime, so
+    /// it must not be invoked from within an async context (Tokio's
+    /// `block_on` panics there).
     ///
     /// # Errors
     /// - [`Error::PoolAtCapacity`] if the pool is full and no idle
@@ -795,6 +824,9 @@ impl LspClientPool {
         };
 
         let victim_count = victims.len();
+        // Stop victims concurrently and with a per-victim bound —
+        // unlike capacity LRU (unbounded `shutdown()`), the sweeper
+        // task must not be stalled indefinitely by one wedged entry.
         let outcomes =
             futures::future::join_all(victims.into_iter().map(|(key, entry)| async move {
                 let result = entry.shutdown_bounded(entry_timeout).await;
@@ -807,6 +839,13 @@ impl LspClientPool {
             .lock()
             .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
         for (key, entry, result) in outcomes {
+            // The registry may have changed while victims were being
+            // stopped outside the lock: a drain (`shutdown_all` /
+            // `force_shutdown_all` / `shutdown_all_bounded`) can have
+            // removed the record, and after a drain that returned the
+            // pool to Running a fresh record may exist under the same
+            // key. Only remove the exact record we reserved (same
+            // `Arc`, still Evicting) — never a newcomer.
             let still_reserved = reg.entries.get(&key).is_some_and(|record| {
                 record.state == RecordState::Evicting && Arc::ptr_eq(&record.entry, &entry)
             });
@@ -1133,6 +1172,10 @@ impl LspClientPool {
 
 #[derive(Default)]
 struct PoolEntry {
+    /// Data-plane state: the live client plus per-document version
+    /// counters. Held for the whole of `with_lsp_client` — spawn,
+    /// readiness wait, and the caller's work — so concurrent
+    /// acquires of the same key serialize here, not in the registry.
     state: Mutex<PoolEntryState>,
     /// Serializes normal, idle-sweep, and final shutdown paths for
     /// this entry. Final shutdown may race a reserved eviction, but
@@ -1146,13 +1189,22 @@ struct PoolEntry {
 
 #[derive(Default)]
 struct ProcessControlSlot {
+    /// Set (and never cleared) by `shutdown_bounded` before it
+    /// terminates the child. Once set, `install_process_control`
+    /// rejects new clients, so a racing spawn cannot install a fresh
+    /// child after final shutdown has begun.
     stopping: bool,
+    /// Control handle of the currently-installed client, if any.
     control: Option<LspProcessControl>,
 }
 
 #[derive(Default)]
 struct PoolEntryState {
+    /// Live client; `None` until the first spawn and again after a
+    /// terminal server exit is cleaned up.
     client: Option<LspClient>,
+    /// URI → document version; decides `didOpen` vs `didChange` in
+    /// `PooledLsp::sync_document`.
     opened_documents: HashMap<String, i32>,
 }
 
@@ -1245,6 +1297,10 @@ impl PoolEntry {
                 spec.initialization_options.clone(),
                 spec.request_timeout,
             );
+            // Publish the control handle before spawning: if a
+            // bounded final shutdown has already flagged `stopping`,
+            // this rejects with `PoolStopped` and no child is
+            // spawned.
             self.install_process_control(client.process_control())?;
             if let Err(err) = client.start_process().await {
                 self.clear_process_control()?;
@@ -1280,6 +1336,8 @@ impl PoolEntry {
             client,
             opened_documents,
         } = &mut *state;
+        // `client` is always `Some` here (pre-existing, or just
+        // installed above); the error arm is defensive.
         let client = client
             .as_ref()
             .ok_or_else(|| super::Error::ServerExited(None.into()))?;
@@ -1320,6 +1378,13 @@ impl PoolEntry {
         result
     }
 
+    /// Graceful entry shutdown, used by capacity LRU eviction,
+    /// `shutdown_all`, and (wrapped in an outer timeout)
+    /// `force_shutdown_all`. Waits without its own bound on the
+    /// shutdown gate and the data-plane mutex, so an in-flight pass
+    /// completes first. `Ok(())` means either no client was installed
+    /// or `LspClient::shutdown` reaped the child — callers treat it
+    /// as termination-proven.
     async fn shutdown(&self) -> Result<()> {
         let _shutdown_guard = self.shutdown_gate.lock().await;
         let mut state = self.state.lock().await;
@@ -1361,6 +1426,13 @@ impl PoolEntry {
         }
     }
 
+    /// Install the control handle for a client that is about to be
+    /// spawned.
+    ///
+    /// # Errors
+    /// [`Error::PoolStopped`] when a final shutdown has already
+    /// flagged the slot as stopping (the caller must not spawn); a
+    /// protocol error when the slot mutex is poisoned.
     fn install_process_control(&self, control: LspProcessControl) -> Result<()> {
         let mut slot = self
             .process_control
@@ -1373,6 +1445,12 @@ impl PoolEntry {
         Ok(())
     }
 
+    /// Drop the control handle after the child is known terminated
+    /// (or was never spawned). `stopping` is deliberately left
+    /// untouched — the spawn veto is permanent for this entry.
+    ///
+    /// # Errors
+    /// A protocol error when the slot mutex is poisoned.
     fn clear_process_control(&self) -> Result<()> {
         self.process_control
             .lock()
@@ -1382,6 +1460,8 @@ impl PoolEntry {
     }
 }
 
+/// Run the configured readiness gate against a freshly initialized
+/// client; `InitializeResponseOnly` needs no extra wait.
 async fn dispatch_readiness<F, Fut>(
     readiness: &ReadinessStrategy,
     wait_for_workspace_load: F,
@@ -1409,6 +1489,9 @@ pub fn global() -> Result<&'static LspClientPool> {
     if let Some(pool) = GLOBAL_POOL.get() {
         return Ok(pool);
     }
+    // Init race: concurrent first callers may each build a pool; the
+    // `get_or_init` loser is dropped before any child is spawned
+    // (only its empty runtime and sweeper task existed).
     let pool = LspClientPool::new()?;
     Ok(GLOBAL_POOL.get_or_init(|| pool))
 }

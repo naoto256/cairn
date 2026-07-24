@@ -1,3 +1,25 @@
+//! Daemon-restart recovery for persisted analyzer jobs.
+//!
+//! The durable job state is one `workspace_analysis_runs` row per
+//! `(manifest_id, analyzer_id)` in each per-repo CAS store; the
+//! scheduler queue, `JobIndex`, tracked keys and runtime metrics
+//! are process-local and vanish with the daemon.
+//! `restore_from_db` rebuilds the in-memory side in four phases:
+//!
+//! 1. Status recovery: flip `running` rows back to `queued`.
+//! 2. Cross-store scan: group rows by `job_id`, seed the
+//!    daemon-global id allocator above every historical id, every
+//!    tombstoned id, and the wall clock, then assign fresh ids to
+//!    queued rows persisted with `job_id IS NULL`.
+//! 3. Collision recycle: rewrite every row of an ambiguous-id
+//!    group to fresh ids, after durably tombstoning the old id in
+//!    `index.db::ambiguous_job_ids` (the crash-safety anchor for
+//!    the non-atomic per-store rewrites).
+//! 4. Advertise dispatch-active (`queued`) rows to the memory
+//!    queue; terminal rows remain history only.
+//!
+//! Nothing is deleted here — garbage collection of terminal rows
+//! is `JobManager::prune_jobs`'s domain (`jobs/list.rs`).
 use super::*;
 
 /// A single row observed during `restore_from_db`, tagged with the
@@ -21,6 +43,32 @@ struct RestoreRow {
 }
 
 impl JobManager {
+    /// Rebuild in-memory job state from every registered store
+    /// after a daemon restart. Called once at startup, before
+    /// `start_workers` (see `daemon.rs::init_job_manager`), so no
+    /// `running` row can belong to this process yet.
+    ///
+    /// Per-row contract:
+    /// * `running` — flipped back to `queued` and re-queued for
+    ///   dispatch; the writing daemon is dead, so the attempt is
+    ///   treated as never started. `cancel_requested` survives the
+    ///   flip, so a pre-restart cancel still lands when a worker
+    ///   drains the job.
+    /// * `queued` — re-advertised to the memory queue under its
+    ///   persisted (or freshly assigned) `job_id`.
+    /// * terminal — kept on disk as history and never
+    ///   re-dispatched, but still scanned: its `job_id`
+    ///   participates in cross-store collision detection and
+    ///   raises the allocator floor.
+    ///
+    /// Failure mode: an error aborts the remaining work. The
+    /// phases are per-store loops with no cross-store transaction,
+    /// so a partial run can leave some stores rewritten and others
+    /// not — the durable ambiguous-id tombstone (phase 3) keeps
+    /// that window safe, and the next restart's restore finishes
+    /// the rewrite. The daemon treats a restore error as fatal
+    /// (fail-closed) rather than starting workers on unseeded
+    /// state.
     pub fn restore_from_db(&self) -> Result<()> {
         let index_db_path = self.cas_data_dir.index_db_path();
         let mut index = cas_registry::open(&index_db_path)?;

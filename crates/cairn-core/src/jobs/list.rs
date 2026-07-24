@@ -1,6 +1,38 @@
+//! Read-side job APIs: `jobs` (listing snapshots) and `prune_jobs`
+//! (garbage collection of orphaned terminal runs).
+//!
+//! Both walk the per-store `workspace_analysis_runs` rows; listing
+//! additionally decorates rows with process-local runtime metrics
+//! (`jobs/metrics.rs`). Rows persisted with `job_id IS NULL`
+//! (never externally named) are skipped by listing; pruning
+//! deletes them like any other orphan terminal row, but only
+//! non-NULL ids take part in the `JobIndex` cleanup.
 use super::*;
 
 impl JobManager {
+    /// Snapshot jobs across registered repositories.
+    ///
+    /// Filters: `alias_filter` restricts to one alias (an unknown
+    /// alias yields an empty list, not an error — contrast
+    /// `prune_jobs`); `state_filter` keeps rows whose persisted
+    /// state matches; `options.limit` truncates after the global
+    /// sort (highest `job_id` first, i.e. newest first).
+    ///
+    /// The default view (`options.include_all == false`) keeps, per
+    /// store: rows whose manifest a current anchor references, and
+    /// within those every queued/running row plus the latest
+    /// terminal row per analyzer (`latest_default_job_rows`).
+    /// `include_all` returns every row that has a `job_id`.
+    ///
+    /// Lifecycle gating: in the unscoped enumeration a repository
+    /// that is unavailable (Removing / Removed) is silently
+    /// skipped; with `alias_filter` set, the unavailability error
+    /// propagates instead. A bare `JobManager` without a lifecycle
+    /// manager applies no gating.
+    ///
+    /// Runtime-metric fields (`scheduler_state`, `queued_ms`, ...)
+    /// stay `None` for jobs this process never held in memory —
+    /// e.g. terminal rows that predate the last daemon restart.
     pub(crate) fn jobs(
         &self,
         alias_filter: Option<&str>,
@@ -58,6 +90,22 @@ impl JobManager {
         Ok(out)
     }
 
+    /// Delete terminal runs whose manifest no current anchor
+    /// references ("orphans"), store by store.
+    ///
+    /// * `repo_filter` — one alias (an unknown alias is
+    ///   [`Error::RepoNotFound`], unlike `jobs`) or, when `None`,
+    ///   every registered repository.
+    /// * `dry_run` — report the would-be counts (rows matching the
+    ///   predicate, plus how many of their ids currently sit in
+    ///   the `JobIndex`) without deleting anything.
+    ///
+    /// Active (`queued`/`running`) orphans are deliberately
+    /// preserved and logged instead of deleted, so a job for a
+    /// superseded manifest is never hidden while it can still run.
+    /// Lifecycle gating mirrors `jobs`: unscoped enumeration skips
+    /// unavailable repositories, an explicit alias propagates the
+    /// error.
     pub fn prune_jobs(&self, repo_filter: Option<&str>, dry_run: bool) -> Result<JobsPruneSummary> {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
         let enumerate_all = repo_filter.is_none();
@@ -121,6 +169,8 @@ impl JobManager {
     }
 }
 
+/// Every externally named row (`job_id IS NOT NULL`) in one store,
+/// newest (highest `job_id`) first — the `include_all` scope.
 fn collect_all_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSnapshot>> {
     let mut stmt = conn.prepare(
         "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
@@ -131,6 +181,9 @@ fn collect_all_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSnapsho
     collect_job_rows(&mut stmt, alias)
 }
 
+/// Like `collect_all_job_rows`, but restricted to rows whose
+/// manifest at least one current anchor references — the default
+/// `jobs list` scope.
 fn collect_current_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSnapshot>> {
     let mut stmt = conn.prepare(
         "SELECT job_id, analyzer_id, status, started_at_ns, finished_at_ns, error
@@ -142,11 +195,22 @@ fn collect_current_job_rows(conn: &Connection, alias: &str) -> Result<Vec<JobSna
     collect_job_rows(&mut stmt, alias)
 }
 
+/// Shared WHERE fragment defining a prunable row: terminal status
+/// AND its manifest is not referenced by any current anchor. The
+/// status list must enumerate exactly the states
+/// `RunStatus::is_terminal` accepts (it does today).
 const ORPHAN_TERMINAL_RUNS_WHERE: &str = "
     manifest_id NOT IN (SELECT DISTINCT manifest_id FROM anchors)
     AND status IN ('succeeded', 'failed', 'cancelled', 'skipped', 'timed_out')
 ";
 
+/// Delete one store's orphan terminal rows and drop their
+/// `JobIndex` entries; returns `(deleted_runs,
+/// deleted_index_entries)`. The non-NULL orphan ids are captured
+/// before the IMMEDIATE transaction re-evaluates the predicate for
+/// the DELETE, so the index cleanup is a best-effort cache sweep
+/// over that pre-delete snapshot; dry-run reuses the same snapshot
+/// to count would-be removals without mutating anything.
 fn prune_jobs_in_store(
     conn: &mut Connection,
     job_index: &JobIndex,
@@ -179,6 +243,8 @@ fn count_orphan_terminal_runs(conn: &Connection) -> Result<u64> {
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+/// Ids of rows matching the prune predicate — the `JobIndex`
+/// cleanup / dry-run counting target.
 fn orphan_terminal_job_ids(conn: &Connection) -> Result<Vec<JobId>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT job_id FROM workspace_analysis_runs
@@ -190,6 +256,9 @@ fn orphan_terminal_job_ids(conn: &Connection) -> Result<Vec<JobId>> {
     Ok(job_ids)
 }
 
+/// Count queued/running rows on unreferenced manifests. These are
+/// *not* pruned — the count only feeds the preservation warning in
+/// `prune_jobs`.
 fn count_orphan_active_runs(conn: &Connection) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM workspace_analysis_runs
@@ -201,6 +270,13 @@ fn count_orphan_active_runs(conn: &Connection) -> Result<u64> {
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+/// Map DB rows to `JobSnapshot`s. The store's `started_at_ns` is
+/// stamped at queue time (see `queue_analyzer_run`), so it maps to
+/// `created_at`. The runtime-only fields begin `None` and are
+/// filled by `JobRuntimeMetricsStore::decorate` only for jobs this
+/// process tracks; `started_at` itself has no producer on this
+/// path and stays `None` (the actual run start is surfaced as
+/// `run_started_at`).
 fn collect_job_rows(stmt: &mut rusqlite::Statement<'_>, alias: &str) -> Result<Vec<JobSnapshot>> {
     let rows = stmt
         .query_map([], |r| {
@@ -229,6 +305,12 @@ fn collect_job_rows(stmt: &mut rusqlite::Statement<'_>, alias: &str) -> Result<V
     Ok(rows)
 }
 
+/// Default-view filter for one store's rows, which arrive newest
+/// (highest `job_id`) first: keep every queued/running row, only
+/// the first-seen (= latest) terminal row per analyzer, and pass
+/// through rows whose state string this build does not recognize
+/// (persisted by an older or newer binary) rather than hiding
+/// them.
 pub(super) fn latest_default_job_rows(rows: Vec<JobSnapshot>) -> Vec<JobSnapshot> {
     let mut seen_terminal = HashSet::new();
     let mut out = Vec::new();

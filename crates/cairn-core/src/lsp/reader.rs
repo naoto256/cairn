@@ -1,3 +1,11 @@
+//! Background read loop and readiness tracking for one LSP session.
+//!
+//! A single `reader_loop` task owns the server's stdout and
+//! dispatches every incoming message: responses are routed to
+//! pending request waiters, a small set of server-to-client requests
+//! is answered inline, and `$/progress` traffic feeds
+//! `ProgressState`, which `wait_for_quiescence` consults to decide
+//! when the initial workspace load has settled.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +20,24 @@ use tracing::{debug, info};
 use super::error::{Error, Result};
 use super::transport::{read_lsp_message, write_lsp_message};
 
+/// Drain `reader` until EOF or a transport error, dispatching each
+/// message.
+///
+/// Per-message dispatch, first match wins:
+/// - server-to-client requests we support (currently only
+///   `window/workDoneProgress/create`) are answered inline through
+///   `writer`; a failed reply write is ignored here
+/// - responses are matched against `pending` by numeric id; a
+///   response whose waiter is gone (e.g. the request timed out) is
+///   dropped
+/// - `$/progress` and `rust-analyzer/serverStatus` notifications
+///   update `progress`
+/// - other notifications are logged at debug level and discarded;
+///   other server requests are silently dropped without a response
+///
+/// On EOF or read error the loop clears `alive` and fails every
+/// pending waiter (see `fail_pending`), so callers blocked on a
+/// response observe the server's death instead of hanging.
 pub(super) async fn reader_loop<R>(
     mut reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
@@ -64,6 +90,12 @@ fn log_notification(message: &Value) {
     debug!(method, "lsp_server_notification");
 }
 
+/// Aggregated view of the server's `$/progress` traffic, used to
+/// infer when the workspace load has settled.
+///
+/// `notify` wakes `wait_for_quiescence` after every recorded change;
+/// combined with `change_seq` in the snapshot, this lets the waiter
+/// detect activity that both started and finished while it slept.
 #[derive(Default)]
 pub(super) struct ProgressState {
     inner: Mutex<ProgressSnapshot>,
@@ -72,8 +104,14 @@ pub(super) struct ProgressState {
 
 #[derive(Default)]
 struct ProgressSnapshot {
+    /// Progress tokens with a `begin` but no matching `end` yet.
     active_tokens: HashSet<String>,
+    /// True once any `begin` has been seen since the last `reset`.
+    /// Guards against declaring quiescence before the server has
+    /// started reporting work at all.
     saw_begin: bool,
+    /// Monotonic count of recorded progress events; lets
+    /// `wait_for_quiescence` detect churn during its quiet period.
     change_seq: u64,
 }
 
@@ -90,6 +128,13 @@ impl ProgressState {
         inner.change_seq = 0;
     }
 
+    /// Fold one `$/progress` notification into the snapshot.
+    ///
+    /// Only `begin` and `end` change the active-token set, but any
+    /// message with a `params.value.kind` (including `report`) bumps
+    /// `change_seq` and wakes waiters, restarting an in-flight quiet
+    /// period. Messages without a kind are ignored; a missing token
+    /// is bucketed under a `"<missing>"` placeholder.
     pub(super) async fn record(&self, message: &Value) {
         let Some(params) = message.get("params") else {
             return;
@@ -133,6 +178,9 @@ impl ProgressState {
         self.notify.notify_waiters();
     }
 
+    /// Log `rust-analyzer/serverStatus` notifications. Observability
+    /// only: the `quiescent` flag is not fed into the readiness
+    /// decision, which relies solely on `$/progress` bookkeeping.
     async fn record_server_status(&self, message: &Value) {
         let quiescent = message
             .get("params")
@@ -155,6 +203,14 @@ impl ProgressState {
         info!(health, "rust-analyzer workspace is quiescent");
     }
 
+    /// Resolve once the workspace load looks complete: at least one
+    /// progress `begin` has been observed and no tokens have been
+    /// active for a full, uninterrupted `quiet_period`.
+    ///
+    /// Any progress event landing during the quiet period (detected
+    /// via `change_seq`) restarts the wait. This never resolves if
+    /// the server emits no progress at all, so callers must bound it
+    /// with an overall timeout of their own.
     pub(super) async fn wait_for_quiescence(
         &self,
         quiet_period: Duration,
@@ -189,11 +245,15 @@ impl ProgressState {
     }
 }
 
+/// Reason `wait_for_quiescence` returned. Currently the only signal
+/// is `$/progress` quiescence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkspaceLoadComplete {
     ProgressQuiescence,
 }
 
+// LSP progress tokens may be integers or strings; normalize both to
+// a string key so they share one set.
 fn progress_token(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -211,6 +271,12 @@ fn is_server_status_notification(message: &Value) -> bool {
         && message.get("method").and_then(Value::as_str) == Some("rust-analyzer/serverStatus")
 }
 
+/// Build the reply for server-to-client requests this client
+/// supports.
+///
+/// Only `window/workDoneProgress/create` is handled; it is answered
+/// with a `null` result, matching the spec's void response. `None`
+/// means the message is not such a request and dispatch continues.
 fn server_request_response(message: &Value) -> Option<Value> {
     let id = message.get("id")?;
     let method = message.get("method")?.as_str()?;
@@ -224,6 +290,16 @@ fn server_request_response(message: &Value) -> Option<Value> {
     }))
 }
 
+/// Interpret `message` as a JSON-RPC response to one of our
+/// requests, returning the request id and outcome.
+///
+/// Anything carrying a `method` is a request or notification, never
+/// a response. Ids are matched as `u64` because that is the only id
+/// shape this client emits (`LspClient::next_id`); responses with
+/// any other id type yield `None` and are dropped. An `error` member
+/// missing the numeric `code` that JSON-RPC 2.0 requires degrades to
+/// `Error::Protocol`. A success response without a `result` member
+/// maps to `Value::Null`.
 pub(super) fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
     if message.get("method").is_some() {
         return None;
@@ -246,6 +322,8 @@ pub(super) fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
     ))
 }
 
+/// Fail every in-flight request waiter with a per-receiver copy of
+/// `err`, draining the pending map.
 async fn fail_pending(pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>, err: Error) {
     // Two shapes reach here:
     //

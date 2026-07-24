@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 /// 2. common Homebrew prefix variants
 /// 3. standard per-user binary directories
 /// 4. PATH search
+///
+/// `env_override` is the *name* of an environment variable whose
+/// value is the binary path. `None` means no source yielded an
+/// existing file.
 pub fn discover_lsp_binary(bare_name: &str, env_override: Option<&str>) -> Option<PathBuf> {
     discover_lsp_binary_candidates(&[bare_name], env_override)
 }
@@ -23,6 +27,10 @@ pub fn discover_lsp_binary(bare_name: &str, env_override: Option<&str>) -> Optio
 ///
 /// This is useful for servers whose wrapper name differs by installation
 /// source, such as `phpantom_lsp` vs `phpantom-lsp`.
+///
+/// Location takes priority over name: every candidate name is tried
+/// in one location before moving to the next location in the
+/// resolution order documented on `discover_lsp_binary`.
 pub fn discover_lsp_binary_candidates(
     bare_names: &[&str],
     env_override: Option<&str>,
@@ -37,6 +45,11 @@ pub fn discover_lsp_binary_candidates(
 }
 
 /// Find sourcekit-lsp using SOURCEKIT_LSP, xcrun, Homebrew prefixes, then PATH.
+///
+/// `SOURCEKIT_LSP` holds the binary path directly. The extra xcrun
+/// step exists because on macOS the binary lives inside the selected
+/// Xcode/Swift toolchain rather than in any of the generic
+/// locations.
 pub fn discover_sourcekit_lsp() -> Option<PathBuf> {
     if let Some(path) = env_path(std::env::var_os("SOURCEKIT_LSP")) {
         return Some(path);
@@ -53,6 +66,13 @@ pub fn discover_sourcekit_lsp() -> Option<PathBuf> {
     )
 }
 
+/// Testable core of discovery: every environment-derived input is
+/// passed in as a value.
+///
+/// Sources are tried in priority order and the first existing file
+/// wins. `env_value` is the override variable's value (a path); when
+/// it is set but does not point at an existing file, discovery falls
+/// through to the remaining sources instead of failing.
 fn discover_lsp_binary_candidates_with(
     bare_names: &[&str],
     env_value: Option<OsString>,
@@ -99,12 +119,17 @@ fn env_path(value: Option<OsString>) -> Option<PathBuf> {
     value.and_then(canonical_file)
 }
 
+/// If canonicalization fails, the original path is returned rather
+/// than discarding a usable binary. Executability is not checked;
+/// a non-executable file still matches.
 fn canonical_file(path: impl AsRef<Path>) -> Option<PathBuf> {
     let path = path.as_ref();
     path.is_file()
         .then(|| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
+// Default Homebrew prefixes: Apple silicon first, then Intel macOS.
+// `/usr/local` doubles as a conventional manual-install location.
 fn homebrew_prefixes() -> Vec<PathBuf> {
     ["/opt/homebrew", "/usr/local"]
         .into_iter()
@@ -112,6 +137,8 @@ fn homebrew_prefixes() -> Vec<PathBuf> {
         .collect()
 }
 
+// De facto standard per-user install locations, in priority order:
+// XDG-style ~/.local/bin, dotnet global tools, cargo install output.
 fn per_user_binary_dirs(home_dir: &Path) -> [PathBuf; 3] {
     [
         home_dir.join(".local").join("bin"),
