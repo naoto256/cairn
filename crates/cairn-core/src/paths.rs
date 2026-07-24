@@ -32,6 +32,9 @@ const APP_NAME: &str = "cairn";
 
 /// Resolved storage root. Constructed once at daemon startup and passed
 /// down to anything that needs to open a DB.
+///
+/// Serves the legacy per-snapshot layout only; the CAS layout is
+/// addressed through [`CasDataDir`] (see the module doc).
 #[derive(Debug, Clone)]
 pub struct DataDir {
     root: PathBuf,
@@ -165,6 +168,10 @@ impl CasDataDir {
 
     /// Top-level alias → repo index DB (sits next to `repos/`, not
     /// under it).
+    ///
+    /// This is the daemon-global index: one `index.db` maps aliases
+    /// across every registered repository, while per-repository facts
+    /// live in each repo's own `store.db`.
     #[must_use]
     pub fn index_db_path(&self) -> PathBuf {
         self.root.join("index.db")
@@ -175,6 +182,10 @@ impl CasDataDir {
 /// deliberately not cryptographic — it just needs to be consistent across
 /// runs and unlikely to collide for the ~hundreds of repositories one
 /// user actually registers.
+///
+/// No canonicalization happens here: callers must canonicalize first,
+/// or distinct spellings of the same path (symlinks, `..`, trailing
+/// slashes) would hash to different storage directories.
 #[must_use]
 pub fn path_hash(path: &Path) -> String {
     // 64-bit FNV-1a, hex-encoded. Pure Rust, deterministic, zero deps.
@@ -186,6 +197,11 @@ pub fn path_hash(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
+/// Allowlist mapping to a filesystem-safe file stem. Lossy: distinct
+/// branches such as `feature/x` and `feature_x` collide on disk. The
+/// original branch string in `registry.db` stays authoritative, and
+/// the legacy layout this feeds is being retired, so the collision
+/// risk is accepted.
 fn sanitize_branch_for_filename(branch: &str) -> String {
     branch
         .chars()
