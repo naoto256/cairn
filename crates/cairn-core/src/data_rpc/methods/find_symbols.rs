@@ -67,6 +67,11 @@ impl DataMethod for FindSymbols {
             },
             |hits| parser_id_filter(hits.iter().map(|(_, _, hit)| hit.parser_id.clone())),
             |out: &mut Vec<(String, String, SymbolHit)>| {
+                // Deterministic cross-repo ordering: named languages
+                // first (unknown sinks to the end), then path → line
+                // → repo → qualified. Sorting by path before repo
+                // keeps hits from the same file adjacent even when
+                // several repos contribute overlapping paths.
                 out.sort_by(|(repo_a, _, a), (repo_b, _, b)| {
                     language_sort_key(a.language.as_deref())
                         .cmp(&language_sort_key(b.language.as_deref()))
@@ -161,6 +166,10 @@ fn into_wire_hit(repo: &str, anchor: &str, h: SymbolHit, signature_only: bool) -
     }
 }
 
+/// Sort key that keeps named languages ahead of `None` (unknown /
+/// unindexed language). The leading `bool` acts as the primary key
+/// — `false < true` — so a language-tagged hit sorts before an
+/// untagged one; secondary comparison is the language name itself.
 fn language_sort_key(language: Option<&str>) -> (bool, &str) {
     match language {
         Some(lang) => (false, lang),

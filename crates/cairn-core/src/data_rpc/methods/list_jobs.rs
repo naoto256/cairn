@@ -1,4 +1,19 @@
 //! `list_jobs` — read-only background analyzer job inventory for MCP/data clients.
+//!
+//! Rows come from `workspace_analysis_runs`. A run enters the
+//! inventory only if it (a) carries a scheduler-assigned `job_id`
+//! and (b) is attached to a manifest that at least one live anchor
+//! still resolves — orphan rows left behind by anchor deletion do
+//! not surface here.
+//!
+//! Scope selection is one-of alias (via `args.scope.repo`) or
+//! unscoped-all. Under unscoped enumeration the loop walks
+//! [`cas_registry::list_all`], which returns one row per alias
+//! rather than per repository: a repository with N aliases has its
+//! jobs collected N times. Lifecycle handling also splits by that
+//! mode — an unscoped call skips a Removing owner and reports
+//! `partial_truncated("repo_unavailable")`; a scoped call lets the
+//! typed `RepositoryUnavailable` error propagate.
 
 use cairn_proto::methods::{JobEntry, ListJobsArgs, ListJobsResult};
 use linkme::distributed_slice;
@@ -29,6 +44,8 @@ impl DataMethod for ListJobs {
         let (jobs, capped, skipped_unavailable) =
             tokio::task::spawn_blocking(move || -> Result<(Vec<_>, bool, bool)> {
                 let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+                // Scoped calls surface a Removing owner as a typed error;
+                // unscoped calls skip it and set `partial_truncated`.
                 let enumerate_all = args.scope.repo.is_none();
                 let entries = match args.scope.repo.as_deref() {
                     Some(alias) => {
@@ -44,6 +61,9 @@ impl DataMethod for ListJobs {
                 };
                 let mut out = Vec::new();
                 let mut skipped_unavailable = false;
+                // `list_all` yields one row per alias; repositories with
+                // multiple aliases have their job rows collected once per
+                // alias without deduplication.
                 for entry in entries {
                     let _lease = match &lifecycle {
                         Some(lifecycle) if enumerate_all => {
@@ -67,6 +87,8 @@ impl DataMethod for ListJobs {
                         args.include_terminal,
                     )?);
                 }
+                // Newest job first; the limit below is a post-sort cap,
+                // not a paging cursor.
                 out.sort_by_key(|job| std::cmp::Reverse(job.job_id));
                 let capped = if let Some(limit) = args.pagination.limit {
                     let limit = limit as usize;
@@ -86,6 +108,10 @@ impl DataMethod for ListJobs {
 
         Ok(serde_json::to_value(ListJobsResult {
             jobs,
+            // Completeness precedence: an unavailable-owner skip wins
+            // over a cap-truncation because "we dropped an unknown
+            // amount" is a stronger claim than "we dropped the tail
+            // past `limit`".
             completeness: if skipped_unavailable {
                 cairn_proto::Completeness::partial_truncated("repo_unavailable")
             } else if capped {
@@ -99,6 +125,14 @@ impl DataMethod for ListJobs {
     }
 }
 
+/// Load one repository's workspace-analyzer job rows.
+///
+/// Only rows with `job_id IS NOT NULL` and whose `manifest_id` is
+/// still reachable from a live anchor are considered — pre-job runs
+/// (no scheduler id) and orphan runs from deleted anchors are
+/// excluded. `include_terminal=false` narrows the row set to
+/// `queued`/`running`; `state`, when set, further restricts to that
+/// exact status label.
 fn collect_jobs(
     conn: &rusqlite::Connection,
     alias: &str,
@@ -129,10 +163,21 @@ fn collect_jobs(
     }
 }
 
+/// Materialise one row into the wire `JobEntry`.
+///
+/// `state` and `scheduler_state` currently share the same DB status
+/// column — the split exists in the wire type for a future
+/// scheduler-visible view. `queued_ms`, `pool_wait_ms`,
+/// `progress_ticks`, `pool_group`, and `rate` are placeholders
+/// because the store does not yet record scheduler-side timing or
+/// pool assignment.
 fn job_entry(alias: &str, r: &rusqlite::Row<'_>) -> rusqlite::Result<JobEntry> {
     let status: String = r.get(2)?;
     let started_at: i64 = r.get(3)?;
     let finished_at: Option<i64> = r.get(4)?;
+    // ns → ms with fail-soft: an unfinished row, a clock skew making
+    // finish < start, or an overflowing i64→u64 conversion all fall
+    // back to 0 rather than surfacing as an error.
     let run_ms = finished_at
         .and_then(|finished| finished.checked_sub(started_at))
         .and_then(|delta| u64::try_from(delta / 1_000_000).ok())

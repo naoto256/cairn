@@ -1,3 +1,16 @@
+//! `get_symbol_source_rows` — resolve a qualified name to the
+//! physical declarations that render its source span.
+//!
+//! Reads directly from Tier-1 `symbols`; no resolution-layer join.
+//! Because multiple parser rows can describe the same physical
+//! declaration (e.g. a base tree-sitter parse plus a Tier-2 native
+//! enricher covering the same byte range), the CTE deduplicates by
+//! `(path, blob_sha, byte_start, byte_end)` via `ROW_NUMBER()` and
+//! picks a canonical metadata row per physical declaration. The
+//! output is stable across processes because both the intra-tuple
+//! tiebreak (`parser_id COLLATE BINARY ASC, symbols.id ASC`) and the
+//! outer ORDER BY are total on the persisted columns — see the tests
+//! at the end of this module.
 use cairn_proto::common::SymbolKind;
 use rusqlite::{Connection, ToSql};
 
@@ -53,6 +66,14 @@ pub fn get_symbol_source_rows(
             name: anchor.as_str().to_string(),
         })?;
 
+    // `ranked` numbers rows within each physical declaration tuple
+    // (path, blob_sha, byte_start, byte_end). The BINARY collation on
+    // `parser_id` avoids locale sensitivity so the winner is stable
+    // across environments; `symbols.id ASC` breaks ties when the same
+    // parser wrote the tuple twice (rare but possible on partial
+    // reindex). The `qualified = ?2` filter rides
+    // `idx_symbols_qualified`, so per-lookup work is proportional to
+    // matching rows rather than the whole table.
     let mut sql = String::from(
         "WITH ranked AS (
              SELECT s.id AS symbol_id, s.name, s.kind, s.signature, s.doc,
@@ -79,6 +100,16 @@ pub fn get_symbol_source_rows(
         sql.push_str(" AND s.line_start = ?");
         bound.push(Box::new(i64::from(line)));
     }
+    // `physical_rank = 1` keeps one canonical row per physical
+    // declaration. The outer ORDER BY is total across
+    // (path, line_start, byte_start, byte_end, blob_sha) — every
+    // physical declaration is uniquely keyed by
+    // (path, blob_sha, byte_start, byte_end), so appending line_start
+    // and blob_sha ensures a stable page ordering even when a caller
+    // is iterating overloaded / re-exported names that share a line
+    // but land in different byte ranges. `LIMIT limit.max(1)`
+    // promotes a caller-supplied 0 to 1 so `LIMIT 0` (SQLite: no
+    // rows) never reaches the planner.
     sql.push_str(
         ")
          SELECT symbol_id, name, kind, signature, doc,

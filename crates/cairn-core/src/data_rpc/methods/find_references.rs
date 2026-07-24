@@ -96,6 +96,12 @@ impl DataMethod for FindReferences {
             tier3_status: &tier3_status,
             query_args: QueryArgsView {
                 repo: args.scope.repo.as_deref(),
+                // `fuzzy: true` suppresses the try-fuzzy empty-result
+                // hint: `find_references` matches by symbol name
+                // without a fuzzy toggle to flip. `direction` is
+                // reported true only when the caller picked a
+                // non-`Incoming` direction, which lets the shared
+                // relax-filter hint suggest dropping it.
                 fuzzy: true,
                 kind: args.kind.is_some(),
                 container: None,

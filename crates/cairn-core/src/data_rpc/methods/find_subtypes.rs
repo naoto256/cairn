@@ -105,6 +105,10 @@ impl DataMethod for FindSubtypes {
 #[distributed_slice(DATA_METHODS)]
 static REGISTER: fn() -> Box<dyn DataMethod> = || Box::new(FindSubtypes);
 
+/// Projection to the wire `ImplHit`. Shared with `find_supertypes`:
+/// both directions produce the same envelope, and the type on which
+/// side of the impl edge the caller pinned is inferred from which
+/// method emitted the row (this projection does not swap sides).
 pub(super) fn into_wire_hit(repo: &str, anchor: &str, h: QueryHit) -> ImplHit {
     ImplHit {
         type_qualified: h.type_qualified,

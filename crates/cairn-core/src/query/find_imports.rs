@@ -69,6 +69,9 @@ pub fn find_imports(
         anchor::resolve(conn, anchor)?.ok_or_else(|| crate::Error::AnchorNotFound {
             name: anchor.as_str().to_string(),
         })?;
+    // Default page of 200 (imports tend to have higher per-file cardinality
+    // than impl edges). `.max(1)` prevents a caller-supplied `Some(0)`
+    // from emitting `LIMIT 0`, which SQLite reads as "no rows".
     let limit = args.limit.unwrap_or(200).max(1);
 
     // Best-resolution CTE mirrors find_impls.rs verbatim: rank
@@ -77,6 +80,12 @@ pub fn find_imports(
     // `source_rank_case_sql`, then keep only `rn = 1`. The
     // `kind = 'import'` filter excludes the type / call sites that
     // share the same byte-range key space in `resolutions`.
+    //
+    // The `(manifest_id = ?1 OR manifest_id IS NULL)` filter and the
+    // manifest-first ORDER BY tie-break implement the v11 dual
+    // scoping already spelled out on `find_impls`; here it is the
+    // two partial indexes (`idx_resolutions_manifest_site` and
+    // `idx_resolutions_blob_scoped_site`) that cover each branch.
     let source_rank = source_rank_case_sql("source");
     let mut sql = format!(
         "WITH best_resolution AS (

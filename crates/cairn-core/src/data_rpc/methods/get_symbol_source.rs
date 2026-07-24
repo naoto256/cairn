@@ -25,10 +25,26 @@ use crate::{Error, Result};
 
 pub struct GetSymbolSource;
 
+/// Cap on the candidate list included in the ambiguity error the
+/// wire type carries back to the caller.
 const AMBIGUITY_CANDIDATE_LIMIT: usize = 20;
+/// Row cap passed to [`query_one_or_all_snapshots`] as the
+/// effective limit — one past `AMBIGUITY_CANDIDATE_LIMIT` so the
+/// helper can detect that the ambiguity list itself was
+/// truncated.
 const EXECUTION_CANDIDATE_LIMIT: u32 = (AMBIGUITY_CANDIDATE_LIMIT + 1) as u32;
+/// Cap the per-store query asks SQLite for — two past
+/// `AMBIGUITY_CANDIDATE_LIMIT` so that after dedup in
+/// [`finalize_source_hits`] the caller still has enough rows to
+/// prove the "more than we return" claim without loading the
+/// whole result set.
 const STORE_CANDIDATE_PROBE_LIMIT: usize = AMBIGUITY_CANDIDATE_LIMIT + 2;
 
+/// One physical declaration returned by a snapshot query, with
+/// enough metadata to feed both [`finalize_source_hits`] dedup and
+/// [`materialise`]. `repo` is the alias the caller reached this
+/// row through; `repo_hash` and `manifest_id` are the dedup keys
+/// so two aliases for the same repository do not double-count.
 struct SourceHit {
     repo: String,
     repo_hash: String,
@@ -59,6 +75,9 @@ impl DataMethod for GetSymbolSource {
 
     async fn dispatch(&self, ctx: &DataCtx, params: Value) -> Result<Value> {
         let args: GetSymbolSourceArgs = parse_params(params)?;
+        // Argument gate. `qualified` is required, `line` is
+        // 1-indexed and only meaningful together with `file` so
+        // the store query can narrow by exact position.
         if args.qualified.trim().is_empty() {
             return Err(Error::InvalidArgument(
                 "get_symbol_source: `qualified` must be non-empty".into(),
@@ -122,6 +141,12 @@ impl DataMethod for GetSymbolSource {
 
         let freshness_issues = execution.freshness_issues;
         let mut hits = execution.items;
+        // Two or more physical declarations = ambiguous; report the
+        // candidate list before doing any file IO so the caller can
+        // disambiguate with `file` (and optionally `line`) on the
+        // next call. `candidates_truncated` is true when either the
+        // execution helper hit its own cap or the deduped list is
+        // still longer than the wire cap.
         if hits.len() > 1 {
             let candidates_truncated = execution.capped || hits.len() > AMBIGUITY_CANDIDATE_LIMIT;
             hits.truncate(AMBIGUITY_CANDIDATE_LIMIT);
@@ -132,6 +157,14 @@ impl DataMethod for GetSymbolSource {
             });
         }
         let Some(hit) = hits.pop() else {
+            // Zero hits split by cause. If the snapshot helper
+            // recorded a freshness issue, the miss is attributed to
+            // that (stale reconcile state or a file absent from the
+            // manifest) — `file`-scoped calls become the typed
+            // `FileNotIndexed`, whole-repo calls become
+            // `SnapshotStale`. The synthetic `*` repo marker means
+            // "no registered repo satisfied the exact-file guard"
+            // and is stripped from the typed error.
             if let Some(issue) = freshness_issues.first() {
                 let repo = (issue.repo != "*").then(|| issue.repo.clone());
                 return match args.file.clone() {
@@ -146,6 +179,10 @@ impl DataMethod for GetSymbolSource {
                     }),
                 };
             }
+            // Fresh snapshots that simply do not carry the symbol
+            // keep the legacy `InvalidArgument` contract — callers
+            // (and older CLI adapters) distinguish "no such symbol"
+            // from "index is stale" by this error variant.
             let scope = requested_repo
                 .as_deref()
                 .map(|name| format!("repo=`{name}`"))
@@ -178,6 +215,9 @@ impl DataMethod for GetSymbolSource {
         let (diagnostics, hints) =
             build_snapshot_aware_feedback(&emission_ctx, &freshness_issues, execution.capped);
         let row = hit.row;
+        // `signature_only` skips the blob read entirely: the caller
+        // only wants metadata and the signature already recorded on
+        // the row.
         let source = if args.signature_only {
             String::new()
         } else {
@@ -210,6 +250,17 @@ impl DataMethod for GetSymbolSource {
     }
 }
 
+/// Deterministic sort followed by physical-declaration dedup.
+///
+/// Sort key is `(repo, anchor, path, line_start, byte range,
+/// blob_sha)` so retries observe the same ordering. The dedup key
+/// is `(repo_hash, manifest_id, path, blob_sha, byte range)`:
+/// multiple aliases for the same repository share `repo_hash` and
+/// `manifest_id`, so an alias-fanout in the enumeration collapses
+/// to one row here. The `repo` display alias may still differ
+/// across rows for the same physical declaration when several
+/// separate repositories carry byte-identical files — those are
+/// intentionally kept because they are genuinely different sources.
 fn finalize_source_hits(hits: &mut Vec<SourceHit>) {
     hits.sort_by(|left, right| {
         (
@@ -256,6 +307,20 @@ fn materialise(
     worktree_root: &std::path::Path,
     row: &SymbolSourceRow,
 ) -> Result<String> {
+    // Blob-load error taxonomy:
+    // - `WorktreeBlobMismatch`: the worktree file exists but its
+    //   SHA no longer matches the indexed blob, i.e. an on-disk
+    //   edit that the reconcile machinery has not caught yet.
+    //   Report as `FileNotIndexed` so the caller retries after
+    //   reindex; deliberately do NOT expose `worktree_root` in the
+    //   message because the path is private to the daemon.
+    // - `InvalidBlobSha`: the persisted `blob_sha` is not a 40-hex
+    //   string, so no git or worktree lookup can even be attempted;
+    //   a valid SHA whose git object lookup fails still falls
+    //   through to the worktree fallback below.
+    // - `WorktreeRead`: the worktree fallback read itself failed.
+    // Both fold to `InvalidArgument` because the fix is the same
+    // (reindex).
     let bytes = load_blob_or_verified_worktree(worktree_root, &row.blob_sha, &row.path).map_err(
         |err| match err {
             BlobLoadError::WorktreeBlobMismatch => Error::FileNotIndexed {
@@ -271,6 +336,11 @@ fn materialise(
             }
         },
     )?;
+    // Guard against a persisted byte range that does not address
+    // valid bytes in the returned blob. A replaced blob would have
+    // surfaced earlier as `WorktreeBlobMismatch`; reaching this
+    // point means the persisted offsets and the indexed blob
+    // disagree (parser/store corruption, or a stale bad fact).
     if row.byte_end > bytes.len() || row.byte_start > row.byte_end {
         return Err(Error::InvalidArgument(format!(
             "get_symbol_source: blob {} shorter than indexed byte range ({}..{} vs {} bytes); reindex needed",
