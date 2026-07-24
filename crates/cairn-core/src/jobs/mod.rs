@@ -42,10 +42,20 @@ use scheduler::{SchedulerMsg, scheduler_loop};
 #[cfg(test)]
 use scheduler::JobScheduler;
 
+/// Externally visible job identifier (surfaced by `jobs list` /
+/// `jobs cancel`). Allocated from the daemon-global monotonic
+/// allocator on [`JobManager`]; ids retired as ambiguous by
+/// `restore_from_db` are tombstoned in `index.db` and never reused.
 pub type JobId = i64;
 
+/// Hard ceiling on concurrent analyzer worker tasks. Applies both to
+/// the automatic sizing in `fallback_worker_concurrency` and to
+/// `CAIRN_WORKER_CONCURRENCY` overrides (larger values are clamped).
 const MAX_WORKER_CONCURRENCY: usize = 8;
 
+/// Acknowledgement for one analyzer run accepted by the enqueue
+/// path. `state` is the `RunStatus` string persisted on the run row
+/// — always `"queued"` at enqueue time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueuedAnalyzerJob {
     pub job_id: JobId,
@@ -53,6 +63,17 @@ pub struct QueuedAnalyzerJob {
     pub state: String,
 }
 
+/// One `jobs list` row for a single analyzer run.
+///
+/// `job_id`, `analyzer_id`, `state`, `finished_at` and `error`
+/// come from the durable `workspace_analysis_runs` row; `alias` is
+/// supplied by the caller's registry lookup, `created_at` carries
+/// the row's `started_at_ns`, and `started_at` is always `None` on
+/// this path. The fields from `pool_group`
+/// onward are runtime-only scheduler metrics filled in by
+/// `JobRuntimeMetricsStore::decorate`; they stay `None` for jobs
+/// that predate the current daemon process, because the metrics
+/// store is in-memory only and not persisted across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobSnapshot {
     pub job_id: JobId,
@@ -75,18 +96,31 @@ pub struct JobSnapshot {
     pub progress_per_minute: Option<f64>,
 }
 
+/// Listing knobs for `JobManager::jobs`. With `include_all` unset,
+/// the listing covers only runs whose manifest is referenced by a
+/// current anchor and collapses history to active runs plus the
+/// latest terminal run per analyzer; `limit` truncates after the
+/// global newest-first (descending `job_id`) sort.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct JobListOptions {
     pub(crate) include_all: bool,
     pub(crate) limit: Option<usize>,
 }
 
+/// Outcome of `JobManager::cancel`. `cancelled == true` only when a
+/// queued row was flipped to `cancelled` on the spot. A running job
+/// yields `cancelled == false` with `cancel_requested` set — the
+/// analyzer stops cooperatively at its next checkpoint, so the
+/// cancel's completion is not observed here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CancelResult {
     pub cancelled: bool,
     pub reason: String,
 }
 
+/// Aggregate result of `JobManager::prune_jobs`: per-repo breakdown
+/// plus totals. On a dry run the counts report what *would* be
+/// deleted; nothing is removed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobsPruneSummary {
     pub repos: Vec<JobsPruneRepoSummary>,
@@ -94,6 +128,10 @@ pub struct JobsPruneSummary {
     pub total_deleted_index_entries: u64,
 }
 
+/// Per-repository slice of a prune pass. `deleted_runs_count` counts
+/// orphan terminal run rows (terminal status, manifest no longer
+/// referenced by any anchor); `deleted_index_entries_count` counts
+/// the matching in-memory `JobIndex` locators dropped with them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobsPruneRepoSummary {
     pub alias: String,
@@ -101,6 +139,10 @@ pub struct JobsPruneRepoSummary {
     pub deleted_index_entries_count: u64,
 }
 
+// In-memory dispatch payload for one analyzer run, carried from
+// enqueue through the scheduler to a worker. Snapshots everything
+// the worker needs (store path, repo root, identity) so the run
+// does not depend on registry lookups at dispatch time.
 #[derive(Debug, Clone)]
 struct Job {
     id: JobId,
@@ -112,6 +154,11 @@ struct Job {
     analyzer_id: String,
 }
 
+// Fully-stamped internal enqueue request consumed by
+// `queue_analyzer_run`. Unlike the public `EnqueueAnalyzerRun`, the
+// run-row stamp (`job_id`, `analyzer_revision`, `config_hash`,
+// `pool_group`) has already been derived inside `JobManager`, so
+// this type never crosses the crate boundary.
 struct QueueAnalyzerRun<'a> {
     conn: &'a mut Connection,
     alias: &'a str,
@@ -126,6 +173,10 @@ struct QueueAnalyzerRun<'a> {
     pool_group: Option<&'static str>,
 }
 
+// Scheduler-to-worker message. `pool_group` and `key` are echoed
+// back in `SchedulerMsg::WorkerFinished` so the scheduler frees the
+// pool-group slot and releases the tracked de-dup key exactly when
+// the worker is done with them.
 #[derive(Debug)]
 struct DispatchJob {
     job: Job,
@@ -148,6 +199,11 @@ struct JobKey {
     analyzer_id: String,
 }
 
+// State guarded by `JobManager::admission` (see that field's doc
+// for the lock's linearization role). `accepting` flips to false in
+// `begin_shutdown` and never back; `active_progress` holds the
+// cancellation handle of every currently running job so shutdown
+// and `cancel` can reach in-flight analyzer work.
 struct JobAdmissionState {
     accepting: bool,
     active_progress: HashMap<JobId, AnalyzerProgress>,
@@ -283,6 +339,11 @@ pub struct EnqueueAnalyzerRun<'a> {
 }
 
 impl JobManager {
+    /// Acquire a lifecycle lease for `repo_hash` when a lifecycle
+    /// manager is wired. `Ok(None)` means this manager was built
+    /// without lifecycle ownership ([`Self::new`]) and no admission
+    /// gating applies; `Err` propagates the lifecycle refusal (e.g.
+    /// the repository is removed or being removed).
     pub(crate) fn acquire_repository_lease(
         &self,
         repo_hash: &str,
@@ -293,6 +354,9 @@ impl JobManager {
             .transpose()
     }
 
+    /// Build a manager without lifecycle ownership; every place that
+    /// consults `lifecycle` skips repository admission gating.
+    /// Callers that need gating use [`Self::with_lifecycle`].
     #[must_use]
     pub fn new(cas_data_dir: Arc<CasDataDir>) -> Arc<Self> {
         Self::build(cas_data_dir, None)
@@ -443,6 +507,10 @@ impl JobManager {
         }
     }
 
+    /// Spawn the worker tasks and the scheduler task. Intended to be
+    /// called once at daemon startup: the scheduler receiver is
+    /// consumed on the first call, so a second call would only add
+    /// worker tasks and never start another scheduler.
     pub fn start_workers(self: &Arc<Self>) {
         let workers = worker_concurrency();
         for _ in 0..workers {
@@ -553,6 +621,16 @@ impl JobManager {
         })
     }
 
+    /// Enqueue one analyzer run per analyzer supplied by the
+    /// register path. Ids come from one contiguous block of the
+    /// daemon-global allocator; the returned vec contains only the
+    /// jobs actually queued (requests coalesced by the de-dup /
+    /// tracked-keys gate are omitted).
+    ///
+    /// # Errors
+    /// [`Error::JobManagerShuttingDown`] once `begin_shutdown` has
+    /// closed admission; otherwise SQLite errors from the run-row
+    /// writes.
     pub fn enqueue_reindex(&self, request: EnqueueReindex<'_>) -> Result<Vec<QueuedAnalyzerJob>> {
         let EnqueueReindex {
             conn,
@@ -672,6 +750,10 @@ impl JobManager {
         &self,
         request: QueueAnalyzerRun<'_>,
     ) -> Result<Option<QueuedAnalyzerJob>> {
+        // The admission lock is held from here across the durable row
+        // write and the memory enqueue below, so `begin_shutdown`
+        // (which takes the same lock) cannot interleave between "row
+        // committed" and "job visible to the scheduler".
         let admission = self.admission.lock().expect("job admission lock poisoned");
         if !admission.accepting {
             return Err(Error::JobManagerShuttingDown);
@@ -739,6 +821,10 @@ impl JobManager {
             analyzer_id: analyzer_id.to_string(),
         });
         if !enqueued {
+            // The scheduler channel was unavailable: release the
+            // de-dup key so the durable `queued` row is not shadowed.
+            // The row stays on disk and the next `restore_from_db`
+            // re-advertises it to the memory queue.
             self.tracked_keys.release(&key);
         }
         drop(admission);
@@ -749,6 +835,17 @@ impl JobManager {
         }))
     }
 
+    /// Cancel one job by its externally visible id. Resolution
+    /// order: durable ambiguous-id tombstone (authoritative reject),
+    /// then the `JobIndex` fast path, then a full per-store scan.
+    /// The scan uses lifecycle enumeration gating, so a repository
+    /// that refuses a lease (e.g. Removing) is skipped rather than
+    /// failing the whole cancel.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] (`unknown job id`) when the id is
+    /// tombstoned or matches no store row; SQLite / registry errors
+    /// otherwise.
     pub fn cancel(&self, job_id: JobId) -> Result<CancelResult> {
         // Check the durable ambiguous-id tombstone *first*. Callers
         // holding a `JobId` that was retired by a prior
@@ -818,6 +915,11 @@ impl JobManager {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
+        // Queued rows are flipped terminal immediately; running rows
+        // only get the cooperative flag plus a progress-handle cancel
+        // and reach `cancelled` once the worker observes the request.
+        // The returned count therefore includes running jobs that are
+        // merely marked, not yet finished.
         for (job_id, status) in &rows {
             if status == RunStatus::Queued.as_str() {
                 conn.execute(
@@ -838,6 +940,12 @@ impl JobManager {
         Ok(rows.len())
     }
 
+    /// Try to cancel `job_id` inside one store. `Ok(None)` means the
+    /// id has no row here (or the persisted status string is
+    /// unrecognized) and the caller should keep scanning. Queued
+    /// rows are flipped durably; running rows only get
+    /// `cancel_requested` plus a progress-handle cancel; terminal
+    /// rows report their state without change.
     fn cancel_in_store(&self, conn: &Connection, job_id: JobId) -> Result<Option<CancelResult>> {
         let row: Option<(String, i64, String)> = conn
             .query_row(
@@ -892,6 +1000,11 @@ impl JobManager {
         Ok(Some(result))
     }
 
+    /// Drain the pipeline within `drain_timeout`: close admission
+    /// and cancel active runs (`begin_shutdown`), stop the
+    /// scheduler, drop the worker channel, and join every worker.
+    /// On timeout the remaining tasks are abandoned with a warning;
+    /// their completion is then left to process exit.
     pub async fn shutdown(&self, drain_timeout: Duration) {
         self.begin_shutdown();
         test_observe_job_manager_drain();
@@ -952,6 +1065,9 @@ impl JobManager {
 
     fn register_active_progress(&self, job_id: JobId, progress: AnalyzerProgress) {
         let mut admission = self.admission.lock().expect("job admission lock poisoned");
+        // A run registering after `begin_shutdown` already closed
+        // admission is cancelled on the spot, so a late registration
+        // cannot miss the shutdown cancellation sweep.
         if !admission.accepting {
             progress.cancel();
         }
@@ -978,6 +1094,11 @@ impl JobManager {
             .remove(&job_id);
     }
 
+    /// Hand a job to the scheduler task. Returns `false` when the
+    /// scheduler channel is unavailable (shutdown took the sender,
+    /// or the scheduler task is gone); the caller is responsible
+    /// for releasing the tracked key in that case. The `JobIndex`
+    /// locator is inserted only after a successful send.
     fn enqueue_memory(&self, job: Job) -> bool {
         let sender = self
             .scheduler_sender
@@ -1032,6 +1153,9 @@ fn test_observe_job_manager_drain() {
 #[cfg(not(test))]
 fn test_observe_job_manager_drain() {}
 
+// Test-only hooks letting shutdown-ordering tests observe when
+// `begin_shutdown` first closes admission and when `shutdown`
+// starts its drain.
 #[cfg(test)]
 pub(crate) static JOB_MANAGER_SHUTDOWN_OBSERVER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     Mutex::new(None);
@@ -1040,6 +1164,11 @@ pub(crate) static JOB_MANAGER_SHUTDOWN_OBSERVER: Mutex<Option<Box<dyn Fn() + Sen
 pub(crate) static JOB_MANAGER_DRAIN_OBSERVER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     Mutex::new(None);
 
+/// Resolve an analyzer id to its serialization pool group via the
+/// linked-in registry. `Ok(None)` is a known analyzer without a
+/// pool group (freely parallel); `Err` is an unknown id — the
+/// scheduler downgrades that to an unpooled dispatch with a warning
+/// rather than dropping the job.
 fn pool_group_for_analyzer_id(analyzer_id: &str) -> Result<Option<&'static str>> {
     all_workspace_analyzers()
         .into_iter()
@@ -1058,6 +1187,10 @@ impl JobManager {
     }
 }
 
+/// Wall-clock nanoseconds since the Unix epoch. Saturating: a clock
+/// before the epoch yields 0 and an out-of-range duration yields
+/// `i64::MAX`. Not monotonic — the job-id allocator enforces its
+/// own monotonicity via floors instead of relying on this clock.
 fn now_ns() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -1068,16 +1201,24 @@ fn now_ns() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// Millisecond delta between two `now_ns`-style stamps. `None` when
+/// `end_ns < start_ns` (wall clock went backwards between stamps)
+/// or the subtraction overflows.
 fn duration_ms(start_ns: i64, end_ns: i64) -> Option<u64> {
     let delta = end_ns.checked_sub(start_ns)?;
     u64::try_from(delta / 1_000_000).ok()
 }
 
+/// Worker-pool size: `CAIRN_WORKER_CONCURRENCY` when set to a
+/// positive integer (clamped to `MAX_WORKER_CONCURRENCY`),
+/// otherwise the automatic fallback.
 fn worker_concurrency() -> usize {
     let env_value = std::env::var("CAIRN_WORKER_CONCURRENCY").ok();
     worker_concurrency_from_env_value(env_value.as_deref(), fallback_worker_concurrency)
 }
 
+/// Testable core of `worker_concurrency`. Unparsable or zero env
+/// values fall through to `fallback` rather than erroring.
 fn worker_concurrency_from_env_value(
     env_value: Option<&str>,
     fallback: impl FnOnce() -> usize,
@@ -1101,6 +1242,8 @@ fn worker_concurrency_from_env_value(
     fallback()
 }
 
+/// Automatic sizing: half the available parallelism, clamped to
+/// `[1, MAX_WORKER_CONCURRENCY]`; 1 when parallelism is unknown.
 fn fallback_worker_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)

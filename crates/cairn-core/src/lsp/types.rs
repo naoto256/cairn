@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{Error, Result};
 
+/// Minimal URI newtype (this module deliberately avoids a full
+/// `url` crate dependency).
+///
+/// Only [`Url::from_file_path`] validates its input; the `From`
+/// string conversions and `Deserialize` accept any string because
+/// server-supplied URIs are passed through verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Url(String);
 
@@ -31,6 +37,9 @@ impl Url {
     }
 }
 
+// Unchecked conversions for URIs already in wire form. No
+// validation: the value is trusted as received from the server or
+// as written by the caller.
 impl From<&str> for Url {
     fn from(value: &str) -> Self {
         Self(value.to_string())
@@ -44,6 +53,10 @@ impl From<String> for Url {
 }
 
 /// Zero-based LSP position.
+///
+/// Per the LSP spec, `character` counts UTF-16 code units by
+/// default; this client does not negotiate a `positionEncoding`
+/// during `initialize`, so that default applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     pub line: u32,
@@ -57,6 +70,9 @@ pub struct Range {
     pub end: Position,
 }
 
+/// A resolved definition target in caller-facing form.
+/// `LocationLink` replies are collapsed into this type by
+/// `parse_definition_result`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Location {
@@ -64,6 +80,11 @@ pub struct Location {
     pub range: Range,
 }
 
+/// Wire shape for servers answering `textDocument/definition`
+/// with `LocationLink[]` (the client advertises `linkSupport`).
+/// When collapsing to [`Location`], `target_selection_range` (the
+/// symbol name itself) is preferred over `target_range` (the whole
+/// declaration).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct LocationLink {
@@ -72,6 +93,9 @@ pub(super) struct LocationLink {
     pub(super) target_selection_range: Option<Range>,
 }
 
+/// Percent-encode every byte outside RFC 3986 "unreserved" plus
+/// `/`, which stays literal as the path separator. Encoding is
+/// byte-wise, so multi-byte UTF-8 sequences are escaped per byte.
 fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {

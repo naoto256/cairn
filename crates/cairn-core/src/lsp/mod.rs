@@ -7,6 +7,9 @@
 
 mod client;
 mod error;
+// `pool` stays a public module (not curated re-exports): tier-3
+// language crates configure spawning through its `LspSpawnSpec`,
+// `AvailabilityStrategy`, and `ReadinessStrategy` types directly.
 pub mod pool;
 mod reader;
 mod transport;

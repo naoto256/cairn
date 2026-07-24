@@ -1,6 +1,14 @@
 use super::*;
 
 impl JobManager {
+    /// One worker task. All workers compete for dispatches on the
+    /// shared receiver (serialized by the async mutex); the loop
+    /// ends when the dispatch channel closes during shutdown. A
+    /// failed run is logged and the loop continues — and
+    /// `notify_worker_finished` is sent on success *and* failure so
+    /// the scheduler frees the worker slot, pool-group slot, and
+    /// tracked de-dup key in either outcome (the notify itself is
+    /// best-effort and may be dropped during shutdown).
     pub(super) async fn worker_loop(self: Arc<Self>) {
         loop {
             let dispatch = {
@@ -26,6 +34,10 @@ impl JobManager {
     }
 
     async fn run_job(&self, dispatch: DispatchJob) -> Result<()> {
+        // Hold a lifecycle lease (when wired) for the whole run so
+        // repository removal cannot proceed underneath the analyzer;
+        // the lease moves into the blocking task and is dropped when
+        // the run returns.
         let lease = self
             .lifecycle
             .as_ref()
@@ -38,15 +50,27 @@ impl JobManager {
             crate::workspace_analyzer::AnalyzerProgress::with_observer(Arc::new(move |ticks| {
                 progress_metrics.mark_progress(job_id, ticks);
             }));
+        // Register the progress handle before the blocking run starts
+        // so `begin_shutdown` / `cancel` can reach this job; if
+        // admission is already closed, registration cancels the
+        // handle immediately and the run below observes it at its
+        // first cancellation check.
         self.register_active_progress(job_id, progress.clone());
         let joined = tokio::task::spawn_blocking(move || {
             run_job_blocking(dispatch.job, runtime_metrics, progress, lease)
         })
         .await;
         self.unregister_active_progress(job_id);
+        // A panic inside the blocking task surfaces as a JoinError
+        // and is converted to an internal error instead of unwinding
+        // through the worker loop.
         joined.map_err(|e| Error::internal_task_panic("analyzer job", e))?
     }
 
+    /// Report a finished dispatch back to the scheduler so it frees
+    /// the worker slot / pool group and releases the tracked key.
+    /// Best-effort: during shutdown the sender may already be taken
+    /// or the scheduler gone, and the send is dropped silently.
     fn notify_worker_finished(&self, job_id: JobId, pool_group: Option<&'static str>, key: JobKey) {
         let sender = self
             .scheduler_sender
@@ -61,6 +85,9 @@ impl JobManager {
         }
     }
 
+    /// Tell the scheduler a queued job was cancelled so it is
+    /// dropped from the pending lanes before dispatch. Best-effort,
+    /// same as `notify_worker_finished`.
     pub(super) fn notify_cancelled_job(&self, job_id: JobId) {
         let sender = self
             .scheduler_sender
@@ -72,6 +99,11 @@ impl JobManager {
     }
 }
 
+/// Synchronous body of one analyzer run, executed on the blocking
+/// pool. Re-reads the durable row before doing anything: the state
+/// at dispatch time wins over the (possibly stale) memory-queue
+/// entry. `_lease` pins the repository's lifecycle for the whole
+/// run and is released on return.
 fn run_job_blocking(
     job: Job,
     runtime_metrics: JobRuntimeMetricsStore,
@@ -88,9 +120,16 @@ fn run_job_blocking(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    // The lookup is keyed by (job_id, manifest, analyzer). If no row
+    // matches (e.g. the run row was rewritten or removed since this
+    // job was dispatched), the job is a no-op.
     let Some((state, cancel_requested)) = row else {
         return Ok(());
     };
+    // Three cancellation sources collapse here: the in-process
+    // progress handle (shutdown, or cancel of a job this process is
+    // handling), a row already flipped to `cancelled`, and a queued
+    // row whose `cancel_requested` flag was set while it waited.
     if progress.is_cancelled()
         || state == RunStatus::Cancelled.as_str()
         || (state == RunStatus::Queued.as_str() && cancel_requested != 0)
@@ -104,6 +143,8 @@ fn run_job_blocking(
         runtime_metrics.mark_finished(job.id, RunStatus::Cancelled.as_str());
         return Ok(());
     }
+    // Any other terminal state means the run already concluded
+    // elsewhere; nothing to do.
     if state != RunStatus::Queued.as_str() && state != RunStatus::Running.as_str() {
         return Ok(());
     }
@@ -120,6 +161,9 @@ fn run_job_blocking(
         job_id = job.id,
         "analyzer job started"
     );
+    // ANALYZER_STALL_TIMEOUT bounds progress *silence*, not total
+    // run time: a long run that keeps ticking progress is allowed
+    // (see the constant's rationale in workspace_analyzer::run).
     let outcome = run_one_workspace_analyzer_with_timeout(
         &mut conn,
         AnalyzerRunRequest {
