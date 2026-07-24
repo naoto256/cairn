@@ -72,9 +72,7 @@ pub struct JobsListArgs {
 /// Arguments to the `jobs.cancel` control method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsCancelArgs {
-    /// Job id returned by [`JobSnapshot::job_id`]. The wire format is a
-    /// decimal string; legacy integer inputs remain accepted.
-    #[serde(with = "crate::job_id_serde")]
+    /// Numeric job id returned by [`JobSnapshot::job_id`].
     pub job_id: i64,
 }
 
@@ -96,24 +94,10 @@ pub struct JobsListResult {
     pub jobs: Vec<JobSnapshot>,
 }
 
-/// Analyzer job queued by a repository registration or inline reindex.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedAnalyzerJobReceipt {
-    /// Daemon-assigned job id, serialized as a lossless decimal string.
-    #[serde(with = "crate::job_id_serde")]
-    pub job_id: i64,
-    /// Analyzer backend id that owns this job.
-    pub analyzer_id: String,
-    /// Initial queued-job state.
-    pub state: String,
-}
-
 /// Snapshot of one analyzer job as stored by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSnapshot {
-    /// Daemon-assigned job id. Serialized as a decimal string so JSON clients
-    /// can pass it losslessly to `jobs.cancel`.
-    #[serde(with = "crate::job_id_serde")]
+    /// Daemon-assigned job id. Stable enough to pass to `jobs.cancel`.
     pub job_id: i64,
     /// Repository alias the analyzer job belongs to.
     pub alias: String,
@@ -196,43 +180,6 @@ pub struct JobsPruneRepoEntry {
     pub deleted_runs_count: u64,
     /// Number of runtime job-index entries removed for deleted job ids.
     pub deleted_index_entries_count: u64,
-}
-
-#[cfg(test)]
-mod job_id_tests {
-    use serde_json::json;
-
-    use super::{JobSnapshot, JobsCancelArgs};
-
-    #[test]
-    fn jobs_cancel_accepts_string_and_number_but_serializes_string() {
-        let from_string: JobsCancelArgs = serde_json::from_value(json!({"job_id": "7"})).unwrap();
-        let from_number: JobsCancelArgs = serde_json::from_value(json!({"job_id": 7})).unwrap();
-
-        assert_eq!(from_string.job_id, 7);
-        assert_eq!(from_number.job_id, 7);
-        assert_eq!(serde_json::to_value(from_number).unwrap()["job_id"], "7");
-    }
-
-    #[test]
-    fn job_snapshot_large_job_id_round_trips_exactly() {
-        const JOB_ID: i64 = 1_784_679_083_389_822_001;
-
-        let snapshot: JobSnapshot = serde_json::from_value(json!({
-            "job_id": JOB_ID.to_string(),
-            "alias": "cairn",
-            "analyzer_id": "rust-analyzer-lsp",
-            "state": "queued",
-            "created_at": 0
-        }))
-        .unwrap();
-        assert_eq!(snapshot.job_id, JOB_ID);
-
-        let serialized = serde_json::to_value(snapshot).unwrap();
-        assert_eq!(serialized["job_id"], JOB_ID.to_string());
-        let round_trip: JobSnapshot = serde_json::from_value(serialized).unwrap();
-        assert_eq!(round_trip.job_id, JOB_ID);
-    }
 }
 
 // ─── status ────────────────────────────────────────────────────────────────

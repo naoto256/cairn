@@ -5,15 +5,6 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
-## [0.8.1] — Unreleased
-
-### Fixed
-
-- **Job ids are lossless for JSON clients.** Job list responses,
-  register/reindex queued-job receipts, and cancellation requests now encode
-  `job_id` as a decimal string, avoiding precision loss above JavaScript's safe
-  integer range. Deserialization still accepts legacy JSON numbers.
-
 ## [0.8.0] — 2026-07-20
 
 > Compatibility: no source-code breaking changes. `get_symbol_source` has a
