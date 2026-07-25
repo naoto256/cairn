@@ -45,11 +45,6 @@ impl JobManager {
             .transpose()?;
         let runtime_metrics = self.runtime_metrics.clone();
         let job_id = dispatch.job.id;
-        // The lifecycle admission above is the last fallible step
-        // before the blocking worker starts. Mark the job running
-        // here, rather than at channel dispatch, so a fast terminal
-        // worker cannot race a later scheduler-side transition.
-        runtime_metrics.mark_running(job_id);
         let progress_metrics = runtime_metrics.clone();
         let progress =
             crate::workspace_analyzer::AnalyzerProgress::with_observer(Arc::new(move |ticks| {
@@ -62,14 +57,15 @@ impl JobManager {
         // first cancellation check.
         self.register_active_progress(job_id, progress.clone());
         let joined = tokio::task::spawn_blocking(move || {
+            // Enter running state only after the blocking pool grants
+            // an execution slot. The terminal-state guard inside
+            // `mark_running` keeps this transition monotonic.
+            runtime_metrics.mark_running(job_id);
             run_job_blocking(dispatch.job, runtime_metrics, progress, lease)
         })
         .await;
         self.unregister_active_progress(job_id);
-        // A panic inside the blocking task surfaces as a JoinError
-        // and is converted to an internal error instead of unwinding
-        // through the worker loop.
-        joined.map_err(|e| Error::internal_task_panic("analyzer job", e))?
+        finalize_joined_run(&self.runtime_metrics, job_id, joined)
     }
 
     /// Report a finished dispatch back to the scheduler so it frees
@@ -100,6 +96,31 @@ impl JobManager {
             .expect("job scheduler sender lock poisoned");
         if let Some(sender) = sender.as_ref() {
             let _ = sender.send(SchedulerMsg::Cancel(job_id));
+        }
+    }
+}
+
+/// Collapse the blocking worker's two failure channels into the
+/// runtime-metrics terminal transition.
+///
+/// `run_job_blocking` reports ordinary failures through its inner
+/// [`Result`], while panics surface as a [`tokio::task::JoinError`].
+/// Both mark an unfinished run failed; a concurrent terminal state
+/// such as cancellation remains authoritative.
+fn finalize_joined_run(
+    runtime_metrics: &JobRuntimeMetricsStore,
+    job_id: JobId,
+    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            runtime_metrics.mark_failed_if_unfinished(job_id);
+            Err(err)
+        }
+        Err(err) => {
+            runtime_metrics.mark_failed_if_unfinished(job_id);
+            Err(Error::internal_task_panic("analyzer job", err))
         }
     }
 }
@@ -192,4 +213,67 @@ fn run_job_blocking(
         "analyzer job finished"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::tests::job;
+
+    fn scheduler_state(metrics: &JobRuntimeMetricsStore, job_id: JobId) -> String {
+        let mut snapshot = job(job_id, "pyright-lsp", "failed");
+        metrics.decorate(&mut snapshot, now_ns());
+        snapshot.scheduler_state.unwrap()
+    }
+
+    fn running_metrics(job_id: JobId) -> JobRuntimeMetricsStore {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(job_id, None, 1);
+        metrics.mark_running(job_id);
+        metrics
+    }
+
+    #[test]
+    fn inner_worker_error_marks_unfinished_metrics_failed() {
+        let metrics = running_metrics(1);
+
+        let result = finalize_joined_run(
+            &metrics,
+            1,
+            Ok(Err(Error::InvalidArgument("worker failed".into()))),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(scheduler_state(&metrics, 1), RunStatus::Failed.as_str());
+    }
+
+    #[tokio::test]
+    async fn worker_panic_marks_unfinished_metrics_failed() {
+        let metrics = running_metrics(2);
+        let join_error = tokio::spawn(async {
+            panic!("worker panic");
+        })
+        .await
+        .unwrap_err();
+
+        let result = finalize_joined_run(&metrics, 2, Err(join_error));
+
+        assert!(result.is_err());
+        assert_eq!(scheduler_state(&metrics, 2), RunStatus::Failed.as_str());
+    }
+
+    #[test]
+    fn late_worker_failure_preserves_concurrent_cancellation() {
+        let metrics = running_metrics(3);
+        metrics.mark_finished(3, RunStatus::Cancelled.as_str());
+
+        let result = finalize_joined_run(
+            &metrics,
+            3,
+            Ok(Err(Error::InvalidArgument("late failure".into()))),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(scheduler_state(&metrics, 3), RunStatus::Cancelled.as_str());
+    }
 }
