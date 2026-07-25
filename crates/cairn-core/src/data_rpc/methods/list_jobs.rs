@@ -7,11 +7,10 @@
 //! not surface here.
 //!
 //! Scope selection is one-of alias (via `args.scope.repo`) or
-//! unscoped-all. Under unscoped enumeration the loop walks
-//! [`cas_registry::list_all`], which returns one row per alias
-//! rather than per repository: a repository with N aliases has its
-//! jobs collected N times. Lifecycle handling also splits by that
-//! mode — an unscoped call skips a Removing owner and reports
+//! unscoped-all. Under unscoped enumeration the alias rows from
+//! [`cas_registry::list_all`] are collapsed by canonical
+//! `repo_hash`, so each store contributes once. Lifecycle handling
+//! also splits by that mode — an unscoped call skips a Removing owner and reports
 //! `partial_truncated("repo_unavailable")`; a scoped call lets the
 //! typed `RepositoryUnavailable` error propagate.
 
@@ -57,13 +56,10 @@ impl DataMethod for ListJobs {
                             })?;
                         vec![entry]
                     }
-                    None => cas_registry::list_all(&index)?,
+                    None => cas_registry::dedupe_by_repo_hash(cas_registry::list_all(&index)?),
                 };
                 let mut out = Vec::new();
                 let mut skipped_unavailable = false;
-                // `list_all` yields one row per alias; repositories with
-                // multiple aliases have their job rows collected once per
-                // alias without deduplication.
                 for entry in entries {
                     let _lease = match &lifecycle {
                         Some(lifecycle) if enumerate_all => {
@@ -243,5 +239,45 @@ mod tests {
         assert_eq!(result.jobs[0].job_id, 42);
         assert_eq!(result.jobs[0].state, "running");
         assert_eq!(result.jobs[0].scheduler_state, "running");
+    }
+
+    #[tokio::test]
+    async fn unscoped_list_deduplicates_alias_shared_store() {
+        let fixture = test_support::registered_fixture();
+        let entry = {
+            let mut index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+            let entry = cas_registry::lookup_by_alias(&index, "demo")
+                .unwrap()
+                .unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(&tx, "demo-alias", &entry.root_path, &entry.repo_hash, 2).unwrap();
+            tx.commit().unwrap();
+            entry
+        };
+        let conn =
+            cas_store::open(&fixture.ctx.cas_data_dir.store_db_path(&entry.repo_hash)).unwrap();
+        let manifest_id: i64 = conn
+            .query_row(
+                "SELECT manifest_id FROM anchors WHERE anchor_name = 'HEAD'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+             (manifest_id, analyzer_id, analyzer_revision, config_hash, status,
+              started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+             VALUES (?1, 'demo-lsp', 1, 'cfg', 'running', 1000, NULL, NULL, 42, 0)",
+            params![manifest_id],
+        )
+        .unwrap();
+
+        let value = ListJobs
+            .dispatch(&fixture.ctx, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let result: ListJobsResult = serde_json::from_value(value).unwrap();
+        assert_eq!(result.jobs.len(), 1);
+        assert_eq!(result.jobs[0].job_id, 42);
     }
 }

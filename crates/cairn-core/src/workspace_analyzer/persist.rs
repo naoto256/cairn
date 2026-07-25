@@ -101,6 +101,13 @@ pub(super) fn persist_resolved_refs(
         let Some(target_path) = r.target_path.as_deref() else {
             continue;
         };
+        // Import's header-level fallback below can synthesize a row
+        // without finding a target symbol. Prove manifest membership
+        // first so a malformed or unnormalised analyzer path cannot
+        // bypass that fallback and create a ghost edge.
+        if blob_for_path(&tx, manifest_id, target_path)?.is_none() {
+            continue;
+        }
         let target =
             target_symbol_for_location(&tx, manifest_id, &parser_id, target_path, &r.target)?;
         // Import refs (e.g. C/C++/ObjC `#include`) commonly resolve to a

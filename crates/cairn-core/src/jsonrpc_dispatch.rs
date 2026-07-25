@@ -83,10 +83,8 @@ where
 /// The returned string is exactly one serialized [`Response`],
 /// suitable for direct write-back by the framing layer. On envelope
 /// parse failure the response uses [`error_code::PARSE_ERROR`]
-/// (-32700); the echoed id is `RequestId::Number(0)` — a placeholder
-/// chosen by this implementation, distinct from the [`RequestId::Null`]
-/// the JSON-RPC 2.0 spec (§5 Response Object) prescribes when the
-/// request id cannot be recovered.
+/// (-32700) and [`RequestId::Null`], as prescribed when the request
+/// id cannot be recovered.
 pub(crate) async fn handle_line<Ctx, M>(
     plane: &'static str,
     methods: &HashMap<&'static str, Box<M>>,
@@ -100,7 +98,7 @@ where
         Ok(req) => req,
         Err(err) => {
             let resp = error_resp(
-                RequestId::Number(0),
+                RequestId::Null,
                 error_code::PARSE_ERROR,
                 format!("invalid JSON-RPC envelope: {err}"),
             );
@@ -116,7 +114,7 @@ where
 /// response shape; timing is an agent-facing data-query diagnostic.
 ///
 /// Envelope parse failures follow the same rules as [`handle_line`]:
-/// [`error_code::PARSE_ERROR`] with `RequestId::Number(0)` echoed.
+/// [`error_code::PARSE_ERROR`] with [`RequestId::Null`] echoed.
 /// Timing injection only touches successful, object-shaped results
 /// (see [`inject_timing`]).
 pub(crate) async fn handle_line_with_result_timing<Ctx, M>(
@@ -132,7 +130,7 @@ where
         Ok(req) => req,
         Err(err) => {
             let resp = error_resp(
-                RequestId::Number(0),
+                RequestId::Null,
                 error_code::PARSE_ERROR,
                 format!("invalid JSON-RPC envelope: {err}"),
             );
@@ -306,6 +304,7 @@ mod tests {
         let response = handle_line("test", &methods, &(), "{").await;
 
         assert!(response.contains(r#""code":-32700"#));
+        assert!(response.contains(r#""id":null"#));
         assert!(response.contains("invalid JSON-RPC envelope"));
     }
 

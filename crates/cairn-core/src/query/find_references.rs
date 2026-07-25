@@ -169,7 +169,7 @@ fn run_find_references(
                         r.kind,
                         enc.qualified AS enclosing,
                         me.path, r.line, r.blob_sha, r.parser_id,
-                        r.byte_start, r.byte_end,
+                        r.byte_start, r.byte_end, r.id AS ref_id,
                         res.target_path AS target_path,
                         CASE WHEN res.source IS NOT NULL THEN res.source
                              ELSE '",
@@ -262,10 +262,10 @@ fn run_find_references(
             );
         }
         // Deterministic per-page ordering: file, then line, then
-        // in-line byte offset, then tier rank as a final tiebreaker so
-        // include_noise mode keeps the higher-tier row above the
-        // lower-tier row when both survive.
-        sql.push_str(" ORDER BY path, line, byte_start, source_rank");
+        // in-line byte offset, then tier rank. The persistent ref id
+        // is the final total-order tiebreaker when otherwise-identical
+        // rows survive in include-noise mode.
+        sql.push_str(" ORDER BY path, line, byte_start, source_rank, ref_id");
         sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -435,7 +435,7 @@ fn run_strict_incoming(
                     r.kind,
                     enc.qualified AS enclosing,
                     me.path, r.line, r.blob_sha, r.parser_id,
-                    r.byte_start, r.byte_end,
+                    r.byte_start, r.byte_end, r.id AS ref_id,
                     res.target_path AS target_path,
                     CASE WHEN res.source IS NOT NULL THEN res.source
                          ELSE '",
@@ -501,7 +501,7 @@ fn run_strict_incoming(
     } else {
         " AND target_qualified = ?2"
     });
-    sql.push_str(" ORDER BY path, line, byte_start, source_rank");
+    sql.push_str(" ORDER BY path, line, byte_start, source_rank, ref_id");
     sql.push_str(&format!(" LIMIT {limit}"));
 
     let mut stmt = conn.prepare(&sql)?;

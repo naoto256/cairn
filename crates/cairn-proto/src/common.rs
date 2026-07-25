@@ -37,13 +37,12 @@ pub enum SourceTier {
 
 /// Per-language enrichment status within one snapshot.
 ///
-/// `tier` reports whether a matching analyzer run is recorded for any
-/// blob in this `(snapshot, language)` slice; freshness against the
-/// current analyzer revision is enforced separately on the next parse.
-/// `tier=Syntactic && has_analyzer=true` therefore means Tier-2
-/// capability exists but no matching analyzer run is recorded for this
-/// snapshot's blob set — analyzer-ran-with-zero-facts already counts
-/// as `Semantic`.
+/// `tier` reports whether semantic analysis is realized for this
+/// `(snapshot, language)` slice: either a matching per-blob analyzer
+/// stamp exists, or a workspace analyzer succeeded for the current
+/// tentative manifest. Freshness against the current analyzer revision
+/// is enforced separately on the next parse/run. Analyzer-ran-with-
+/// zero-facts already counts as `Semantic`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageEnrichment {
     /// Short language tag, e.g. `"rust"`, `"python"`, `"markdown"`.
@@ -51,11 +50,10 @@ pub struct LanguageEnrichment {
     /// Realized tier for this `(snapshot, language)` slice.
     ///
     /// Derived from per-blob Tier-2 analyzer stamps
-    /// (`blobs.analyzer_id`) recorded against this snapshot's manifest.
-    /// A registered workspace analyzer (Tier-2.5 / Tier-3) whose
-    /// backend has no in-process Tier-2 analyzer does not upgrade
-    /// this field even after its runs complete; consult
-    /// [`crate::TierStatus`] / `TierRepoStatus` for that view.
+    /// (`blobs.analyzer_id`) recorded against this snapshot's manifest,
+    /// plus succeeded Tier-2.5 / Tier-3 runs when the snapshot is the
+    /// current tentative worktree. Committed snapshots remain
+    /// blob-derived.
     pub tier: SourceTier,
     /// Whether the language's backend declares an analyzer at compile time.
     ///

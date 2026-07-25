@@ -380,6 +380,42 @@ fn references_include_noise_keeps_tier2_and_tier3_duplicates() {
 }
 
 #[test]
+fn references_use_ref_id_as_final_stable_tiebreaker() {
+    let (_db, conn) = refs_dedup_fixture(false, None);
+    conn.execute(
+        "INSERT INTO refs
+           (id, blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+            byte_start, byte_end, line, source)
+         VALUES
+           (20, 'sha-ref', 'tree-sitter-rust', 1, 'render', 'z::render', 'call',
+            42, 48, 5, 'rust-syn-z'),
+           (10, 'sha-ref', 'tree-sitter-rust', 1, 'render', 'a::render', 'call',
+            42, 48, 5, 'rust-syn-a')",
+        [],
+    )
+    .unwrap();
+
+    let hits = find_references(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "render".into(),
+            direction: ReferenceDirection::Incoming,
+            include_noise: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.target_qualified.as_deref())
+            .collect::<Vec<_>>(),
+        vec![None, Some("a::render"), Some("z::render")]
+    );
+}
+
+#[test]
 fn references_empty_symbol_errors() {
     let (_repo, _db, c) = registered();
     let err = find_references(

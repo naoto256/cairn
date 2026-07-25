@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::cas::{registry as cas_registry, store as cas_store};
-use crate::manifest::{self, ManifestEntry, ManifestId};
+use crate::manifest::{self, ManifestId};
 use crate::paths::CasDataDir;
 use crate::workspace_analyzer::{
     ANALYZER_STALL_TIMEOUT, AnalyzerProgress, AnalyzerRunRequest, RunRecord, RunStatus,
@@ -259,7 +259,6 @@ pub struct EnqueueReindex<'a> {
     pub repo_hash: &'a str,
     pub repo_root: &'a Path,
     pub manifest_id: ManifestId,
-    pub entries: &'a [ManifestEntry],
     pub now_ns: i64,
     pub analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
 }
@@ -638,7 +637,6 @@ impl JobManager {
             repo_hash,
             repo_root,
             manifest_id,
-            entries,
             now_ns,
             analyzers,
         } = request;
@@ -670,10 +668,6 @@ impl JobManager {
             })? {
                 jobs.push(job);
             }
-        }
-
-        if entries.is_empty() {
-            return Ok(jobs);
         }
         Ok(jobs)
     }
@@ -928,6 +922,8 @@ impl JobManager {
                      WHERE job_id = ?2",
                     params![now_ns(), job_id],
                 )?;
+                self.runtime_metrics
+                    .mark_finished(*job_id, RunStatus::Cancelled.as_str());
                 self.notify_cancelled_job(*job_id);
             } else {
                 conn.execute(

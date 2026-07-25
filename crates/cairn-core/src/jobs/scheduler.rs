@@ -227,7 +227,6 @@ impl JobScheduler {
                 GroupLane::Unpooled => None,
             };
             let key = JobKey::from_job(&job);
-            self.runtime_metrics.mark_running(job.id);
             // A send failure means the worker channel is closed
             // (shutdown in progress). Roll back the group
             // reservation and the tracked key and stop draining;
@@ -399,5 +398,21 @@ mod tests {
         scheduler.drain_runnable();
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_worker_send_does_not_mark_job_running() {
+        let (mut scheduler, rx) = test_scheduler(1);
+        scheduler.runtime_metrics.mark_enqueued(1, None, 1);
+        scheduler.enqueue(test_job(1, 1, "pyright-lsp"));
+        drop(rx);
+
+        scheduler.drain_runnable();
+
+        let mut snapshot = job(1, "pyright-lsp", "queued");
+        scheduler.runtime_metrics.decorate(&mut snapshot, 2);
+        assert_eq!(snapshot.scheduler_state.as_deref(), Some("queued"));
+        assert_eq!(snapshot.run_started_at, None);
+        assert_eq!(scheduler.active_workers, 0);
     }
 }

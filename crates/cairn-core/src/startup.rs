@@ -289,10 +289,11 @@ fn initializing_error(line: &str, initialization: DaemonInitializationStatus) ->
 
 fn parse_request(line: &str) -> std::result::Result<Request, String> {
     // The request id is unrecoverable from a malformed envelope, so
-    // the parse-error response carries a fixed placeholder id.
+    // JSON-RPC requires a null response id rather than a numeric
+    // placeholder that could collide with a real request.
     serde_json::from_str(line).map_err(|err| {
         serialize_response(&error_response(
-            RequestId::Number(0),
+            RequestId::Null,
             error_code::PARSE_ERROR,
             format!("invalid JSON-RPC envelope: {err}"),
         ))
@@ -310,6 +311,13 @@ mod tests {
 
     fn request(method: &str) -> String {
         json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": null}).to_string()
+    }
+
+    #[test]
+    fn malformed_startup_request_uses_null_response_id() {
+        let response: Response = serde_json::from_str(&parse_request("{").unwrap_err()).unwrap();
+        assert!(matches!(response.id, RequestId::Null));
+        assert_eq!(response.error.unwrap().code, error_code::PARSE_ERROR);
     }
 
     fn ready_resources() -> (tempfile::TempDir, ReadyDaemon) {

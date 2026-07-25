@@ -34,6 +34,8 @@
 //!   `cancel(retired_id)` returns `unknown job id` even after a
 //!   partial cross-store rewrite crashed midway.
 
+use std::collections::HashSet;
+
 use cairn_proto::RepoReconcileStatus;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -1025,6 +1027,21 @@ pub fn list_all(conn: &Connection) -> Result<Vec<AliasEntry>> {
     )?;
     let rows: rusqlite::Result<Vec<AliasEntry>> = stmt.query_map([], row_to_entry)?.collect();
     Ok(rows?)
+}
+
+/// Collapse alias rows to one deterministic representative per
+/// canonical repository.
+///
+/// [`list_all`] is ordered by alias, so the first retained row is
+/// always the lexicographically-smallest alias for that `repo_hash`.
+/// Callers that open one store per repository must use this helper
+/// before walking an unscoped alias listing.
+pub(crate) fn dedupe_by_repo_hash(entries: Vec<AliasEntry>) -> Vec<AliasEntry> {
+    let mut seen = HashSet::new();
+    entries
+        .into_iter()
+        .filter(|entry| seen.insert(entry.repo_hash.clone()))
+        .collect()
 }
 
 /// Remove one alias by name. Returns `true` if a row was deleted.

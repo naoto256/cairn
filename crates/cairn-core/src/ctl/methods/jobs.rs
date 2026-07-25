@@ -7,12 +7,11 @@
 //! probing a stripped-down daemon can distinguish "not configured"
 //! from an actual crash.
 //!
-//! Only `jobs.prune` wraps its work in `spawn_blocking`; `jobs.list`
-//! and `jobs.cancel` invoke synchronous SQLite calls directly on
-//! the async runtime. `jobs.list` enumerates every registered
-//! alias's store before applying a final `limit`, and `jobs.cancel`
-//! walks every store when the `JobIndex` fast-path misses — under a
-//! contended DB either can stall the reactor thread.
+//! All three verbs wrap synchronous SQLite work in `spawn_blocking`.
+//! `jobs.list` can enumerate every registered store before applying
+//! a final `limit`, and `jobs.cancel` can walk every store when the
+//! `JobIndex` fast-path misses, so neither belongs on a runtime
+//! reactor thread.
 //!
 //! Semantics of `jobs.cancel` (see [`JobManager::cancel`]):
 //!
@@ -66,14 +65,19 @@ impl ControlMethod for JobsList {
             ),
             None => None,
         };
-        let jobs = manager.jobs(
-            args.alias.as_deref(),
-            state,
-            JobListOptions {
-                include_all: args.all,
-                limit: args.limit.map(|value| value as usize),
-            },
-        )?;
+        let manager = manager.clone();
+        let jobs = tokio::task::spawn_blocking(move || {
+            manager.jobs(
+                args.alias.as_deref(),
+                state,
+                JobListOptions {
+                    include_all: args.all,
+                    limit: args.limit.map(|value| value as usize),
+                },
+            )
+        })
+        .await
+        .map_err(|e| Error::internal_task_panic("jobs.list", e))??;
         Ok(serde_json::to_value(JobsListResult {
             jobs: jobs
                 .into_iter()
@@ -114,7 +118,10 @@ impl ControlMethod for JobsCancel {
         let Some(manager) = &ctx.job_manager else {
             return Err(Error::InvalidArgument("job manager unavailable".into()));
         };
-        let result = manager.cancel(args.job_id)?;
+        let manager = manager.clone();
+        let result = tokio::task::spawn_blocking(move || manager.cancel(args.job_id))
+            .await
+            .map_err(|e| Error::internal_task_panic("jobs.cancel", e))??;
         Ok(serde_json::to_value(JobsCancelResult {
             cancelled: result.cancelled,
             reason: result.reason,

@@ -76,8 +76,8 @@ pub use sockets::SocketPaths;
 ///   [`Error::SchemaCorruption`].
 ///
 /// The wire translation lives in `jsonrpc_errors::error_from`;
-/// only [`Error::Internal`] has its message body sanitized before
-/// crossing the boundary.
+/// every variant receives a fixed client-safe message before crossing
+/// the boundary. Variant payloads remain available to server logs.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Filesystem, process, or socket I/O failure bubbled from a
@@ -106,7 +106,7 @@ pub enum Error {
     /// fails to shape `params` into the typed argument struct, plus
     /// a handful of methods for structurally malformed inputs that
     /// survived shape validation. Maps to `INVALID_PARAMS`; the
-    /// message body is preserved on the wire.
+    /// wire message is fixed; parse details remain server-side.
     #[error("invalid params: {0}")]
     InvalidParams(String),
     /// User-facing repo alias is not registered.
@@ -222,8 +222,8 @@ pub enum Error {
     /// data-RPC methods) and various operational failures that do
     /// not fit another variant (path canonicalization, data-directory
     /// setup, clock queries, git spawn, parser lookup, watcher arm).
-    /// Maps to `INVALID_PARAMS`; the message body is preserved on
-    /// the wire.
+    /// Maps to `INVALID_PARAMS`; the wire message is fixed because
+    /// this legacy variant can also wrap operational details.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     /// Server-side fault that should not be attributed to the
@@ -249,9 +249,9 @@ pub enum Error {
     /// Language-server / workspace-analyzer failure surfaced from
     /// [`lsp::Error`]. Raised primarily by
     /// [`workspace_analyzer`] around LSP acquire, request, and
-    /// file-URL construction. Maps to a JSON-RPC internal error;
-    /// the underlying `lsp::Error` display is preserved in the
-    /// message (via `#[error(transparent)]`).
+    /// file-URL construction. Maps to a JSON-RPC internal error with
+    /// a fixed message; the underlying `lsp::Error` remains available
+    /// to server-side diagnostics only.
     #[error(transparent)]
     Lsp(#[from] lsp::Error),
     /// Reserved for schema-invariant violations detected at read
