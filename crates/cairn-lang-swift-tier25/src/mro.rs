@@ -111,6 +111,10 @@ fn resolve_base(
         }
         // Keep the resolved name even when not pinnable, so subclass
         // relationships travel across import boundaries.
+        // `class Dog: Foundation.NSObject` cannot land on a workspace
+        // file for `NSObject`, but downstream `Dog`-conformance
+        // checks still want the qualified `Foundation.NSObject`
+        // recorded as the parent so name-based fallbacks work.
         return Some(candidate);
     }
     // 2. Same-module lookup.
@@ -130,6 +134,15 @@ fn resolve_base(
 
 /// Best-effort linearization. The class itself first, then BFS over
 /// resolved parents.
+///
+/// BFS (not C3, not any principled MRO algorithm): Swift's real
+/// dispatch uses a witness table built at compile time that no
+/// tree-sitter walk can reproduce. Under BFS a class's declared
+/// bases appear before its grandparents in declaration order, which
+/// matches the intuition that `override` on a direct base beats an
+/// inherited override further up. Diamond conformances flatten to
+/// the first path visited — a real ambiguity that Tier-3 would need
+/// SourceKit to resolve.
 fn linearize(
     class: &str,
     parents: &HashMap<String, Vec<String>>,

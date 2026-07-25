@@ -136,6 +136,9 @@ fn resolve_binding_into_qualified(
             //      `M/N/__init__.py`) → qualified module `M.N`.
             // The module_index handles both via `lookup` (symbol) and
             // `module_path` (module). Reach for the symbol first.
+            // This lines up with CPython's own resolution order for
+            // `from M import N`: the interpreter checks whether `N`
+            // is a name in `M` before attempting to import a submodule.
             let candidate = format!("{absolute}.{imported}");
             if module_index.lookup(&candidate).is_some()
                 || module_index.module_path(&candidate).is_some()

@@ -17,12 +17,21 @@ use crate::const_resolver::{CallReceiver, FileConstFacts, ImportKind, MethodCall
 use crate::containing_namespaces;
 use crate::mro::Mro;
 
+/// Pinned target of a resolved call: the workspace file that owns the
+/// method body and its fully-qualified name.
 #[derive(Debug, Clone)]
 pub struct DispatchResolution {
     pub path: String,
     pub qualified: String,
 }
 
+/// Workspace-wide method index consulted during call resolution.
+/// Populated once per `analyze_files` pass by walking every file's
+/// `method_defs`; the three sub-maps trade off precision for
+/// permissiveness — `by_owner` is the exact `(class_fqn, name)` lookup
+/// used by MRO walks, `by_package` covers top-level (package-scoped)
+/// callables, and `by_name` is the best-effort unique-name fallback
+/// for extension-method dispatch.
 #[derive(Debug, Default)]
 pub struct MethodIndex {
     by_owner: HashMap<(String, String), MethodEntry>,
@@ -85,6 +94,11 @@ impl MethodIndex {
     }
 }
 
+/// Resolve one call site to a `(target_path, target_qualified)` pair,
+/// or return None so the caller skips the row entirely. The branches
+/// mirror `CallReceiver`: Dotted / This / Super / Bare, each with a
+/// small cascade of candidate lookups. See the module-level doc for
+/// which shapes are pinnable.
 pub fn resolve_call(
     call: &MethodCall,
     package_index: &PackageIndex,

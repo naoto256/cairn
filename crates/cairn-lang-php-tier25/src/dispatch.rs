@@ -35,6 +35,11 @@ struct MethodEntry {
 }
 
 impl MethodIndex {
+    // Duplicate `(owner, method)` pairs are resolved first-file-wins
+    // via `or_insert`. Real PHP forbids re-declaring the same method on
+    // the same class within a single unit; cross-file collisions here
+    // usually mean the workspace contains two class-name collisions the
+    // resolver already treated as one entry in `ConstIndex`.
     pub fn build(per_file: &[(String, Vec<u8>, FileConstFacts)]) -> Self {
         let mut by_owner = HashMap::new();
         for (path, _, facts) in per_file {
@@ -55,6 +60,12 @@ impl MethodIndex {
     }
 }
 
+/// Pin a call site to its defining class+method.
+///
+/// The shape is: resolve the receiver to a starting `owner` class,
+/// then walk the MRO chain looking for a matching method. Returns
+/// `None` for `Unknown` receivers and for `self`/`parent`/`static`
+/// used outside a class body.
 pub fn resolve_call(
     call: &MethodCall,
     const_index: &ConstIndex,

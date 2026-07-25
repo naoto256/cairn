@@ -16,12 +16,22 @@ use crate::AliasTarget;
 use crate::const_resolver::{CallReceiver, FileConstFacts, ImportKind, MethodCall, PackageIndex};
 use crate::mro::Mro;
 
+/// Pinned target of a resolved call: the file that owns the method
+/// body plus the short qualified name inside that file (`"Foo.bar"`).
+/// Unlike the C# / Kotlin variants, `qualified` is not a package-
+/// prefixed FQN — JS qualifieds are file-local by construction.
 #[derive(Debug, Clone)]
 pub struct DispatchResolution {
     pub path: String,
     pub qualified: String,
 }
 
+/// Workspace-wide method / top-level-function index. Keyed by
+/// `(path, owner, name)` rather than a global FQN because JS
+/// qualifieds are file-local; two files can independently define
+/// `class Foo { bar() {} }` with no naming conflict, and the
+/// dispatch caller already knows which file the receiver resolved
+/// to.
 #[derive(Debug, Default)]
 pub struct MethodIndex {
     /// (path, owner_class_qualified, method_name) → entry.

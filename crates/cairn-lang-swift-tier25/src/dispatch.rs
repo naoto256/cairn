@@ -31,6 +31,20 @@ pub struct DispatchResolution {
 /// Workspace-wide method index keyed by `(owner_qualified,
 /// method_name)`. The owner is either a class FQN or an empty
 /// string (top-level functions in module-less Swift files).
+///
+/// Three parallel indexes cover the three call shapes that require
+/// distinct lookup keys:
+///
+/// * `by_owner` — exact `owner.method` for class-method and
+///   `self.method` dispatch. Populated for every method definition.
+/// * `by_module` — module-scoped top-level functions, keyed by
+///   `(module, name)`. Populated only when the def's `owner` matches
+///   the file's inferred module, so we can serve
+///   `module.helper()` calls without walking `by_owner`'s
+///   class-shaped keys.
+/// * `by_name` — all defs grouped by bare method name, consulted as
+///   the last-resort fallback for protocol-extension default
+///   implementations (see `get_unique_by_name`).
 #[derive(Debug, Default)]
 pub struct MethodIndex {
     by_owner: HashMap<(String, String), MethodEntry>,
@@ -83,6 +97,15 @@ impl MethodIndex {
         self.by_module.get(&(module.to_string(), name.to_string()))
     }
 
+    /// Return the sole `MethodEntry` for `name` only when it's
+    /// unambiguous. `resolve_dotted_call` reaches this branch as a
+    /// last-resort fallback whenever every earlier index miss on a
+    /// dotted call fails — not just protocol-extension default
+    /// implementations, and without inspecting the receiver's type
+    /// or MRO. When the workspace has a single definition of `name`
+    /// it is pinned; multiple definitions bail to `None` so we
+    /// don't pin an arbitrary one. Tier-3 with SourceKit is the
+    /// principled fix.
     fn get_unique_by_name(&self, name: &str) -> Option<&MethodEntry> {
         let bucket = self.by_name.get(name)?;
         if bucket.len() == 1 {
@@ -126,6 +149,12 @@ pub fn resolve_call(
         CallReceiver::SuperRef => {
             let owner = call.lexical_class.as_deref()?;
             let chain = mro.ancestors(owner);
+            // `skip(1)` drops the lexical class itself so `super`
+            // dispatches into its parents. Swift's linearization
+            // (`mro::linearize`) always places the class itself
+            // first, so this matches "resume walk one hop past the
+            // caller's own type" exactly (unlike Ruby, whose prepend
+            // modules can occupy MRO slot 0).
             for ancestor in chain.into_iter().skip(1) {
                 if let Some(hit) = methods.get_method(&ancestor, &call.method) {
                     return Some(DispatchResolution {

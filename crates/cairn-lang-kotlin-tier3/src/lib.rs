@@ -84,6 +84,12 @@ impl WorkspaceAnalyzer for KotlinLanguageServerWorkspaceAnalyzer {
 static REGISTER_KOTLIN_LANGUAGE_SERVER_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(KotlinLanguageServerWorkspaceAnalyzer);
 
+/// Files feeding `WorkspaceAnalyzer::config_paths` into
+/// `workspace_analysis_runs.config_hash`. Gradle / Maven build
+/// files and the server's per-repo `.kotlin-language-server`
+/// override change the SHA-1 fingerprint that
+/// `workspace_analyzers_needing_rerun` compares, forcing a re-run
+/// even when no `.kt` source blob changed.
 fn kotlin_config_paths() -> &'static [&'static str] {
     &[
         "build.gradle",
@@ -167,6 +173,11 @@ fn run_kotlin_language_server_pass(
     )
 }
 
+/// Resolve `kotlin-language-server` via
+/// `cairn_core::lsp_discovery` so worker resolution matches
+/// doctor's under launchd's minimal PATH.
+/// `KOTLIN_LANGUAGE_SERVER` is the operator override env var (a
+/// path to the wrapper script).
 fn kotlin_language_server_binary() -> PathBuf {
     discover_lsp_binary("kotlin-language-server", Some("KOTLIN_LANGUAGE_SERVER"))
         .unwrap_or_else(|| PathBuf::from("kotlin-language-server"))

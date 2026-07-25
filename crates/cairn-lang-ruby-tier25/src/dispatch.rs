@@ -18,6 +18,11 @@ pub struct DispatchResolution {
 
 /// Workspace-wide method index keyed by `(owner_qualified, method_name,
 /// singleton)`. Built once per analyzer run alongside the const + MRO.
+///
+/// The `singleton` component of the key is what makes Ruby dispatch
+/// tractable at Tier-2.5: `def foo` and `def self.foo` on the same
+/// owner are distinct entries and are searched via disjoint MRO
+/// chains (instance vs singleton — see `mro.rs`).
 #[derive(Debug, Default)]
 pub struct MethodIndex {
     by_owner: HashMap<(String, String, bool), MethodEntry>,
@@ -34,6 +39,11 @@ impl MethodIndex {
         let mut by_owner = HashMap::new();
         for (path, _, facts) in per_file {
             for m in &facts.method_defs {
+                // First definition wins. Ruby lets a class be reopened
+                // in any file and the last `def` at runtime overrides
+                // earlier ones, but load order is not known at
+                // Tier-2.5, so we pin any concrete site rather than
+                // guess.
                 by_owner
                     .entry((m.owner.clone(), m.name.clone(), m.singleton))
                     .or_insert(MethodEntry {
@@ -79,6 +89,14 @@ pub fn resolve_call(
                 return None;
             }
             let owner = call.lexical_scope.join("::");
+            // Start the ancestor walk at index 1: `super` skips the
+            // innermost MRO entry for the lexical class. Exact when
+            // the caller is a plain `def` in `owner` with no
+            // `prepend` modules. With prepend the MRO is
+            // `[Prepended, Owner, Parent, ...]` — a super from a
+            // method defined in `Owner` should resume at `Parent`,
+            // but `skip(1)` lands on `Owner` itself, one position
+            // too early.
             for ancestor in mro.ancestors(&owner).into_iter().skip(1) {
                 if let Some(hit) = methods.get(&ancestor, &call.method, false) {
                     return Some(DispatchResolution {
@@ -93,6 +111,8 @@ pub fn resolve_call(
         // dispatch. With a known lexical owner we can run the same MRO
         // walk as `self.foo`; outside any class (top-level scripts)
         // there is nothing to anchor on and Tier-3 must take over.
+        // The anchor Ruby would use there is `main` / `Object`'s
+        // private receiver, which Tier-2.5 does not model.
         CallReceiver::None => {
             if call.lexical_scope.is_empty() {
                 return None;

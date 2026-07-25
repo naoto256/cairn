@@ -6,6 +6,19 @@
 //! Tier-1 parser id so the workspace runner can feed each analyzer the
 //! files that were actually parsed by that dialect. All three
 //! analyzers share one `typescript-language-server-lsp` pool key.
+//!
+//! `config_paths` names the workspace files that feed the
+//! analyzer-currency `config_hash`
+//! (`cairn_core::workspace_analyzer::expected`):
+//! `tsconfig.json`, `jsconfig.json`, `package.json`. The three
+//! analyzers share the same list because the underlying language
+//! service reads them regardless of which parser produced the file.
+//!
+//! `TYPESCRIPT_POOL_ID` is the coarse pool key returned from
+//! `pool_group()`; TS / JS / TSX analyzers share one server per repo
+//! by returning it. `POOL_CONFIG_ID` becomes the finer `config_hash`
+//! on `LspSpawnSpec` — bumping its `-v1` suffix distinguishes spec
+//! revisions inside the shared group.
 
 #![forbid(unsafe_code)]
 

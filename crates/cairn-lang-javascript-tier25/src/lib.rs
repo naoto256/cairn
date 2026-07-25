@@ -46,6 +46,36 @@
 //!   expression and we deliberately skip it from MRO.
 //! * `Object.setPrototypeOf`, `Object.assign(Cls.prototype, ...)`,
 //!   duck-typed prototype chains.
+//!
+//! # Deviations from the shared Tier-2.5 shape
+//!
+//! See `cairn-lang-csharp-tier25`'s `lib.rs` for the five-file
+//! Tier-2.5 layout (`const_resolver` / `require_graph` / `mro` /
+//! `dispatch` / `lib`). JavaScript's implementation of that
+//! layout differs from the more "namespaced" backends (C#, Kotlin)
+//! in three load-bearing ways:
+//!
+//! * **No package concept.** JS has no `namespace` / `package`
+//!   declaration; a symbol's identity is the file it lives in
+//!   plus its top-level name. `PackageIndex` therefore keys by
+//!   `(path, qualified)` rather than by qualified alone, and
+//!   qualifieds are short (`"Foo"`, `"Foo.bar"`) rather than
+//!   package-prefixed FQNs.
+//! * **Two import systems, unified.** ESM (`import`) and CJS
+//!   (`require`) are extracted through the same
+//!   `ImportBinding` type with a `ImportKind` tag (`Esm` /
+//!   `EsmNamespace` / `SideEffect` / `Cjs`). `import_kind` is
+//!   carried through to dispatch because `Foo.bar` semantics
+//!   differ across shapes: only `EsmNamespace` re-exposes named
+//!   exports as members that can be statically pinned; the other
+//!   shapes leave `Foo.bar` as a runtime property access.
+//! * **Re-export chains.** `export { X } from './barrel'` is
+//!   JS-specific — `PackageIndex::build` flattens chains up to
+//!   `MAX_REEXPORT_HOPS` and records dropped (cyclic / over-
+//!   budget) entries in `dropped_reexports` so downstream
+//!   emitters can distinguish "no such export" (silent None)
+//!   from "the export exists but we can't pin its origin"
+//!   (suppress row rather than fabricate a mid-chain fact).
 
 #![deny(unsafe_code)]
 

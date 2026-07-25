@@ -518,6 +518,13 @@ impl<'a> Visitor<'a> {
         });
     }
 
+    // Deliberately conservative: this only emits a `ConstRef` when
+    // the direct parent is `object_creation_expression`
+    // (`new Foo()`) or `class_constant_access_expression`
+    // (`Foo::CONST`). Return-type annotations, parameter-type hints,
+    // property-type hints, `instanceof`, and typed catch clauses are
+    // therefore not resolved here — the grammar surfaces them under
+    // different parents, and Tier-3 (LSP-backed) picks them up.
     fn try_emit_type_ref(&mut self, node: Node<'_>) {
         let Some(parent) = node.parent() else {
             return;
@@ -653,6 +660,12 @@ pub struct ConstIndex {
 }
 
 impl ConstIndex {
+    // First defining file wins per qualified name (`or_insert`).
+    // Deterministic in per-file visitation order, which is set by the
+    // caller (`analyze_files` iterates `files` in-order). If the same
+    // fully-qualified class name lives in two files (unusual — PHP
+    // autoloaders would fail to load it), the later definition is
+    // dropped from the workspace index.
     pub fn build(per_file: &[(String, Vec<u8>, FileConstFacts)]) -> Self {
         let mut by_qualified = HashMap::new();
         for (path, _, facts) in per_file {
