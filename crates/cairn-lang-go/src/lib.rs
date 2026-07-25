@@ -32,6 +32,7 @@ use cairn_lang_treesitter_generic::{
 };
 use linkme::distributed_slice;
 use tree_sitter::Node;
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 /// Backend instance.
 pub struct GoBackend;
@@ -213,9 +214,13 @@ fn emit_symbol(
 }
 
 /// Go's export rule: a declared identifier is exported iff its
-/// first Unicode character is an uppercase letter.
+/// first Unicode character has Unicode general category `Lu`.
 fn go_visibility(name: &str) -> Visibility {
-    if name.chars().next().is_some_and(char::is_uppercase) {
+    if name
+        .chars()
+        .next()
+        .is_some_and(|ch| get_general_category(ch) == GeneralCategory::UppercaseLetter)
+    {
         Visibility::Public
     } else {
         Visibility::Private
@@ -545,7 +550,7 @@ var varName = 4
     }
 
     #[test]
-    fn unicode_uppercase_identifier_is_exported() {
+    fn unicode_uppercase_letter_identifier_is_exported() {
         let facts = GoBackend
             .extract_syntactic("package main\nfunc Éclair() {}\n".as_bytes())
             .unwrap();
@@ -553,6 +558,18 @@ var varName = 4
         assert_eq!(
             symbol(&facts, "Éclair").visibility,
             Some(Visibility::Public)
+        );
+    }
+
+    #[test]
+    fn non_letter_unicode_uppercase_identifier_is_not_exported() {
+        let facts = GoBackend
+            .extract_syntactic("package main\nfunc Ⅳalue() {}\n".as_bytes())
+            .unwrap();
+
+        assert_eq!(
+            symbol(&facts, "Ⅳalue").visibility,
+            Some(Visibility::Private)
         );
     }
 

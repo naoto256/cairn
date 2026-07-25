@@ -283,6 +283,26 @@ end
     );
 }
 
+#[test]
+fn nested_class_method_uses_canonical_owner() {
+    let src = r#"
+module A
+  class B
+    def m; end
+  end
+end
+"#;
+    let facts = parse_file(src.as_bytes()).unwrap();
+    let method = facts
+        .method_defs
+        .iter()
+        .find(|method| method.name == "m")
+        .expect("nested method should be extracted");
+
+    assert_eq!(method.owner, "A::B");
+    assert_eq!(method.qualified, "A::B#m");
+}
+
 // ─── dispatch ─────────────────────────────────────────────────────────────
 
 #[test]

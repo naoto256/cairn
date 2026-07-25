@@ -219,10 +219,8 @@ class Child(Base):
     let calls = calls_of(&res, "m.py");
 
     assert!(
-        calls
-            .iter()
-            .all(|call| call.target_qualified.as_deref() != Some("m.Base.step")),
-        "{calls:#?}"
+        calls.is_empty(),
+        "explicit-operand super calls must remain unresolved: {calls:#?}"
     );
 }
 

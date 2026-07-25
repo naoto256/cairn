@@ -259,9 +259,9 @@ fn strip_generic_args(s: &str) -> String {
 }
 
 /// Textual `#[test]` recognizer. We only look at raw attribute text
-/// (no macro expansion): contiguous `attribute_item` siblings
-/// immediately before the function are inspected, and any whose text
-/// contains the substring `"test"` promotes the fn to
+/// (no macro expansion): contiguous `attribute_item` and comment
+/// siblings immediately before the function are inspected, and any
+/// attribute whose text contains the substring `"test"` promotes the fn to
 /// [`SymbolKind::Test`]. This deliberately over-approximates —
 /// anything mentioning `test`, e.g. `#[cfg(test)]`,
 /// `#[cfg_attr(test, ignore)]`, or a user-defined
@@ -270,14 +270,17 @@ fn strip_generic_args(s: &str) -> String {
 /// the index is consumed.
 fn has_test_attribute(node: Node<'_>, source: &[u8]) -> bool {
     let mut sibling = node.prev_named_sibling();
-    while let Some(attribute) = sibling {
-        if attribute.kind() != "attribute_item" {
-            break;
+    while let Some(item) = sibling {
+        match item.kind() {
+            "attribute_item" => {
+                if node_text(item, source).contains("test") {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
         }
-        if node_text(attribute, source).contains("test") {
-            return true;
-        }
-        sibling = attribute.prev_named_sibling();
+        sibling = item.prev_named_sibling();
     }
     false
 }
@@ -426,6 +429,24 @@ fn it_works() {}
         let facts = RustBackend.extract_syntactic(src).unwrap();
         let s = &facts.symbols[0];
         assert_eq!(s.name, "it_works");
+        assert_eq!(s.kind, SymbolKind::Test);
+    }
+
+    #[test]
+    fn recognizes_test_attribute_across_comments() {
+        let src = br"
+#[test]
+// line comment
+/* block comment */
+/// doc comment
+fn it_works() {}
+";
+        let facts = RustBackend.extract_syntactic(src).unwrap();
+        let s = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "it_works")
+            .unwrap();
         assert_eq!(s.kind, SymbolKind::Test);
     }
 
