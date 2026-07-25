@@ -15,6 +15,7 @@
 //! IDE plugins) hit the daemon directly over the JSON-RPC surface
 //! without speaking MCP at all.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,38 +89,45 @@ impl Daemon {
     /// Bind both sockets, run accept loops until `shutdown` is
     /// notified, then drop the listeners and explicitly unlink the
     /// socket files (dropping a `UnixListener` does not remove its
-    /// path).
+    /// path). The shutdown waiter is armed synchronously when this
+    /// method is called, before the returned future is first polled.
     ///
     /// # Errors
     /// Bind / accept failures propagate.
-    pub async fn run(self) -> Result<()> {
+    pub fn run(self) -> impl Future<Output = Result<()>> {
         self.run_with_shutdown_timeout(DAEMON_SHUTDOWN_TIMEOUT)
-            .await
     }
 
-    async fn run_with_shutdown_timeout(self, shutdown_timeout: Duration) -> Result<()> {
-        let shutdown_wait = arm_shutdown(self.shutdown);
-        self.paths.ensure()?;
-        let cairn = bind_socket_with_mode(&self.paths.cairn)?;
-        let ctrl = bind_socket_with_mode(&self.paths.control)?;
-        info!(cairn = %self.paths.cairn.display(), control = %self.paths.control.display(), "daemon listening");
-        if let Some(job_manager) = self.job_manager.clone() {
-            spawn_revision_staleness_scan(job_manager, self.reconcile.clone());
+    fn run_with_shutdown_timeout(
+        self,
+        shutdown_timeout: Duration,
+    ) -> impl Future<Output = Result<()>> {
+        // Arm while constructing the future, before its first poll can race a
+        // shutdown signal.
+        let shutdown_wait = arm_shutdown(self.shutdown.clone());
+        async move {
+            self.paths.ensure()?;
+            let cairn = bind_socket_with_mode(&self.paths.cairn)?;
+            let ctrl = bind_socket_with_mode(&self.paths.control)?;
+            info!(cairn = %self.paths.cairn.display(), control = %self.paths.control.display(), "daemon listening");
+            if let Some(job_manager) = self.job_manager.clone() {
+                spawn_revision_staleness_scan(job_manager, self.reconcile.clone());
+            }
+            run_bound(
+                self.paths,
+                cairn,
+                ctrl,
+                self.data_handler,
+                self.control_handler,
+                shutdown_wait,
+                RuntimeOwnership::Static {
+                    job_manager: self.job_manager,
+                    lifecycle: self.lifecycle,
+                },
+                shutdown_timeout,
+            )
+            .await
         }
-        run_bound(
-            self.paths,
-            cairn,
-            ctrl,
-            self.data_handler,
-            self.control_handler,
-            shutdown_wait,
-            RuntimeOwnership::Static {
-                job_manager: self.job_manager,
-                lifecycle: self.lifecycle,
-            },
-            shutdown_timeout,
-        )
-        .await
     }
 }
 
@@ -634,6 +642,32 @@ mod tests {
                 watch_manager: watcher,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn ready_daemon_observes_shutdown_fired_before_run_is_polled() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let run = Daemon {
+            paths: paths.clone(),
+            data_handler: Arc::new(EchoHandler),
+            control_handler: Arc::new(EchoHandler),
+            shutdown: shutdown.clone(),
+            job_manager: None,
+            reconcile: None,
+            lifecycle: None,
+        }
+        .run_with_shutdown_timeout(Duration::from_millis(100));
+
+        shutdown.notify_waiters();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("pre-fired ready-daemon shutdown notification was lost");
+        assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+        assert!(!paths.cairn.exists());
+        assert!(!paths.control.exists());
     }
 
     #[tokio::test]
