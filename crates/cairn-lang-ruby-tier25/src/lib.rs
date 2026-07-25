@@ -65,7 +65,9 @@ pub const TIER_PREFIX: &str = "tier25";
 // so existing workspace_analysis_runs need to be invalidated and the
 // analyzer re-run to repopulate rows with manifest_id Some. Analyzer
 // logic itself is unchanged.
-pub const ANALYZER_REVISION: u32 = 4;
+// Bumped to 5 for cycle-safe MRO construction, balanced lexical scopes,
+// corrected super dispatch, and extension-aware require resolution.
+pub const ANALYZER_REVISION: u32 = 5;
 pub const PARSER_ID: &str = "tree-sitter-ruby";
 pub const RESOLUTION_SOURCE: &str = "tier25-ruby-resolver";
 

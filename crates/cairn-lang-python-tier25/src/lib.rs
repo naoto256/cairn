@@ -74,7 +74,9 @@ pub const TIER_PREFIX: &str = "tier25";
 // now set `target_qualified = None` to honor the `WorkspaceResolution`
 // contract (path-scoped lookup no longer pins symbol_id for imports).
 // Cached runs need invalidation.
-pub const ANALYZER_REVISION: u32 = 4;
+// Bumped to 5: explicit-operand super calls remain unresolved, and nested
+// functions inside class methods no longer enter the method index.
+pub const ANALYZER_REVISION: u32 = 5;
 pub const PARSER_ID: &str = "tree-sitter-python";
 pub const RESOLUTION_SOURCE: &str = "tier25-python-resolver";
 

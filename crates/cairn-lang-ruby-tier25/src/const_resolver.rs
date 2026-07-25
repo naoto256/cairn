@@ -146,12 +146,11 @@ struct Visitor<'a> {
     /// (e.g. entering `Outer::Inner` from inside `Outer` pushes both
     /// `Outer` and `Inner`), so already-visible segments can end up
     /// duplicated in `scope` for the duration of the child scope.
-    /// `close_scope` pops by the *segment count* of whatever
-    /// `class_defs.last()` reports at close time, which does not
-    /// necessarily match what was pushed for this scope (see the
-    /// `close_scope` doc), so the scope is a walk-local address —
-    /// not a canonical FQN.
+    /// Each open scope records its own pushed-segment count so closing
+    /// a nested scope cannot consume its parent's segments. The scope
+    /// remains a walk-local address, not a canonical FQN.
     scope: Vec<String>,
+    scope_segment_counts: Vec<usize>,
     /// Whether the current position is a *singleton* context. Pushed
     /// as `true` only on `singleton_class` (`class << self`) entry;
     /// pushed as `false` on class / module entry; `def self.foo`
@@ -169,6 +168,7 @@ impl<'a> Visitor<'a> {
             source,
             facts: FileConstFacts::default(),
             scope: Vec::new(),
+            scope_segment_counts: Vec::new(),
             singleton_stack: vec![false],
         }
     }
@@ -270,6 +270,7 @@ impl<'a> Visitor<'a> {
         // segments so nested lookups join with `::` correctly.
         let pieces: Vec<String> = qualified.split("::").map(str::to_string).collect();
         self.scope.extend(pieces.iter().cloned());
+        self.scope_segment_counts.push(pieces.len());
         self.singleton_stack.push(false);
         Some((
             if node.kind() == "class" {
@@ -281,18 +282,8 @@ impl<'a> Visitor<'a> {
         ))
     }
 
-    /// The pop count comes from the segment count of the last
-    /// `class_defs` entry, not any container-identity check. After
-    /// closing a nested child, `class_defs.last()` is still that
-    /// child, so the outer close pops by the child's segment count
-    /// rather than the outer's — behaviour that only lines up when
-    /// outer and child happen to share the same segment count.
     fn close_scope(&mut self, _kind: &str) {
-        // Pop back to the parent scope. We pushed `qualified.split("::")`
-        // pieces in `open_class_or_module`; record how many to pop by
-        // recomputing the last class_def's piece count.
-        if let Some(last) = self.facts.class_defs.last() {
-            let n = last.qualified.split("::").count();
+        if let Some(n) = self.scope_segment_counts.pop() {
             for _ in 0..n {
                 self.scope.pop();
             }

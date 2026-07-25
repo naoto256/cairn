@@ -89,15 +89,12 @@ pub fn resolve_call(
                 return None;
             }
             let owner = call.lexical_scope.join("::");
-            // Start the ancestor walk at index 1: `super` skips the
-            // innermost MRO entry for the lexical class. Exact when
-            // the caller is a plain `def` in `owner` with no
-            // `prepend` modules. With prepend the MRO is
-            // `[Prepended, Owner, Parent, ...]` — a super from a
-            // method defined in `Owner` should resume at `Parent`,
-            // but `skip(1)` lands on `Owner` itself, one position
-            // too early.
-            for ancestor in mro.ancestors(&owner).into_iter().skip(1) {
+            let ancestors = mro.ancestors(&owner);
+            let start = ancestors
+                .iter()
+                .position(|ancestor| ancestor == &owner)
+                .map_or(0, |owner_index| owner_index + 1);
+            for ancestor in ancestors.into_iter().skip(start) {
                 if let Some(hit) = methods.get(&ancestor, &call.method, false) {
                     return Some(DispatchResolution {
                         path: hit.path.clone(),

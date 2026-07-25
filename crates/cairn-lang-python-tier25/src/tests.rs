@@ -5,6 +5,7 @@ use cairn_core::workspace_analyzer::{
 };
 
 use crate::analyze_files;
+use crate::const_resolver::parse_file;
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
@@ -199,6 +200,58 @@ class Child(Base):
             .any(|c| c.target_qualified.as_deref() == Some("m.Base.step")),
         "super().step() should resolve to Base.step; got {:#?}",
         calls
+    );
+}
+
+#[test]
+fn explicit_operand_super_call_stays_unresolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = "\
+class Base:
+    def step(self):
+        pass
+
+class Child(Base):
+    def step(self):
+        super(Base, self).step()
+";
+    let res = run(tmp.path(), &[("m.py", src)]);
+    let calls = calls_of(&res, "m.py");
+
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.target_qualified.as_deref() != Some("m.Base.step")),
+        "{calls:#?}"
+    );
+}
+
+#[test]
+fn nested_function_inside_method_is_not_indexed_as_method() {
+    let src = b"\
+class Service:
+    def outer(self):
+        def inner():
+            pass
+        return inner()
+";
+    let facts = parse_file(src, Some("service".to_string()), false).expect("source should parse");
+
+    assert!(
+        facts
+            .method_defs
+            .iter()
+            .any(|method| method.name == "outer"),
+        "{:#?}",
+        facts.method_defs
+    );
+    assert!(
+        facts
+            .method_defs
+            .iter()
+            .all(|method| method.name != "inner"),
+        "{:#?}",
+        facts.method_defs
     );
 }
 

@@ -77,18 +77,14 @@ impl RequireGraph {
 /// `require_relative "../foo/bar"` from `dir/file.rb` → `dir/../foo/bar.rb`,
 /// returned only when the resolved path exists in `file_paths`.
 ///
-/// The `.rb` suffix candidate is tried *first* to match Ruby's own
-/// `require_relative` semantics: MRI appends `.rb` when the literal
-/// lacks a recognized extension, so `require_relative "foo"` finds
-/// `foo.rb` even when a raw `foo` file happens to exist. The bare
-/// fallback covers literals that already carry the suffix (which is
-/// what `load` typically emits).
+/// The `.rb` suffix candidate is tried *first* when the literal lacks
+/// an extension. Literals with a recognized extension are used as-is.
 pub fn resolve_relative(from: &str, literal: &str, file_paths: &[String]) -> Option<String> {
     let from_path = PathBuf::from(from);
     let base = from_path.parent().map(PathBuf::from).unwrap_or_default();
     let joined = base.join(literal);
     let normalized = normalize_path(&joined);
-    [format!("{normalized}.rb"), normalized.clone()]
+    ruby_path_candidates(&normalized, true)
         .into_iter()
         .find(|cand| file_paths.contains(cand))
 }
@@ -102,14 +98,20 @@ pub fn resolve_relative(from: &str, literal: &str, file_paths: &[String]) -> Opt
 /// conventional `lib/` and Rails `app/` roots — and leaves gem /
 /// stdlib resolution to Tier-3.
 fn resolve_workspace_require(literal: &str, workspace: &HashSet<&str>) -> Option<String> {
-    let candidates = [
-        format!("{literal}.rb"),
-        format!("lib/{literal}.rb"),
-        format!("app/{literal}.rb"),
-    ];
-    candidates
+    let mut candidates = ["", "lib/", "app/"]
         .into_iter()
-        .find(|cand| workspace.contains(cand.as_str()))
+        .flat_map(|prefix| ruby_path_candidates(&format!("{prefix}{literal}"), false));
+    candidates.find(|cand| workspace.contains(cand.as_str()))
+}
+
+fn ruby_path_candidates(path: &str, include_extensionless_fallback: bool) -> Vec<String> {
+    if std::path::Path::new(path).extension().is_some() {
+        vec![path.to_string()]
+    } else if include_extensionless_fallback {
+        vec![format!("{path}.rb"), path.to_string()]
+    } else {
+        vec![format!("{path}.rb")]
+    }
 }
 
 fn normalize_path(path: &std::path::Path) -> String {

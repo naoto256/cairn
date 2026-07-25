@@ -109,48 +109,72 @@ fn compute_instance_chain(
 ) -> Vec<String> {
     let mut chain: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let visit = |chain: &mut Vec<String>, seen: &mut HashSet<String>, name: &str| {
+    let mut active_path: HashSet<String> = HashSet::new();
+    append_instance_chain(
+        class,
+        superclass,
+        includes,
+        prepends,
+        classes,
+        &mut active_path,
+        &mut seen,
+        &mut chain,
+        0,
+    );
+    chain
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_instance_chain(
+    class: &str,
+    superclass: &HashMap<String, String>,
+    includes: &HashMap<String, Vec<String>>,
+    prepends: &HashMap<String, Vec<String>>,
+    classes: &HashSet<String>,
+    active_path: &mut HashSet<String>,
+    seen: &mut HashSet<String>,
+    chain: &mut Vec<String>,
+    hops: usize,
+) {
+    if hops > 64 || !active_path.insert(class.to_string()) {
+        return;
+    }
+
+    let mut visit = |name: &str| {
         if seen.insert(name.to_string()) {
             chain.push(name.to_string());
         }
     };
-
-    // prepended modules, last-prepended takes precedence.
     if let Some(ps) = prepends.get(class) {
-        for p in ps.iter().rev() {
-            visit(&mut chain, &mut seen, p);
+        for prepend in ps.iter().rev() {
+            visit(prepend);
         }
     }
-    visit(&mut chain, &mut seen, class);
+    visit(class);
     if let Some(is) = includes.get(class) {
-        for i in is.iter().rev() {
-            visit(&mut chain, &mut seen, i);
+        for include in is.iter().rev() {
+            visit(include);
         }
     }
-    let mut cursor = superclass.get(class).cloned();
-    let mut hops = 0;
-    while let Some(parent) = cursor {
-        // Cap the walk at 64 hops to bound this returning outer walk
-        // over pathological workspaces. It does not bound
-        // workspace-parent recursion cycles
-        // (`class A < B; class B < A`) — those go through
-        // `superclass.get(&parent)` in the recursive helpers and
-        // exhaust the stack before this counter is reached. Stop as
-        // well when the parent name is not a workspace class —
-        // record just the name and leave chain resolution to the
-        // fallback resolver.
-        if hops > 64 || !classes.contains(&parent) {
-            visit(&mut chain, &mut seen, &parent);
-            break;
+
+    if let Some(parent) = superclass.get(class) {
+        if classes.contains(parent) {
+            append_instance_chain(
+                parent,
+                superclass,
+                includes,
+                prepends,
+                classes,
+                active_path,
+                seen,
+                chain,
+                hops + 1,
+            );
+        } else {
+            visit(parent);
         }
-        let sub = compute_instance_chain(&parent, superclass, includes, prepends, classes);
-        for s in sub {
-            visit(&mut chain, &mut seen, &s);
-        }
-        cursor = superclass.get(&parent).cloned();
-        hops += 1;
     }
-    chain
+    active_path.remove(class);
 }
 
 fn compute_singleton_chain(

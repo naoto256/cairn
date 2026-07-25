@@ -44,6 +44,12 @@ impl LanguageBackend for RustBackend {
         "tree-sitter-rust"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // v2: only contiguous attributes immediately before a function
+        // participate in test classification.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         extract(source, &language, RustVisitor::new())
@@ -253,30 +259,25 @@ fn strip_generic_args(s: &str) -> String {
 }
 
 /// Textual `#[test]` recognizer. We only look at raw attribute text
-/// (no macro expansion): any preceding `attribute_item` in the same
-/// parent whose text contains the substring `"test"` promotes the
-/// fn to [`SymbolKind::Test`]. This deliberately over-approximates —
+/// (no macro expansion): contiguous `attribute_item` siblings
+/// immediately before the function are inspected, and any whose text
+/// contains the substring `"test"` promotes the fn to
+/// [`SymbolKind::Test`]. This deliberately over-approximates —
 /// anything mentioning `test`, e.g. `#[cfg(test)]`,
 /// `#[cfg_attr(test, ignore)]`, or a user-defined
 /// `#[my_test_helper]`, will match — but under-approximation
 /// (missing a `#[test]` fn) is the costlier failure mode for how
 /// the index is consumed.
 fn has_test_attribute(node: Node<'_>, source: &[u8]) -> bool {
-    let parent = match node.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    let mut cursor = parent.walk();
-    for sibling in parent.children(&mut cursor) {
-        if sibling.start_byte() >= node.start_byte() {
+    let mut sibling = node.prev_named_sibling();
+    while let Some(attribute) = sibling {
+        if attribute.kind() != "attribute_item" {
             break;
         }
-        if sibling.kind() == "attribute_item" {
-            let text = node_text(sibling, source);
-            if text.contains("test") {
-                return true;
-            }
+        if node_text(attribute, source).contains("test") {
+            return true;
         }
+        sibling = attribute.prev_named_sibling();
     }
     false
 }
@@ -426,6 +427,35 @@ fn it_works() {}
         let s = &facts.symbols[0];
         assert_eq!(s.name, "it_works");
         assert_eq!(s.kind, SymbolKind::Test);
+    }
+
+    #[test]
+    fn test_attribute_does_not_leak_to_following_function() {
+        let src = br"
+#[test]
+fn first() {}
+
+fn second() {}
+";
+        let facts = RustBackend.extract_syntactic(src).unwrap();
+        assert_eq!(
+            facts
+                .symbols
+                .iter()
+                .find(|s| s.name == "first")
+                .unwrap()
+                .kind,
+            SymbolKind::Test
+        );
+        assert_eq!(
+            facts
+                .symbols
+                .iter()
+                .find(|s| s.name == "second")
+                .unwrap()
+                .kind,
+            SymbolKind::Function
+        );
     }
 
     #[test]
