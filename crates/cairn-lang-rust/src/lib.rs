@@ -73,6 +73,10 @@ impl RustVisitor {
 
 impl Visitor for RustVisitor {
     fn visit_node(&mut self, node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts) {
+        // Pop container frames whose end byte is at or before this
+        // node's start — the generic walker is depth-first with no
+        // enter/leave callbacks, so nesting is bracketed by comparing
+        // byte offsets on every visit.
         let start = node.start_byte();
         self.nesting.pop_outside(start);
 
@@ -107,6 +111,10 @@ impl Visitor for RustVisitor {
     }
 }
 
+/// Symbol kinds that open a nesting frame in [`NestingTracker`].
+/// `Impl` counts here (not just type definitions) so methods inside
+/// `impl Foo { ... }` qualify as `Foo::method` — critical for the
+/// Tier-2 `syn` walker's `enclosing_qualified` join key.
 fn is_container(kind: &SymbolKind) -> bool {
     matches!(
         kind,
@@ -244,6 +252,15 @@ fn strip_generic_args(s: &str) -> String {
     }
 }
 
+/// Textual `#[test]` recognizer. We only look at raw attribute text
+/// (no macro expansion): any preceding `attribute_item` in the same
+/// parent whose text contains the substring `"test"` promotes the
+/// fn to [`SymbolKind::Test`]. This deliberately over-approximates —
+/// anything mentioning `test`, e.g. `#[cfg(test)]`,
+/// `#[cfg_attr(test, ignore)]`, or a user-defined
+/// `#[my_test_helper]`, will match — but under-approximation
+/// (missing a `#[test]` fn) is the costlier failure mode for how
+/// the index is consumed.
 fn has_test_attribute(node: Node<'_>, source: &[u8]) -> bool {
     let parent = match node.parent() {
         Some(p) => p,
@@ -264,6 +281,14 @@ fn has_test_attribute(node: Node<'_>, source: &[u8]) -> bool {
     false
 }
 
+/// Coarse mapping from Rust `visibility_modifier` text to the
+/// language-agnostic [`Visibility`] enum. Any modifier text containing
+/// the substring `"crate"` (`pub(crate)`, `pub(in crate::path)`) folds
+/// to [`Visibility::Crate`]; anything else (`pub`, `pub(super)`,
+/// `pub(in super)`, `pub(self)`) reads as [`Visibility::Public`].
+/// The enum has no `Restricted` variant for `pub(super)` / `pub(in
+/// path)`, so those all round-trip through `Public` — the coarser
+/// bucket is what index consumers currently want anyway.
 fn extract_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

@@ -321,6 +321,10 @@ fn match_kotlin_item(node: Node<'_>, source: &[u8]) -> Option<(SymbolKind, Strin
     }
 }
 
+/// Byte where a container's body opens. Regular classes / objects /
+/// companion objects wrap their body in `class_body`; `enum class`
+/// declarations use the distinct `enum_class_body` kind, so both
+/// have to be probed.
 fn class_body_start(node: Node<'_>) -> Option<usize> {
     find_direct_child(node, "class_body")
         .or_else(|| find_direct_child(node, "enum_class_body"))
@@ -361,6 +365,12 @@ fn extension_receiver_name(node: Node<'_>, name: Node<'_>, source: &[u8]) -> Opt
     None
 }
 
+/// True when `node` has an anonymous token child whose kind matches
+/// `token`. The tree-sitter-kotlin-ng grammar exposes several
+/// role-marking keywords as anonymous tokens (`interface` inside
+/// `class_declaration`, `val` / `var` inside `class_parameter`, `*`
+/// inside `import`), so `.children()` is required — `.named_children()`
+/// would skip them.
 fn has_direct_token(node: Node<'_>, token: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|c| c.kind() == token)
@@ -374,6 +384,12 @@ fn has_property_modifier(node: Node<'_>, modifier: &str) -> bool {
     has_modifier(node, "property_modifier", modifier)
 }
 
+/// Look up a specific keyword inside a specific modifier category.
+/// Kotlin groups modifiers by category (`class_modifier`,
+/// `property_modifier`, `visibility_modifier`, ...); each category is
+/// a named child of the outer `modifiers` node, and the keyword text
+/// (`enum`, `const`, `open`, ...) sits under it as an anonymous
+/// token — hence the [`has_direct_token`] scan on the inner node.
 fn has_modifier(node: Node<'_>, modifier_kind: &str, modifier: &str) -> bool {
     let Some(modifiers) = find_direct_child(node, "modifiers") else {
         return false;

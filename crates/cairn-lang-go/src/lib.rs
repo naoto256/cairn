@@ -5,6 +5,20 @@
 //! constants, top-level variables, and import declarations. Tier-2
 //! semantic enrichment is deliberately reserved for a future gopls
 //! integration.
+//!
+//! # Layout
+//!
+//! All symbols are recorded as top-level (`parent_idx = None`).
+//! Container / child relationships are expressed textually in
+//! `qualified`: methods use `Receiver.Method` (see
+//! `match_go_item`), which is enough for `find_symbols` /
+//! outline queries without maintaining a parent frame the way the
+//! Rust and Python backends do. `const`/`var` inside a function
+//! body are filtered out by `is_top_level_value_spec` rather than
+//! emitted as nested symbols.
+//!
+//! See `cairn-lang-treesitter-generic` for the shared tier-1
+//! backend shape this file plugs into.
 
 #![forbid(unsafe_code)]
 
@@ -46,6 +60,10 @@ static REGISTER_GO: fn() -> Box<dyn LanguageBackend> = || Box::new(GoBackend);
 
 // ─── visitor ───────────────────────────────────────────────────────────────
 
+/// Go visitor. The [`NestingTracker`] uses `"."` as the qualified-
+/// name separator to match Go's dotted syntax, and today is used
+/// only for its `pop_outside` side (the visitor never calls
+/// `push`) — see the module-level "Layout" note.
 struct GoVisitor {
     nesting: NestingTracker,
 }
@@ -86,6 +104,12 @@ impl Visitor for GoVisitor {
     }
 }
 
+/// Classify a Go top-level declaration node. Returns
+/// `(kind, name, qualified, body_start)` when the node is a
+/// function, method, or named type; `None` otherwise. Method
+/// `qualified` is `Receiver.Method` (see [`receiver_type_name`]
+/// for how the receiver name is pulled through pointer / generic
+/// wrappers); everything else uses the bare name.
 fn match_go_item(
     node: Node<'_>,
     source: &[u8],
@@ -130,6 +154,11 @@ fn match_go_item(
     }
 }
 
+/// Emit one symbol per name in a `const_spec` / `var_spec`. Go's
+/// grouped declarations bind multiple names in a single spec
+/// (`var a, b, c int` or `const ( X, Y = 1, 2 )`); we treat each
+/// name as its own top-level symbol so `find_symbols` resolves
+/// them individually.
 fn emit_named_specs(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts, kind: SymbolKind) {
     let mut cursor = node.walk();
     for child in node.children_by_field_name("name", &mut cursor) {
@@ -141,6 +170,11 @@ fn emit_named_specs(node: Node<'_>, source: &[u8], facts: &mut SyntacticFacts, k
     }
 }
 
+/// Push one [`SymbolFact`] onto `facts.symbols`. Signature and doc
+/// are extracted here so all Go emit paths (functions, methods,
+/// types, and the per-name value-spec fan-out) share the same
+/// shape. `parent_idx` is always `None` — Go's tier-1 keeps a flat
+/// symbol layout (see the module docs).
 fn emit_symbol(
     node: Node<'_>,
     source: &[u8],
@@ -170,6 +204,11 @@ fn emit_symbol(
     });
 }
 
+/// Go's export rule: a declared identifier is exported iff its
+/// first character is an uppercase letter. This check inspects the
+/// first byte only (ASCII fast path); non-ASCII Unicode-uppercase
+/// identifiers (which the language spec technically permits) fall
+/// through to `Private`.
 fn go_visibility(name: &str) -> Visibility {
     if name
         .as_bytes()
@@ -182,6 +221,13 @@ fn go_visibility(name: &str) -> Visibility {
     }
 }
 
+/// Turn one `import_spec` into an [`ImportFact`]. `to_module` is
+/// the stripped import path; `imported` defaults to the path's
+/// last non-empty segment (the package's local binding). Blank
+/// (`_`) and dot (`.`) imports are recorded — the alias itself
+/// carries their intent — while dot imports set `imported = "*"`
+/// so downstream consumers can recognize the whole-namespace
+/// injection.
 fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     let path = child_by_field(node, "path")?;
     let to_module = strip_go_string(node_text(path, source));
@@ -207,6 +253,12 @@ fn match_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     })
 }
 
+/// Best-effort default binding for `import "a/b/c"`: the last
+/// non-empty path segment (`"c"`). This is not always the real
+/// package name — Go lets the file's `package` clause diverge from
+/// the directory name — but it matches the overwhelming
+/// convention and is what a caller referencing the import will
+/// most often type.
 fn default_imported_name(to_module: &str) -> Option<String> {
     to_module
         .rsplit('/')
@@ -214,6 +266,10 @@ fn default_imported_name(to_module: &str) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// Strip the surrounding delimiter from a Go string literal —
+/// either `"…"` (interpreted) or `` `…` `` (raw). Escapes inside
+/// interpreted strings are left as-written; import paths in
+/// practice contain none.
 fn strip_go_string(text: &str) -> String {
     let trimmed = text.trim();
     for delim in ['"', '`'] {
@@ -227,6 +283,11 @@ fn strip_go_string(text: &str) -> String {
     trimmed.to_string()
 }
 
+/// Pull the receiver type name out of a `method_declaration`'s
+/// receiver clause. `func (r *T) M()` → `"T"`, `func (T) M()` →
+/// `"T"`, `func (r *pkg.T) M()` → `"T"`. The unwrapping happens in
+/// [`base_type_name`], which strips pointer / generic / qualifier
+/// wrappers until only the local type name remains.
 fn receiver_type_name(receiver: Node<'_>, source: &[u8]) -> Option<String> {
     let mut cursor = receiver.walk();
     for child in receiver.named_children(&mut cursor) {
@@ -240,6 +301,9 @@ fn receiver_type_name(receiver: Node<'_>, source: &[u8]) -> Option<String> {
     None
 }
 
+/// Peel `*T`, `pkg.T`, and `T[U]` down to the local type name so a
+/// method's `qualified` reads as `T.Method` regardless of how the
+/// receiver was written.
 fn base_type_name(node: Node<'_>, source: &[u8]) -> String {
     match node.kind() {
         "pointer_type" => {
@@ -263,6 +327,20 @@ fn base_type_name(node: Node<'_>, source: &[u8]) -> String {
     }
 }
 
+/// Guard that keeps function-body `const` / `var` out of the
+/// symbol table. Two ancestry shapes are treated as top-level:
+///
+/// - `spec → const_declaration | var_declaration → source_file`
+///   covers both the single-line form (`var x = 1`, `const C = 1`)
+///   and grouped `const ( … )`, since tree-sitter-go emits each
+///   inner `const_spec` directly under the enclosing
+///   `const_declaration`.
+/// - `spec → var_spec_list → var_declaration → source_file`
+///   covers grouped `var ( a int; b int )`, which unlike the
+///   `const` form goes through an intermediate `var_spec_list`.
+///
+/// Anything nested deeper (inside a function body, an anonymous
+/// struct initializer, …) returns `false`.
 fn is_top_level_value_spec(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -281,6 +359,14 @@ fn is_top_level_value_spec(node: Node<'_>) -> bool {
     false
 }
 
+/// Go doc-comment lookup. Tries the comments immediately above
+/// `node` first (the common case: `// Foo does X.` right above
+/// `func Foo`). If nothing sits directly above, falls back to the
+/// comment above the immediate parent — which reaches the
+/// declaration-level doc for grouped `type ( … )` and `const ( … )`
+/// forms whose specs sit directly under the declaration, but does
+/// not reach it for grouped `var ( … )` whose specs go through
+/// `var_spec_list` first.
 fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
     doc_from_preceding_comments(node, source).or_else(|| {
         node.parent().and_then(|parent| match parent.kind() {
@@ -292,12 +378,22 @@ fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
     })
 }
 
+/// Adjacency-based doc classifier for Go: every leading `//`
+/// (and every `/* */`) comment counts as doc text unless a blank
+/// line separates it from the declaration. Any other sibling
+/// (which for Go's `comment` grammar node is unlikely) resets the
+/// run — see [`extract_doc_above_node`] for the shared policy.
 fn doc_from_preceding_comments(node: Node<'_>, source: &[u8]) -> Option<String> {
     extract_doc_above_node(node, source, |sibling, text| {
         (sibling.kind() == "comment").then(|| DocCommentPart::Append(strip_go_doc_marker(text)))
     })
 }
 
+/// Strip Go's comment markers so the returned string is the doc
+/// text alone: `//` line comments lose the leading slashes and
+/// one space; `/* … */` block comments lose the fences and any
+/// leading `*` on inner lines (godoc-style). Unknown shapes fall
+/// back to the trimmed original text.
 fn strip_go_doc_marker(text: &str) -> String {
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix("//") {

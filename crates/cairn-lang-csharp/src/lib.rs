@@ -285,6 +285,12 @@ fn has_modifier(node: Node<'_>, source: &[u8], text: &str) -> bool {
         .any(|c| c.kind() == "modifier" && node_text(c, source) == text)
 }
 
+/// True when `node` has `keyword` as a direct anonymous-token child.
+/// The tree-sitter-c-sharp grammar exposes several role-marking
+/// keywords as unnamed tokens: a `record_declaration`'s `struct`
+/// keyword (distinguishing `record struct` from a class-like record)
+/// and a `using_directive`'s `static` keyword both take this shape,
+/// so `.named_children()` would skip them.
 fn has_keyword_child(node: Node<'_>, keyword: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)

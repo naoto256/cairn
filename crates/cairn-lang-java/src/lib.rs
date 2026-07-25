@@ -197,6 +197,9 @@ impl JavaVisitor {
     }
 }
 
+/// Container kinds that push a new nesting scope. `Struct` covers
+/// Java records — `match_java_item` maps `record_declaration` to
+/// `Struct`, and records nest like classes.
 fn is_container(kind: &SymbolKind) -> bool {
     matches!(
         kind,
@@ -254,6 +257,16 @@ fn java_visibility(node: Node<'_>, parent_kind: Option<&SymbolKind>) -> Visibili
     }
 }
 
+/// Coarse backend heuristic: detect the "static final" pair on a
+/// `field_declaration`, a shape commonly associated with constants.
+/// It neither proves nor fully models the JLS constant-variable
+/// rules (`static` is not required — an instance `final` initialized
+/// to a constant expression also qualifies — and initializer / type
+/// constraints matter too). Used here to reclassify a class /
+/// struct field as `Constant`. Interface members and
+/// `constant_declaration` nodes are already handled by earlier
+/// branches of that OR chain, so this only fires for non-interface
+/// class / struct fields.
 fn has_static_final(node: Node<'_>) -> bool {
     let Some(modifiers) = find_modifiers(node) else {
         return false;

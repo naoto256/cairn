@@ -119,6 +119,11 @@ impl PhpVisitor {
         }
     }
 
+    /// Innermost class-like container, falling back to the enclosing
+    /// namespace symbol so a namespaced free function / class parents
+    /// under the namespace instead of the file root. `NestingTracker`
+    /// only tracks class-nesting, so the namespace fallback lives
+    /// here rather than in the tracker.
     fn current_parent(&self) -> Option<usize> {
         self.nesting
             .current_parent()
@@ -545,6 +550,11 @@ fn extract_phpdoc(node: Node<'_>, source: &[u8]) -> Option<String> {
     .filter(|doc| !doc.is_empty())
 }
 
+/// Strip a `/** ... */` PHPDoc block down to its body: drop the
+/// outer delimiters, then trim the canonical leading `*` from each
+/// interior line and collapse blanks. Truncated to 1024 bytes at a
+/// UTF-8 char boundary so a pathological doc block cannot inflate
+/// a symbol row.
 fn strip_phpdoc_markers(text: &str) -> String {
     let trimmed = text.trim();
     let inner = trimmed

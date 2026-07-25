@@ -312,6 +312,9 @@ struct BodyVisitor<'a> {
 impl<'ast> Visit<'ast> for BodyVisitor<'_> {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         // `foo()` / `path::foo()` — receiver-less call.
+        // A callee that isn't `Expr::Path` (closure calls `(|| ...)()`,
+        // index calls `arr[0]()`, etc.) is silently skipped; those are
+        // rare in Rust source and carry no stable target name.
         if let syn::Expr::Path(p) = node.func.as_ref() {
             let qualified = path_to_string(&p.path);
             let target_name = p
@@ -499,6 +502,9 @@ fn walk_type_for_refs(ty: &syn::Type, role: TypeRole, enclosing: &str, facts: &m
         // `impl Trait` / `dyn Trait` are themselves trait-bound
         // mentions; record each trait as `Bound` regardless of the
         // outer role (the bound binds the position, not the role).
+        // Line is the outer type's start line, not each bound's own —
+        // multi-line `impl A + B` collapses to one line number, which
+        // is acceptable for the current display layer.
         syn::Type::TraitObject(t) => {
             for bound in &t.bounds {
                 if let syn::TypeParamBound::Trait(tb) = bound {
@@ -594,6 +600,11 @@ fn emit_macro_invoke(mac: &syn::Macro, enclosing: &str, facts: &mut SemanticFact
     });
 }
 
+/// Emit a `RefKind::Annotation` row for one attribute path. Serves
+/// both plain `#[name]` attribute macros and each derive entry in a
+/// `#[derive(...)]` list. `target_qualified` is the `::`-joined
+/// path so `#[serde::Deserialize]` and `#[Deserialize]` produce
+/// distinguishable rows even when they resolve to the same trait.
 fn emit_annotation_path(path: &syn::Path, enclosing: &str, facts: &mut SemanticFacts) {
     let qualified = path_to_string(path);
     let target_name = path
