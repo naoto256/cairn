@@ -1,6 +1,7 @@
 use super::*;
 use crate::lsp::Error;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
@@ -31,6 +32,74 @@ impl<'writer> MakeWriter<'writer> for CapturedLog {
     fn make_writer(&'writer self) -> Self::Writer {
         self.clone()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_global_pool_initialization_runs_once() {
+    static TEST_POOL: OnceLock<LspClientPool> = OnceLock::new();
+    static TEST_INIT: StdMutex<()> = StdMutex::new(());
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let initializations = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let barrier = Arc::clone(&barrier);
+        let initializations = Arc::clone(&initializations);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            initialize_global_pool(&TEST_POOL, &TEST_INIT, || {
+                initializations.fetch_add(1, Ordering::SeqCst);
+                LspClientPool::with_config(NonZeroUsize::new(1).unwrap(), None)
+            })
+            .map(|pool| std::ptr::from_ref(pool) as usize)
+        }));
+    }
+
+    let mut addresses = Vec::new();
+    for task in tasks {
+        addresses.push(
+            task.await
+                .expect("initializer task must not panic")
+                .unwrap(),
+        );
+    }
+    assert_eq!(initializations.load(Ordering::SeqCst), 1);
+    assert!(addresses.iter().all(|address| *address == addresses[0]));
+}
+
+#[test]
+fn failed_global_pool_initialization_can_retry() {
+    let cell = OnceLock::new();
+    let init_gate = StdMutex::new(());
+    let initializations = AtomicUsize::new(0);
+
+    let first = initialize_global_pool(&cell, &init_gate, || {
+        initializations.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Protocol("transient runtime failure".into()))
+    });
+    let first = match first {
+        Ok(_) => panic!("first initialization must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        first.to_string(),
+        "LSP protocol error: transient runtime failure"
+    );
+    assert!(cell.get().is_none());
+
+    let second = initialize_global_pool(&cell, &init_gate, || {
+        initializations.fetch_add(1, Ordering::SeqCst);
+        LspClientPool::with_config(NonZeroUsize::new(1).unwrap(), None)
+    })
+    .unwrap();
+    let third = initialize_global_pool(&cell, &init_gate, || {
+        initializations.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Protocol("must not run after success".into()))
+    })
+    .unwrap();
+
+    assert!(std::ptr::eq(second, third));
+    assert_eq!(initializations.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(unix)]
@@ -1194,6 +1263,23 @@ fn bounded_final_shutdown_rejects_late_process_control_install() {
         entry.install_process_control(client.process_control()),
         Err(Error::PoolStopped)
     ));
+}
+
+#[test]
+fn bounded_entry_shutdown_timeout_message_is_context_neutral() {
+    let entry = PoolEntry::default();
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let _gate = entry.shutdown_gate.lock().await;
+        let err = entry
+            .shutdown_bounded(Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "LSP child termination could not be proven: bounded LSP entry shutdown exceeded 1ms"
+        );
+    });
 }
 
 #[cfg(unix)]

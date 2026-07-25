@@ -1422,7 +1422,7 @@ impl PoolEntry {
         match timeout(entry_timeout, shutdown).await {
             Ok(result) => result,
             Err(_) => Err(Error::ChildTerminationFailed(format!(
-                "bounded final shutdown exceeded {}ms",
+                "bounded LSP entry shutdown exceeded {}ms",
                 entry_timeout.as_millis()
             ))),
         }
@@ -1481,6 +1481,39 @@ where
 }
 
 static GLOBAL_POOL: OnceLock<LspClientPool> = OnceLock::new();
+static GLOBAL_POOL_INIT: StdMutex<()> = StdMutex::new(());
+
+fn initialize_global_pool<'a, F>(
+    cell: &'a OnceLock<LspClientPool>,
+    init_gate: &StdMutex<()>,
+    initialize: F,
+) -> Result<&'a LspClientPool>
+where
+    F: FnOnce() -> Result<LspClientPool>,
+{
+    if let Some(pool) = cell.get() {
+        return Ok(pool);
+    }
+    let _guard = match init_gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("lsp pool: recovering poisoned global initialization gate");
+            poisoned.into_inner()
+        }
+    };
+    if let Some(pool) = cell.get() {
+        return Ok(pool);
+    }
+    let pool = initialize()?;
+    if cell.set(pool).is_err() {
+        return Err(Error::Protocol(
+            "lsp pool initialized outside its synchronization gate".into(),
+        ));
+    }
+    Ok(cell
+        .get()
+        .expect("global LSP pool must exist after successful initialization"))
+}
 
 /// Return the daemon-global LSP pool.
 ///
@@ -1488,14 +1521,7 @@ static GLOBAL_POOL: OnceLock<LspClientPool> = OnceLock::new();
 /// Returns an LSP protocol error if the pool runtime cannot be
 /// initialized.
 pub fn global() -> Result<&'static LspClientPool> {
-    if let Some(pool) = GLOBAL_POOL.get() {
-        return Ok(pool);
-    }
-    // Init race: concurrent first callers may each build a pool; the
-    // `get_or_init` loser is dropped before any child is spawned
-    // (only its empty runtime and sweeper task existed).
-    let pool = LspClientPool::new()?;
-    Ok(GLOBAL_POOL.get_or_init(|| pool))
+    initialize_global_pool(&GLOBAL_POOL, &GLOBAL_POOL_INIT, LspClientPool::new)
 }
 
 /// Shut down the daemon-global pool if it was initialized.

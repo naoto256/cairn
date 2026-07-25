@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 #[tokio::test]
 async fn workspace_load_resets_quiet_timer_when_new_progress_arrives() {
@@ -26,6 +28,51 @@ async fn workspace_load_resets_quiet_timer_when_new_progress_arrives() {
     let completed = timeout(Duration::from_millis(100), waiter)
         .await
         .unwrap()
+        .unwrap();
+    assert_eq!(completed, WorkspaceLoadComplete::ProgressQuiescence);
+}
+
+#[tokio::test]
+async fn workspace_load_observes_activity_completed_after_snapshot() {
+    let progress = Arc::new(ProgressState::default());
+    let snapshot_seen = Arc::new(Notify::new());
+    let release_snapshot = Arc::new(Notify::new());
+    let first_snapshot = Arc::new(AtomicBool::new(true));
+
+    let snapshot_wait = snapshot_seen.notified();
+    tokio::pin!(snapshot_wait);
+    snapshot_wait.as_mut().enable();
+
+    let waiter = {
+        let progress = Arc::clone(&progress);
+        let snapshot_seen = Arc::clone(&snapshot_seen);
+        let release_snapshot = Arc::clone(&release_snapshot);
+        let first_snapshot = Arc::clone(&first_snapshot);
+        tokio::spawn(async move {
+            progress
+                .wait_for_quiescence_with_snapshot_hook(Duration::from_millis(10), move || {
+                    let snapshot_seen = Arc::clone(&snapshot_seen);
+                    let release_snapshot = Arc::clone(&release_snapshot);
+                    let first_snapshot = Arc::clone(&first_snapshot);
+                    async move {
+                        if first_snapshot.swap(false, Ordering::SeqCst) {
+                            snapshot_seen.notify_one();
+                            release_snapshot.notified().await;
+                        }
+                    }
+                })
+                .await
+        })
+    };
+
+    snapshot_wait.await;
+    progress.record(&progress_message("phase-1", "begin")).await;
+    progress.record(&progress_message("phase-1", "end")).await;
+    release_snapshot.notify_one();
+
+    let completed = timeout(Duration::from_millis(100), waiter)
+        .await
+        .expect("pre-armed activity notification must wake the waiter")
         .unwrap();
     assert_eq!(completed, WorkspaceLoadComplete::ProgressQuiescence);
 }
