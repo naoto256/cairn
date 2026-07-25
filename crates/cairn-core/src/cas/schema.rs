@@ -835,7 +835,7 @@ mod tests {
     //      `idx_resolutions_blob_scoped_site` and *not* the
     //      manifest-site index.
     //
-    // The production-shape SQL below MUST MIRROR `find_imports.rs:74-95`'s
+    // The production-shape SQL below MUST MIRROR `find_imports.rs:91-105`'s
     // `best_resolution` CTE; the three query paths share the same
     // (kind filter + manifest_id OR predicate) shape with only the
     // selected columns and partition key differing. A shared SQL
@@ -906,7 +906,7 @@ mod tests {
         apply_standard_pragmas(&conn).unwrap();
         apply(&mut conn, MIGRATIONS).unwrap();
 
-        // MUST MIRROR find_imports.rs:74-95 `best_resolution` CTE.
+        // MUST MIRROR find_imports.rs:91-105 `best_resolution` CTE.
         // The `source_rank` CASE / `id` tie-break in the ORDER BY of
         // the ROW_NUMBER are not relevant to the planner's index
         // choice; the WHERE clause and partition shape are.

@@ -6,10 +6,13 @@
 //! preflight, or running -> terminal}`: an empty selection goes
 //! `queued -> skipped` and a materialization failure goes
 //! `queued -> failed`, neither passing through `running`. The stall
-//! watchdog treats
-//! the analyzer's progress ticks as a liveness beacon: a run is
-//! stopped only when the beacon stops advancing, never for total
-//! elapsed time (see [`ANALYZER_STALL_TIMEOUT`]).
+//! watchdog treats the analyzer's progress ticks as a liveness
+//! beacon: a run is stopped only when the beacon stops advancing,
+//! never for total elapsed time (see [`ANALYZER_STALL_TIMEOUT`]).
+//! "Stopped" marks the run row terminal (`TimedOut`) and lets the
+//! runner move on; the worker thread is only *asked* to cancel, so a
+//! stall's detached worker can keep running in the background after
+//! the run has been recorded.
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -333,8 +336,11 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
     ) {
         // A cancel that lands while the analyzer is executing wins
         // over its result: both `Ok` facts and `Err` are discarded
-        // here and nothing is persisted. The stall path never reaches
-        // this arm — it returns `TimedOut`, not `Completed`.
+        // and no resolutions are persisted — but the run row is still
+        // upserted to the terminal `Cancelled` status below via
+        // `mark_run`, so the cancellation is recorded durably even
+        // though the computed facts are dropped. The stall path never
+        // reaches this arm — it returns `TimedOut`, not `Completed`.
         AnalyzerRun::Completed(_) if progress.is_cancelled() => {
             let message = "analyzer cancelled";
             mark_run(

@@ -195,8 +195,11 @@ fn into_wire_item(q: QueryOutlineItem) -> OutlineItem {
         signature: q.signature,
         line: q.line,
         doc: q.doc,
-        // CAS query layer doesn't yet round-trip per-fact source-tier;
-        // mirror the find_symbols default until it does.
+        // CAS query layer doesn't yet round-trip per-fact source-tier
+        // for outline rows, so every item is fixed to Syntactic. This
+        // is not the find_symbols behaviour: that path inspects
+        // `blobs.analyzer_id` and promotes to Semantic, whereas
+        // get_outline carries no such metadata yet.
         source: SourceTier::Syntactic,
     }
 }

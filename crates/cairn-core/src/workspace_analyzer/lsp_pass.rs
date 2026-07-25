@@ -126,9 +126,12 @@ pub struct LspMultiKindDefinitionPass {
 /// refs as workspace facts.
 ///
 /// # Errors
-/// Returns [`Error::Lsp`] for binary availability, spawn, readiness,
-/// and protocol failures, and IO errors when a worktree file cannot
-/// be read.
+/// Always returns [`Error::Lsp`]. Beyond binary availability, spawn,
+/// readiness, and protocol failures, a worktree file that cannot be
+/// read also surfaces here: its IO error is flattened into an
+/// `lsp::Error::Protocol` string by `core_error_to_lsp` rather than
+/// preserved as a distinct variant, so callers must not match for a
+/// separate IO error.
 pub fn run_lsp_definition_pass(
     pass: LspDefinitionPass,
     repo_root: &Path,
@@ -180,9 +183,12 @@ pub fn run_lsp_definition_pass(
 /// each document at most once per file.
 ///
 /// # Errors
-/// Returns [`Error::Lsp`] for binary availability, spawn, readiness,
-/// and protocol failures, and IO errors when a worktree file cannot
-/// be read.
+/// Always returns [`Error::Lsp`]. Beyond binary availability, spawn,
+/// readiness, and protocol failures, a worktree file that cannot be
+/// read also surfaces here: its IO error is flattened into an
+/// `lsp::Error::Protocol` string by `core_error_to_lsp` rather than
+/// preserved as a distinct variant, so callers must not match for a
+/// separate IO error.
 pub fn run_lsp_multi_kind_definition_pass(
     pass: LspMultiKindDefinitionPass,
     repo_root: &Path,
@@ -679,9 +685,12 @@ fn is_requested_site_location(
 ///   the budget lasts, when `retry_file_not_found` is set;
 /// - any other error is terminal.
 ///
-/// Exhausting the budget yields `Ok(vec![])`: the site is treated as
-/// unresolved rather than failing the pass. Cancellation is checked
-/// before each attempt.
+/// Exhausting the attempt budget yields `Ok(vec![])` — the site is
+/// treated as unresolved rather than failing the pass — but only
+/// when no terminal error was hit along the way: a non-retryable
+/// error (and a second content-modified) short-circuits to `Err`
+/// immediately, so the budget can only run out across purely
+/// retryable outcomes. Cancellation is checked before each attempt.
 async fn definition_with_retry_from<F, Fut>(
     mut definition: F,
     policy: DefinitionRetryPolicy,

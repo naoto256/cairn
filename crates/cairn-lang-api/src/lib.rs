@@ -54,7 +54,8 @@ pub enum SymbolScope {
 }
 
 /// A symbol declaration. `parent_idx` is an index into `SyntacticFacts.symbols`
-/// (forward reference within the same fact bundle).
+/// pointing at the enclosing symbol. A parent is always emitted before its
+/// children, so this is a back-reference to an earlier entry in the same bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolFact {
     pub name: String,

@@ -133,13 +133,17 @@ pub struct StalenessSummary {
     /// a `parser_revision` different from what the current backend
     /// reports).
     pub parser_drift_aliases: usize,
-    /// Number of `request_force_by_alias(ParserRevisionDrift)`
-    /// requests dispatched to the reconcile manager as a result
-    /// of parser-revision drift. Counts *requests* (durable
-    /// intent records); the worker executes the register /
-    /// analyzer enqueue work asynchronously and its outcome is
-    /// visible on `repo_reconcile_state` rather than in this
-    /// summary.
+    /// Parser-revision drift dispatches attempted — one per drifted
+    /// alias, so this currently always equals `parser_drift_aliases`.
+    /// Incremented whenever the drift pre-check fires, whether the
+    /// request went to the reconcile manager
+    /// (`request_force_by_alias(ParserRevisionDrift)`, the production
+    /// path) or to the `enqueue_full_repo_reindex` compat fallback,
+    /// and even when that dispatch returns `Err`. It records the
+    /// *attempt*, not a confirmed durable intent record; the worker
+    /// runs the register / analyzer enqueue work asynchronously and
+    /// its outcome is visible on `repo_reconcile_state` rather than in
+    /// this summary.
     pub parser_drift_reconcile_requests: usize,
 }
 
@@ -225,14 +229,16 @@ struct PerAliasSummary {
     jobs_enqueued: usize,
     active_stale: usize,
     terminal_failed_current_revision: usize,
-    /// `true` iff the parser-revision drift pre-check fired and
-    /// a durable reconcile force request was recorded (through
+    /// `true` iff the parser-revision drift pre-check fired. When it
+    /// does, a force dispatch is attempted — either
     /// [`RepoReconcileManager::request_force_by_alias`] with
-    /// [`ReconcileTrigger::ParserRevisionDrift`], or through the
-    /// compat helper [`JobManager::enqueue_full_repo_reindex`]
-    /// when reconcile is unavailable — test-only). When set, the
-    /// analyzer-revision drift loop is skipped — the upcoming
-    /// reindex will re-stamp everything, so re-queueing here
+    /// [`ReconcileTrigger::ParserRevisionDrift`] (production) or the
+    /// compat helper [`JobManager::enqueue_full_repo_reindex`] when
+    /// reconcile is unavailable (test / degraded startup) — but the
+    /// flag is set regardless of whether that dispatch succeeds; a
+    /// dispatch `Err` is logged and the flag still reports `true`.
+    /// When set, the analyzer-revision drift loop is skipped — the
+    /// upcoming reindex will re-stamp everything, so re-queueing here
     /// would only cause coalesce noise.
     parser_drift: bool,
 }

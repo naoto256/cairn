@@ -314,9 +314,10 @@ fn route_repo_command(command: RepoCommand) -> Result<CtlInvocation> {
 /// Route jobs subcommands. Each variant maps to a `jobs.*` method
 /// on the control socket; `Prune` also stashes `dry_run` in the
 /// `RenderHint` so the human printer can pick the "would delete"
-/// vs "deleted" verb — the wire payload itself does not echo
-/// `dry_run`, and the `RenderHint` is what preserves the caller's
-/// mode across the round-trip.
+/// vs "deleted" verb. The request payload carries `dry_run` to the
+/// daemon, but the `JobsPruneResult` response does not echo it
+/// back, so the caller-side `RenderHint` is what preserves the mode
+/// across the round-trip.
 fn route_jobs_command(command: JobsCommand) -> CtlInvocation {
     match command {
         JobsCommand::List {
@@ -581,9 +582,9 @@ fn render_prune(r: &PruneResult) {
 }
 
 /// Text renderer for `JobsPruneResult`. The `dry_run` flag comes
-/// from the caller-side `RenderHint`, not the wire payload, and
+/// from the caller-side `RenderHint`, not the response payload, and
 /// picks the "would delete" vs "deleted" verb; the daemon returns
-/// the same shape either way.
+/// the same shape either way and never reports which action it took.
 fn render_jobs_prune(r: &JobsPruneResult, dry_run: bool) {
     let verb = if dry_run { "would delete" } else { "deleted" };
     println!(

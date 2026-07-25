@@ -60,8 +60,9 @@ pub struct BlobMeta {
 /// addition) as staleness, independently of `parser_revision`.
 ///
 /// # Errors
-/// Any SQLite error encountered while writing, or row-id conversion
-/// out of range (shouldn't happen for realistic source sizes).
+/// Any SQLite error encountered while writing. (usize→i64 offset
+/// conversions saturate at `i64::MAX` rather than erroring, so they
+/// never surface here.)
 pub fn insert(
     tx: &Transaction<'_>,
     blob_sha: &str,

@@ -109,7 +109,9 @@ impl Visitor for GoVisitor {
 /// function, method, or named type; `None` otherwise. Method
 /// `qualified` is `Receiver.Method` (see [`receiver_type_name`]
 /// for how the receiver name is pulled through pointer / generic
-/// wrappers); everything else uses the bare name.
+/// wrappers), falling back to the bare method name when the
+/// receiver type cannot be resolved; functions and named types
+/// always use the bare name.
 fn match_go_item(
     node: Node<'_>,
     source: &[u8],

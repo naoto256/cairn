@@ -14,8 +14,10 @@
 //! `obj.method(...)` where `obj` is a local variable / parameter,
 //! existential / `Any` dispatch, Mirror / KVC reflection, and
 //! Foundation / UIKit / SwiftUI framework calls are deliberately
-//! *not* recorded. Protocol-extension default implementations on a
-//! statically-known receiver are best-effort matched by name only.
+//! *not* recorded. Dotted calls that miss every keyed index fall
+//! back to a unique-by-name match as a last resort (protocol-
+//! extension default implementations are the motivating case, but
+//! any such miss reaches it — see `get_unique_by_name`).
 
 use std::collections::HashMap;
 
@@ -43,8 +45,9 @@ pub struct DispatchResolution {
 ///   `module.helper()` calls without walking `by_owner`'s
 ///   class-shaped keys.
 /// * `by_name` — all defs grouped by bare method name, consulted as
-///   the last-resort fallback for protocol-extension default
-///   implementations (see `get_unique_by_name`).
+///   the last-resort fallback whenever every keyed index misses on a
+///   dotted call — protocol-extension default implementations are the
+///   motivating case, not the only one (see `get_unique_by_name`).
 #[derive(Debug, Default)]
 pub struct MethodIndex {
     by_owner: HashMap<(String, String), MethodEntry>,

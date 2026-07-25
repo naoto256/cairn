@@ -109,7 +109,7 @@ impl DataDir {
 }
 
 /// Resolved storage root for the CAS layout (sibling of [`DataDir`];
-/// they share the same root, so a single `cairn-ng` directory holds
+/// they share the same root, so a single `cairn` directory holds
 /// both schemas).
 #[derive(Debug, Clone)]
 pub struct CasDataDir {

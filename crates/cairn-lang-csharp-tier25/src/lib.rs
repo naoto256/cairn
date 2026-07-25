@@ -215,7 +215,7 @@ pub fn analyze_files(
     // 3. Emit Import resolutions for `using` directives whose target
     // lives in the workspace.
     //
-    // Phase 1 contract (matches Ruby / JavaScript): Import-edge rows
+    // fact-fallback contract (matches Ruby / JavaScript): Import-edge rows
     // record `target_path` only; `target_qualified` is forced to
     // `None`. The require_graph still computes the qualified name
     // internally for alias / binding resolution, but leaking it into

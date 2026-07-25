@@ -14,9 +14,12 @@
 //! (JSON array per §6) fails envelope deserialization into a single
 //! [`Request`] and is surfaced as [`error_code::PARSE_ERROR`]; there
 //! is no array-level fan-out. The MCP surface (`cairn::mcp`) uses a
-//! different handler that reads envelope shape directly and silently
-//! drops missing-id notifications and batches — the `PARSE_ERROR`
-//! path is daemon-side only.
+//! different handler that reads envelope shape directly: it silently
+//! drops any input without an `id` (missing-id notifications and
+//! batch arrays), but a malformed envelope that still carries an
+//! `id` field is answered with an [`error_code::PARSE_ERROR`] reply.
+//! MCP never fans out a batch, so the daemon's array-level
+//! `PARSE_ERROR` has no MCP counterpart.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
