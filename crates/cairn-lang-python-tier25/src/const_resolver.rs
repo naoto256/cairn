@@ -323,12 +323,8 @@ impl<'a> Visitor<'a> {
     // enclosing function name (`outer_fn.NestedClass`). This is not
     // strict PEP 3155 — CPython inserts a `<locals>` marker between
     // the two — but keeping it flat matches how the rest of the
-    // resolver builds qualifieds. `current_class()` walks the
-    // container stack for the innermost class frame, so a `def`
-    // nested inside a function that is itself inside a class is
-    // recorded as a method on that outer class (its enclosing
-    // function frame is skipped over rather than the whole `def`
-    // being suppressed).
+    // resolver builds qualifieds. Nested functions are not recorded
+    // as methods or module-level callables.
     fn enter_function(&mut self, node: Node<'_>) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -339,7 +335,9 @@ impl<'a> Visitor<'a> {
         // module-level callable when at top level (owner = the
         // file's module). Nested functions (inside another function)
         // are skipped — they can't be statically dispatched anyway.
-        if let Some(owner) = self.current_class() {
+        if self.current_function().is_none()
+            && let Some(owner) = self.current_class()
+        {
             self.facts.method_defs.push(MethodDef {
                 qualified: format!("{owner}.{name}"),
                 owner,
@@ -665,13 +663,8 @@ fn classify_attribute_call<'tree>(
     (receiver, Some(method), method_node)
 }
 
-/// Recognise a `super(...)` callable. We only check that the callee
-/// is the bare identifier `super` — argument shape (zero-arg vs
-/// explicit `super(Type, self)`) is not inspected, so both forms
-/// route through `CallReceiver::SuperRef` and get the same MRO walk.
-/// A shadowed local `super` binding could false-positive here, but
-/// re-binding `super` in Python is rare enough that we treat it as
-/// pathological.
+/// Recognise a zero-argument `super()` callable. Explicit operands
+/// select a different MRO anchor and are left to Tier-3.
 fn is_super_call(call_node: Node<'_>, source: &[u8]) -> bool {
     let Some(func) = call_node.child_by_field_name("function") else {
         return false;
@@ -679,7 +672,12 @@ fn is_super_call(call_node: Node<'_>, source: &[u8]) -> bool {
     if func.kind() != "identifier" {
         return false;
     }
-    std::str::from_utf8(&source[func.byte_range()]) == Ok("super")
+    if std::str::from_utf8(&source[func.byte_range()]) != Ok("super") {
+        return false;
+    }
+    call_node
+        .child_by_field_name("arguments")
+        .is_some_and(|arguments| arguments.named_child_count() == 0)
 }
 
 // ─── workspace-wide module index ──────────────────────────────────────────

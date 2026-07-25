@@ -40,7 +40,9 @@ impl Analyzer for TypescriptAnalyzer {
         // 2: dotted heritage bases (`extends ns.Base`) now resolve to
         // the full dotted name instead of the first identifier, and
         // JSX component usages emit `Instantiate` refs.
-        2
+        // 3: generic type heads emit once at their enclosing role;
+        // only type arguments emit as GenericArg refs.
+        3
     }
 
     fn extract_semantic(&self, source: &[u8]) -> Result<SemanticFacts, ExtractError> {
@@ -336,12 +338,8 @@ impl TsSemanticWalker {
     /// one `RefKind::Type` row; structural wrappers (`Array<T>`,
     /// unions, tuples, function types) descend with the same role
     /// unless the wrapper itself distinguishes a bucket. `generic_type`
-    /// first emits its head name at the incoming `role`, then walks
-    /// *all* of its own named children — head included — again as
-    /// [`TypeRole::GenericArg`], so `Vec<Foo>` currently produces
-    /// three rows in this order: role=Param `Vec`, role=GenericArg
-    /// `Vec` (the head re-emitted), and role=GenericArg `Foo`. The
-    /// duplicate head is a follow-up bug candidate. `predefined_type`
+    /// emits its head name at the incoming `role`, then walks only its
+    /// `type_arguments` as [`TypeRole::GenericArg`]. `predefined_type`
     /// (`string` / `number` / …) is dropped because those are built-in
     /// keywords, not resolvable symbol targets.
     fn emit_type_expr(&mut self, node: Node<'_>, source: &[u8], role: TypeRole) {
@@ -353,7 +351,12 @@ impl TsSemanticWalker {
                 if let Some(name) = first_named_child(node) {
                     self.emit_type_expr(name, source, role);
                 }
-                self.emit_type_descendants(node, source, TypeRole::GenericArg);
+                if let Some(arguments) = node
+                    .named_children(&mut node.walk())
+                    .find(|child| child.kind() == "type_arguments")
+                {
+                    self.emit_type_expr(arguments, source, TypeRole::GenericArg);
+                }
             }
             "type_arguments" | "type_parameters" => {
                 self.emit_type_descendants(node, source, role);
@@ -692,6 +695,23 @@ mod tests {
             r.kind == RefKind::Type
                 && r.target_name == "Target"
                 && r.type_role == Some(TypeRole::Alias)
+        }));
+    }
+
+    #[test]
+    fn generic_type_head_is_not_reemitted_as_argument() {
+        let refs = refs("function f(value: Box<Item>) {}");
+        let box_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Type && r.target_name == "Box")
+            .collect();
+
+        assert_eq!(box_refs.len(), 1, "{refs:?}");
+        assert_eq!(box_refs[0].type_role, Some(TypeRole::Param));
+        assert!(refs.iter().any(|r| {
+            r.kind == RefKind::Type
+                && r.target_name == "Item"
+                && r.type_role == Some(TypeRole::GenericArg)
         }));
     }
 
