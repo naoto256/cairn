@@ -49,6 +49,12 @@ impl LanguageBackend for GoBackend {
         "tree-sitter-go"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // v2: exported-name classification follows Unicode uppercase
+        // semantics, and grouped var specs inherit declaration docs.
+        2
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
         extract(source, &language, GoVisitor::new())
@@ -207,16 +213,9 @@ fn emit_symbol(
 }
 
 /// Go's export rule: a declared identifier is exported iff its
-/// first character is an uppercase letter. This check inspects the
-/// first byte only (ASCII fast path); non-ASCII Unicode-uppercase
-/// identifiers (which the language spec technically permits) fall
-/// through to `Private`.
+/// first Unicode character is an uppercase letter.
 fn go_visibility(name: &str) -> Visibility {
-    if name
-        .as_bytes()
-        .first()
-        .is_some_and(|first| first.is_ascii_uppercase())
-    {
+    if name.chars().next().is_some_and(char::is_uppercase) {
         Visibility::Public
     } else {
         Visibility::Private
@@ -366,17 +365,23 @@ fn is_top_level_value_spec(node: Node<'_>) -> bool {
 /// `func Foo`). If nothing sits directly above, falls back to the
 /// comment above the immediate parent — which reaches the
 /// declaration-level doc for grouped `type ( … )` and `const ( … )`
-/// forms whose specs sit directly under the declaration, but does
-/// not reach it for grouped `var ( … )` whose specs go through
-/// `var_spec_list` first.
+/// forms whose specs sit directly under the declaration. Grouped
+/// `var ( … )` specs go through `var_spec_list`, so that wrapper is
+/// peeled before checking the declaration.
 fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
     doc_from_preceding_comments(node, source).or_else(|| {
-        node.parent().and_then(|parent| match parent.kind() {
+        let parent = node.parent()?;
+        let declaration = if parent.kind() == "var_spec_list" {
+            parent.parent()?
+        } else {
+            parent
+        };
+        match declaration.kind() {
             "type_declaration" | "const_declaration" | "var_declaration" => {
-                doc_from_preceding_comments(parent, source)
+                doc_from_preceding_comments(declaration, source)
             }
             _ => None,
-        })
+        }
     })
 }
 
@@ -536,6 +541,38 @@ var varName = 4
         assert_eq!(
             symbol(&facts, "varName").visibility,
             Some(Visibility::Private)
+        );
+    }
+
+    #[test]
+    fn unicode_uppercase_identifier_is_exported() {
+        let facts = GoBackend
+            .extract_syntactic("package main\nfunc Éclair() {}\n".as_bytes())
+            .unwrap();
+
+        assert_eq!(
+            symbol(&facts, "Éclair").visibility,
+            Some(Visibility::Public)
+        );
+    }
+
+    #[test]
+    fn grouped_var_inherits_declaration_doc() {
+        let facts = GoBackend
+            .extract_syntactic(
+                br#"package main
+
+// Shared value.
+var (
+    Grouped int
+)
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            symbol(&facts, "Grouped").doc.as_deref(),
+            Some("Shared value.")
         );
     }
 

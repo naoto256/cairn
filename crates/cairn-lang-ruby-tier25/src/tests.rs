@@ -248,6 +248,41 @@ end
     );
 }
 
+#[test]
+fn mro_cycle_terminates_with_each_class_once() {
+    let src = "class A < B; end\nclass B < A; end\n";
+    let facts = parse_file(src.as_bytes()).unwrap();
+    let per_file = vec![("a.rb".to_string(), src.as_bytes().to_vec(), facts)];
+    let ci = ConstIndex::build(&per_file);
+    let mro = Mro::build(&per_file, &ci);
+    let chain = mro.ancestors("A");
+
+    assert_eq!(chain.iter().filter(|name| name.as_str() == "A").count(), 1);
+    assert_eq!(chain.iter().filter(|name| name.as_str() == "B").count(), 1);
+}
+
+#[test]
+fn nested_scope_close_preserves_parent_for_following_sibling() {
+    let src = r#"
+module Root
+  class Outer
+    class Child; end
+  end
+  class Sibling; end
+end
+"#;
+    let facts = parse_file(src.as_bytes()).unwrap();
+
+    assert!(
+        facts
+            .class_defs
+            .iter()
+            .any(|definition| definition.qualified == "Root::Sibling"),
+        "{:#?}",
+        facts.class_defs
+    );
+}
+
 // ─── dispatch ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -324,6 +359,37 @@ end
     assert_eq!(r.qualified, "Base#step");
 }
 
+#[test]
+fn dispatch_super_skips_owner_after_prepended_module() {
+    let src = r#"
+module Prepended
+  def step; end
+end
+class Base
+  def step; end
+end
+class Child < Base
+  prepend Prepended
+  def step
+    super
+  end
+end
+"#;
+    let facts = parse_file(src.as_bytes()).unwrap();
+    let per_file = vec![("a.rb".to_string(), src.as_bytes().to_vec(), facts.clone())];
+    let ci = ConstIndex::build(&per_file);
+    let mro = Mro::build(&per_file, &ci);
+    let mi = MethodIndex::build(&per_file);
+    let call = facts
+        .method_calls
+        .iter()
+        .find(|call| matches!(call.receiver, CallReceiver::Super))
+        .expect("expected super call site");
+
+    let resolved = resolve_call(call, &ci, &mro, &mi).expect("super should resolve");
+    assert_eq!(resolved.qualified, "Base#step");
+}
+
 // ─── require_graph ────────────────────────────────────────────────────────
 
 #[test]
@@ -341,6 +407,28 @@ fn require_relative_resolves_workspace_file() {
         res
     );
     assert_eq!(r.unwrap().target_path.as_deref(), Some("lib/util.rb"));
+}
+
+#[test]
+fn require_relative_with_extension_does_not_append_rb() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = "require_relative \"foo.rb\"\n";
+    let res = run(
+        tmp.path(),
+        &[
+            ("main.rb", main),
+            ("foo.rb", "class Exact; end\n"),
+            ("foo.rb.rb", "class Doubled; end\n"),
+        ],
+    );
+    let import = res
+        .iter()
+        .find(|resolution| {
+            resolution.source_path == "main.rb" && resolution.kind == ResolutionKind::Import
+        })
+        .expect("require_relative should resolve");
+
+    assert_eq!(import.target_path.as_deref(), Some("foo.rb"));
 }
 
 #[test]

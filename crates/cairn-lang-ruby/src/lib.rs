@@ -74,7 +74,9 @@ impl LanguageBackend for RubyBackend {
         // entirely; bumping the revision forces a re-parse.
         // v5: invalidate rows produced before worktree hashing and parsing
         // shared one immutable, single-read payload.
-        5
+        // v6: bare visibility markers only affect
+        // class/module/singleton-class bodies.
+        6
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -118,9 +120,10 @@ struct RubyVisitor {
     nesting: NestingTracker,
     root_visibility: Visibility,
     /// Stack of `(container_end_byte, current_section_visibility)`,
-    /// one entry per open class / module body. Popped when the walk
-    /// passes `container_end_byte`. Empty at the top level; the
-    /// top-level section default lives in `root_visibility`.
+    /// one entry per open class / module / singleton-class body.
+    /// Popped when the walk passes `container_end_byte`. Empty at the
+    /// top level; the top-level section default lives in
+    /// `root_visibility`.
     visibility_scopes: Vec<(usize, Visibility)>,
 }
 
@@ -204,13 +207,20 @@ impl RubyVisitor {
 
     /// Handle the bare-identifier form of the visibility marker: a
     /// stand-alone `private` (no parens, no arguments) parses as an
-    /// `identifier` child of `body_statement`, not a `call`. In any
-    /// other position `private` is a variable read and is ignored.
+    /// `identifier` child of `body_statement`, not a `call`. Only a
+    /// class/module/singleton-class body owns a visibility section;
+    /// method bodies and other positions treat the identifier as a
+    /// variable read.
     fn update_bare_visibility_section(&mut self, node: Node<'_>, source: &[u8]) -> bool {
-        if node
+        let Some(body) = node
             .parent()
-            .is_none_or(|parent| parent.kind() != "body_statement")
-        {
+            .filter(|parent| parent.kind() == "body_statement")
+        else {
+            return false;
+        };
+        if !body.parent().is_some_and(|container| {
+            matches!(container.kind(), "class" | "module" | "singleton_class")
+        }) {
             return false;
         }
         let visibility = match node_text(node, source) {
@@ -491,6 +501,9 @@ impl Visitor for RubyVisitor {
 
         match node.kind() {
             "module" | "class" => self.emit_container(node, source, facts),
+            "singleton_class" => self
+                .visibility_scopes
+                .push((node.end_byte(), Visibility::Public)),
             "method" => self.emit_method(node, source, facts),
             "singleton_method" => self.emit_singleton_method(node, source, facts),
             "assignment" => self.emit_constant(node, source, facts),
@@ -874,6 +887,47 @@ end
         assert_eq!(
             symbol(&facts, "hidden").visibility,
             Some(Visibility::Private)
+        );
+    }
+
+    #[test]
+    fn bare_visibility_marker_inside_method_does_not_change_class_section() {
+        let src = "\
+class S
+  def configure
+    private
+  end
+
+  def still_public; end
+end
+";
+        let facts = syntactic(src);
+        assert_eq!(
+            symbol(&facts, "still_public").visibility,
+            Some(Visibility::Public)
+        );
+    }
+
+    #[test]
+    fn singleton_class_visibility_is_scoped_to_its_body() {
+        let src = "\
+class S
+  class << self
+    private
+    def hidden; end
+  end
+
+  def visible; end
+end
+";
+        let facts = syntactic(src);
+        assert_eq!(
+            symbol(&facts, "hidden").visibility,
+            Some(Visibility::Private)
+        );
+        assert_eq!(
+            symbol(&facts, "visible").visibility,
+            Some(Visibility::Public)
         );
     }
 
