@@ -318,6 +318,17 @@ impl<'a> Visitor<'a> {
         self.container_stack.pop();
     }
 
+    // Function definitions push a non-class container frame so any
+    // nested `class` inside the function is still qualified with the
+    // enclosing function name (`outer_fn.NestedClass`). This is not
+    // strict PEP 3155 — CPython inserts a `<locals>` marker between
+    // the two — but keeping it flat matches how the rest of the
+    // resolver builds qualifieds. `current_class()` walks the
+    // container stack for the innermost class frame, so a `def`
+    // nested inside a function that is itself inside a class is
+    // recorded as a method on that outer class (its enclosing
+    // function frame is skipped over rather than the whole `def`
+    // being suppressed).
     fn enter_function(&mut self, node: Node<'_>) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -654,6 +665,13 @@ fn classify_attribute_call<'tree>(
     (receiver, Some(method), method_node)
 }
 
+/// Recognise a `super(...)` callable. We only check that the callee
+/// is the bare identifier `super` — argument shape (zero-arg vs
+/// explicit `super(Type, self)`) is not inspected, so both forms
+/// route through `CallReceiver::SuperRef` and get the same MRO walk.
+/// A shadowed local `super` binding could false-positive here, but
+/// re-binding `super` in Python is rare enough that we treat it as
+/// pathological.
 fn is_super_call(call_node: Node<'_>, source: &[u8]) -> bool {
     let Some(func) = call_node.child_by_field_name("function") else {
         return false;

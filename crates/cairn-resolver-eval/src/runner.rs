@@ -156,6 +156,11 @@ pub fn run_case(case: &GoldenCase) -> Result<EvalReport> {
     })
 }
 
+/// Read the `workspace_analysis_runs` row for `(manifest_id,
+/// analyzer_id)` and bail unless its `status` is `succeeded`. Called
+/// from [`register_fixture`] so a silent Tier-2.5 analyzer failure
+/// surfaces here — otherwise an empty Tier-2.5 hit set would falsely
+/// blame the resolver's correctness instead of the run status.
 fn assert_tier25_run_succeeded(
     conn: &rusqlite::Connection,
     manifest_id: i64,
@@ -179,6 +184,12 @@ fn assert_tier25_run_succeeded(
     Ok(())
 }
 
+/// Dispatch `case.tool` to the matching `cairn-core` query verb and
+/// flatten each row into an [`ActualHit`]. Field mapping is per-tool:
+/// `find_symbols` has no resolution-layer provenance so its rows record
+/// `kind_source = None`; the reference / import / subtype / supertype
+/// verbs propagate `kind_source` from their winning `resolutions` row
+/// so [`crate::report::TierReport::score_tier25`] can filter on it.
 fn run_tool(
     conn: &rusqlite::Connection,
     anchor: &AnchorName,

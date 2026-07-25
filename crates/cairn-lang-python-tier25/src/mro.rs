@@ -97,6 +97,20 @@ impl Mro {
     }
 }
 
+/// Resolve one base-class expression to a workspace qualified name.
+///
+/// Cascade: alias-map → in-module → bare lookup. The alias branch is
+/// the only one that returns `Some` even without a workspace hit —
+/// an import-bound name is treated as canonical for MRO purposes so
+/// downstream subclass relationships travel across import boundaries
+/// (e.g. two files subclassing the same alias share an ancestor
+/// entry). Because the alias map is populated only from
+/// workspace-resolved imports, that non-workspace return case
+/// covers workspace-internal aliases whose target we could not
+/// re-resolve — not stdlib bases, which never enter the alias map
+/// at all. The in-module and bare branches require a workspace
+/// hit; otherwise `None` is returned and that base is dropped from
+/// the parents map.
 fn resolve_base(
     parts: &[String],
     aliases: &std::collections::HashMap<String, String>,
@@ -140,6 +154,12 @@ fn resolve_base(
 
 /// C3 linearization. Returns `None` when the bases are inconsistent
 /// (caller falls back to DFS).
+///
+/// Non-workspace bases participate as one-element sequences so they
+/// merge into the result exactly once. The recursion is bounded at
+/// depth 64, which caps both accidental cycles and pathologically
+/// deep inheritance towers — a bound this deep is well beyond any
+/// realistic Python class hierarchy.
 fn c3_linearize(
     class: &str,
     parents: &HashMap<String, Vec<String>>,

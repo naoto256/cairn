@@ -37,6 +37,50 @@
 //!   block technically only applies inside that block; we treat all
 //!   `using` directives as file-scoped, matching the Tier-1 backend's
 //!   model).
+//!
+//! # Files in this crate (Tier-2.5 shape)
+//!
+//! Every Tier-2.5 backend (this crate plus the sibling
+//! `javascript-tier25` / `kotlin-tier25` / `ruby-tier25` /
+//! `python-tier25` / `php-tier25` / `swift-tier25` crates) is
+//! organized into the same five production modules — plus a
+//! `tests.rs` — each covering one leg of the resolution pipeline.
+//! This file layout is *convention*, not a shared trait — every
+//! backend re-implements the pieces against its own grammar, but
+//! the responsibility split lines up so a reader familiar with
+//! one Tier-2.5 backend can navigate any of them.
+//!
+//! * `const_resolver.rs` — per-file tree-sitter walk that extracts
+//!   raw declaration facts (classes, methods, imports, calls) into
+//!   a `FileConstFacts`. Also defines the workspace-wide
+//!   `PackageIndex` (FQN → defining file) that later stages query.
+//! * `require_graph.rs` — resolves each file's `using` /
+//!   `import` / `require` bindings against `PackageIndex`. Emits
+//!   Import-edge resolution rows for the persist layer and a
+//!   per-file alias map (short local name → workspace target) that
+//!   dispatch consults.
+//! * `mro.rs` — computes ancestor chains for the workspace's
+//!   classes. `Mro::ancestors(class)` returns the walk order used
+//!   by `this.foo()` / `super.foo()` dispatch. The internal
+//!   discipline (BFS here, single-chain in JS, `is_constructor_
+//!   invocation`-split in Kotlin) is language-specific and lives
+//!   in each backend's own `mro.rs`.
+//! * `dispatch.rs` — static call resolution. Given the alias map,
+//!   `PackageIndex`, `Mro`, and a method index, resolves a
+//!   `MethodCall` to a `DispatchResolution { path, qualified }`
+//!   or returns None so the persist layer skips the row (Tier-2.5
+//!   emits *no* "site observed" row for unresolvable calls).
+//! * `lib.rs` — the `WorkspaceAnalyzer` impl and the top-level
+//!   `analyze_files` orchestrator that stitches the four
+//!   submodules together per file.
+//!
+//! The per-file emissions (`resolutions` rows) share one contract
+//! across all Tier-2.5 backends: Import edges carry `target_path`
+//! only (`target_qualified` is forced `None`, matching the persist
+//! layer's fact-fallback contract); Type / Call edges carry
+//! `(target_path, target_qualified)` when both can be pinned.
+//! Language-specific `//!` blocks in the sibling files describe
+//! how each backend fills those slots.
 
 #![deny(unsafe_code)]
 

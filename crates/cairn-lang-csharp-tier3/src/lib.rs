@@ -68,6 +68,15 @@ impl WorkspaceAnalyzer for CsharpLsWorkspaceAnalyzer {
 static REGISTER_CSHARP_LS_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(CsharpLsWorkspaceAnalyzer);
 
+/// Files feeding `WorkspaceAnalyzer::config_paths` into
+/// `workspace_analysis_runs.config_hash`. Adding or removing a
+/// `.csproj`, `.sln`, or `.slnx`, or editing any MSBuild props /
+/// `global.json`, changes the SHA-1 fingerprint that
+/// `workspace_analyzers_needing_rerun` compares, forcing csharp-ls
+/// to re-run even when no `.cs` source blob changed.
+///
+/// Glob patterns (`*.csproj`, `*.sln`, `*.slnx`) are expanded by
+/// `expanded_config_paths` in cairn-core.
 fn csharp_config_paths() -> &'static [&'static str] {
     &[
         "*.csproj",
@@ -138,6 +147,10 @@ fn run_csharp_ls_pass(
     )
 }
 
+/// Resolve `csharp-ls` via `cairn_core::lsp_discovery` so worker
+/// resolution matches doctor's under launchd's minimal PATH.
+/// `CSHARP_LS` is the operator override env var (a path to the
+/// binary).
 fn csharp_ls_binary() -> PathBuf {
     discover_lsp_binary("csharp-ls", Some("CSHARP_LS"))
         .unwrap_or_else(|| PathBuf::from("csharp-ls"))

@@ -3,6 +3,19 @@
 //! This crate follows the single-language Tier-3 pattern: one analyzer id,
 //! no shared sibling pool, and tree-sitter collectors that ask sourcekit-lsp
 //! to resolve cross-file call and type definition sites.
+//!
+//! `config_paths` names the workspace files that feed the
+//! analyzer-currency `config_hash`
+//! (`cairn_core::workspace_analyzer::expected`):
+//! `Package.swift`, `Package.resolved`, `.swift-version`,
+//! `.swift-format`, `compile_commands.json`. Editing any forces a
+//! sourcekit-lsp re-run without a source blob change.
+//!
+//! `run_sourcekit_lsp_passes` issues the definition pass twice — for
+//! call sites and type references — and merges facts. The type pass
+//! excludes declaration names (see `is_declaration_type_name`) so
+//! `textDocument/definition` on a class or protocol name does not
+//! round-trip to a self-reference that duplicates Tier-2 symbols.
 
 #![forbid(unsafe_code)]
 

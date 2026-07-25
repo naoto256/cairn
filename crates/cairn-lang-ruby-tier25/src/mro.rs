@@ -130,6 +130,15 @@ fn compute_instance_chain(
     let mut cursor = superclass.get(class).cloned();
     let mut hops = 0;
     while let Some(parent) = cursor {
+        // Cap the walk at 64 hops to bound this returning outer walk
+        // over pathological workspaces. It does not bound
+        // workspace-parent recursion cycles
+        // (`class A < B; class B < A`) — those go through
+        // `superclass.get(&parent)` in the recursive helpers and
+        // exhaust the stack before this counter is reached. Stop as
+        // well when the parent name is not a workspace class —
+        // record just the name and leave chain resolution to the
+        // fallback resolver.
         if hops > 64 || !classes.contains(&parent) {
             visit(&mut chain, &mut seen, &parent);
             break;
@@ -179,6 +188,12 @@ fn compute_singleton_chain(
         cursor = superclass.get(&parent).cloned();
         hops += 1;
     }
+    // Deliberately drop `includes` / `prepends` on the singleton
+    // chain: Ruby's `include M` / `prepend M` extends the *instance*
+    // MRO of the receiver, not the singleton MRO. `Foo.bar` never
+    // dispatches into a plain `include`d module — only `extend M`
+    // reaches the singleton, and that path is handled above via the
+    // `extends` map.
     let _ = (includes, prepends);
     chain
 }

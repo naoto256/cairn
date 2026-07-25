@@ -310,6 +310,8 @@ fn resolve_dotted(
     // module name is best-effort derived from the file's containing
     // `Package.swift` target (or `None` for loose files). When the
     // module is known, prepend it.
+    // Today `module` is always `None` until SPM target mapping is
+    // wired in; see `const_resolver.rs` on `FileConstFacts::module`.
     if let Some(module) = facts.module.as_deref().filter(|s| !s.is_empty()) {
         let candidate = format!("{module}.{}", parts.join("."));
         if let Some(hit) = package_index.lookup(&candidate) {

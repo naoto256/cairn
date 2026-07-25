@@ -69,6 +69,12 @@ impl WorkspaceAnalyzer for JdtlsWorkspaceAnalyzer {
 static REGISTER_JDTLS_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(JdtlsWorkspaceAnalyzer);
 
+/// Files feeding `WorkspaceAnalyzer::config_paths` into
+/// `workspace_analysis_runs.config_hash`. A Maven / Gradle edit,
+/// or a change to the Eclipse project metadata jdtls itself
+/// consumes, changes the SHA-1 fingerprint that
+/// `workspace_analyzers_needing_rerun` compares, forcing jdtls
+/// to re-run even when no `.java` source blob changed.
 fn java_config_paths() -> &'static [&'static str] {
     &[
         "pom.xml",
@@ -145,6 +151,10 @@ fn run_jdtls_pass(
     )
 }
 
+/// Resolve `jdtls` via `cairn_core::lsp_discovery` so worker
+/// resolution matches doctor's under launchd's minimal PATH.
+/// `JDTLS` is the operator override env var (a path to the
+/// binary).
 fn jdtls_binary() -> PathBuf {
     discover_lsp_binary("jdtls", Some("JDTLS")).unwrap_or_else(|| PathBuf::from("jdtls"))
 }

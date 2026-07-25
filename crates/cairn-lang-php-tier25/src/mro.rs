@@ -18,6 +18,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::const_resolver::{ConstIndex, FileConstFacts, MixinKind};
 
+/// Precomputed MRO chains for every class the workspace defines.
+///
+/// `chain` is the full innermost-first ancestor list used by dispatch
+/// (class → traits → parent chain → interfaces); `parent_of` records
+/// only the single direct `extends` parent so `parent::method()` can
+/// jump one hop up before consulting the chain.
 #[derive(Debug, Default)]
 pub struct Mro {
     chain: HashMap<String, Vec<String>>,
@@ -99,6 +105,15 @@ impl Mro {
     }
 }
 
+/// Build the linear ancestor list for one class. PHP semantics: `use`d
+/// traits are copied into the class before parent methods are looked
+/// up, so traits sit between the class itself and the parent chain.
+/// The parent walk follows only the first `extends` per class (PHP
+/// single inheritance) and stops when it hits a name not defined in
+/// the workspace — non-workspace bases (vendor, stdlib) still enter the
+/// chain so cross-file subclass edges keep their target name, but we
+/// have no facts to keep walking. The `hops > 64` guard limits any
+/// pathological cycle introduced by malformed input.
 fn compute_chain(
     class: &str,
     extends: &HashMap<String, Vec<String>>,

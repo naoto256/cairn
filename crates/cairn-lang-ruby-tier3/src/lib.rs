@@ -3,6 +3,20 @@
 //! This is a single-language Tier-3 crate: one analyzer id, one LSP process
 //! pool, and tree-sitter collectors that ask ruby-lsp to resolve sites that
 //! Tier-2 can only keep as name-level Ruby facts.
+//!
+//! `config_paths` names the files that feed the analyzer-currency
+//! `config_hash` (`cairn_core::workspace_analyzer::expected`):
+//! `Gemfile`,
+//! `Gemfile.lock`, `.rubocop.yml`, `.ruby-version`, and the
+//! literal directory path `.ruby-lsp/` — cairn-core's hasher does a
+//! `fs::read` on each entry, so the directory path silently fails
+//! and its contents are not fingerprinted today. Editing any of
+//! the file entries forces a re-run without a source blob change.
+//!
+//! `run_ruby_lsp_passes` issues the definition pass twice — once for
+//! method-call sites, once for constant references — and merges the
+//! results. Both passes share the same `LspSpawnSpec`, so the pool
+//! keeps one server per repo across both `RefKind`s.
 
 #![forbid(unsafe_code)]
 
@@ -101,6 +115,11 @@ fn run_ruby_lsp_passes(
     Ok(facts)
 }
 
+// ruby-lsp resolves its runtime gems from `Gemfile.lock`; a Gemfile
+// without a lockfile makes the server exit during `initialize`, which
+// would surface as an analyzer hard failure. Rejecting up front lets
+// the runner report `WorkspaceUnsuitable` (a soft skip with an
+// actionable reason) instead.
 fn preflight_workspace(repo_root: &Path) -> Result<()> {
     if repo_root.join("Gemfile").is_file() && !repo_root.join("Gemfile.lock").is_file() {
         return Err(cairn_core::lsp::Error::WorkspaceUnsuitable(

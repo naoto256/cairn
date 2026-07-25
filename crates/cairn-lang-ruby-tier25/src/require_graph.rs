@@ -76,6 +76,13 @@ impl RequireGraph {
 
 /// `require_relative "../foo/bar"` from `dir/file.rb` → `dir/../foo/bar.rb`,
 /// returned only when the resolved path exists in `file_paths`.
+///
+/// The `.rb` suffix candidate is tried *first* to match Ruby's own
+/// `require_relative` semantics: MRI appends `.rb` when the literal
+/// lacks a recognized extension, so `require_relative "foo"` finds
+/// `foo.rb` even when a raw `foo` file happens to exist. The bare
+/// fallback covers literals that already carry the suffix (which is
+/// what `load` typically emits).
 pub fn resolve_relative(from: &str, literal: &str, file_paths: &[String]) -> Option<String> {
     let from_path = PathBuf::from(from);
     let base = from_path.parent().map(PathBuf::from).unwrap_or_default();
@@ -86,6 +93,14 @@ pub fn resolve_relative(from: &str, literal: &str, file_paths: &[String]) -> Opt
         .find(|cand| file_paths.contains(cand))
 }
 
+/// Workspace-local approximation of Ruby's `$LOAD_PATH` walk.
+///
+/// Real Ruby resolution is `LOAD_PATH.map { |d| d + literal + '.rb' }
+/// .find(:exists?)`, but `LOAD_PATH` is a runtime-mutable global we
+/// can't observe statically. Tier-2.5 substitutes the three entries
+/// that dominate real projects — repo root plus the Rails / Bundler
+/// conventional `lib/` and Rails `app/` roots — and leaves gem /
+/// stdlib resolution to Tier-3.
 fn resolve_workspace_require(literal: &str, workspace: &HashSet<&str>) -> Option<String> {
     let candidates = [
         format!("{literal}.rb"),

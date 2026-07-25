@@ -33,6 +33,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::const_resolver::{FileConstFacts, ImportBinding, ImportKind, PackageIndex};
 
+/// One import / require site's resolution: source-side byte range
+/// (pinning the Import row to the `from './...'` or
+/// `require('./...')` module-string node) plus optional
+/// `target_path`. `target_qualified` is always `None` for JS —
+/// unlike C# / Kotlin, this backend never populates the import-edge
+/// qualified because import edges target a *file*, not a symbol
+/// (see the module-level doc).
 #[derive(Debug, Clone)]
 pub struct RequireEdge {
     pub site_byte_start: u32,

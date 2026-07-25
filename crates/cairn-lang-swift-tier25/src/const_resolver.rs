@@ -224,6 +224,12 @@ impl<'a> Visitor<'a> {
 
     /// The innermost class frame's qualified name (used for `self`
     /// / `super` and for method owners).
+    ///
+    /// Walks the container stack looking for the most-recent
+    /// `is_class` frame — necessary because a method can be defined
+    /// *inside* a function body (a nested type declaration), in
+    /// which case the intermediate function frames sit between the
+    /// class and the leaf.
     fn current_class(&self) -> Option<String> {
         let mut last_class_idx: Option<usize> = None;
         for (i, frame) in self.container_stack.iter().enumerate() {
@@ -328,6 +334,10 @@ impl<'a> Visitor<'a> {
     /// Enter a `class_declaration` node — which in tree-sitter-swift
     /// covers `class`, `struct`, `enum`, and `extension` (the actual
     /// keyword is on the `declaration_kind` field).
+    ///
+    /// `protocol` is modeled as a separate grammar node, so
+    /// `enter_protocol` is a near-duplicate that hard-codes
+    /// `SwiftTypeKind::Protocol`.
     fn enter_class_like(&mut self, node: Node<'_>) {
         let keyword = find_field(node, "declaration_kind")
             .map(|n| self.text(n).to_string())
@@ -350,6 +360,10 @@ impl<'a> Visitor<'a> {
         // field. Swift's syntax cannot tell us whether the first
         // entry is a class-superclass or a protocol; we treat them
         // all uniformly here and let the MRO logic linearize.
+        // Each base also emits a `TypeRef` so the resolution pass
+        // pins the heritage identifier at the same byte range as the
+        // Tier-2 `ImplFact::interface_byte_range` — required for the
+        // JOIN that upgrades Tier-2 impl edges to Tier-2.5 targets.
         let mut cursor = node.walk();
         for specifier in node.children(&mut cursor) {
             if specifier.kind() != "inheritance_specifier" {
@@ -470,6 +484,9 @@ impl<'a> Visitor<'a> {
     fn emit_property(&mut self, node: Node<'_>) {
         // Skip function-local bindings — they're noise in a workspace
         // index and the Tier-1 backend already filters them out.
+        // Matching the Tier-1 boundary here is what keeps the
+        // Tier-2.5 `resolutions` rows join-compatible with Tier-2
+        // symbols on the same byte ranges.
         if is_inside_function_body(node) {
             return;
         }
@@ -791,6 +808,12 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
 /// function / property's FQN → defining file. Swift FQNs in
 /// Tier-2.5 are bare lexical chains (`Outer.Inner.member`) because
 /// the language has no `package` keyword.
+///
+/// Extensions do not get a fresh qualified: `extension Foo { ... }`
+/// pushes `Foo` onto the container stack, so members added by the
+/// extension end up under `Foo.member` — the same key as members
+/// declared in the primary declaration. That's what lets dispatch
+/// find `extension`-added methods with no separate merge step.
 #[derive(Debug, Default)]
 pub struct PackageIndex {
     by_qualified: HashMap<String, PackageTarget>,

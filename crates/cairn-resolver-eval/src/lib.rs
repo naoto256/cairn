@@ -29,6 +29,22 @@
 //! only consumers of the harness — there is no `pub` API meant for
 //! downstream code yet, but the modules are `pub` so integration tests
 //! (`tests/golden.rs`) can drive them.
+//!
+//! ## Uses
+//!
+//! Two consumers share the same fixture / register / query plumbing:
+//!
+//! - `tests/golden.rs` — accuracy gate. Runs [`run_case`] over each
+//!   [`GoldenCase`], averages Tier-2 and Tier-2.5 precision / recall
+//!   per language, and asserts against ratchet floors. A regression
+//!   fails CI.
+//! - `tests/perf.rs` — record-only benchmark. Reuses
+//!   [`RegisteredFixture`] to time `register_repo` and repeated
+//!   queries, then calls
+//!   [`RegisteredFixture::delete_tier25_resolutions`] to observe the
+//!   Tier-2 baseline against the same store. Marked
+//!   `#[ignore = "record-only benchmark; ..."]`; the numbers are
+//!   reported, not gated.
 
 #![deny(unsafe_code)]
 

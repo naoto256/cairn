@@ -67,6 +67,13 @@ impl WorkspaceAnalyzer for PhpantomLspWorkspaceAnalyzer {
 static REGISTER_PHPANTOM_LSP_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(PhpantomLspWorkspaceAnalyzer);
 
+/// Files feeding `WorkspaceAnalyzer::config_paths` into
+/// `workspace_analysis_runs.config_hash`. A Composer manifest /
+/// lock edit, a PHPStan config change, or an update to the
+/// per-project Phpactor settings PHPantom consumes changes the
+/// SHA-1 fingerprint that `workspace_analyzers_needing_rerun`
+/// compares, forcing a re-run even when no `.php` source blob
+/// changed.
 fn php_config_paths() -> &'static [&'static str] {
     &[
         "composer.json",
@@ -132,6 +139,14 @@ fn run_phpantom_lsp_pass(
     )
 }
 
+/// Resolve the PHPantom LSP binary via
+/// `cairn_core::lsp_discovery::discover_lsp_binary_candidates` so
+/// worker resolution matches doctor's under launchd's minimal
+/// PATH. The candidate list covers both wrapper names PHPantom
+/// ships under: the upstream release artifact installs
+/// `phpantom_lsp`, some distributions install the hyphenated
+/// `phpantom-lsp` alias. `PHPANTOM_LSP` is the operator override
+/// env var (a path to either wrapper).
 fn phpantom_lsp_binary() -> PathBuf {
     discover_lsp_binary_candidates(&["phpantom_lsp", "phpantom-lsp"], Some("PHPANTOM_LSP"))
         .unwrap_or_else(|| PathBuf::from("phpantom_lsp"))

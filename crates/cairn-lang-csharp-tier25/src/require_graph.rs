@@ -17,6 +17,16 @@ use std::collections::HashMap;
 
 use crate::const_resolver::{FileConstFacts, ImportBinding, ImportKind, PackageIndex};
 
+/// One `using` directive's resolution: the source-side byte range
+/// (so the persist layer can pin the Import row to the correct
+/// site) plus an optional workspace target. External namespaces
+/// (BCL, NuGet) keep `target_path = None` but retain
+/// `target_qualified = Some(FQN)` internally so downstream steps
+/// still know the imported namespace name. The emit path in
+/// `lib.rs` scrubs `target_qualified` for every persisted Import
+/// row before it hits the wire, matching the Tier-2 fact-fallback
+/// contract (see the fact-fallback behavior in
+/// `crate::analyze_files`).
 #[derive(Debug, Clone)]
 pub struct RequireEdge {
     pub site_byte_start: u32,
@@ -25,6 +35,14 @@ pub struct RequireEdge {
     pub target_qualified: Option<String>,
 }
 
+/// Per-workspace `using` resolution table. Two axes:
+/// * `edges`: `path → [RequireEdge]` powers the Import-row emitter.
+/// * `bindings`: `(path, local_name) → qualified_fqn` lets the
+///   alias-map construction in `analyze_files` project each file's
+///   `using` clauses to short-name → FQN without re-walking facts.
+///   `using static` entries are deliberately excluded — they don't
+///   bind a single name; call sites consult `import_bindings`
+///   directly for the static-member lookup.
 #[derive(Debug, Default)]
 pub struct RequireGraph {
     edges: HashMap<String, Vec<RequireEdge>>,

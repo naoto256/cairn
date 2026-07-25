@@ -1,6 +1,12 @@
 //! Tree-sitter walker that collects call and import sites from TypeScript,
 //! JavaScript, and TSX sources. Shared by all three Tier-3 analyzers in this
 //! crate.
+//!
+//! Sites are the positions cairn passes to `textDocument/definition`.
+//! For calls this is the callee identifier; for imports it is the
+//! module-specifier string range (`"./dep"`, not the imported
+//! bindings), because that is what resolves to the module's own
+//! definition.
 
 use std::collections::HashSet;
 

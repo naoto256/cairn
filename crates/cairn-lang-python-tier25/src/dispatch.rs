@@ -44,6 +44,17 @@ struct MethodEntry {
 }
 
 impl MethodIndex {
+    // Two indices, populated from the same walk:
+    //   * `by_owner` — every method_def keyed by its owner (class
+    //     qualified for methods; module qualified for top-level
+    //     `def`s, since `const_resolver` gives module-level functions
+    //     the module as their owner).
+    //   * `by_module` — bare-name lookup for `mod.name(...)` calls.
+    //     Only top-level classes and top-level functions land here;
+    //     nested classes are addressable through their enclosing
+    //     class's qualified name via `by_owner`.
+    // Both maps are first-write-wins so the visitation order on
+    // `per_file` decides ties.
     pub fn build(per_file: &[(String, Vec<u8>, FileConstFacts)]) -> Self {
         let mut by_owner = HashMap::new();
         let mut by_module = HashMap::new();
@@ -172,6 +183,18 @@ pub fn resolve_call(
     }
 }
 
+/// Two-pass cascade for `A.B.method()` shapes:
+///
+/// 1. Read the prefix as a class name (alias → in-module → bare). If
+///    the workspace has a class at that qualified, walk its MRO for
+///    `method`.
+/// 2. Otherwise (or if MRO lookup misses), treat the prefix as a
+///    module reference and search `(module, method)` under the
+///    module-callable index.
+///
+/// Python doesn't syntactically distinguish `Class.method` from
+/// `module.function`, so we try the class shape first — a workspace
+/// class hit is the more precise signal.
 fn resolve_dotted_call(
     parts: &[String],
     method: &str,
