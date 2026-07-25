@@ -208,20 +208,29 @@ impl RubyVisitor {
     /// Handle the bare-identifier form of the visibility marker: a
     /// stand-alone `private` (no parens, no arguments) parses as an
     /// `identifier` child of `body_statement`, not a `call`. Only a
-    /// class/module/singleton-class body owns a visibility section;
-    /// method bodies and other positions treat the identifier as a
-    /// variable read.
+    /// class/module/singleton-class body owns a visibility section,
+    /// including markers nested in control-flow bodies. A method
+    /// boundary blocks the walk so markers inside methods remain
+    /// variable reads.
     fn update_bare_visibility_section(&mut self, node: Node<'_>, source: &[u8]) -> bool {
-        let Some(body) = node
-            .parent()
-            .filter(|parent| parent.kind() == "body_statement")
-        else {
+        // tree-sitter-ruby places direct class/begin statements under
+        // `body_statement`, conditional/case/rescue branches under `then`
+        // or `else`, and ensure-body statements under `ensure`. Expression
+        // children such as assignment LHS identifiers meet none of them.
+        let Some(mut ancestor) = node.parent().filter(|parent| {
+            matches!(parent.kind(), "body_statement" | "then" | "else" | "ensure")
+        }) else {
             return false;
         };
-        if !body.parent().is_some_and(|container| {
-            matches!(container.kind(), "class" | "module" | "singleton_class")
-        }) {
-            return false;
+        loop {
+            let Some(parent) = ancestor.parent() else {
+                return false;
+            };
+            match parent.kind() {
+                "class" | "module" | "singleton_class" => break,
+                "method" | "singleton_method" | "call" => return false,
+                _ => ancestor = parent,
+            }
         }
         let visibility = match node_text(node, source) {
             "public" => Visibility::Public,
@@ -904,6 +913,39 @@ end
         let facts = syntactic(src);
         assert_eq!(
             symbol(&facts, "still_public").visibility,
+            Some(Visibility::Public)
+        );
+    }
+
+    #[test]
+    fn bare_visibility_marker_in_nested_class_body_changes_class_section() {
+        let src = "\
+class S
+  if condition
+    private
+  end
+
+  def hidden; end
+end
+";
+        let facts = syntactic(src);
+        assert_eq!(
+            symbol(&facts, "hidden").visibility,
+            Some(Visibility::Private)
+        );
+    }
+
+    #[test]
+    fn local_named_private_does_not_change_class_section() {
+        let src = "\
+class S
+  private = true
+  def visible; end
+end
+";
+        let facts = syntactic(src);
+        assert_eq!(
+            symbol(&facts, "visible").visibility,
             Some(Visibility::Public)
         );
     }

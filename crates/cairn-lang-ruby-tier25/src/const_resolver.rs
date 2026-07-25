@@ -140,17 +140,12 @@ pub fn parse_file(source: &[u8]) -> Option<FileConstFacts> {
 struct Visitor<'a> {
     source: &'a [u8],
     facts: FileConstFacts,
-    /// Enclosing class/module segments joined with `::` to yield the
-    /// qualified name at any point in the walk. `open_class_or_module`
-    /// extends this by the *full* qualified path it just computed
-    /// (e.g. entering `Outer::Inner` from inside `Outer` pushes both
-    /// `Outer` and `Inner`), so already-visible segments can end up
-    /// duplicated in `scope` for the duration of the child scope.
-    /// Each open scope records its own pushed-segment count so closing
-    /// a nested scope cannot consume its parent's segments. The scope
-    /// remains a walk-local address, not a canonical FQN.
+    /// Canonical enclosing class/module segments joined with `::` to
+    /// yield the qualified name at any point in the walk.
     scope: Vec<String>,
-    scope_segment_counts: Vec<usize>,
+    /// Prior canonical scopes, restored when leaving nested
+    /// class/module definitions.
+    scope_snapshots: Vec<Vec<String>>,
     /// Whether the current position is a *singleton* context. Pushed
     /// as `true` only on `singleton_class` (`class << self`) entry;
     /// pushed as `false` on class / module entry; `def self.foo`
@@ -168,7 +163,7 @@ impl<'a> Visitor<'a> {
             source,
             facts: FileConstFacts::default(),
             scope: Vec::new(),
-            scope_segment_counts: Vec::new(),
+            scope_snapshots: Vec::new(),
             singleton_stack: vec![false],
         }
     }
@@ -266,11 +261,11 @@ impl<'a> Visitor<'a> {
             byte_end: node.end_byte() as u32,
         });
 
-        // For lexical-scope purposes track the qualified path as individual
-        // segments so nested lookups join with `::` correctly.
+        // Replace the current lexical address with the canonical qualified
+        // path and retain the parent snapshot for close_scope.
         let pieces: Vec<String> = qualified.split("::").map(str::to_string).collect();
-        self.scope.extend(pieces.iter().cloned());
-        self.scope_segment_counts.push(pieces.len());
+        let previous_scope = std::mem::replace(&mut self.scope, pieces);
+        self.scope_snapshots.push(previous_scope);
         self.singleton_stack.push(false);
         Some((
             if node.kind() == "class" {
@@ -283,10 +278,8 @@ impl<'a> Visitor<'a> {
     }
 
     fn close_scope(&mut self, _kind: &str) {
-        if let Some(n) = self.scope_segment_counts.pop() {
-            for _ in 0..n {
-                self.scope.pop();
-            }
+        if let Some(previous_scope) = self.scope_snapshots.pop() {
+            self.scope = previous_scope;
         }
         self.singleton_stack.pop();
     }
