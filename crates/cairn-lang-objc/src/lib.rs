@@ -804,6 +804,12 @@ fn struct_declaration_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
     out
 }
 
+/// Map an ivar `visibility_specification` node to [`Visibility`].
+/// Extends the mapping documented at module level with `@package`
+/// (framework-scope access — collapsed to `Crate`, the closest analog
+/// the enum offers). Any specifier text that matches none of the four
+/// keywords falls back to `Public` as a defensive default; in practice
+/// tree-sitter-objc only produces those four.
 fn visibility_from_specifier(node: Node<'_>, source: &[u8]) -> Visibility {
     let text = node_text(node, source);
     if text.contains("@public") {

@@ -191,6 +191,11 @@ impl SwiftVisitor {
     }
 }
 
+/// Container kinds that push a new nesting scope. `Impl` is present
+/// because Swift `extension` declarations surface as
+/// `SymbolKind::Impl` (see `match_swift_item`), and their members
+/// should qualify under the *extended* type name — so the extension
+/// node itself has to act as a nesting parent.
 fn is_container(kind: &SymbolKind) -> bool {
     matches!(
         kind,
@@ -273,6 +278,11 @@ fn declared_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
+/// Classify a `property_declaration` in / out of a type container.
+/// Inside a type both `let` and `var` become `Property`; at top level
+/// the binding's mutability decides — `var` → `Variable`, everything
+/// else (`let`, or an absent / unrecognised binding pattern) →
+/// `Constant`.
 fn property_kind(node: Node<'_>, in_type: bool) -> SymbolKind {
     if in_type {
         return SymbolKind::Property;
@@ -304,6 +314,9 @@ fn property_body_start(node: Node<'_>) -> Option<usize> {
         .map(|c| c.start_byte())
 }
 
+/// Flatten a Swift binding pattern to the list of bound identifier
+/// texts — the leaf `simple_identifier`s that `emit_properties`
+/// turns into one symbol each.
 fn bound_identifiers(pattern: Node<'_>, source: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     collect_bound_identifiers(pattern, source, &mut out);

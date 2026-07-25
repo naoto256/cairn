@@ -347,6 +347,12 @@ impl Visitor for TypescriptVisitor {
     }
 }
 
+/// Symbol kinds whose bodies open a nesting frame for qualified
+/// naming (`Class.method`, `Interface.member`). Note this differs
+/// from [`function_frame_ends`](TypescriptVisitor::function_frame_ends):
+/// a class body qualifies its members but does not mark them as
+/// [`SymbolScope::Nested`] — nesting for `scope` is function-body
+/// bound, nesting for `qualified` is container-body bound.
 fn is_container(kind: &SymbolKind) -> bool {
     matches!(
         kind,
@@ -408,6 +414,15 @@ fn match_typescript_item(
     }
 }
 
+/// Map a TypeScript `accessibility_modifier` (`public` / `private` /
+/// `protected`) onto the shared [`Visibility`] enum. `protected` folds
+/// onto [`Visibility::Crate`] as the closest "restricted, not fully
+/// private" bucket — the enum has no dedicated `Protected` variant,
+/// and the Rust-borrowed name doesn't reflect TS semantics but the
+/// discriminator is what consumers key on. Absence of any modifier
+/// returns `None`, not `Visibility::Public`, because unmarked TS class
+/// members default to public *only for classes*; leaving it `None`
+/// keeps that ambiguity visible.
 fn typescript_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -423,6 +438,13 @@ fn typescript_visibility(node: Node<'_>, source: &[u8]) -> Option<Visibility> {
     None
 }
 
+/// Collect a JSDoc block (`/** ... */`) immediately above `node`.
+/// Unlike Rust's `///` / `//!` clusters which are *appended*, JSDoc
+/// uses [`DocCommentPart::Replace`]: only the closest `/**` block
+/// survives — a plain `//` line comment between the JSDoc block and
+/// the declaration [`DocCommentPart::Reset`]s the accumulator so
+/// stale docs above unrelated code don't attach. Empty stripped
+/// bodies fold to `None` so the symbol row's `doc` stays absent.
 fn extract_jsdoc(node: Node<'_>, source: &[u8]) -> Option<String> {
     extract_doc_above_node(node, source, |sibling, text| {
         if sibling.kind() != "comment" {
@@ -443,6 +465,11 @@ fn strip_jsdoc_markers(text: &str) -> String {
         .strip_prefix("/**")
         .and_then(|s| s.strip_suffix("*/"))
         .unwrap_or(trimmed);
+    // JSDoc convention: each continuation line typically starts with
+    // ` * ` after leading whitespace. Strip a single `*` prefix so
+    // rendered output doesn't carry the frame; blank rendered lines
+    // drop out so the final joined string skips the customary blank
+    // separator between summary and description.
 
     let lines: Vec<&str> = inner
         .lines()
@@ -935,6 +962,15 @@ fn last_identifier(node: Node<'_>, source: &[u8]) -> Option<String> {
     out
 }
 
+/// Unwrap a matched pair of `"`, `'`, or `` ` `` around a module
+/// specifier. Callers only pass `string` nodes here — `template_string`
+/// is rejected upstream by `is_require_string_call` and the import
+/// source-node kind — so the backtick branch is defensive and
+/// currently unreachable in practice. Escape sequences inside the
+/// literal are *not* unescaped: module specifiers used as
+/// `ImportFact.to_module` keep the source spelling (minus the
+/// delimiters) so downstream resolvers can pattern-match against
+/// exactly what the author wrote.
 fn strip_string_literal(text: &str) -> String {
     let trimmed = text.trim();
     for quote in ['"', '\'', '`'] {
