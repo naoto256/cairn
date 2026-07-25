@@ -2511,7 +2511,7 @@ mod tests {
         assert_eq!(truncate_utf8("abcdef", 3), "abc");
         // "あ" is 3 bytes; asking for 2 must trim to 0.
         assert_eq!(truncate_utf8("あ", 2), "");
-        // "aあb" is 5 bytes; asking for 4 must trim to "a" (1 byte).
+        // "aあb" is 5 bytes; asking for 4 must trim to "aあ" (4 bytes).
         assert_eq!(truncate_utf8("aあb", 4), "aあ");
     }
 

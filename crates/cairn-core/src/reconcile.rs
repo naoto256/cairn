@@ -1030,9 +1030,11 @@ impl RepoReconcileManager {
         })
     }
 
-    /// Returns `(has_work, exit_now)`. `exit_now` transitions
-    /// the runtime out of `worker_running` under the mutex so a
-    /// concurrent request can respawn cleanly.
+    /// Returns `true` when the worker may exit — the runtime entry is
+    /// already gone, or no request landed since `observed_seq`. On a
+    /// clean exit with the entry still present it also transitions the
+    /// runtime out of `worker_running` under the mutex so a concurrent
+    /// request can respawn cleanly.
     fn try_finalize_exit(&self, repo_hash: &str, observed_seq: u64) -> bool {
         let mut runtimes = self.lock_runtimes();
         let Some(rt) = runtimes.get_mut(repo_hash) else {
@@ -1198,7 +1200,8 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         // startup-recovery path clears it before spawning
         // workers, but during normal steady-state a concurrent
         // process should never leave `attempt_generation` set.
-        // Log loudly and re-notify so recovery can pick it up.
+        // Log loudly and wait for the next notification; recovery,
+        // not this worker, clears the interrupted attempt.
         if state.attempt_generation.is_some() {
             drop(permit);
             warn!(

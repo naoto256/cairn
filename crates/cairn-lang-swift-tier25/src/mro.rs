@@ -135,9 +135,12 @@ fn resolve_base(
 /// Best-effort linearization. The class itself first, then BFS over
 /// resolved parents.
 ///
-/// BFS (not C3, not any principled MRO algorithm): Swift's real
-/// dispatch uses a witness table built at compile time that no
-/// tree-sitter walk can reproduce. Under BFS a class's declared
+/// BFS (not C3, not any principled MRO algorithm): Swift resolves a
+/// protocol requirement through a witness table — a runtime
+/// conformance-dispatch structure built at compile time that no
+/// tree-sitter walk can reproduce — so this pass only approximates
+/// the *static* ancestor ordering, never the witness table itself.
+/// Under BFS a class's declared
 /// bases appear before its grandparents in declaration order, which
 /// matches the intuition that `override` on a direct base beats an
 /// inherited override further up. Diamond conformances flatten to

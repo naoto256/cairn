@@ -8,11 +8,14 @@
 //! anchor/job aggregations — is wrapped in `spawn_blocking` so a
 //! status call over many repos does not stall the reactor.
 //!
-//! Enumeration is lifecycle-gated: each entry is fenced by
+//! Enumeration is lifecycle-gated when a `RepoLifecycleManager` is
+//! wired (production path): each entry is fenced by
 //! [`RepoLifecycleManager::acquire_for_enumeration`], so a repo
 //! currently in `Removing` (or with no active gate) is silently
 //! skipped rather than raising. That matches the shape callers
-//! expect from a "snapshot of currently addressable repos".
+//! expect from a "snapshot of currently addressable repos". When no
+//! lifecycle manager is present (tests / degraded startup) there is
+//! no gate and every registered entry is enumerated.
 //!
 //! The reconcile-state row is fail-closed: if the index has a
 //! `repositories` row but no matching `repo_reconcile_state`, the

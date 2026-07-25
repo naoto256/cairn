@@ -63,10 +63,12 @@ pub struct RegisterOutcome {
     /// tentative manifest entries were byte-identical to the prior
     /// tentative, no blobs were re-parsed by the pre-publication parse pass,
     /// and no expected analyzer needs a re-run. An expected analyzer needs a
-    /// re-run when its row is absent, non-succeeded, or at a stale revision.
-    /// All three gates must hold — entries-unchanged alone is not enough to
-    /// skip (it would let a parser_revision bump leave the resolutions table
-    /// stale under a reused `manifest_id`).
+    /// re-run when its row is absent, non-succeeded, at a stale revision, or
+    /// at a stale config hash (its `config_paths` content changed) — so an
+    /// unchanged config hash, matching current analyzer currency, is part of
+    /// what makes the skip safe. All three gates must hold — entries-unchanged
+    /// alone is not enough to skip (it would let a parser_revision bump leave
+    /// the resolutions table stale under a reused `manifest_id`).
     pub skip_analyzers_for_unchanged_manifest: bool,
     /// Analyzer jobs enqueued by the `*_enqueue_*` entry points;
     /// always empty for the inline-run variants.

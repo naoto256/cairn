@@ -685,14 +685,16 @@ fn note_partial(c: &Completeness) {
 }
 
 /// Dispatch the wire reply for `method` to the matching typed
-/// printer. Each typed branch emits one grep-friendly line per
-/// item; branches that call `note_partial` forward
-/// `Completeness::Partial` to stderr so a shell user sees the SLA
-/// caveat without it polluting the stdout stream that pipes into
-/// `awk` / `grep` (`list_repos` and `get_symbol_source` do not
-/// call it). Unknown methods, and responses that fail to decode
-/// into the expected type, fall through to a pretty-printed JSON
-/// dump so the caller still sees the payload.
+/// printer. The list-style branches emit one grep-friendly line
+/// per item; `get_symbol_source` is the exception, printing a
+/// header comment followed by the raw source block. Branches that
+/// call `note_partial` forward `Completeness::Partial` to stderr so
+/// a shell user sees the SLA caveat without it polluting the stdout
+/// stream that pipes into `awk` / `grep` (`list_repos` and
+/// `get_symbol_source` do not call it). Unknown methods, and
+/// responses that fail to decode into the expected type, fall
+/// through to a pretty-printed JSON dump so the caller still sees
+/// the payload.
 fn render(method: &str, value: &Value) {
     match method {
         "list_repos" => {

@@ -87,8 +87,9 @@ const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Daemon {
     /// Bind both sockets, run accept loops until `shutdown` is
-    /// notified, then drop the listeners (and unlink the socket
-    /// files as a side effect on Unix).
+    /// notified, then drop the listeners and explicitly unlink the
+    /// socket files (dropping a `UnixListener` does not remove its
+    /// path).
     ///
     /// # Errors
     /// Bind / accept failures propagate.

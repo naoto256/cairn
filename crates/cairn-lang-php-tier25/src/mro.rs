@@ -113,7 +113,10 @@ impl Mro {
 /// the workspace — non-workspace bases (vendor, stdlib) still enter the
 /// chain so cross-file subclass edges keep their target name, but we
 /// have no facts to keep walking. The `hops > 64` guard limits any
-/// pathological cycle introduced by malformed input.
+/// pathological cycle introduced by malformed input. Interfaces are
+/// appended last, but only the ones this class directly implements —
+/// the walk does not recurse into an interface's own parent
+/// interfaces, nor pull in interfaces declared on parent classes.
 fn compute_chain(
     class: &str,
     extends: &HashMap<String, Vec<String>>,

@@ -5,9 +5,11 @@
 //! # Lifecycle contract
 //!
 //! With a `RepoLifecycleManager` wired (production path) the
-//! handler acquires a `RegistrationPermit` before doing any work
-//! and releases it either by publishing (success) or aborting
-//! (failure). The permit fences the repo against `remove_repo` —
+//! handler acquires a `RegistrationPermit` before opening the store
+//! or scanning — the path canonicalize and `repo_hash` derivation in
+//! step 1 below run first, but no store, index, or watcher work
+//! happens until the permit is held — and releases it either by
+//! publishing (success) or aborting (failure). The permit fences the repo against `remove_repo` —
 //! removal may close admission, but destructive cleanup waits for
 //! this lease to drain — and does *not* serialise concurrent
 //! `register_repo` calls for the same `repo_hash`; several leases

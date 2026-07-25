@@ -447,7 +447,8 @@ mod tests {
     }
 
     /// R2 must-fix #2 pin: queued / running / failed / skipped /
-    /// cancelled / timed_out must all return `false` even when the
+    /// cancelled / timed_out must all force the analyzer to re-run
+    /// (the currency filter returns `true` for them) even when the
     /// revision matches. A half-finished pass leaves the resolutions
     /// table either empty or partially populated, so it must not
     /// masquerade as up-to-date.
