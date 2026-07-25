@@ -33,6 +33,14 @@ use crate::const_resolver::{CallReceiver, FileConstFacts, ImportKind, MethodCall
 use crate::mro::Mro;
 use crate::require_graph::ResolvedBinding;
 
+/// Pinned target of a resolved call: `path` identifies the
+/// workspace file that owns the method body, and `qualified` is
+/// the fully-qualified name (`com.foo.Service.fetch`). Class /
+/// interface FQNs are unique workspace-wide, but callable FQNs
+/// are not — overloads in the same file share both `path` and
+/// `qualified`; the resolution carries no signature or site
+/// discriminator, so overload identity within a file remains
+/// unresolved at this layer.
 #[derive(Debug, Clone)]
 pub struct DispatchResolution {
     pub path: String,

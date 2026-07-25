@@ -209,6 +209,11 @@ static REGISTER_CPP_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
 static REGISTER_OBJC_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(ClangdObjcWorkspaceAnalyzer);
 
+/// Files whose contents feed `WorkspaceAnalyzer::config_paths` into
+/// `workspace_analysis_runs.config_hash`. An edit or delete under
+/// any of them changes the SHA-1 fingerprint that
+/// `workspace_analyzers_needing_rerun` compares, forcing a rerun
+/// even when no C / C++ / ObjC source blob changed.
 fn clangd_config_paths() -> &'static [&'static str] {
     &["compile_commands.json", "compile_flags.txt", ".clangd"]
 }
@@ -299,6 +304,11 @@ fn include_collector_for(language: ClangdLanguage) -> fn(&[u8]) -> Result<Vec<De
     }
 }
 
+/// Resolve `clangd` via `cairn_core::lsp_discovery` so worker
+/// resolution matches doctor's under launchd's minimal PATH.
+/// `CLANGD` is the operator override env var (a path to the
+/// binary); missing binary falls back to bare `clangd` for
+/// spawn to surface a clear error.
 fn clangd_binary() -> PathBuf {
     discover_lsp_binary("clangd", Some("CLANGD")).unwrap_or_else(|| PathBuf::from("clangd"))
 }

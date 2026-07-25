@@ -7,6 +7,20 @@
 //! sync, retry, path mapping) lives in cairn-core's definition-pass
 //! substrate; this crate contributes the rust-analyzer launch spec and
 //! the grammar-specific call-site extraction.
+//!
+//! `config_paths` returns the workspace files that feed the
+//! analyzer-currency `config_hash`
+//! (`cairn_core::workspace_analyzer::expected`):
+//! `Cargo.toml`, `rust-toolchain.toml`, `rust-toolchain`. Editing any
+//! forces a rust-analyzer re-run even when no source blob changed.
+//!
+//! `readiness: ProgressQuiescence` defers all definition requests
+//! until rust-analyzer's `$/progress` stream is quiet (bounded by
+//! `WORKSPACE_LOAD_TIMEOUT`). Alongside that, `retry_empty_definition
+//! = false` is a Rust-specific policy choice; readiness does not
+//! determine retry policy. Java (jdtls) and Kotlin
+//! (kotlin-language-server) use the same readiness gate with
+//! retry enabled.
 
 #![forbid(unsafe_code)]
 

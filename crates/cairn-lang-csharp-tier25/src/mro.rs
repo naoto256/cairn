@@ -6,12 +6,24 @@
 //! distinguish `class` vs `interface` bases (both use
 //! `kind="inherit"`), so at this layer we collect every resolved base
 //! in declaration order and linearize.
+//!
+//! Linearization is BFS with a `MAX_HOPS` guard — *not* C3.
+//! Precise C3 (or the .NET runtime's actual interface-flattening
+//! rules) belongs to Tier-3 for the same reason Python's real MRO
+//! does: it matters for virtual-dispatch semantics on diamond
+//! hierarchies. Tier-2.5 only pins definitions, so declaration-
+//! order BFS is sufficient and deliberately cheaper.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::const_resolver::{BaseEdge, FileConstFacts, ImportBinding, ImportKind, PackageIndex};
 use crate::containing_namespaces;
 
+/// Workspace-wide ancestor chains for every class, keyed by FQN.
+/// FQN is not a per-declaration identity in C# — `partial` types
+/// legally spread the same FQN across multiple declarations — so
+/// keying by FQN coalesces those declarations into a single
+/// logical type here, which is what the resolver needs.
 #[derive(Debug, Default)]
 pub struct Mro {
     chain: HashMap<String, Vec<String>>,
@@ -48,6 +60,11 @@ impl Mro {
         Self { chain, parents }
     }
 
+    /// Linearized ancestor list for `class`, most-derived first (the
+    /// class itself is index 0). Classes not seen at build time — or
+    /// classes with no bases — fall back to a single-element vector
+    /// containing the class itself, so callers can unconditionally
+    /// iterate ancestors without a separate "unknown class" branch.
     pub fn ancestors(&self, class: &str) -> Vec<String> {
         self.chain
             .get(class)
@@ -55,6 +72,11 @@ impl Mro {
             .unwrap_or_else(|| vec![class.to_string()])
     }
 
+    /// Directly-declared parents of `class`. Aliased external bases
+    /// (`resolve_base` returned `Some` without a workspace hit) also
+    /// appear here so downstream dispatch keeps their FQN in view;
+    /// only names that never resolved to a candidate are dropped.
+    /// Not linearized — `ancestors` is the transitive form.
     pub fn parents_of(&self, class: &str) -> &[String] {
         self.parents.get(class).map(Vec::as_slice).unwrap_or(&[])
     }

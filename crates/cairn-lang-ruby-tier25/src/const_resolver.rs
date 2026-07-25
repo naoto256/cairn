@@ -140,7 +140,26 @@ pub fn parse_file(source: &[u8]) -> Option<FileConstFacts> {
 struct Visitor<'a> {
     source: &'a [u8],
     facts: FileConstFacts,
+    /// Enclosing class/module segments joined with `::` to yield the
+    /// qualified name at any point in the walk. `open_class_or_module`
+    /// extends this by the *full* qualified path it just computed
+    /// (e.g. entering `Outer::Inner` from inside `Outer` pushes both
+    /// `Outer` and `Inner`), so already-visible segments can end up
+    /// duplicated in `scope` for the duration of the child scope.
+    /// `close_scope` pops by the *segment count* of whatever
+    /// `class_defs.last()` reports at close time, which does not
+    /// necessarily match what was pushed for this scope (see the
+    /// `close_scope` doc), so the scope is a walk-local address —
+    /// not a canonical FQN.
     scope: Vec<String>,
+    /// Whether the current position is a *singleton* context. Pushed
+    /// as `true` only on `singleton_class` (`class << self`) entry;
+    /// pushed as `false` on class / module entry; `def self.foo`
+    /// does **not** push here — the singleton classification for that
+    /// method is recorded on the emitted `MethodDef` instead. Read
+    /// by the innermost lookup (`.last()`) and seeded with a `false`
+    /// bottom so `.last().unwrap_or(&false)` is a total function
+    /// even at top-level.
     singleton_stack: Vec<bool>,
 }
 
@@ -262,6 +281,12 @@ impl<'a> Visitor<'a> {
         ))
     }
 
+    /// The pop count comes from the segment count of the last
+    /// `class_defs` entry, not any container-identity check. After
+    /// closing a nested child, `class_defs.last()` is still that
+    /// child, so the outer close pops by the child's segment count
+    /// rather than the outer's — behaviour that only lines up when
+    /// outer and child happen to share the same segment count.
     fn close_scope(&mut self, _kind: &str) {
         // Pop back to the parent scope. We pushed `qualified.split("::")`
         // pieces in `open_class_or_module`; record how many to pop by
@@ -456,6 +481,10 @@ impl<'a> Visitor<'a> {
     fn try_emit_const_ref(&mut self, node: Node<'_>) {
         // Skip declaration sites: the parent class/module/scope_resolution
         // surrounds the constant when it names the thing being declared.
+        // Qualified references (`Foo::Bar`) are emitted once, by
+        // `try_emit_qualified_const_ref` on the outer `scope_resolution`
+        // node, so bare constants nested inside a scope_resolution are
+        // dropped here to avoid double-counting.
         let Some(parent) = node.parent() else {
             return;
         };

@@ -25,6 +25,12 @@ use crate::require_graph::RequireGraph;
 /// short and only file-unique.
 type ClassKey = (String, String);
 
+/// Workspace-wide ancestor chains for every class. Single-chain
+/// (walks `parents.first()` only), so unlike the C# / Kotlin
+/// backends there's no BFS over multiple bases — JS classes are
+/// single-inheritance and interface-less. Mixin factories
+/// (`class Foo extends Mixin(Base)`) are dropped at fact-extraction
+/// time and don't participate in the chain.
 #[derive(Debug, Default)]
 pub struct Mro {
     /// For each class, the linearized ancestor list (self first).

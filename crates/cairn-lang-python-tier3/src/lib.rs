@@ -7,6 +7,17 @@
 //! document sync, retry, path mapping) lives in cairn-core's
 //! definition-pass substrate; this crate contributes the pyright
 //! launch spec and the grammar-specific call-site extraction.
+//!
+//! `config_paths` returns the two workspace files that feed the
+//! analyzer-currency `config_hash`
+//! (`cairn_core::workspace_analyzer::expected`):
+//! `pyrightconfig.json` and `pyproject.toml`. Editing either forces a
+//! pyright re-run even when no source blob changed.
+//!
+//! `pyright_binary` resolves through `cairn_core::lsp_discovery` so
+//! doctor and the pool share one rule (`$PYRIGHT`, then `PATH`); the
+//! bare-name fallback keeps the spec valid so `Command` re-checks
+//! `PATH` at spawn.
 
 #![forbid(unsafe_code)]
 

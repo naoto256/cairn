@@ -97,6 +97,10 @@ impl WorkspaceAnalyzer for GoplsWorkspaceAnalyzer {
 static REGISTER_GO_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(GoplsWorkspaceAnalyzer);
 
+/// Resolve `gopls` via `cairn_core::lsp_discovery` so worker
+/// resolution matches doctor's under launchd's minimal PATH.
+/// `GOPLS` is the operator override env var (a path to the
+/// binary).
 fn gopls_binary() -> PathBuf {
     discover_lsp_binary("gopls", Some("GOPLS")).unwrap_or_else(|| PathBuf::from("gopls"))
 }

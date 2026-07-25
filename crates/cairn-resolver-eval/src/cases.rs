@@ -6,6 +6,19 @@
 //! changes, expect breakage here first — that's the point.
 //!
 //! Each `pub fn <lang>_cases()` returns the cases for that language.
+//!
+//! ## Tier-2.5 coverage
+//!
+//! The crate force-links Tier-2.5 backends for python, php, kotlin,
+//! swift, csharp, javascript, and ruby (see `Cargo.toml` and
+//! `crate::force_link_tier25_analyzers`). Cases for those languages
+//! populate `tier25_expected` and rely on the runner's
+//! [`crate::report::TierReport::score_tier25`] filter to isolate rows
+//! whose winning provenance starts with `tier25-` or `tier3-`.
+//!
+//! Languages without a linked Tier-2.5 backend (rust, typescript, java)
+//! leave `tier25_expected` empty on every case; the Tier-2 baseline is
+//! the only accuracy signal for those slices.
 
 use crate::types::{ExpectedHit, GoldenCase, Query, Tool};
 

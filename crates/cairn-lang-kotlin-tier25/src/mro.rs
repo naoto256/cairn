@@ -22,6 +22,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::const_resolver::{BaseEdge, FileConstFacts, ImportBinding, ImportKind, PackageIndex};
 
+/// Workspace-wide ancestor chains for every class, keyed by FQN.
+/// FQN-only keying is sound for Kotlin: the language forbids two
+/// declarations with the same FQN in the same workspace (see the
+/// `ancestors` method doc below), so no `(path, FQN)` scoping is
+/// needed here.
 #[derive(Debug, Default)]
 pub struct Mro {
     chain: HashMap<String, Vec<String>>,

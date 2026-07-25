@@ -23,6 +23,16 @@ use std::collections::HashMap;
 
 use crate::const_resolver::{FileConstFacts, ImportBinding, ImportKind, PackageIndex};
 
+/// One `import` declaration's resolution: source-side byte range
+/// (so the persist layer can pin the Import row to the correct
+/// site) plus an optional workspace target. External targets
+/// (kotlin-stdlib, Android SDK, external jars) keep
+/// `target_path = None` but retain `target_qualified = Some(FQN)`
+/// internally so downstream steps still know the imported name.
+/// The emit path in `lib.rs` scrubs `target_qualified` for every
+/// persisted Import row before it hits the wire, matching the
+/// Tier-2 fact-fallback contract (see the fact-fallback behavior
+/// in `crate::analyze_files`).
 #[derive(Debug, Clone)]
 pub struct RequireEdge {
     pub site_byte_start: u32,

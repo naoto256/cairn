@@ -170,6 +170,12 @@ pub fn analyze_files(
     // resolutions.
     let mro = Mro::build(&per_file, &const_index);
     let methods = MethodIndex::build(&per_file);
+    // Autoload declarations are a *deferred* binding: `autoload :Foo,
+    // "path/to/foo"` teaches Ruby that a later reference to `Foo`
+    // should trigger a require of the given path. Feed the fallback
+    // resolver by pre-resolving the path literals once here so
+    // `ConstIndex::resolve` can plug it in as a last-chance lookup
+    // (see the `4. Autoload.` branch there).
     let mut autoload_map: HashMap<String, String> = HashMap::new();
     for (path, _, facts) in &per_file {
         for (qualified, rel_target) in &facts.autoloads {

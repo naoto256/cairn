@@ -37,6 +37,42 @@
 //! * JVM `invokevirtual` precedence across complex multi-interface
 //!   diamonds (linearization is best-effort; precise rules live in
 //!   Tier-3 once a JVM resolver is wired in).
+//!
+//! # Deviations from the shared Tier-2.5 shape
+//!
+//! See `cairn-lang-csharp-tier25`'s `lib.rs` for the five-file
+//! Tier-2.5 layout (`const_resolver` / `require_graph` / `mro` /
+//! `dispatch` / `lib`). Kotlin's implementation of that layout
+//! differs from the C# and JS backends in a few load-bearing
+//! ways:
+//!
+//! * **Path-aware callable index despite unique class FQNs.**
+//!   Kotlin's package rules make `pkg.Foo` workspace-globally
+//!   unique at the class / interface level. `PackageIndex`
+//!   nevertheless keys by `(path, qualified)` because it holds
+//!   both class declarations and method / callable definitions,
+//!   and legitimate overloads share a qualified name — an
+//!   overload set at `pkg.Foo.bar` maps to several
+//!   `method_defs` entries in different (or the same) file(s).
+//!   `lookup_in_file` pins alias-bound imports to the file their
+//!   `import` resolved to, mirroring the JS backend's need to
+//!   keep aliases file-scoped. `lookup_unique` returning `None`
+//!   is a normal "more than one candidate" outcome for
+//!   callables, not a workspace-integrity signal.
+//! * **Class + interface split in the MRO.** Heritage edges
+//!   carry `is_constructor_invocation` from Tier-2's
+//!   `constructor_invocation` heuristic — `Base()` (with
+//!   parens) is treated as `inherit`; bare `Greeter` is
+//!   `implement`. MRO puts inherited classes ahead of
+//!   implemented interfaces in linearization order; JS-style
+//!   single-chain and C#-style declaration-order-only both
+//!   diverge from this.
+//! * **JVM synthetic-class normalization.** Java callers of a
+//!   Kotlin top-level function come through as
+//!   `<FileStem>Kt.function()`. `dispatch.rs` Stage 7.5 strips
+//!   the `Kt` suffix and looks the callee up as a package-level
+//!   callable so cross-language calls resolve without the
+//!   caller having to know it's a synthetic class.
 
 #![deny(unsafe_code)]
 
