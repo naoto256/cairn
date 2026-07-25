@@ -23,6 +23,9 @@ mod register_repo;
 mod reindex_repo;
 mod repo_status;
 
+// Cockpit copy shared by more than one tool's argument schema. Kept
+// in this module so the wording — which is what an LLM reads when
+// choosing whether to pass a parameter — cannot drift between tools.
 pub(super) const BRANCH_PARAM_DESC: &str = "Restrict to a single snapshot by bare branch name (for example `main` or `release/0.1.0`). Do not pass `HEAD`, `tag/<v>`, or `tentative/<id>` here; those are anchor names. Omit both `branch` and `anchor` to default to the registered worktree's `tentative/<id>` snapshot (= committed HEAD plus uncommitted edits), falling back to `HEAD` when no tentative snapshot exists yet.";
 
 pub(super) const ANCHOR_PARAM_DESC: &str = "Raw anchor name: `HEAD`, `branch/<n>`, `tag/<n>`, or `tentative/<id>`. Takes priority over `branch`. Omit both `anchor` and `branch` to default to the registered worktree's `tentative/<id>` snapshot (= committed HEAD plus uncommitted edits), falling back to `HEAD` when no tentative snapshot exists yet. Pass `HEAD` explicitly to scope to committed-only state, or a tag/tentative name to target a specific snapshot.";

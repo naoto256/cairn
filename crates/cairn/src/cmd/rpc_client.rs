@@ -4,6 +4,18 @@
 //! request and wait for one newline-delimited response. Keeping that
 //! transport in one helper prevents subtle drift in EOF and parse-error
 //! handling while leaving each command responsible for rendering.
+//!
+//! Wire shape: the client writes one line terminated by `\n` and
+//! reads one line from the reply, matching the server-side framing
+//! owned by `cairn-core`'s daemon accept loop and
+//! `cairn_core::jsonrpc_dispatch`. `read_line` returns whatever it
+//! got up to the first newline or EOF, so a reply that lacks the
+//! terminating newline still parses if the daemon closed the
+//! connection after writing it. A zero-length read is surfaced as
+//! an explicit "daemon closed the connection without responding"
+//! error rather than silent success. Each call opens a fresh UDS
+//! connection and drops it when the response has been read — the
+//! transport is intentionally connection-per-request.
 
 use std::path::Path;
 
@@ -16,6 +28,12 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// Convenience wrapper that builds a JSON-RPC 2.0 request with a
+/// fixed numeric id of 1 and delegates to `send_request`. Since
+/// each call uses its own connection there is no id collision
+/// risk; callers that need a specific id should construct the
+/// [`Request`] themselves. Notifications are not supported —
+/// [`Request::id`] is a required field on this envelope.
 pub(crate) async fn round_trip(
     socket_path: &Path,
     method: &str,
@@ -30,6 +48,14 @@ pub(crate) async fn round_trip(
     send_request(socket_path, &req).await
 }
 
+/// Send `req` over a fresh UDS connection and return the parsed
+/// [`Response`]. Connect, write/flush, and read I/O errors are
+/// propagated directly; a zero-length read is surfaced as an
+/// explicit "daemon closed the connection without responding"
+/// error; decode failure is a `serde_json` error on the response
+/// line with the offending line attached. The returned
+/// [`Response`] may itself carry a JSON-RPC `error` object;
+/// callers decide how to render that (see [`render_error`]).
 pub(crate) async fn send_request(socket_path: &Path, req: &Request) -> Result<Response> {
     let stream = UnixStream::connect(socket_path).await?;
     let (read, mut write) = stream.into_split();
@@ -47,12 +73,26 @@ pub(crate) async fn send_request(socket_path: &Path, req: &Request) -> Result<Re
     serde_json::from_str(buf.trim()).with_context(|| format!("parsing response: {}", buf.trim()))
 }
 
+/// Render a JSON-RPC `error` object to stderr. Emits an `error:`
+/// line and, for the `DAEMON_INITIALIZING` code, an extra
+/// `status:` progress line and an optional `hint:` line pulled
+/// from the error's `data` payload — matching the fields the
+/// daemon attaches while the [`StartupGate`](cairn_core::startup)
+/// still has phases outstanding.
 pub(crate) fn render_error(error: &ResponseError) {
     for line in error_lines(error) {
         eprintln!("{line}");
     }
 }
 
+/// Format a JSON-RPC error into 1–3 lines: the base `error:` line
+/// is always present. For `DAEMON_INITIALIZING` payloads a
+/// `status:` line is added when the `initialization` field decodes,
+/// and a `hint:` line is added when the first `hints` entry has a
+/// string `message` field — the two lines are independent, so
+/// either may appear alone. Any missing or unparseable field is
+/// silently omitted rather than producing a partial line, so an
+/// unknown data shape degrades cleanly to the base error line.
 fn error_lines(error: &ResponseError) -> Vec<String> {
     let mut lines = vec![format!("error: {}", error.message)];
     if error.code != error_code::DAEMON_INITIALIZING {

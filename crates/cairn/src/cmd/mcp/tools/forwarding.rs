@@ -9,7 +9,15 @@ use serde_json::Value;
 use super::super::types::ToolSpec;
 use super::super::{McpTool, ToolRoute};
 
+/// A minimal [`McpTool`] whose `route` simply forwards the caller's
+/// arguments unchanged to a fixed daemon method. Tools with no
+/// argument reshaping — most of the read-side tools — construct one
+/// of these instead of writing a bespoke `impl McpTool`. Tools that
+/// need to rewrite, validate, or split arguments write their own
+/// implementation.
 pub(super) struct ForwardingTool {
+    /// Function-pointer wrapper around `ToolSpec` so the const
+    /// constructors stay `const fn`.
     spec: fn() -> ToolSpec,
     method: &'static str,
     plane: Plane,

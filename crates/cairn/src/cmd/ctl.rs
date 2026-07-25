@@ -179,6 +179,14 @@ struct CtlInvocation {
     render_hint: RenderHint,
 }
 
+/// Entry point for `cairn ctl`. Resolves the runtime socket paths,
+/// runs the daemon/CLI version guard (skipped only for
+/// `daemon shutdown`, the remediation path for a mismatched
+/// daemon), sends one JSON-RPC request to the routed socket, and
+/// either renders the reply or dumps `--json`. A wire error is
+/// surfaced as `Err`; on success, a `--wait`-driven `reindex`
+/// bootstraps `wait_for_jobs` only after the initial reply has
+/// been rendered.
 pub async fn run(args: Args) -> Result<()> {
     let paths = match args.runtime_dir {
         Some(p) => SocketPaths::with_runtime_dir(p),
@@ -232,6 +240,11 @@ fn should_check_daemon_version(command: &CtlCommand) -> bool {
     )
 }
 
+/// Translate a parsed `CtlCommand` into the `CtlInvocation`
+/// describing which socket to talk to, which JSON-RPC method to
+/// call, and how to render the reply. Only the `repo` branch is
+/// fallible (path canonicalization for `register_repo`), which is
+/// why the return type is `Result<CtlInvocation>`.
 fn route_ctl_command(command: CtlCommand) -> Result<CtlInvocation> {
     match command {
         CtlCommand::Repo { command } => route_repo_command(command),
@@ -241,6 +254,14 @@ fn route_ctl_command(command: CtlCommand) -> Result<CtlInvocation> {
     }
 }
 
+/// Route repo subcommands. `Register` canonicalizes the on-disk
+/// path so the daemon stores the resolved root, and encodes the
+/// `--persistent` / `--ephemeral` flags as `Option<bool>`: `None`
+/// leaves the daemon default in place, `Some(true)` pins the alias
+/// past a temporarily missing root, and `Some(false)` explicitly
+/// restores the auto-prune policy. `List` reuses the read-only
+/// data socket's `list_repos` method so the wire protocol stays
+/// unchanged.
 fn route_repo_command(command: RepoCommand) -> Result<CtlInvocation> {
     match command {
         RepoCommand::Register {
@@ -290,6 +311,12 @@ fn route_repo_command(command: RepoCommand) -> Result<CtlInvocation> {
     }
 }
 
+/// Route jobs subcommands. Each variant maps to a `jobs.*` method
+/// on the control socket; `Prune` also stashes `dry_run` in the
+/// `RenderHint` so the human printer can pick the "would delete"
+/// vs "deleted" verb — the wire payload itself does not echo
+/// `dry_run`, and the `RenderHint` is what preserves the caller's
+/// mode across the round-trip.
 fn route_jobs_command(command: JobsCommand) -> CtlInvocation {
     match command {
         JobsCommand::List {
@@ -327,6 +354,9 @@ fn route_blobs_command(command: BlobsCommand) -> CtlInvocation {
     }
 }
 
+/// `Status` carries a `RenderHint::Status { snapshots }` so the
+/// printer can expand per-snapshot lines only when the user
+/// passed `--snapshots`.
 fn route_daemon_command(command: DaemonCommand) -> CtlInvocation {
     match command {
         DaemonCommand::Status { snapshots } => {
@@ -350,6 +380,18 @@ fn control_invocation(method: &'static str, params: Value) -> CtlInvocation {
     }
 }
 
+/// Render a JSON-RPC reply for `method`. If the reply carries an
+/// error, forward it through `rpc_client::render_error` (which
+/// formats the `DAEMON_INITIALIZING` hint envelope on stderr) and
+/// stop. Otherwise, decode `resp.result` with the type the wire
+/// method is declared to return and hand off to the matching
+/// `render_*` helper. The trailing `if let Some(jobs) = ...`
+/// branch is a generic fallback for any method whose success
+/// payload is `{"jobs": [...]}`; if that fails too the printer
+/// emits a bare `ok`. The fallback decodes `job_id` via
+/// `Value::as_i64`, so a missing or non-numeric id prints as
+/// `job 0` — the strongly typed `jobs.list` branch above uses
+/// `JobSnapshot::job_id` directly.
 fn render(method: &str, resp: &Response, render_hint: RenderHint) {
     if let Some(err) = &resp.error {
         rpc_client::render_error(err);
@@ -437,6 +479,14 @@ fn render(method: &str, resp: &Response, render_hint: RenderHint) {
     println!("ok");
 }
 
+/// Poll `jobs.list` for `alias` until no job remains in `queued`
+/// or `running`, or return an error when `timeout` elapses. Called
+/// after `--wait` on `repo reindex`. The state comparison is on
+/// the raw wire string (`job.state.as_str()`) — every other value,
+/// including terminal states like `succeeded` / `failed` /
+/// `skipped` / `cancelled` / `timed_out`, counts as done. The loop
+/// sleeps one second between polls so a long reindex does not spin
+/// the daemon.
 async fn wait_for_jobs(
     socket_path: &std::path::Path,
     alias: &str,
@@ -530,6 +580,10 @@ fn render_prune(r: &PruneResult) {
     }
 }
 
+/// Text renderer for `JobsPruneResult`. The `dry_run` flag comes
+/// from the caller-side `RenderHint`, not the wire payload, and
+/// picks the "would delete" vs "deleted" verb; the daemon returns
+/// the same shape either way.
 fn render_jobs_prune(r: &JobsPruneResult, dry_run: bool) {
     let verb = if dry_run { "would delete" } else { "deleted" };
     println!(
@@ -554,6 +608,11 @@ fn render_repo_list(r: &ListReposResult) {
     }
 }
 
+/// Build the `repo list` output lines. Timing / completeness
+/// fields on `ListReposResult` are deliberately omitted from the
+/// human view — the text output stays grep-friendly and only
+/// surfaces the repo columns shell users read directly (see the
+/// `repo_list_render_hides_timing_from_human_output` test).
 fn format_repo_list_lines(r: &ListReposResult) -> Vec<String> {
     r.repos
         .iter()
@@ -572,6 +631,12 @@ fn format_repo_list_lines(r: &ListReposResult) -> Vec<String> {
         .collect()
 }
 
+/// Text renderer for `StatusReport`. Emits the version / uptime
+/// header, then either an initialization line (short-circuiting
+/// the rest, because `repos` is empty while init is in flight) or
+/// one summary line per repo with optional per-snapshot detail
+/// (`--snapshots`) and a job-summary suffix when the repo has any
+/// job counts.
 fn render_status(r: &StatusReport, snapshots: bool) {
     println!("cairn {} (uptime: {}s)", r.daemon_version, r.uptime_secs);
     if let Some(line) = initialization_status_line(r) {
@@ -603,6 +668,9 @@ fn render_status(r: &StatusReport, snapshots: bool) {
     }
 }
 
+/// Return the "initializing X/Y: phase" line for a status report,
+/// or `None` once the daemon has finished initializing so the
+/// caller falls through to the repo summary instead.
 fn initialization_status_line(report: &StatusReport) -> Option<String> {
     if report.initialization.is_ready() {
         return None;

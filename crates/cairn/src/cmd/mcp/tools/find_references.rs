@@ -8,6 +8,8 @@ use super::super::{MCP_TOOLS, McpTool};
 use super::forwarding::ForwardingTool;
 use super::{ANCHOR_PARAM_DESC, BRANCH_PARAM_DESC, VERBOSE_TIER3_DESC};
 
+// Kept local: `RefKind` values only surface in this tool's schema,
+// unlike `SymbolKind` which several tools reuse from `mod.rs`.
 const REF_KIND_DESC: &str = "Restrict to one RefKind. Use snake_case strings: `call`, `type`, `import`, `instantiate`, `read`, `write`, `override`, `macro_invoke`, or `annotation`. Omit for every kind.";
 
 fn spec() -> ToolSpec {
