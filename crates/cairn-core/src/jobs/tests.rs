@@ -386,6 +386,36 @@ fn repository_removal_cancels_running_job_active_handle() {
 }
 
 #[test]
+fn repository_removal_marks_queued_job_metrics_finished() {
+    let data = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+    let manager = JobManager::new(Arc::clone(&cas_data_dir));
+    let repo_hash = "repo-hash";
+    let manifest_id = ManifestId(1);
+    let mut conn = cas_store::open(&cas_data_dir.store_db_path(repo_hash)).unwrap();
+    insert_manifest(&conn, manifest_id.0);
+    let queued = manager
+        .queue_analyzer_run(test_queue_request(
+            &mut conn,
+            repo.path(),
+            repo_hash,
+            manifest_id,
+            1,
+        ))
+        .unwrap()
+        .expect("job should queue");
+
+    assert_eq!(manager.cancel_repository(repo_hash).unwrap(), 1);
+
+    let mut snapshot = job(queued.job_id, &queued.analyzer_id, "cancelled");
+    manager.runtime_metrics.decorate(&mut snapshot, 2);
+    assert_eq!(snapshot.scheduler_state.as_deref(), Some("cancelled"));
+    assert!(snapshot.finished_at.is_none());
+    assert!(snapshot.queued_ms.is_some());
+}
+
+#[test]
 fn begin_shutdown_cancels_active_progress_and_rejects_new_admission() {
     let data = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -462,7 +492,6 @@ fn enqueue_reindex_queues_only_selected_analyzers() {
             repo_hash,
             repo_root: repo.path(),
             manifest_id,
-            entries: &[],
             now_ns: 1,
             analyzers,
         })

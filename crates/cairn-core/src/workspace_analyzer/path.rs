@@ -6,7 +6,7 @@
 //! path from a foreign URI risks colliding with a same-named file in
 //! the repo.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::lsp::Location;
 
@@ -14,14 +14,28 @@ use crate::lsp::Location;
 /// `repo_root`, or `None` when the target lives outside the repo.
 ///
 /// Backslash separators in the stripped remainder are normalised to
-/// `/` so the result matches manifest-entry paths. The prefix strip
-/// is lexical: `..` segments in the decoded URI are not canonicalised
-/// away here, so callers must validate the returned path against the
-/// manifest before trusting it.
+/// `/` so the result matches manifest-entry paths. `.` and `..`
+/// components are resolved lexically; a `..` that would escape the
+/// repository root rejects the location.
 pub(super) fn location_to_repo_path(repo_root: &Path, location: &Location) -> Option<String> {
     let path = file_uri_to_path(location.uri.as_str())?;
     let rel = path.strip_prefix(repo_root).ok()?;
-    Some(rel.to_string_lossy().replace('\\', "/"))
+    normalize_relative_path(&rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn normalize_relative_path(path: &str) -> Option<String> {
+    let mut normalized = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(value) => normalized.push(value.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized.join("/"))
 }
 
 /// Parse a `file://` URI into a filesystem path.
@@ -115,6 +129,24 @@ mod tests {
         let rel = location_to_repo_path(
             Path::new("/tmp/repo"),
             &location("file:///tmp/.cargo/registry/src/index/foo-1.0/src/lib.rs"),
+        );
+        assert_eq!(rel, None);
+    }
+
+    #[test]
+    fn normalizes_parent_components_that_stay_inside_repo() {
+        let rel = location_to_repo_path(
+            Path::new("/tmp/repo"),
+            &location("file:///tmp/repo/src/../include/api.hpp"),
+        );
+        assert_eq!(rel.as_deref(), Some("include/api.hpp"));
+    }
+
+    #[test]
+    fn rejects_parent_components_that_escape_repo_root() {
+        let rel = location_to_repo_path(
+            Path::new("/tmp/repo"),
+            &location("file:///tmp/repo/src/../../outside.hpp"),
         );
         assert_eq!(rel, None);
     }

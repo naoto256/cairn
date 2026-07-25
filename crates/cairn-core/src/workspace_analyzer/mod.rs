@@ -1000,6 +1000,73 @@ mod tests {
     }
 
     #[test]
+    fn persist_resolved_refs_rejects_import_target_outside_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/main.c', 'source-sha')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('source-sha', 'tree-sitter-c', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolutions: Vec::new(),
+            resolved_refs: vec![ResolvedRef {
+                source_path: "src/main.c".into(),
+                source_position: Position {
+                    line: 0,
+                    character: 0,
+                },
+                source_byte_range: 0..1,
+                kind: RefKind::Import,
+                target: Location {
+                    uri: crate::lsp::Url::from("file:///repo/src/../../outside.hpp"),
+                    range: crate::lsp::Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                },
+                target_path: Some("src/../../outside.hpp".into()),
+            }],
+        };
+
+        let inserted = persist_resolved_refs(
+            &mut conn,
+            ManifestId(1),
+            "clangd-c-lsp",
+            "tier3",
+            "tree-sitter-c",
+            &facts,
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(refs, 0);
+    }
+
+    #[test]
     fn persist_resolved_refs_uses_analyzer_parser_id_for_python_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();

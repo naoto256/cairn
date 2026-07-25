@@ -7,12 +7,10 @@
 //! (`tier`). This is read-only reporting over the fact tables — it
 //! never triggers analysis and writes nothing.
 //!
-//! `tier` is derived solely from `blobs.analyzer_id`, i.e. per-blob
-//! Tier-2 analyzer runs. A registered workspace analyzer (Tier-2.5/3)
-//! counts toward `has_analyzer` but never upgrades `tier`, even after
-//! its runs complete — run lifecycle/status is tracked in
-//! `workspace_analysis_runs` and the resolved facts themselves land
-//! in `refs` / `resolutions`, none of which this module consults.
+//! `tier` is realized by either a per-blob Tier-2 analyzer stamp or a
+//! succeeded workspace-analyzer run for the current tentative
+//! manifest. Committed snapshots retain their blob-derived reporting:
+//! workspace runs are worktree-scoped and do not promote them.
 use std::collections::HashSet;
 
 use cairn_lang_api::LanguageBackend;
@@ -32,7 +30,8 @@ use crate::workspace_analyzer::all_workspace_analyzers;
 /// `has_analyzer` is capability — a Tier-2 or workspace analyzer is
 /// registered for the parser. `tier` is realized state — `Semantic`
 /// iff at least one manifest blob carries this backend's
-/// `analyzer_id`.
+/// `analyzer_id`, or a workspace analyzer for this parser succeeded
+/// on the current tentative manifest.
 ///
 /// # Errors
 /// SQLite failures reading the store.
@@ -59,6 +58,8 @@ pub(crate) fn collect_enrichment(
         .into_iter()
         .map(|a| (a.parser_id(), a.id()))
         .collect::<HashSet<_>>();
+    let succeeded_workspace_analyzer_ids =
+        succeeded_workspace_analyzers_for_tentative(conn, manifest_id)?;
 
     let mut out: Vec<LanguageEnrichment> = Vec::with_capacity(parser_ids.len());
     for parser_id in parser_ids {
@@ -75,7 +76,12 @@ pub(crate) fn collect_enrichment(
                 .iter()
                 .any(|(workspace_parser_id, _)| *workspace_parser_id == parser_id);
         let analyzer_id = backend.and_then(|b| b.analyzer().map(|a| a.name()));
-        let tier = if manifest_has_analyzer_run(conn, manifest_id, &parser_id, analyzer_id)? {
+        let tier = if manifest_has_analyzer_run(conn, manifest_id, &parser_id, analyzer_id)?
+            || workspace_run_realizes_parser(
+                &parser_id,
+                &workspace_analyzer_ids,
+                &succeeded_workspace_analyzer_ids,
+            ) {
             SourceTier::Semantic
         } else {
             SourceTier::Syntactic
@@ -98,6 +104,40 @@ pub(crate) fn collect_enrichment(
     }
     out.sort_by(|a, b| a.language.cmp(&b.language));
     Ok(out)
+}
+
+/// Successful workspace-analyzer ids for a tentative manifest.
+///
+/// Workspace runs describe the live worktree. A committed manifest
+/// can share blobs with that worktree, but it must not inherit the
+/// tentative run's realized tier.
+fn succeeded_workspace_analyzers_for_tentative(
+    conn: &Connection,
+    manifest_id: i64,
+) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT war.analyzer_id
+           FROM workspace_analysis_runs war
+           JOIN manifests m ON m.manifest_id = war.manifest_id
+          WHERE war.manifest_id = ?1
+            AND m.kind = 'tentative'
+            AND war.status = 'succeeded'",
+    )?;
+    Ok(stmt
+        .query_map(params![manifest_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
+fn workspace_run_realizes_parser(
+    parser_id: &str,
+    workspace_analyzer_ids: &HashSet<(&'static str, &'static str)>,
+    succeeded_analyzer_ids: &HashSet<String>,
+) -> bool {
+    workspace_analyzer_ids
+        .iter()
+        .any(|(workspace_parser_id, analyzer_id)| {
+            *workspace_parser_id == parser_id && succeeded_analyzer_ids.contains(*analyzer_id)
+        })
 }
 
 /// Best-effort display name for a `parser_id` that has no live
@@ -199,6 +239,50 @@ mod tests {
     }
 
     #[test]
+    fn succeeded_workspace_run_marks_tentative_manifest_semantic() {
+        let (_tmp, conn) = fresh_store();
+        seed_manifest_blob(&conn, "sha-workspace", "fake-parser", None, None);
+        conn.execute(
+            "UPDATE manifests SET kind = 'tentative', commit_sha = NULL",
+            [],
+        )
+        .unwrap();
+        insert_workspace_run(&conn, "fake-workspace", "succeeded");
+        let backends: Vec<Box<dyn LanguageBackend>> = Vec::new();
+
+        let enrichment = collect_enrichment(&conn, 1, &backends).unwrap();
+        assert_eq!(enrichment[0].tier, SourceTier::Semantic);
+    }
+
+    #[test]
+    fn succeeded_workspace_run_does_not_promote_committed_manifest() {
+        let (_tmp, conn) = fresh_store();
+        seed_manifest_blob(&conn, "sha-workspace", "fake-parser", None, None);
+        insert_workspace_run(&conn, "fake-workspace", "succeeded");
+        let backends: Vec<Box<dyn LanguageBackend>> = Vec::new();
+
+        let enrichment = collect_enrichment(&conn, 1, &backends).unwrap();
+        assert_eq!(enrichment[0].tier, SourceTier::Syntactic);
+    }
+
+    #[test]
+    fn go_workspace_analyzer_success_realizes_parser_tier() {
+        let workspace = HashSet::from([("tree-sitter-go", "gopls-lsp")]);
+        let succeeded = HashSet::from(["gopls-lsp".to_string()]);
+
+        assert!(workspace_run_realizes_parser(
+            "tree-sitter-go",
+            &workspace,
+            &succeeded
+        ));
+        assert!(!workspace_run_realizes_parser(
+            "tree-sitter-c",
+            &workspace,
+            &succeeded
+        ));
+    }
+
+    #[test]
     fn parser_without_tier2_or_workspace_analyzer_is_not_analyzable() {
         let (_tmp, conn) = fresh_store();
         seed_manifest_blob(&conn, "sha-plain", "tree-sitter-plain", None, None);
@@ -241,6 +325,17 @@ mod tests {
             "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
              VALUES (1, 'x.empty', ?1)",
             params![blob_sha],
+        )
+        .unwrap();
+    }
+
+    fn insert_workspace_run(conn: &Connection, analyzer_id: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash, status,
+                started_at_ns, finished_at_ns, error)
+             VALUES (1, ?1, 1, 'cfg', ?2, 0, 1, NULL)",
+            params![analyzer_id, status],
         )
         .unwrap();
     }

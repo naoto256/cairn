@@ -189,12 +189,11 @@ fn run_find_symbols(
     if let Some(p) = args.path_prefix.as_deref()
         && !p.is_empty()
     {
-        // `LIKE '<p>%'` with an unescaped user prefix: `%` and `_`
-        // inside `p` are interpreted as LIKE metacharacters. Callers
-        // controlling the prefix should sanitise if they need
-        // literal matching.
-        sql.push_str(" AND me.path LIKE ?");
-        bound.push(Box::new(format!("{p}%")));
+        // Treat the caller's prefix literally. `%`, `_`, and the
+        // escape character itself otherwise broaden the SQLite LIKE
+        // predicate beyond the requested filesystem path.
+        sql.push_str(" AND me.path LIKE ? ESCAPE '\\'");
+        bound.push(Box::new(format!("{}%", escape_like(p))));
     }
     // `language IS NULL` first so blobs without an analyzer stamp (in
     // practice: no language attribution) sort to the end rather than
@@ -207,6 +206,13 @@ fn run_find_symbols(
     let rows: rusqlite::Result<Vec<SymbolHit>> =
         stmt.query_map(param_refs.as_slice(), row_to_hit)?.collect();
     Ok(rows?)
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {

@@ -83,14 +83,7 @@ impl JobManager {
         // deterministic because `list_all` is already `ORDER BY
         // alias`. Phase 4's memory-queue Job then carries a
         // canonical alias per store.
-        let unique_entries: Vec<_> = {
-            let mut seen: HashSet<String> = HashSet::new();
-            entries
-                .iter()
-                .filter(|e| seen.insert(e.repo_hash.clone()))
-                .cloned()
-                .collect()
-        };
+        let unique_entries = cas_registry::dedupe_by_repo_hash(entries);
         // Load every id previously retired as ambiguous. Any surviving
         // row that still carries one of these ids must be recycled
         // even if no sibling row is present this time — a prior

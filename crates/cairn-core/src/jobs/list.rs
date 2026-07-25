@@ -42,7 +42,12 @@ impl JobManager {
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
         let mut out = Vec::new();
         let enumerate_all = alias_filter.is_none();
-        for entry in cas_registry::list_all(&index)? {
+        let entries = if enumerate_all {
+            cas_registry::dedupe_by_repo_hash(cas_registry::list_all(&index)?)
+        } else {
+            cas_registry::list_all(&index)?
+        };
+        for entry in entries {
             if let Some(alias) = alias_filter
                 && entry.alias != alias
             {
@@ -118,7 +123,7 @@ impl JobManager {
                 })?;
                 vec![entry]
             }
-            None => cas_registry::list_all(&index)?,
+            None => cas_registry::dedupe_by_repo_hash(cas_registry::list_all(&index)?),
         };
 
         let mut repos = Vec::with_capacity(entries.len());
@@ -405,5 +410,60 @@ mod tests {
         assert_eq!(result.total_deleted_index_entries, 1);
         assert_eq!(count_runs(&conn, 2, "orphan-terminal-lsp"), 1);
         assert!(manager.job_index.get(20).is_some());
+    }
+
+    #[test]
+    fn list_and_prune_visit_alias_shared_store_once() {
+        let (_data, repo, manager, conn) = prune_test_manager();
+        {
+            let mut index = cas_registry::open(&manager.cas_data_dir.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(
+                &tx,
+                "repo-alias",
+                repo.path().to_str().unwrap(),
+                "repo-hash",
+                2,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        insert_manifest(&conn, 1);
+        insert_manifest(&conn, 2);
+        insert_anchor(&conn, "HEAD", 1);
+        insert_job_run(&conn, 1, "current-lsp", "succeeded", Some(30));
+        insert_job_run(&conn, 2, "orphan-lsp", "failed", Some(31));
+
+        let jobs = manager
+            .jobs(
+                None,
+                None,
+                JobListOptions {
+                    include_all: true,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            jobs.iter().filter(|job| job.job_id == 30).count(),
+            1,
+            "alias-shared store must not duplicate list rows"
+        );
+        let scoped = manager
+            .jobs(
+                Some("repo-alias"),
+                None,
+                JobListOptions {
+                    include_all: true,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|job| job.alias == "repo-alias"));
+
+        let pruned = manager.prune_jobs(None, true).unwrap();
+        assert_eq!(pruned.repos.len(), 1);
+        assert_eq!(pruned.total_deleted_runs, 1);
     }
 }
