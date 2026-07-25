@@ -161,6 +161,30 @@ impl JobRuntimeMetricsStore {
         }
     }
 
+    /// Fail a worker run only when no concurrent terminal transition
+    /// has already won. In particular, a late error must not replace
+    /// a cancellation recorded while the blocking worker was active.
+    pub(super) fn mark_failed_if_unfinished(&self, job_id: JobId) {
+        let now = now_ns();
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("job metrics lock poisoned")
+            .get_mut(&job_id)
+        {
+            if entry.finished_at_ns.is_some() {
+                return;
+            }
+            if let Some(started) = entry.pool_wait_started_at_ns.take() {
+                entry.pool_wait_ms = entry
+                    .pool_wait_ms
+                    .saturating_add(duration_ms(started, now).unwrap_or(0));
+            }
+            entry.scheduler_state = RunStatus::Failed.as_str().to_string();
+            entry.finished_at_ns = Some(now);
+        }
+    }
+
     /// Merge this store's entry into a snapshot. No-op when the
     /// job was never tracked by this process — the runtime-only
     /// snapshot fields then stay `None`.

@@ -1067,6 +1067,84 @@ mod tests {
     }
 
     #[test]
+    fn persist_resolved_refs_keeps_manifest_header_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES
+               (1, 'src/main.c', 'source-sha'),
+               (1, 'include/api.h', 'header-sha')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES
+               ('source-sha', 'tree-sitter-c', 1, 0),
+               ('header-sha', 'tree-sitter-c', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let facts = WorkspaceFacts {
+            resolutions: Vec::new(),
+            resolved_refs: vec![ResolvedRef {
+                source_path: "src/main.c".into(),
+                source_position: Position {
+                    line: 0,
+                    character: 0,
+                },
+                source_byte_range: 0..1,
+                kind: RefKind::Import,
+                target: Location {
+                    uri: crate::lsp::Url::from("file:///repo/include/api.h"),
+                    range: crate::lsp::Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                },
+                target_path: Some("include/api.h".into()),
+            }],
+        };
+
+        let inserted = persist_resolved_refs(
+            &mut conn,
+            ManifestId(1),
+            "clangd-c-lsp",
+            "tier3",
+            "tree-sitter-c",
+            &facts,
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 1);
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT target_name, target_qualified, kind FROM refs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("api.h".into(), "include/api.h".into(), "import".into())
+        );
+    }
+
+    #[test]
     fn persist_resolved_refs_uses_analyzer_parser_id_for_python_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let mut conn = crate::cas::store::open(&tmp.path().join("store.db")).unwrap();

@@ -105,11 +105,10 @@ pub(super) fn persist_resolved_refs(
         // without finding a target symbol. Prove manifest membership
         // first so a malformed or unnormalised analyzer path cannot
         // bypass that fallback and create a ghost edge.
-        if blob_for_path(&tx, manifest_id, target_path)?.is_none() {
+        let Some(target_blob) = blob_for_path(&tx, manifest_id, target_path)? else {
             continue;
-        }
-        let target =
-            target_symbol_for_location(&tx, manifest_id, &parser_id, target_path, &r.target)?;
+        };
+        let target = target_symbol_for_location(&tx, &target_blob, &parser_id, &r.target)?;
         // Import refs (e.g. C/C++/ObjC `#include`) commonly resolve to a
         // file location that sits outside any symbol's byte range — the
         // top of the header itself, before any declaration. Falling
@@ -666,14 +665,10 @@ fn parser_for_blob(conn: &Connection, blob_sha: &str, parser_id: &str) -> Result
 /// targets).
 fn target_symbol_for_location(
     conn: &Connection,
-    manifest_id: ManifestId,
+    target_blob: &str,
     parser_id: &str,
-    target_path: &str,
     location: &Location,
 ) -> Result<Option<(String, String)>> {
-    let Some(blob_sha) = blob_for_path(conn, manifest_id, target_path)? else {
-        return Ok(None);
-    };
     let line = i64::from(location.range.start.line.saturating_add(1));
     Ok(conn
         .query_row(
@@ -684,7 +679,7 @@ fn target_symbol_for_location(
                AND kind IN ('function', 'method', 'test')
              ORDER BY (line_end - line_start) ASC, line_start DESC
              LIMIT 1",
-            params![blob_sha, parser_id, line],
+            params![target_blob, parser_id, line],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
