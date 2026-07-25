@@ -1,4 +1,10 @@
 //! `repo_status` MCP tool.
+//!
+//! Only tool in this module that implements [`McpTool`] directly
+//! instead of delegating to [`super::forwarding::ForwardingTool`],
+//! so the MCP-side zero-arg entrypoint can inject the server's cwd
+//! into `path` before the request reaches the stricter data-RPC
+//! contract (which still demands exactly one of `repo` / `path`).
 
 use linkme::distributed_slice;
 use serde_json::{Value, json};

@@ -3,6 +3,22 @@
 //! Brings the runtime sockets up with the real MCP and control
 //! handlers and installs SIGINT / SIGTERM signal handling that
 //! triggers a clean shutdown.
+//!
+//! # Role split with `cairn_core::daemon`
+//!
+//! This module is the CLI-side entry point. It resolves paths
+//! from CLI flags or platform defaults, raises the file-descriptor
+//! soft limit (Unix), installs the signal handler and shutdown
+//! `Notify`, binds the UDS listeners via [`InitializingDaemon`],
+//! and drives startup-side initialization in a separate task that
+//! feeds resources into the [`StartupGate`].
+//!
+//! Everything inside the daemon — the accept loops, request
+//! framing, teardown ordering, and periodic reconcile / staleness
+//! machinery — lives in `cairn_core` (`cairn_core::daemon`,
+//! `cairn_core::reconcile`, `cairn_core::jobs`,
+//! `cairn_core::lifecycle`, ...). This file's job is to assemble
+//! those pieces once and hand them to the core run loop.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,9 +43,19 @@ use tracing::info;
 #[cfg(unix)]
 use tracing::warn;
 
+/// Soft `RLIMIT_NOFILE` we try to reach on Unix before opening any
+/// sockets or per-repo watchers. Chosen to cover the fanout of
+/// UDS clients, LSP children, notify handles, and per-repo SQLite
+/// store handles under a realistic multi-repo workload without
+/// forcing an unbounded raise. Capped at the process hard limit
+/// by [`nofile_raise_target`].
 #[cfg(unix)]
 const DAEMON_NOFILE_TARGET: u64 = 4096;
 
+/// Clap flags accepted by `cairn daemon`. Both overrides feed the
+/// path resolvers used to construct [`SocketPaths`] and
+/// [`CasDataDir`]; leaving them `None` falls back to the platform
+/// default lookup.
 #[derive(ClapArgs, Debug)]
 pub struct Args {
     /// Override the runtime directory (otherwise picked from
@@ -43,6 +69,19 @@ pub struct Args {
     pub data_dir: Option<std::path::PathBuf>,
 }
 
+/// Startup sequence for the daemon subcommand.
+///
+/// Resolves paths, raises the file-descriptor soft limit, installs
+/// the signal handler, binds both UDS listeners via
+/// `InitializingDaemon::bind` (so the bind step completes before
+/// entering the `select!`; bind failures return from here, not
+/// from the accept-loop arm), and spawns the slower runtime
+/// bring-up (`initialize_runtime`) concurrently with the accept
+/// loops. The `tokio::select!` below reconciles which of the two
+/// completes first — either the accept loops stop (shutdown
+/// notified) or initialization finishes. Initialization failure
+/// signals shutdown to unwind the accept loops; initialization
+/// success does not.
 pub async fn run(args: Args) -> Result<()> {
     raise_nofile_soft_limit();
     let paths = match args.runtime_dir {
@@ -61,6 +100,15 @@ pub async fn run(args: Args) -> Result<()> {
     let daemon_run = daemon.run();
     tokio::pin!(daemon_run);
 
+    // Ordering:
+    // - If the accept loops return first (shutdown), the
+    //   initialization task gets up to 10s to observe shutdown and
+    //   drain its own resources; on timeout we abort, and the outer
+    //   runtime grace budget may still abandon any residual
+    //   blocking work rather than reap it cleanly.
+    // - If initialization returns first with an error, we notify
+    //   shutdown so the accept loops unwind before we await them.
+    //   Initialization success does not notify shutdown.
     let (daemon_result, initialization_result) = tokio::select! {
         daemon_result = &mut daemon_run => {
             let initialization_result = match tokio::time::timeout(
@@ -89,6 +137,12 @@ pub async fn run(args: Args) -> Result<()> {
     initialization_result
 }
 
+/// Compute the effective soft `RLIMIT_NOFILE` we should attempt to
+/// raise to. Returns `None` when no raise is necessary — either the
+/// current soft limit already meets [`DAEMON_NOFILE_TARGET`] (or the
+/// hard-capped target), or the current limit is unknown so we cannot
+/// prove a raise is needed. When the hard limit is known, the
+/// requested value is clamped to it to avoid `setrlimit` `EPERM`.
 #[cfg(unix)]
 fn nofile_raise_target(current: Option<u64>, maximum: Option<u64>) -> Option<u64> {
     let target = maximum.map_or(DAEMON_NOFILE_TARGET, |hard| hard.min(DAEMON_NOFILE_TARGET));
@@ -98,6 +152,11 @@ fn nofile_raise_target(current: Option<u64>, maximum: Option<u64>) -> Option<u64
     }
 }
 
+/// Best-effort raise of the soft `RLIMIT_NOFILE` for this process
+/// before any sockets or watchers open. Failure is logged and
+/// swallowed: the daemon continues under the original limit, and
+/// per-repo watcher / SQLite store code paths surface fd
+/// exhaustion at their own boundaries.
 #[cfg(unix)]
 fn raise_nofile_soft_limit() {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
@@ -129,15 +188,33 @@ fn raise_nofile_soft_limit() {
     }
 }
 
+/// No-op on non-Unix targets; there is no portable `RLIMIT_NOFILE`
+/// equivalent to raise from process code.
 #[cfg(not(unix))]
 fn raise_nofile_soft_limit() {}
 
+/// Flatten a joined initialization task result: a `JoinError`
+/// (panic / cancellation) becomes a startup error, otherwise the
+/// task's own `Result` is propagated unchanged.
 fn join_initialization(
     result: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
     result.map_err(|err| anyhow!("daemon initialization task failed: {err}"))?
 }
 
+/// Bring the daemon runtime up phase-by-phase and either publish
+/// the [`ReadyDaemon`] bundle through `gate.publish_ready` or, on
+/// an error after the bundle has been assembled, dismantle the
+/// partially built resources with `shutdown_unpublished_resources`
+/// before returning the error.
+///
+/// Each `gate.advance` call moves the reported initialization phase
+/// forward so a `status` RPC arriving during startup can describe
+/// what the daemon is doing. The order of construction is
+/// load-bearing: `lifecycle` seeds the sweep and owns the intent
+/// task, `job_manager` restores queued jobs before workers start,
+/// `reconcile` and `watch_manager` bind against the lifecycle, and
+/// only then does the ready bundle get published atomically.
 async fn initialize_runtime(
     cas_data_dir: Arc<CasDataDir>,
     shutdown: Arc<Notify>,
@@ -268,6 +345,11 @@ async fn initialize_runtime(
     }
 }
 
+/// Install a background task that watches for SIGINT / SIGTERM
+/// and, on either signal, calls `notify_waiters` on the shared
+/// shutdown `Notify`. Registration failures degrade to a warning
+/// and no signal-driven shutdown — the operator can still stop the
+/// daemon via `cairn ctl daemon shutdown` over the control socket.
 fn spawn_signal_handler(shutdown: Arc<Notify>) {
     tokio::spawn(async move {
         let mut sigint =
@@ -316,6 +398,12 @@ fn init_job_manager(
     Ok(job_manager)
 }
 
+/// Arm watchers for every already-registered repository on a
+/// blocking thread. `WatchManager::start_registered` opens the
+/// registry DB and installs notify handles, both of which can
+/// block on filesystem I/O, so it must not run on the async
+/// runtime's worker threads. A join failure (panic / cancel) or
+/// startup failure both surface as a startup error.
 async fn start_registered_watchers(watch_manager: Arc<WatchManager>) -> Result<WatchStartupReport> {
     tokio::task::spawn_blocking(move || watch_manager.start_registered())
         .await

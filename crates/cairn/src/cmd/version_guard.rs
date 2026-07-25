@@ -1,4 +1,26 @@
 //! Daemon/client version guard shared by CLI and MCP front-ends.
+//!
+//! Compares the running daemon's `daemon_version` (via the control
+//! socket `status` RPC) against this binary's `CARGO_PKG_VERSION`
+//! using [`pre_one_zero_compat`], then decides per
+//! [`VersionGuardMode`] whether to continue silently, warn on
+//! stderr, or return an error.
+//!
+//! The compatibility table (defined in
+//! [`cairn_proto::version::pre_one_zero_compat`]):
+//!
+//! - `SamePatch` / `PatchMismatch`: silent, continue.
+//! - `MinorMismatch`: warn on stderr, continue in both modes.
+//! - `MajorMismatch`: fatal for [`VersionGuardMode::Cli`], warn
+//!   (do not fail) for [`VersionGuardMode::Mcp`] so `initialize`
+//!   can still complete and the host surfaces the diagnostic.
+//! - `Unparseable`: warn on stderr, continue — treated as
+//!   "unknown compatibility" rather than an outright failure.
+//!
+//! If the status RPC itself fails (socket missing, daemon down,
+//! transport error) the guard logs a warning and returns `Ok` so
+//! downstream commands can surface the real failure with their
+//! own richer error path.
 
 use std::path::Path;
 
@@ -10,6 +32,8 @@ use serde_json::Value;
 
 use super::rpc_client;
 
+/// Version string this binary reports to the guard — the same
+/// value clap surfaces through `cairn --version`.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +46,11 @@ pub(crate) enum VersionGuardMode {
     Mcp,
 }
 
+/// Run the version guard against the daemon reachable at
+/// `socket_path`. Returns `Err` only in the CLI-fatal case
+/// (`MajorMismatch` under [`VersionGuardMode::Cli`]); every other
+/// outcome (mismatch warning, unparseable versions, transport
+/// failure) is downgraded to a stderr warning and `Ok`.
 pub(crate) async fn check_daemon_version(socket_path: &Path, mode: VersionGuardMode) -> Result<()> {
     let daemon_version = match daemon_version(socket_path).await {
         Ok(version) => version,
@@ -63,6 +92,11 @@ fn version_error(daemon_version: &str) -> String {
     )
 }
 
+/// Extract just the `daemon_version` field from a control-socket
+/// `status` reply. Reports transport failure, RPC-level `error`
+/// objects, missing `result`, and decode failures as distinct
+/// `anyhow` messages so the caller's warning text can point at the
+/// specific step that broke.
 async fn daemon_version(socket_path: &Path) -> Result<String> {
     let resp = control_status(socket_path).await?;
     if let Some(err) = resp.error {
@@ -75,6 +109,8 @@ async fn daemon_version(socket_path: &Path) -> Result<String> {
     Ok(report.daemon_version)
 }
 
+/// Issue a single newline-delimited `status` JSON-RPC round trip
+/// over the control socket via [`rpc_client::round_trip`].
 async fn control_status(socket_path: &Path) -> Result<Response> {
     rpc_client::round_trip(socket_path, "status", Value::Null)
         .await

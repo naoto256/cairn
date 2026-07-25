@@ -1,4 +1,10 @@
 //! `cairn` — entry point for the Cairn binary.
+//!
+//! Dispatches one clap-parsed subcommand on a fresh Tokio runtime,
+//! then shuts the runtime down with a bounded grace period. Every
+//! subcommand handler lives under [`cmd`]; this file only assembles
+//! the CLI surface, keeps the language-backend rlibs linked in, and
+//! initializes tracing to stderr.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -47,6 +53,9 @@ use cairn_lang_typescript_tier3 as _;
 
 mod cmd;
 
+/// Top-level clap surface. `version` inherits `CARGO_PKG_VERSION`
+/// so `cairn --version` prints the same string the version guard
+/// (see `cmd::version_guard`) compares against the running daemon.
 #[derive(Parser, Debug)]
 #[command(
     name = "cairn",
@@ -75,6 +84,10 @@ enum Command {
     Query(cmd::query::Args),
 }
 
+/// Upper bound for `Runtime::shutdown_timeout` after the async
+/// subcommand returns. `Runtime::drop` would otherwise wait
+/// indefinitely for any residual `spawn_blocking` work (see the
+/// caller comment in `main`).
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> Result<()> {
@@ -97,6 +110,10 @@ fn main() -> Result<()> {
     result
 }
 
+/// Install the process-wide tracing subscriber before any
+/// subcommand runs. Everything writes to stderr so the `mcp`
+/// stdio relay's stdout stays reserved for MCP framing, and the
+/// filter honours `RUST_LOG` when set (defaulting to `info`).
 fn init_tracing() {
     // `mcp` runs as a stdio relay; logging on stderr is fine and
     // won't pollute the MCP wire.

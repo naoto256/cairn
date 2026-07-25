@@ -52,6 +52,9 @@ use super::version_guard::{VersionGuardMode, check_daemon_version};
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "cairn";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Hard cap on a single stdin line. Anything longer is drained and
+/// answered with an INVALID_REQUEST so a runaway client cannot push
+/// the front-end into unbounded buffering.
 const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 // ─── tool trait + registry ─────────────────────────────────────────────────
@@ -110,6 +113,12 @@ pub struct Args {
     pub runtime_dir: Option<PathBuf>,
 }
 
+/// Entry point for `cairn mcp`. Runs one MCP session on stdin/stdout
+/// until EOF, dispatching every well-formed line through
+/// [`Dispatcher::handle_line`] and writing at most one framed
+/// response per input line. Notifications (missing `id`) and blank
+/// lines produce no reply; oversized lines answer with
+/// `INVALID_REQUEST` and continue the session.
 pub async fn run(args: Args) -> Result<()> {
     let paths = match args.runtime_dir {
         Some(p) => SocketPaths::with_runtime_dir(p),
@@ -160,6 +169,10 @@ struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// Materialise the tool registry from [`MCP_TOOLS`] and remember
+    /// the resolved socket paths. Tools are sorted by
+    /// `(sort_key, name)` so `tools/list` is deterministic and the
+    /// most-useful entries land at the top.
     fn new(paths: SocketPaths) -> Self {
         let mut entries: Vec<Box<dyn McpTool>> = MCP_TOOLS.iter().map(|c| c()).collect();
         entries.sort_by_key(|t| (t.sort_key(), t.spec().name));
@@ -178,6 +191,9 @@ impl Dispatcher {
         }
     }
 
+    /// Rebuild the ordered [`ToolSpec`] list served by `tools/list`.
+    /// Called on every request rather than cached because tool count
+    /// is tiny and each `spec()` call is cheap.
     fn tool_specs(&self) -> Vec<ToolSpec> {
         self.ordered
             .iter()
@@ -187,6 +203,13 @@ impl Dispatcher {
 
     /// Dispatch one MCP line. Returns `None` for notifications (no
     /// id, no reply expected).
+    ///
+    /// Envelope handling differs from the daemon's JSON-RPC dispatch
+    /// (`cairn_core::jsonrpc_dispatch`): the MCP surface silently
+    /// drops any input that lacks an id, including well-formed
+    /// notifications and inputs whose raw JSON also fails to parse.
+    /// See the module doc on `cairn_proto::jsonrpc` for the
+    /// daemon-side envelope contract.
     async fn handle_line(&self, line: &str) -> Option<String> {
         let req: RpcRequest = match serde_json::from_str::<RpcRequest>(line) {
             Ok(r) => r,
@@ -260,6 +283,11 @@ impl Dispatcher {
         Some(serialize(&resp))
     }
 
+    /// Run the daemon/client version compatibility check at most
+    /// once per session. Failures are logged inside
+    /// [`check_daemon_version`]; this helper does not propagate
+    /// them so a version drift never aborts an MCP session that
+    /// the client is otherwise capable of driving.
     async fn check_daemon_version_once(&self) {
         let mut checked = self.version_checked.lock().await;
         if *checked {
@@ -322,6 +350,16 @@ impl Dispatcher {
     }
 }
 
+/// Attach a `DaemonNotReady` hint to the socket-error response for
+/// `repo_status` calls.
+///
+/// `repo_status` is the natural tool an MCP client reaches for when
+/// the daemon may be down, so a plain "data socket: connection
+/// refused" message would be diagnosable but not actionable. Adding
+/// the hint gives the client enough structure to surface a
+/// start-the-daemon suggestion. Other tools produce the same
+/// unhinted INTERNAL_ERROR shape via their own envelope for the
+/// same socket error class.
 fn repo_status_daemon_not_ready_error(id: RequestId, err: anyhow::Error) -> RpcResponse {
     let mut response = error_resp(
         id,
@@ -346,12 +384,23 @@ fn repo_status_daemon_not_ready_error(id: RequestId, err: anyhow::Error) -> RpcR
 
 // ─── wire IO ───────────────────────────────────────────────────────────────
 
+/// Outcome of one line-read from stdin. `TooLong` signals that the
+/// oversize line was already drained so the next call resumes on
+/// the following line.
 enum McpLine {
     Eof,
     Line(String),
     TooLong,
 }
 
+/// Read one line, completed by newline or EOF, up to `max` bytes.
+/// An EOF-terminated non-empty line is returned as
+/// [`McpLine::Line`] just like a newline-terminated one; only a
+/// zero-length read at line start becomes [`McpLine::Eof`]. Bytes
+/// past the cap are consumed and discarded so the stream stays
+/// framed; the caller sees [`McpLine::TooLong`] instead of
+/// receiving a partial line. Trailing `\n`/`\r` are stripped from
+/// the returned string.
 async fn read_mcp_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
@@ -402,6 +451,16 @@ fn line_from_bytes(mut buf: Vec<u8>) -> std::io::Result<McpLine> {
 
 // ─── response wrapping ────────────────────────────────────────────────────
 
+/// Adapt a daemon JSON-RPC response into an MCP `tools/call` reply.
+///
+/// Errors are forwarded verbatim (code, message, and any structured
+/// `data` such as initialization hints) so callers see the same
+/// diagnostics they would over a direct socket. Successful results
+/// are wrapped in a `ToolsCallResult` with the JSON payload
+/// stringified into a single `text` content block and also duplicated
+/// into `structuredContent` — MCP clients that understand structured
+/// results can consume the object directly, while text-only clients
+/// still see the payload.
 fn mcp_wrap_rpc_response(id: RequestId, resp: RpcResponse) -> RpcResponse {
     if let Some(err) = resp.error {
         return RpcResponse {
@@ -432,6 +491,11 @@ fn mcp_wrap_rpc_response(id: RequestId, resp: RpcResponse) -> RpcResponse {
     }
 }
 
+/// Serialize an MCP result payload into a JSON `Value`, or turn a
+/// serialization failure into an INTERNAL_ERROR response the caller
+/// can return directly. Logs the underlying error before demoting
+/// it so operators can trace which method produced the malformed
+/// payload.
 fn serialize_result<T: Serialize>(
     id: &RequestId,
     result: T,
@@ -448,6 +512,10 @@ fn serialize_result<T: Serialize>(
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
+/// Build the `initialize` response returned to every client. The
+/// protocol version is a hard-coded constant — cairn does not
+/// negotiate with the client's advertised version and simply echoes
+/// what it supports today.
 fn initialize_result() -> InitializeResult {
     InitializeResult {
         protocol_version: MCP_PROTOCOL_VERSION.into(),
