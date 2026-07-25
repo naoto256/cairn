@@ -15,12 +15,14 @@
 //! IDE plugins) hit the daemon directly over the JSON-RPC surface
 //! without speaking MCP at all.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
+use tokio::sync::futures::OwnedNotified;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -45,12 +47,9 @@ pub struct Daemon {
     pub paths: SocketPaths,
     pub data_handler: Arc<dyn LineHandler>,
     pub control_handler: Arc<dyn LineHandler>,
-    /// Shared shutdown signal. The daemon parks on `notified()`;
-    /// signal it via `notify_waiters` (the control handler's
-    /// `shutdown` RPC does). `notify_waiters` wakes only waiters
-    /// already registered — it stores no permit — so the run loop
-    /// arms its `notified()` future before serving; the transition
-    /// itself is one-way.
+    /// Shared shutdown signal. The daemon arms its shutdown future before
+    /// serving; signal it via `notify_waiters` (the control handler's
+    /// `shutdown` RPC does).
     pub shutdown: Arc<Notify>,
     /// Shutdown is ordered by ownership boundaries: stop accepting and drain
     /// admitted RPCs, close job admission and cancel active analyzers, reap LSP
@@ -99,6 +98,7 @@ impl Daemon {
     }
 
     async fn run_with_shutdown_timeout(self, shutdown_timeout: Duration) -> Result<()> {
+        let shutdown_wait = arm_shutdown(self.shutdown);
         self.paths.ensure()?;
         let cairn = bind_socket_with_mode(&self.paths.cairn)?;
         let ctrl = bind_socket_with_mode(&self.paths.control)?;
@@ -112,7 +112,7 @@ impl Daemon {
             ctrl,
             self.data_handler,
             self.control_handler,
-            self.shutdown,
+            shutdown_wait,
             RuntimeOwnership::Static {
                 job_manager: self.job_manager,
                 lifecycle: self.lifecycle,
@@ -129,13 +129,15 @@ pub struct InitializingDaemon {
     cairn: UnixListener,
     control: UnixListener,
     gate: Arc<StartupGate>,
-    shutdown: Arc<Notify>,
+    shutdown_wait: ArmedShutdown,
 }
 
 impl InitializingDaemon {
     /// Bind both sockets synchronously so callers can begin initialization only
     /// after transport availability is guaranteed.
     pub fn bind(paths: SocketPaths, gate: Arc<StartupGate>, shutdown: Arc<Notify>) -> Result<Self> {
+        // Arm synchronously before initialization can race a shutdown signal.
+        let shutdown_wait = arm_shutdown(shutdown);
         paths.ensure()?;
         let cairn = bind_socket_with_mode(&paths.cairn)?;
         let control = bind_socket_with_mode(&paths.control)?;
@@ -145,7 +147,7 @@ impl InitializingDaemon {
             cairn,
             control,
             gate,
-            shutdown,
+            shutdown_wait,
         })
     }
 
@@ -164,12 +166,20 @@ impl InitializingDaemon {
             self.control,
             Arc::new(StartupDataHandler::new(self.gate.clone())),
             Arc::new(StartupControlHandler::new(self.gate.clone())),
-            self.shutdown,
+            self.shutdown_wait,
             RuntimeOwnership::Startup(self.gate),
             shutdown_timeout,
         )
         .await
     }
+}
+
+type ArmedShutdown = Pin<Box<OwnedNotified>>;
+
+fn arm_shutdown(shutdown: Arc<Notify>) -> ArmedShutdown {
+    let mut wait = Box::pin(shutdown.notified_owned());
+    wait.as_mut().enable();
+    wait
 }
 
 /// Who owns the runtime resources when teardown begins.
@@ -238,16 +248,23 @@ async fn run_bound(
     control: UnixListener,
     data_handler: Arc<dyn LineHandler>,
     control_handler: Arc<dyn LineHandler>,
-    shutdown: Arc<Notify>,
+    mut shutdown_wait: ArmedShutdown,
     ownership: RuntimeOwnership,
     shutdown_timeout: Duration,
 ) -> Result<()> {
-    let mut cairn_task = spawn_accept_loop("cairn", cairn, data_handler, shutdown.clone());
-    let mut ctrl_task = spawn_accept_loop("control", control, control_handler, shutdown.clone());
+    // Per-loop notifications use `notify_one`, whose retained permit also
+    // covers the small window before each spawned accept task first polls.
+    let cairn_shutdown = Arc::new(Notify::new());
+    let ctrl_shutdown = Arc::new(Notify::new());
+    let mut cairn_task = spawn_accept_loop("cairn", cairn, data_handler, cairn_shutdown.clone());
+    let mut ctrl_task =
+        spawn_accept_loop("control", control, control_handler, ctrl_shutdown.clone());
 
     // The daemon lifetime is unbounded. Only teardown work after the
     // Running -> ShuttingDown transition consumes the shutdown budget.
-    shutdown.notified().await;
+    shutdown_wait.as_mut().await;
+    cairn_shutdown.notify_one();
+    ctrl_shutdown.notify_one();
 
     let teardown = async {
         // Stop accepting first and let already-admitted RPCs finish.
@@ -734,6 +751,27 @@ mod tests {
             .expect("initializing daemon did not stop")
             .expect("initializing daemon task panicked");
         assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn initializing_daemon_observes_shutdown_fired_before_run() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let gate = StartupGate::new(shutdown.clone(), "test-version");
+        let daemon = InitializingDaemon::bind(paths.clone(), gate, shutdown.clone()).unwrap();
+
+        shutdown.notify_waiters();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            daemon.run_with_shutdown_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect("pre-fired shutdown notification was lost");
+        assert!(result.is_ok(), "daemon teardown failed: {result:?}");
+        assert!(!paths.cairn.exists());
+        assert!(!paths.control.exists());
     }
 
     #[tokio::test]

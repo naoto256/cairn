@@ -1184,7 +1184,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     "reconcile worker: failed to load state; retrying after delay"
                 );
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    _ = tokio::time::sleep(mgr.retry.base_delay) => continue,
                     _ = shutdown.as_mut() => {
                         let mut runtimes = mgr.lock_runtimes();
                         if let Some(rt) = runtimes.get_mut(&repo_hash) {
@@ -1303,19 +1303,38 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 }
                 return;
             }
-            Err(err) => warn!(
-                repo_hash = %repo_hash,
-                generation,
-                forced,
-                error = %err,
-                sqlite_code = ?err.sqlite_error_code(),
-                sqlite_extended_code = ?err.sqlite_extended_code(),
-                "reconcile attempt failed"
-            ),
+            Err(failure) => {
+                let err = &failure.error;
+                warn!(
+                    repo_hash = %repo_hash,
+                    generation,
+                    forced,
+                    error = %err,
+                    sqlite_code = ?err.sqlite_error_code(),
+                    sqlite_extended_code = ?err.sqlite_extended_code(),
+                    "reconcile attempt failed"
+                );
+                if failure.before_start {
+                    // No durable retry deadline exists until Phase A succeeds.
+                    // Pace lifecycle/registry failures locally so a persistently
+                    // unavailable repository cannot hot-spin this worker.
+                    tokio::select! {
+                        _ = tokio::time::sleep(mgr.retry.base_delay) => {}
+                        _ = shutdown.as_mut() => {
+                            let mut runtimes = mgr.lock_runtimes();
+                            if let Some(rt) = runtimes.get_mut(&repo_hash) {
+                                rt.worker_running = false;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
         }
         // Loop back — the DB might have `desired > applied`
-        // again if an event landed mid-attempt, or the failure
-        // path might have set `next_retry_at_ns`.
+        // again if an event landed mid-attempt. Post-start failures
+        // use durable retry/in-flight state; pre-start failures were
+        // paced above because they cannot persist that state.
     }
 }
 
@@ -1328,6 +1347,31 @@ enum AttemptOutcome {
     /// An ephemeral repo's root vanished; removal was handed to
     /// the lifecycle owner and no attempt was started.
     RemovalRequested,
+}
+
+/// Failure classification for worker retry pacing.
+///
+/// Before Phase A commits there is no durable attempt row on which to record
+/// `next_retry_at_ns`, so the worker must apply its own bounded delay.
+struct AttemptFailure {
+    error: Error,
+    before_start: bool,
+}
+
+impl AttemptFailure {
+    fn before_start(error: Error) -> Self {
+        Self {
+            error,
+            before_start: true,
+        }
+    }
+
+    fn after_start(error: Error) -> Self {
+        Self {
+            error,
+            before_start: false,
+        }
+    }
 }
 
 /// Read the durable reconcile row on a blocking thread.
@@ -1364,12 +1408,16 @@ async fn run_attempt(
     repo_hash: &str,
     generation: i64,
     forced: bool,
-) -> Result<AttemptOutcome> {
+) -> std::result::Result<AttemptOutcome, AttemptFailure> {
     // Held for the whole attempt: lifecycle removal drains
     // outstanding leases before touching the store, so the store
     // files stay in place until this attempt finalizes.
     let _lease = match &mgr.lifecycle {
-        Some(lifecycle) => Some(lifecycle.acquire_active_by_repo_hash(repo_hash)?),
+        Some(lifecycle) => Some(
+            lifecycle
+                .acquire_active_by_repo_hash(repo_hash)
+                .map_err(AttemptFailure::before_start)?,
+        ),
         None => None,
     };
     // Ephemeral-root check: a non-persistent repository whose
@@ -1396,11 +1444,15 @@ async fn run_attempt(
             }
         })
         .await
-        .map_err(|e| Error::internal_task_panic("reconcile root lifecycle check", e))??;
+        .map_err(|e| Error::internal_task_panic("reconcile root lifecycle check", e))
+        .map_err(AttemptFailure::before_start)?
+        .map_err(AttemptFailure::before_start)?;
         if missing_ephemeral {
-            lifecycle.request_removal(RemovalIntent::MissingRoot {
-                repo_hash: repo_hash.to_string(),
-            })?;
+            lifecycle
+                .request_removal(RemovalIntent::MissingRoot {
+                    repo_hash: repo_hash.to_string(),
+                })
+                .map_err(AttemptFailure::before_start)?;
             return Ok(AttemptOutcome::RemovalRequested);
         }
     }
@@ -1431,7 +1483,8 @@ async fn run_attempt(
             Ok(())
         })
         .await
-        .map_err(|e| Error::internal_task_panic("reconcile mark_attempt_start", e))?
+        .map_err(|e| Error::internal_task_panic("reconcile mark_attempt_start", e))
+        .map_err(AttemptFailure::before_start)?
     };
     if let Err(err) = start_ok {
         warn!(
@@ -1442,7 +1495,7 @@ async fn run_attempt(
             sqlite_extended_code = ?err.sqlite_extended_code(),
             "reconcile: mark_attempt_start rejected; another worker or stale state — skipping"
         );
-        return Err(err);
+        return Err(AttemptFailure::before_start(err));
     }
 
     // Phase B: pick alias + run the register/enqueue work.
@@ -1467,7 +1520,8 @@ async fn run_attempt(
                 (hook)(&hash_hook, &alias, generation, forced)
             })
             .await
-            .map_err(|e| Error::internal_task_panic("reconcile test hook", e))?
+            .map_err(|e| Error::internal_task_panic("reconcile test hook", e))
+            .map_err(AttemptFailure::after_start)?
         }
         #[cfg(not(test))]
         {
@@ -1530,13 +1584,16 @@ async fn run_attempt(
         }
     })
     .await
-    .map_err(|e| Error::internal_task_panic("reconcile finalize", e))?;
+    .map_err(|e| Error::internal_task_panic("reconcile finalize", e))
+    .map_err(AttemptFailure::after_start)?;
     // Finalize errors take precedence: if the success/failure
     // transition itself could not be committed, the attempt slot
     // stays claimed and startup recovery later clears it as an
     // interrupted attempt.
-    finalize_res?;
-    register_result.map(|_| AttemptOutcome::Completed)
+    finalize_res.map_err(AttemptFailure::after_start)?;
+    register_result
+        .map(|_| AttemptOutcome::Completed)
+        .map_err(AttemptFailure::after_start)
 }
 
 /// Phase B body: resolve the repo row and alias, open the

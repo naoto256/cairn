@@ -1265,6 +1265,50 @@ async fn periodic_cycle_skips_registering_owner_until_publication() {
 }
 
 #[tokio::test]
+async fn lifecycle_rejection_before_attempt_start_is_locally_paced() {
+    let root = tempfile::tempdir().unwrap();
+    let (_t, cas) = fresh_cas();
+    let lifecycle = RepoLifecycleManager::new(cas.clone());
+    let permit = lifecycle
+        .begin_registration("h".into(), root.path().to_path_buf(), 1)
+        .unwrap();
+    lifecycle
+        .publish_registration(permit, "demo", None, 2, RegistrationReconcilePolicy::None)
+        .unwrap();
+
+    let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+    let tx = index.transaction().unwrap();
+    cas_registry::increment_desired_generation(&tx, "h", 3).unwrap();
+    tx.commit().unwrap();
+    drop(index);
+    lifecycle.begin_removal_and_wait("h").await.unwrap();
+
+    let mgr = RepoReconcileManager::with_config_and_lifecycle(
+        cas.clone(),
+        None,
+        Some(lifecycle),
+        ManualClock::new(4),
+        RetryPolicy {
+            base_delay: Duration::from_millis(40),
+            max_delay: Duration::from_millis(40),
+        },
+    );
+    assert!(mgr.wake_or_spawn("h", Some("demo".to_string())));
+
+    tokio::time::sleep(Duration::from_millis(135)).await;
+    let attempts = mgr.test_attempts_started();
+    assert!(
+        (2..=4).contains(&attempts),
+        "pre-start rejection must be bounded by base delay, got {attempts} attempts"
+    );
+    let state = read_state(&cas, "h");
+    assert_eq!(state.attempt_generation, None);
+    assert_eq!(state.consecutive_failures, 0);
+
+    mgr.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
 async fn periodic_cycle_continues_after_one_repository_attempt_fails() {
     let (_t, cas) = fresh_cas();
     seed_repo(&cas, "a", "/a", "a");
