@@ -505,9 +505,7 @@ impl RepoLifecycleManager {
                 state: "shutting_down",
             });
         }
-        self.pending_intents
-            .lock()
-            .map_err(|_| Error::Internal("repo lifecycle intent map poisoned".into()))?
+        self.lock_pending_intents()
             .entry(intent.repo_hash().to_string())
             .or_insert(intent);
         self.pending_notify.notify_one();
@@ -522,10 +520,11 @@ impl RepoLifecycleManager {
         while !self.shutting_down.load(Ordering::SeqCst) {
             self.pending_notify.notified().await;
             loop {
-                let next = self.pending_intents.lock().ok().and_then(|mut intents| {
-                    let key = intents.keys().next()?.clone();
-                    intents.remove(&key)
-                });
+                let next = {
+                    let mut intents = self.lock_pending_intents();
+                    let key = intents.keys().next().cloned();
+                    key.and_then(|key| intents.remove(&key))
+                };
                 let Some(intent) = next else { break };
                 if let Err(err) = self.process_runtime_removal(&intent).await {
                     warn!(
@@ -539,11 +538,9 @@ impl RepoLifecycleManager {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
-                    if let Ok(mut intents) = self.pending_intents.lock() {
-                        intents
-                            .entry(intent.repo_hash().to_string())
-                            .or_insert(intent);
-                    }
+                    self.lock_pending_intents()
+                        .entry(intent.repo_hash().to_string())
+                        .or_insert(intent);
                 }
             }
         }
@@ -680,6 +677,13 @@ impl RepoLifecycleManager {
     fn lock_gates(&self) -> MutexGuard<'_, HashMap<String, Arc<RepoActivityGate>>> {
         self.gates.lock().unwrap_or_else(|poisoned| {
             warn!("repo lifecycle gate registry poisoned; recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    fn lock_pending_intents(&self) -> MutexGuard<'_, HashMap<String, RemovalIntent>> {
+        self.pending_intents.lock().unwrap_or_else(|poisoned| {
+            warn!("repo lifecycle intent map poisoned; recovering");
             poisoned.into_inner()
         })
     }
@@ -1311,11 +1315,45 @@ fn root_is_definitively_missing(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
     use crate::cas::registry;
     use crate::cas::registry::StoreCleanupState;
     use crate::jobs::JobManager;
     use crate::reconcile::{ReconcileTrigger, RepoReconcileManager};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLog {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.bytes.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn removing_linearization_rejects_new_leases() {
@@ -1348,6 +1386,39 @@ mod tests {
         ));
         gate.set_active().unwrap();
         assert!(gate.acquire_active().is_ok());
+    }
+
+    #[test]
+    fn poisoned_pending_intent_map_recovers_without_losing_intent() {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        let lifecycle = RepoLifecycleManager::new(cas);
+        let expected = RemovalIntent::MissingRoot {
+            repo_hash: "poisoned".to_string(),
+        };
+
+        let poison = catch_unwind(AssertUnwindSafe(|| {
+            let mut intents = lifecycle.pending_intents.lock().unwrap();
+            intents.insert("poisoned".to_string(), expected.clone());
+            panic!("poison pending intent map");
+        }));
+        assert!(poison.is_err());
+
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer(output.clone())
+            .finish();
+        let recovered = tracing::subscriber::with_default(subscriber, || {
+            lifecycle.lock_pending_intents().remove("poisoned")
+        });
+
+        assert_eq!(recovered, Some(expected));
+        assert!(
+            output
+                .contents()
+                .contains("repo lifecycle intent map poisoned; recovering")
+        );
     }
 
     #[tokio::test]
