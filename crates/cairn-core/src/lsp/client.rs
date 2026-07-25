@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::info;
 
 use super::error::{Error, Result};
@@ -712,8 +712,11 @@ impl LspClient {
     ///
     /// The oneshot receiver is registered in `pending` before the
     /// message is written, so a fast reply cannot race the
-    /// registration. Failure shapes:
+    /// registration. One deadline covers both the stdin write and
+    /// response wait. Failure shapes:
     /// - write error or timeout: the pending entry is removed here;
+    ///   a write timeout also force-terminates the transport because
+    ///   the partially-written JSON-RPC frame cannot be reused;
     /// - channel closed without a reply (map drained by a
     ///   termination path): reported as `ServerExited`;
     /// - `Err` delivered by the reader (server `error` object, or a
@@ -731,8 +734,9 @@ impl LspClient {
             "method": method,
             "params": params,
         });
+        let deadline = Instant::now() + self.timeout;
 
-        if let Err(err) = self.write_message(&message).await {
+        if let Err(err) = self.write_message_until(deadline, &message).await {
             self.pending.lock().await.remove(&id);
             return Err(self.with_stderr_context(err).await);
         }
@@ -740,7 +744,7 @@ impl LspClient {
         // Ensure the pending slot is reclaimed on every exit path —
         // including a Timeout — so a never-replying server cannot leak
         // entries unboundedly across repeated `request` calls.
-        let response = match timeout(self.timeout, rx).await {
+        let response = match timeout_at(deadline, rx).await {
             Ok(received) => received,
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -763,12 +767,29 @@ impl LspClient {
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.write_message(&json!({
+        let message = json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
-        }))
-        .await
+        });
+        self.write_message_until(Instant::now() + self.timeout, &message)
+            .await
+    }
+
+    /// Bound one stdin write by the caller's operation deadline.
+    /// Cancellation may leave a partial JSON-RPC frame in the pipe,
+    /// so a timeout force-terminates the transport before returning.
+    async fn write_message_until(&self, deadline: Instant, message: &Value) -> Result<()> {
+        match timeout_at(deadline, self.write_message(message)).await {
+            Ok(result) => result,
+            Err(_) => match self.force_terminate().await {
+                Ok(()) => Err(Error::RequestTimeout),
+                Err(cleanup) => Err(Error::OperationWithCleanupFailure {
+                    original: Box::new(Error::RequestTimeout),
+                    cleanup: Box::new(cleanup),
+                }),
+            },
+        }
     }
 
     /// Serialize and frame one message onto stdin. A `None` writer

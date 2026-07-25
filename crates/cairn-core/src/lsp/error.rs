@@ -53,9 +53,8 @@ pub enum Error {
     /// `$/progress` activity settled.
     #[error("LSP readiness timed out")]
     ReadinessTimeout,
-    /// A single request exceeded the per-request timeout. Also used
-    /// by the availability probe when the probe process fails to
-    /// exit within its window.
+    /// A request operation, notification write, or availability
+    /// probe exceeded its timeout.
     #[error("LSP request timed out")]
     RequestTimeout,
     /// The child is gone or unreachable: stdout EOF / read error,
