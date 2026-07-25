@@ -30,8 +30,14 @@ use serde_json::Value;
 // regardless of what the client requested. Add a typed Params struct
 // here when that policy changes.
 
+/// Result body for MCP `initialize`. Echoes the protocol version
+/// cairn implements, advertises server capabilities, identifies the
+/// server, and optionally attaches free-form guidance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeResult {
+    /// MCP protocol version implemented by this server. Cairn does
+    /// not negotiate with the client's requested version; it always
+    /// returns a fixed constant.
     #[serde(rename = "protocolVersion")]
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
@@ -44,17 +50,25 @@ pub struct InitializeResult {
     pub instructions: Option<String>,
 }
 
+/// Server capability advertisement. Cairn currently exposes only
+/// the `tools` capability; other MCP capabilities (resources,
+/// prompts, sampling, logging) are not implemented.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub tools: ToolsCapability,
 }
 
+/// `tools` capability block. `list_changed` is always advertised as
+/// `false` because cairn's tool set is fixed at link time via the
+/// `MCP_TOOLS` distributed slice — the server never emits
+/// `notifications/tools/list_changed`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsCapability {
     #[serde(rename = "listChanged", default)]
     pub list_changed: bool,
 }
 
+/// Server identity returned in the `initialize` handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub name: String,
@@ -63,11 +77,18 @@ pub struct ServerInfo {
 
 // ─── tools/list ─────────────────────────────────────────────────────────────
 
+/// Result body for MCP `tools/list`. The `tools` order is the order
+/// the front-end serves — first-visible tools appear first — and is
+/// derived from each tool's `sort_key`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsListResult {
     pub tools: Vec<ToolSpec>,
 }
 
+/// MCP tool advertisement. `description` is intentionally cockpit
+/// copy aimed at an LLM caller (WHEN / NOT FOR / Recovery labels);
+/// `input_schema` is a JSON Schema object clients can validate
+/// arguments against before calling `tools/call`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -78,6 +99,9 @@ pub struct ToolSpec {
 
 // ─── tools/call ─────────────────────────────────────────────────────────────
 
+/// Params body for MCP `tools/call`. `arguments` is left as raw
+/// JSON and reparsed per tool because each tool owns its own
+/// argument schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsCallParams {
     pub name: String,
@@ -85,6 +109,11 @@ pub struct ToolsCallParams {
     pub arguments: Value,
 }
 
+/// Result body for MCP `tools/call`. The `is_error` field exists so
+/// MCP tools can surface a tool-level failure as a payload rather
+/// than a JSON-RPC error; cairn's front-end currently routes every
+/// failure through a JSON-RPC error instead, so the flag is always
+/// serialized as `false` today.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsCallResult {
     pub content: Vec<ContentBlock>,

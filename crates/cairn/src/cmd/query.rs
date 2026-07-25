@@ -290,6 +290,17 @@ impl CliReferenceDirection {
     }
 }
 
+/// Entry point for `cairn query`. Builds the wire params for one
+/// data-plane JSON-RPC method, runs the daemon/CLI version guard
+/// against the control socket, then sends one request to the data
+/// socket (`cairn.sock`) and either renders the reply
+/// human-readably or dumps it as JSON. Each per-command builder
+/// below only inserts fields the user explicitly set — unset
+/// options are omitted from the wire params rather than sent as
+/// `null`. Wire errors are forwarded through
+/// `rpc_client::render_error` (which formats the
+/// `DAEMON_INITIALIZING` hint envelope on stderr) and then returned
+/// as `Err` so the process exits non-zero.
 pub async fn run(args: Args) -> Result<()> {
     let paths = match args.runtime_dir.clone() {
         Some(p) => SocketPaths::with_runtime_dir(p),
@@ -535,6 +546,10 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Build the wire params shared by the `find_callers` /
+/// `find_callees` / `find_subtypes` / `find_supertypes` methods,
+/// which all take `{name, repo?, branch?, anchor?, limit?}` plus
+/// the common `verbose_tier3` opt-in.
 fn name_query(
     name: &str,
     repo: &Option<String>,
@@ -575,6 +590,12 @@ struct SymbolsQueryArgs<'a> {
     verbose_tier3: bool,
 }
 
+/// Build the wire params for `find_symbols`. Boolean flags
+/// (`fuzzy`, `signature_only`, `verbose_tier3`) are only inserted
+/// when true, so the payload stays minimal and future defaults can
+/// shift without churning the wire shape. Optional filters (`repo`,
+/// `branch`, `anchor`, `kind`, `path`, `container`, `limit`) are
+/// omitted when unset for the same reason.
 fn symbols_query(args: SymbolsQueryArgs<'_>) -> Value {
     let mut p = serde_json::Map::new();
     p.insert("query".into(), Value::String(args.query.to_string()));
@@ -663,6 +684,15 @@ fn note_partial(c: &Completeness) {
     }
 }
 
+/// Dispatch the wire reply for `method` to the matching typed
+/// printer. Each typed branch emits one grep-friendly line per
+/// item; branches that call `note_partial` forward
+/// `Completeness::Partial` to stderr so a shell user sees the SLA
+/// caveat without it polluting the stdout stream that pipes into
+/// `awk` / `grep` (`list_repos` and `get_symbol_source` do not
+/// call it). Unknown methods, and responses that fail to decode
+/// into the expected type, fall through to a pretty-printed JSON
+/// dump so the caller still sees the payload.
 fn render(method: &str, value: &Value) {
     match method {
         "list_repos" => {
