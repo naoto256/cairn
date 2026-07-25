@@ -30,8 +30,18 @@ pub mod methods;
 pub mod reconcile_status;
 pub mod version;
 
+// Promote `RepoReconcileStatus` to the crate root: it is embedded on
+// both the data-RPC `RepoStatusEntry` (in `methods`) and the
+// control-socket `RepoStatus` (in `control`) via
+// `crate::RepoReconcileStatus`, so keeping a single canonical name at
+// the crate root avoids a cross-module reference through the
+// `reconcile_status::` path from either side.
 pub use reconcile_status::RepoReconcileStatus;
 
+// Flat re-export of the most frequently referenced `common` types so
+// out-of-tree consumers can write `use cairn_proto::TierRepoStatus`
+// instead of repeating the `common::` module segment. The underlying
+// module stays `pub` for consumers that prefer the qualified form.
 pub use common::{
     AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,
     HintCode, LanguageEnrichment, MissingTier, PartialReason, Position, Range, ReasonCode, RefKind,

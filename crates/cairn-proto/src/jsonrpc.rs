@@ -6,6 +6,17 @@
 //! out-of-tree consumers (cairn-graph, cairn-audit, IDE plugins) speak
 //! plain JSON-RPC to the daemon without pulling in MCP types they will
 //! never use.
+//!
+//! The types here define what a well-formed message looks like; the
+//! dispatch behavior differs per surface. On the daemon sockets
+//! (`cairn_core::jsonrpc_dispatch` / `jsonrpc_errors`), a request
+//! that omits `id` (a JSON-RPC 2.0 notification) or a batch request
+//! (JSON array per §6) fails envelope deserialization into a single
+//! [`Request`] and is surfaced as [`error_code::PARSE_ERROR`]; there
+//! is no array-level fan-out. The MCP surface (`cairn::mcp`) uses a
+//! different handler that reads envelope shape directly and silently
+//! drops missing-id notifications and batches — the `PARSE_ERROR`
+//! path is daemon-side only.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
