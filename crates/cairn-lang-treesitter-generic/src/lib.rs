@@ -10,6 +10,67 @@
 //!   `Foo.bar`. Each backend supplies its own qualified-name separator.
 //! - Small text helpers ([`collapse_ws`], [`truncate`]) used by
 //!   per-language signature and doc-comment extraction.
+//! - Node/text conveniences ([`node_text`], [`child_by_field`],
+//!   [`line_of`], [`end_line_of`], [`signature_slice`]) and the
+//!   adjacency-aware [`extract_doc_above_node`] +
+//!   [`DocCommentPart`] pair for doc-comment classification.
+//!
+//! # Tier-1 backend shape
+//!
+//! Most tree-sitter-based tier-1 backends in this workspace share a
+//! common skeleton — e.g. `cairn-lang-rust` and `-go` use each of
+//! the pieces below, while `-python` and `-markdown` replace the
+//! doc-extraction piece as described below. Per-language crates
+//! deviate as their grammars demand:
+//!
+//! - A unit struct implementing
+//!   [`cairn_lang_api::LanguageBackend`]. Its `extract_syntactic`
+//!   calls [`extract`] with the language's tree-sitter grammar and a
+//!   language-specific [`Visitor`].
+//! - A `Visitor` that walks every node in the tree and, for the
+//!   subset it recognizes, appends a
+//!   [`cairn_lang_api::SymbolFact`] (and optionally a
+//!   [`cairn_lang_api::ImportFact`]) to the shared
+//!   [`SyntacticFacts`] accumulator. Order in `facts.symbols` is
+//!   walk order.
+//! - A [`NestingTracker`] (or an equivalent level-based stack, for
+//!   Markdown's flat heading grammar) that carries the parent chain
+//!   during the walk. Nesting-aware backends call
+//!   [`NestingTracker::pop_outside`] at the top of each visit and
+//!   [`NestingTracker::push`] on entering a container so that a
+//!   child's qualified name and `parent_idx` reflect lexical
+//!   nesting. Backends that publish only top-level symbols (Go's
+//!   current tier-1) can still use `pop_outside` without ever
+//!   pushing.
+//! - Doc extraction, for backends whose docs live in preceding
+//!   comments, via [`extract_doc_above_node`] with a per-language
+//!   [`DocCommentPart`] classifier (Rust's `///` vs `/** */`, Go's
+//!   leading `//`, ...). Backends whose docs live elsewhere skip
+//!   this helper: Python pulls docstrings out of the function/class
+//!   body itself, and Markdown uses the heading text.
+//! - A `#[linkme::distributed_slice(cairn_lang_api::LANGUAGE_BACKENDS)]`
+//!   entry so the daemon's registry discovers the backend at
+//!   startup.
+//!
+//! Tier-2 (semantic) enrichment lives beside the backend as an
+//! [`cairn_lang_api::Analyzer`]; it typically re-parses the same
+//! bytes with the same grammar so both passes see the same tree.
+//! `cairn-lang-python`'s `analyzer` module is the reference example.
+//!
+//! # Cache invalidation
+//!
+//! Fact rows are persisted in the CAS keyed by `(blob_sha,
+//! parser_id)`. The backend's
+//! [`cairn_lang_api::LanguageBackend::parser_revision`] (and, for
+//! semantic rows, `Analyzer::revision`) sit alongside the row as
+//! orthogonal freshness values, not part of the key, and drive
+//! reuse-vs-recompute decisions. A change here that shifts
+//! extracted facts — new `NestingTracker` semantics, a different
+//! doc-adjacency rule, adjusted signature slicing — silently keeps
+//! serving pre-change facts for previously seen blobs unless every
+//! affected backend bumps its `parser_revision` (or
+//! `Analyzer::revision`). See `cairn-lang-api`'s trait docs for
+//! the stale-facts trap.
 
 #![forbid(unsafe_code)]
 
@@ -107,6 +168,9 @@ impl NestingTracker {
         self.parents.push((symbol_idx, byte_end));
     }
 
+    /// Index into `facts.symbols` for the immediate parent, if any.
+    /// Backends copy this into `SymbolFact::parent_idx` so the
+    /// indexer can resolve the containing symbol.
     #[must_use]
     pub fn current_parent(&self) -> Option<usize> {
         self.parents.last().map(|(idx, _)| *idx)
@@ -253,6 +317,8 @@ pub fn line_of(node: Node<'_>) -> u32 {
     u32::try_from(node.start_position().row).unwrap_or(u32::MAX) + 1
 }
 
+/// 1-based row of the node's exclusive end position (the row past
+/// the last byte the node covers).
 #[must_use]
 pub fn end_line_of(node: Node<'_>) -> u32 {
     u32::try_from(node.end_position().row).unwrap_or(u32::MAX) + 1

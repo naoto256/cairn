@@ -17,6 +17,12 @@ use tree_sitter::{Node, Parser};
 
 use crate::Dialect;
 
+/// Tier-2 analyzer parameterised by [`Dialect`]. One walker services
+/// TypeScript, TSX, and JavaScript by picking the matching grammar;
+/// the emitted fact vocabulary is identical across dialects. JS never
+/// produces TS-only node kinds (`type_alias_declaration`,
+/// `type_parameter`, `interface_declaration`), so those match arms
+/// stay silent for the JS backend without an explicit dialect gate.
 pub struct TypescriptAnalyzer {
     dialect: Dialect,
 }
@@ -119,6 +125,12 @@ impl TsSemanticWalker {
         }
     }
 
+    /// Push the container onto `containers` (for dotted qualification)
+    /// and mirror it into `enclosing` so refs emitted while walking
+    /// this subtree attribute to the container (e.g. an interface's
+    /// property-signature Field refs). Both the stack push and the
+    /// `enclosing` swap are guarded by a name being present — an
+    /// anonymous / recovered container walks its children plainly.
     fn walk_container(&mut self, node: Node<'_>, source: &[u8]) {
         if let Some(name) = declaration_name(node, source) {
             let qualified = self.qualify(&name);
@@ -320,6 +332,18 @@ impl TsSemanticWalker {
         }
     }
 
+    /// Recursive type-expression walker. Each named path leaf becomes
+    /// one `RefKind::Type` row; structural wrappers (`Array<T>`,
+    /// unions, tuples, function types) descend with the same role
+    /// unless the wrapper itself distinguishes a bucket. `generic_type`
+    /// first emits its head name at the incoming `role`, then walks
+    /// *all* of its own named children — head included — again as
+    /// [`TypeRole::GenericArg`], so `Vec<Foo>` currently produces
+    /// three rows in this order: role=Param `Vec`, role=GenericArg
+    /// `Vec` (the head re-emitted), and role=GenericArg `Foo`. The
+    /// duplicate head is a follow-up bug candidate. `predefined_type`
+    /// (`string` / `number` / …) is dropped because those are built-in
+    /// keywords, not resolvable symbol targets.
     fn emit_type_expr(&mut self, node: Node<'_>, source: &[u8], role: TypeRole) {
         match node.kind() {
             "type_identifier" | "identifier" | "nested_type_identifier" => {
@@ -346,6 +370,13 @@ impl TsSemanticWalker {
         }
     }
 
+    /// Emit one `RefKind::Type` row. `target_name` is the last dotted
+    /// segment so `ns.Foo` and `Foo` share the same `target_name` key
+    /// (a `find_references` for `Foo` catches both). `target_qualified`
+    /// is populated only when the type actually carried a namespace
+    /// prefix (`Some("ns.Foo")` for `ns.Foo`, `None` for bare `Foo`).
+    /// Textual builtins (`string`, `number`, …) drop out — they're
+    /// keywords, not symbol targets.
     fn push_type_ref(&mut self, node: Node<'_>, source: &[u8], role: TypeRole) {
         let text = normalized_text(node, source);
         if text.is_empty() || is_builtin_type(&text) {
@@ -493,6 +524,13 @@ fn collect_descendants<'a>(node: Node<'a>, kind: &'static str, out: &mut Vec<Nod
     }
 }
 
+/// Fallback for grammars that expose a `type_parameter`'s constraint
+/// as an anonymous keyword token followed by a bare type node instead
+/// of via a `constraint` field. Walks the children in order and
+/// returns the first named node appearing after the exact keyword
+/// text — used only when `child_by_field(_, "constraint")` returns
+/// `None`, so any grammar update that starts exposing the field
+/// transparently supersedes this path.
 fn named_child_after_keyword<'a>(node: Node<'a>, source: &[u8], keyword: &str) -> Option<Node<'a>> {
     let mut saw_keyword = false;
     let mut cursor = node.walk();

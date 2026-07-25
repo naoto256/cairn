@@ -83,6 +83,15 @@ static REGISTER_PYTHON: fn() -> Box<dyn LanguageBackend> = || Box::new(PythonBac
 
 // ─── visitor ───────────────────────────────────────────────────────────────
 
+/// Python visitor. Uses `"."` as the qualified-name separator to
+/// match Python's dotted attribute syntax. `is_container` reports
+/// `Class` as a container, so nested `def`s inside classes appear
+/// as `Class.method` while nested `def`s inside functions do not
+/// nest under an outer `def`. `match_python_item` emits only
+/// Function and Class symbols, so the `Module` alternative in
+/// `is_container` is dormant today. The Tier-2 analyzer maintains
+/// the same class-only stack to keep `ImplFact.type_qualified`
+/// aligned with `SymbolFact.qualified`.
 struct PythonVisitor {
     nesting: NestingTracker,
 }
@@ -143,10 +152,19 @@ impl Visitor for PythonVisitor {
     }
 }
 
+/// Which symbol kinds count as scope containers for the nesting
+/// tracker. Functions are deliberately excluded so a class or
+/// function defined inside a `def` still qualifies under the
+/// nearest enclosing *class*, not the function — matching how the
+/// Tier-2 analyzer builds `ImplFact.type_qualified`.
 fn is_container(kind: &SymbolKind) -> bool {
     matches!(kind, SymbolKind::Class | SymbolKind::Module)
 }
 
+/// Classify a Python top-level node as a function or class, or
+/// return `None` for anything else. The visitor upgrades a
+/// `Function` inside a class to `Method` (or `Test` for `test_`-
+/// prefixed names) after this returns.
 fn match_python_item(node: Node<'_>, source: &[u8]) -> Option<(SymbolKind, String, Option<usize>)> {
     match node.kind() {
         "function_definition" => {
@@ -206,6 +224,13 @@ fn extract_docstring(node: Node<'_>, source: &[u8]) -> Option<String> {
     None
 }
 
+/// Strip the surrounding quote delimiter from a Python string
+/// literal, trying triple-quoted forms (`"""…"""`, `'''…'''`)
+/// before single-character quotes. Result is trimmed and truncated
+/// to 1024 bytes (matching the shared cap in
+/// `extract_doc_above_node`). Escape sequences inside the
+/// docstring are left as-written — sufficient for outline / hover
+/// consumers, and the raw text is what most docstrings expect.
 fn strip_python_quotes(s: &str) -> String {
     let trimmed = s.trim();
     for delim in ["\"\"\"", "'''"] {

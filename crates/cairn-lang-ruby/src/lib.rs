@@ -109,9 +109,18 @@ pub(crate) fn method_separator(singleton: bool) -> &'static str {
 
 // ─── visitor ───────────────────────────────────────────────────────────────
 
+/// Tier-1 tree walker. Beyond the standard `::` nesting path,
+/// carries Ruby's visibility state machine: bare
+/// `public` / `private` / `protected` markers switch the current
+/// section, and the switch is scoped to the enclosing container
+/// so a marker inside one class does not leak into siblings.
 struct RubyVisitor {
     nesting: NestingTracker,
     root_visibility: Visibility,
+    /// Stack of `(container_end_byte, current_section_visibility)`,
+    /// one entry per open class / module body. Popped when the walk
+    /// passes `container_end_byte`. Empty at the top level; the
+    /// top-level section default lives in `root_visibility`.
     visibility_scopes: Vec<(usize, Visibility)>,
 }
 
@@ -160,6 +169,16 @@ impl RubyVisitor {
         }
     }
 
+    /// Handle the receiver-less `public` / `private` / `protected`
+    /// call form: bare `private` on its own line parses as a `call`
+    /// node with an empty `argument_list`, and flips the current
+    /// section for subsequent method definitions in the same body.
+    /// The listed-arguments form (`private :foo, :bar`) is
+    /// currently unsupported. The separate `modifier_visibility`
+    /// helper handles inline `private def foo` at emit time, but
+    /// does not retroactively reclassify the listed symbols.
+    /// Returns true when the section was updated so the visitor can
+    /// skip the fallthrough to `handle_call`.
     fn update_visibility_section(&mut self, node: Node<'_>, source: &[u8]) -> bool {
         if child_by_field(node, "receiver").is_some() {
             return false;
@@ -183,6 +202,10 @@ impl RubyVisitor {
         true
     }
 
+    /// Handle the bare-identifier form of the visibility marker: a
+    /// stand-alone `private` (no parens, no arguments) parses as an
+    /// `identifier` child of `body_statement`, not a `call`. In any
+    /// other position `private` is a variable read and is ignored.
     fn update_bare_visibility_section(&mut self, node: Node<'_>, source: &[u8]) -> bool {
         if node
             .parent()
