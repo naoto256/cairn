@@ -287,10 +287,12 @@ impl EventClassifier {
     /// 4. Any working-tree directory create/remove/rename — same
     ///    [`RescanReason::DirectoryTopologyChanged`].
     ///
-    /// When any rescan reason fires, the matcher is reloaded and
-    /// exactly one `Rescan` event is emitted — the per-event
-    /// classification loop is skipped, since the consumer will
-    /// re-read the whole snapshot anyway.
+    /// When any rescan reason fires, the matcher is reloaded and a
+    /// single `Rescan` event is enqueued on a best-effort basis (a
+    /// `Full` channel coalesces it into the pending edge, a closed
+    /// channel drops it) — the per-event classification loop is
+    /// skipped, since the consumer will re-read the whole snapshot
+    /// anyway.
     fn handle_batch(&self, events: &[notify_debouncer_full::DebouncedEvent]) {
         let reason = events.iter().find_map(|event| {
             if event.need_rescan() {
@@ -335,9 +337,12 @@ impl EventClassifier {
 
     /// Response to a batch of backend errors: reload the ignore
     /// matcher (the errors may have masked ignore-file writes) and
-    /// emit exactly one [`RescanReason::WatchError`] edge. The
-    /// individual error messages are logged by
-    /// [`handle_debounce_result`] before this is called.
+    /// attempt to emit a single [`RescanReason::WatchError`] edge
+    /// (best-effort — coalesced into the pending edge when the
+    /// channel is `Full`, dropped when the consumer is gone; this
+    /// path ignores `emit`'s return value). The individual error
+    /// messages are logged by [`handle_debounce_result`] before this
+    /// is called.
     fn handle_watch_error_batch(&self) {
         self.reload_matcher();
         self.emit(WatchEvent::Rescan {

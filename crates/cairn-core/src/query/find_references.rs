@@ -239,8 +239,12 @@ fn run_find_references(
         sql.push(')');
         if !args.include_noise {
             // Two-part noise cut. `dedup_rank = 1` keeps one row per
-            // physical byte range (highest tier wins, with a
-            // qualified-target tiebreak). The AND NOT clause drops
+            // (physical byte range, ref kind) — `kind` is part of the
+            // dedup `PARTITION BY` above so two refs that share a byte
+            // range but differ in kind (e.g. a `call` and a `type` on
+            // the same token) stay separate rather than collapsing
+            // into one (highest tier wins, with a qualified-target
+            // tiebreak). The AND NOT clause drops
             // stale lower-tier duplicates that emit a zero byte range
             // (marker for "no token range recorded"), but only when a
             // workspace-tier row on the same `(line, kind,

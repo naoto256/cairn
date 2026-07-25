@@ -2,8 +2,11 @@
 //!
 //! The report is a flat vector of
 //! [`cairn_proto::control::DoctorCheck`] items produced by four
-//! families of probes, always emitted in this order so consumers see
-//! a stable prefix:
+//! families of probes. When a family emits, it does so in this order
+//! so consumers see a stable prefix; families 3 and 4 are skipped
+//! entirely when family 2 takes its empty-registry early-out (a
+//! single `Warn`) or the alias listing itself errors, so the
+//! reconcile-state group is not guaranteed to appear at all:
 //!
 //! 1. Environment coherence — linked language backends, workspace
 //!    analyzer registration, data-directory writability, and Tier-3
@@ -20,9 +23,11 @@
 //! Most non-`Pass` branches fill a remediation string keyed on
 //! `alias` where applicable, so the CLI can print an actionable next
 //! command without cross-referencing docs; a few checks intentionally
-//! omit it (linked-language-backends `Fail`, data-directory `Fail`,
-//! empty-registry `Warn`, alias-index enumeration `Fail`) because no
-//! single command fixes the condition.
+//! omit it (linked-language-backends `Fail`, backend-registration
+//! coherence `Warn`, data-directory `Fail`, empty-registry `Warn`,
+//! alias-index enumeration `Fail`) because no single command fixes
+//! the condition (the coherence `Warn` instead names the missing
+//! import symbol inline in its detail).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1143,11 +1148,16 @@ fn analyzer_drift_rerun_check(
 ///   reason.
 /// - **Case C** (`Pass`) — at least one analyzer pending at the
 ///   current revision and none of the above.
-/// - **Fallback** (`Pass`) — the case matrix did not match, e.g.
-///   parser drift with no expected analyzer to cross-reference
-///   (Tier-1-only language) or a row with an unknown status string.
-///   The plain [`parser_revision_stale_checks`] `Warn` still carries
-///   the operator surface in the drift case.
+/// - **Fallback** (`Pass`) — the case matrix did not match. Two
+///   distinct situations land here: (a) parser drift with no
+///   expected analyzer to cross-reference (a Tier-1-only language
+///   with no Tier-2.5/3 analyzer), and (b) an expected analyzer
+///   whose only row carries a status string this build does not
+///   recognize (the `_ =>` arm clears `every_succeeded_at_current`
+///   without setting any warn flag, so an unknown status also
+///   reaches the fallback). The emitted detail is worded for case
+///   (a); in either case the plain [`parser_revision_stale_checks`]
+///   `Warn` still carries the operator surface for the drift itself.
 fn parser_drift_rerun_check(
     alias: &str,
     stale_parser: &[crate::workspace_analyzer::ParserStaleRevision],
@@ -1442,7 +1452,10 @@ fn tier3_run_check(alias: &str, state: &AliasStoreState) -> DoctorCheck {
     // almost certainly wedged (worker hang, pool deadlock, daemon
     // crash that left the row mid-flight). Surface it loudly so the
     // operator can `reindex_repo` instead of staring at "indexing in
-    // progress" forever.
+    // progress" forever. The `started_at_ns > 0` guard skips rows
+    // with an unset (zero) `started_at_ns` — an age can't be computed
+    // for them, so they never trip the stuck branch and fall through
+    // to the plain in-progress check below.
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)

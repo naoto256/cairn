@@ -66,13 +66,16 @@
 //! scanner remains revision-only; filesystem events drive registration,
 //! whose currency check closes the config-only edit path.
 //!
-//! ### Rollback case (`<` is the only comparison)
-//! Staleness uses `persisted_rev < expected_rev`. A build whose
-//! `revision()` is *lower* than what's persisted (downgrade) does
-//! not trigger spurious reruns — facts produced by the newer
-//! revision are assumed forward-compatible. Cross-version fact
-//! compatibility is therefore an explicit invariant of bumping
-//! `revision()`.
+//! ### Rollback case (startup scan compares with `<`)
+//! The daemon-startup staleness scan uses `persisted_rev <
+//! expected_rev`. A build whose `revision()` is *lower* than what's
+//! persisted (downgrade) does not trigger spurious reruns on that
+//! path — facts produced by the newer revision are assumed forward-
+//! compatible. Cross-version fact compatibility is therefore an
+//! explicit invariant of bumping `revision()`. The `<` comparison is
+//! specific to the startup scan: the register path's
+//! `workspace_analyzers_needing_rerun` instead compares with `!=`, so
+//! there a revision rollback *does* force a rerun.
 //!
 //! ### Sequential by default
 //! The startup scan walks aliases sequentially. Parallel scanning is
@@ -246,9 +249,12 @@ impl AnalyzerProgress {
 /// Stable provenance prefixes recorded in `refs.source` for facts emitted by
 /// registered workspace analyzers.
 ///
-/// The first character of `refs.source` selects the tier: `tier3-<analyzer_id>`
-/// for LSP-class analyzers, `tier25-<analyzer_id>` once the tree-sitter-based
-/// cross-file pass lands, and so on. Listing the known prefixes here lets SQL
+/// The prefix up to the first `-` in `refs.source` selects the tier:
+/// `tier3-<analyzer_id>` for LSP-class analyzers, `tier25-<analyzer_id>` once
+/// the tree-sitter-based cross-file pass lands, and so on. The complete
+/// segment before the first `-` is the tier prefix. `source_rank_case_sql`
+/// handles `tier25` separately to assign rank 1; the loop assigns rank 0 to
+/// the remaining workspace prefixes. Listing the known prefixes here lets SQL
 /// helpers ([`source_rank_case_sql`], [`source_is_workspace_tier_sql`]) and
 /// dedup/noise-suppression code stay tier-agnostic — a new tier only needs to
 /// (a) extend this constant and (b) point its analyzer at the new prefix via
@@ -280,9 +286,8 @@ const TIER2_NATIVE_SOURCES: &[&str] = &["rust-syn"];
 #[must_use]
 pub fn source_rank_case_sql(column: &str) -> String {
     let mut sql = String::from("CASE");
-    // Tier-3 (LSP-class) is most authoritative; Tier-2.5 (in-process cross-file)
-    // ranks below it. We list tier25 first so its LIKE matches before the
-    // generic tier3 prefix loop below, then exclude tier25 from that loop.
+    // Tier-2.5 ranks below Tier-3, so emit tier25 separately at rank 1 and
+    // skip it in the rank-0 workspace-prefix loop.
     sql.push_str(&format!(" WHEN {column} LIKE 'tier25-%' THEN 1"));
     for prefix in WORKSPACE_TIER_PREFIXES {
         if *prefix == "tier25" {

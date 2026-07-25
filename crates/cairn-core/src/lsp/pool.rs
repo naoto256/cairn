@@ -1397,7 +1397,9 @@ impl PoolEntry {
         result
     }
 
-    /// Final-shutdown path that never waits for the data-plane state mutex.
+    /// Bounded entry shutdown that never waits for the data-plane state mutex.
+    /// Used both by `shutdown_all_bounded` (daemon-final shutdown) and by the
+    /// idle sweeper's per-victim eviction, so it is not final-shutdown-only.
     /// The independent process-control handle first disables respawn, then
     /// kills and reaps the child. Dropping the pool record later discards any
     /// document state still held by a pass that is unwinding.

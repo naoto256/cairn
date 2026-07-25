@@ -209,7 +209,10 @@ where
             ))
         })?;
         // Store repo-relative paths so worktree and committed
-        // manifests key their entries identically.
+        // manifests key their entries identically. This holds on
+        // POSIX, where the separator is `/`; on Windows the walk
+        // yields `\`-separated relative paths, which would not match
+        // the `/`-separated keys committed manifests derive from git.
         let path = relative.to_string_lossy().into_owned();
         if !include(&PathHint {
             path: &path,

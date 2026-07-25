@@ -32,7 +32,9 @@ pub fn open_existing(path: &std::path::Path) -> Result<Connection> {
     // No SQLITE_OPEN_CREATE — its absence is the whole contract of
     // this opener. EXRESCODE matches the standard opener so callers
     // can branch on extended result codes (e.g. SQLITE_BUSY_SNAPSHOT);
-    // NO_MUTEX is rusqlite's usual single-threaded-connection mode.
+    // NO_MUTEX opens the connection in SQLite's multi-thread mode:
+    // it disables the per-connection mutex, so this connection must
+    // not be used concurrently from multiple threads.
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
@@ -53,7 +55,7 @@ pub fn open_existing(path: &std::path::Path) -> Result<Connection> {
         },
     };
     // Pragmas are per-connection, and an existing store may predate
-    // the newest schema: even read-only callers bring it current
+    // the newest schema: even non-creating callers bring it current
     // here, exactly as `open` would.
     apply_standard_pragmas(&conn)?;
     apply(&mut conn, MIGRATIONS)?;

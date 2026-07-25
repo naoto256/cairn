@@ -318,7 +318,10 @@ pub fn line_of(node: Node<'_>) -> u32 {
 }
 
 /// 1-based row of the node's exclusive end position (the row past
-/// the last byte the node covers).
+/// the last byte the node covers). Only the row is kept, so two
+/// nodes whose exclusive end lands on the same line share this
+/// value even when their end columns differ (a mid-line boundary
+/// collapses to the shared row).
 #[must_use]
 pub fn end_line_of(node: Node<'_>) -> u32 {
     u32::try_from(node.end_position().row).unwrap_or(u32::MAX) + 1

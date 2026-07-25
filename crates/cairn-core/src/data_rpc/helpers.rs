@@ -730,8 +730,11 @@ pub(crate) fn build_hints(ctx: &EmissionContext<'_>) -> Vec<Hint> {
 ///   truly missing from an untrusted snapshot say nothing about the
 ///   real filter shape.
 /// * Cap-relief hints are re-derived from a synthesised cap context
-///   and prepended below the freshness advisory so the caller still
-///   learns the result was truncated.
+///   and appended after the surviving indexing/reconcile hints (the
+///   freshness advisory is then inserted at the very front), so the
+///   final order is freshness advisory -> indexing/reconcile hints
+///   -> cap-relief, and the caller still learns the result was
+///   truncated.
 pub(crate) fn build_snapshot_aware_feedback(
     ctx: &EmissionContext<'_>,
     freshness_issues: &[QueryFreshnessIssue],
