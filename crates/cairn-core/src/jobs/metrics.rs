@@ -101,14 +101,18 @@ impl JobRuntimeMetricsStore {
         entry.pool_wait_started_at_ns.get_or_insert(now);
     }
 
-    /// Dispatch-time transition: close any open pool-wait window
-    /// into `pool_wait_ms` and stamp `run_started_at_ns` once.
-    /// "running" here means handed to the worker channel — the
-    /// analyzer process itself may start slightly later.
+    /// Worker-start transition: close any open pool-wait window into
+    /// `pool_wait_ms` and stamp `run_started_at_ns` once.
+    ///
+    /// Terminal state is monotonic: a late or duplicate start signal
+    /// cannot overwrite a completion already recorded by the worker.
     pub(super) fn mark_running(&self, job_id: JobId) {
         let now = now_ns();
         let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
         if let Some(entry) = metrics.get_mut(&job_id) {
+            if entry.finished_at_ns.is_some() {
+                return;
+            }
             if let Some(started) = entry.pool_wait_started_at_ns.take() {
                 entry.pool_wait_ms = entry
                     .pool_wait_ms
@@ -248,5 +252,27 @@ mod tests {
         assert_eq!(snapshot.progress_ticks, Some(120));
         assert!(snapshot.last_progress_at.is_some());
         assert!(snapshot.progress_per_minute.is_some());
+    }
+
+    #[test]
+    fn terminal_metrics_cannot_regress_to_running() {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(9, None, 1_000_000_000);
+        metrics.mark_finished(9, RunStatus::Cancelled.as_str());
+        let finished_at = metrics
+            .inner
+            .lock()
+            .unwrap()
+            .get(&9)
+            .unwrap()
+            .finished_at_ns;
+
+        metrics.mark_running(9);
+
+        let stored = metrics.inner.lock().unwrap();
+        let entry = stored.get(&9).unwrap();
+        assert_eq!(entry.scheduler_state, RunStatus::Cancelled.as_str());
+        assert_eq!(entry.finished_at_ns, finished_at);
+        assert_eq!(entry.run_started_at_ns, None);
     }
 }

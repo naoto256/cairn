@@ -202,14 +202,13 @@ pub(crate) fn register_repo_enqueue_analyzers(
         worktree_path,
         now_ns,
         true,
-        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
+        |conn, repo_root, manifest_id, _entries, analyzers, now_ns| {
             job_manager.enqueue_reindex(EnqueueReindex {
                 conn,
                 alias,
                 repo_hash,
                 repo_root,
                 manifest_id,
-                entries,
                 now_ns,
                 analyzers,
             })
@@ -233,14 +232,13 @@ pub(crate) fn register_repo_force_analyzers_enqueue(
         worktree_path,
         now_ns,
         false,
-        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
+        |conn, repo_root, manifest_id, _entries, analyzers, now_ns| {
             job_manager.enqueue_reindex(EnqueueReindex {
                 conn,
                 alias,
                 repo_hash,
                 repo_root,
                 manifest_id,
-                entries,
                 now_ns,
                 analyzers,
             })
@@ -264,14 +262,13 @@ pub(crate) fn register_repo_reconcile_enqueue_analyzers(
             generation: request.generation,
             forced: request.forced,
         },
-        |conn, repo_root, manifest_id, entries, analyzers, now_ns| {
+        |conn, repo_root, manifest_id, _entries, analyzers, now_ns| {
             job_manager.enqueue_reindex(EnqueueReindex {
                 conn,
                 alias: request.alias,
                 repo_hash: request.repo_hash,
                 repo_root,
                 manifest_id,
-                entries,
                 now_ns,
                 analyzers,
             })

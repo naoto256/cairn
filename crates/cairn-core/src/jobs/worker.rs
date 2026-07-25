@@ -45,6 +45,11 @@ impl JobManager {
             .transpose()?;
         let runtime_metrics = self.runtime_metrics.clone();
         let job_id = dispatch.job.id;
+        // The lifecycle admission above is the last fallible step
+        // before the blocking worker starts. Mark the job running
+        // here, rather than at channel dispatch, so a fast terminal
+        // worker cannot race a later scheduler-side transition.
+        runtime_metrics.mark_running(job_id);
         let progress_metrics = runtime_metrics.clone();
         let progress =
             crate::workspace_analyzer::AnalyzerProgress::with_observer(Arc::new(move |ticks| {

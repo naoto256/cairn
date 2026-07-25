@@ -449,9 +449,9 @@ mod tests {
         );
         assert_eq!(rpc_error.data.as_ref().unwrap()["repo"], "demo");
         assert_eq!(rpc_error.data.as_ref().unwrap()["file"], "source.rs");
-        assert_eq!(
-            rpc_error.data.as_ref().unwrap()["reason"],
-            "source_blob_mismatch"
+        assert!(
+            rpc_error.data.as_ref().unwrap().get("reason").is_none(),
+            "internal freshness reason must remain server-side"
         );
     }
 

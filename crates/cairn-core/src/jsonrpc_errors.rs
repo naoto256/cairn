@@ -18,13 +18,11 @@
 //!
 //! # Message sanitization
 //!
-//! Only [`Error::Internal`] has its wire `message` replaced with a
-//! fixed `"internal error"` string. Every other variant is currently
-//! emitted unsanitized: its [`std::fmt::Display`] form is copied
-//! into the JSON-RPC `message` verbatim. That includes potentially
-//! sensitive detail — [`Error::StoreNotFound`] and [`Error::Io`]
-//! interpolate absolute paths, [`Error::Lsp`] carries raw backend
-//! text — and the wrapping code here does not filter it.
+//! Every [`Error`] variant maps to a fixed client-safe message.
+//! Variant payloads can contain absolute paths, SQL/backend text, or
+//! repository identities, so their [`std::fmt::Display`] output must
+//! remain server-side. Only recovery fields explicitly selected
+//! below cross the JSON-RPC boundary.
 //!
 //! # Structured `data`
 //!
@@ -45,21 +43,38 @@ use crate::Error;
 
 /// Build a JSON-RPC error [`Response`] for `err`, echoing `id`
 /// verbatim. Chooses the wire code from the typed variant,
-/// sanitizes only the [`Error::Internal`] message (see the module
-/// docs), and attaches a structured `data` payload for the
-/// error variants that carry hint / diagnostic content.
+/// emits a fixed client-safe message, and attaches a structured
+/// `data` payload for the error variants that carry bounded recovery
+/// content.
 pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
-    // Message: only `Internal(_)` is sanitized. Every other variant
-    // returns its `Display` string as-is, so keep those messages
-    // caller-facing.
+    // Keep this exhaustive: adding a new Error variant must make an
+    // explicit wire-message decision instead of falling back to a
+    // potentially sensitive Display representation.
     let msg = match err {
-        Error::Internal(_) => "internal error".to_string(),
-        _ => err.to_string(),
+        Error::Io(_) => "I/O operation failed",
+        Error::Sqlite(_) => "database operation failed",
+        Error::Scan(_) => "repository scan failed",
+        Error::InvalidParams(_) => "invalid params",
+        Error::RepoNotFound { .. } => "repository not found",
+        Error::RepositoryUnavailable { .. } => "repository unavailable",
+        Error::StoreNotFound { .. } => "repository store not found",
+        Error::AnchorNotFound { .. } => "anchor not found",
+        Error::FileNotIndexed { .. } => "file not indexed",
+        Error::SnapshotStale { .. } => "snapshot is stale",
+        Error::DaemonInitializing { .. } => "daemon is initializing",
+        Error::AmbiguousSource { .. } => "source is ambiguous",
+        Error::InvalidArgument(_) => "invalid argument",
+        Error::Internal(_) => "internal error",
+        Error::JobManagerShuttingDown => "job manager is shutting down",
+        Error::ShutdownDeadlineExceeded { .. } => "daemon shutdown deadline exceeded",
+        Error::Lsp(_) => "language server operation failed",
+        Error::SchemaCorruption(_) => "schema corruption detected",
     };
     // Code: client-input errors → INVALID_PARAMS (-32602); each
     // typed lookup failure → its implementation-defined code in
-    // the -32001..-32005 band; everything else falls through the
-    // wildcard arm to INTERNAL_ERROR (-32603).
+    // the -32001..-32005 band; operational variants map explicitly
+    // to INTERNAL_ERROR (-32603). This match stays exhaustive for
+    // the same fail-closed reason as the message match above.
     let code = match err {
         Error::InvalidParams(_) | Error::InvalidArgument(_) | Error::AnchorNotFound { .. } => {
             error_code::INVALID_PARAMS
@@ -69,8 +84,16 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
         Error::AmbiguousSource { .. } => error_code::AMBIGUOUS_SOURCE,
         Error::SnapshotStale { .. } => error_code::SNAPSHOT_STALE,
         Error::DaemonInitializing { .. } => error_code::DAEMON_INITIALIZING,
-        Error::Internal(_) => error_code::INTERNAL_ERROR,
-        _ => error_code::INTERNAL_ERROR,
+        Error::Io(_)
+        | Error::Sqlite(_)
+        | Error::Scan(_)
+        | Error::RepositoryUnavailable { .. }
+        | Error::StoreNotFound { .. }
+        | Error::Internal(_)
+        | Error::JobManagerShuttingDown
+        | Error::ShutdownDeadlineExceeded { .. }
+        | Error::Lsp(_)
+        | Error::SchemaCorruption(_) => error_code::INTERNAL_ERROR,
     };
     let mut response = jsonrpc_error_response(id, code, msg);
     // RepoNotFound: attach a single actionable hint pointing the
@@ -81,7 +104,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
         error.data = Some(json!({
             "hints": [Hint {
                 code: HintCode::RepoNotRegistered,
-                message: format!("No registered repo covers `{alias}`. Use `register_repo` to add it."),
+                message: "No registered repository matches this alias. Use `register_repo` to add it.".into(),
                 action: None,
                 tool: None,
                 params: None,
@@ -93,7 +116,11 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
     // FileNotIndexed: mark the response as partially truncated and
     // attach a wait-for-index diagnostic + hint so agents can retry
     // after reconciliation rather than treating this as a hard miss.
-    if let Error::FileNotIndexed { repo, file, reason } = err
+    if let Error::FileNotIndexed {
+        repo,
+        file,
+        reason: _,
+    } = err
         && let Some(error) = response.error.as_mut()
     {
         error.data = Some(json!({
@@ -108,7 +135,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
                 analyzer_id: None,
                 repo: repo.clone(),
                 file: Some(file.clone()),
-                details: Some(json!({ "reason": reason })),
+                details: None,
             }],
             "hints": [Hint {
                 code: HintCode::FileNotIndexedOrSnapshotStale,
@@ -121,14 +148,13 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             }],
             "repo": repo,
             "file": file,
-            "reason": reason,
         }));
     }
     // SnapshotStale: same wait-for-index shape as FileNotIndexed but
     // for non-file lookups. `data.file` is deliberately absent — no
     // synthetic target is manufactured (see the regression test in
     // this module).
-    if let Error::SnapshotStale { repo, reason } = err
+    if let Error::SnapshotStale { repo, reason: _ } = err
         && let Some(error) = response.error.as_mut()
     {
         error.data = Some(json!({
@@ -141,7 +167,7 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
                 analyzer_id: None,
                 repo: repo.clone(),
                 file: None,
-                details: Some(json!({ "reason": reason })),
+                details: None,
             }],
             "hints": [Hint {
                 code: HintCode::SnapshotStale,
@@ -153,7 +179,6 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
                 target: repo.clone(),
             }],
             "repo": repo,
-            "reason": reason,
         }));
     }
     // AmbiguousSource: enumerate the matching declarations so the
@@ -173,15 +198,19 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
             "candidates_truncated": candidates_truncated,
         }));
     }
-    // DaemonInitializing: mirror the phase-progress snapshot into
-    // `data` (state, phase, completed / total, detail) so callers
-    // can render progress and decide when to retry instead of
-    // polling blind.
+    // DaemonInitializing: expose bounded phase progress in `data`
+    // (state, phase, completed / total) so callers can render progress
+    // and decide when to retry. Free-form detail remains server-side.
     if let Error::DaemonInitializing { initialization } = err
         && let Some(error) = response.error.as_mut()
     {
         error.data = Some(json!({
-            "initialization": initialization,
+            "initialization": {
+                "state": initialization.state,
+                "phase": initialization.phase,
+                "completed_phases": initialization.completed_phases,
+                "total_phases": initialization.total_phases,
+            },
             "diagnostics": [Diagnostic {
                 code: DiagnosticCode::DaemonInitializing,
                 severity: DiagnosticSeverity::Info,
@@ -194,7 +223,6 @@ pub(crate) fn error_from(id: RequestId, err: &Error) -> Response {
                     "phase": initialization.phase,
                     "completed_phases": initialization.completed_phases,
                     "total_phases": initialization.total_phases,
-                    "detail": initialization.detail,
                 })),
             }],
             "hints": [Hint {
@@ -269,11 +297,36 @@ mod tests {
     }
 
     #[test]
-    fn preserves_invalid_argument_message_for_client_errors() {
+    fn sanitizes_invalid_argument_message_for_client_errors() {
         assert_eq!(
             message_for(Error::InvalidArgument("missing `repo`".into())),
-            "invalid argument: missing `repo`"
+            "invalid argument"
         );
+    }
+
+    #[test]
+    fn sanitizes_operational_error_payloads() {
+        let sensitive = "/private/repo/secret.sqlite";
+        let cases = [
+            Error::Io(std::io::Error::other(sensitive)),
+            Error::Sqlite(rusqlite::Error::InvalidPath(sensitive.into())),
+            Error::RepositoryUnavailable {
+                repo_hash: sensitive.into(),
+                state: "removing",
+            },
+            Error::StoreNotFound {
+                path: sensitive.into(),
+            },
+            Error::SchemaCorruption(sensitive.into()),
+        ];
+
+        for err in cases {
+            let message = message_for(err);
+            assert!(
+                !message.contains(sensitive),
+                "wire message leaked error payload: {message}"
+            );
+        }
     }
 
     #[test]
@@ -303,9 +356,13 @@ mod tests {
         let error = response.error.unwrap();
 
         assert_eq!(error.code, error_code::FILE_NOT_INDEXED);
-        assert!(error.message.contains("source_blob_mismatch"));
+        assert_eq!(error.message, "file not indexed");
         let data = error.data.unwrap();
-        assert_eq!(data["reason"], "source_blob_mismatch");
+        assert!(data.get("reason").is_none());
+        assert!(
+            !data.to_string().contains("source_blob_mismatch"),
+            "internal freshness reason must not cross the wire"
+        );
         assert_eq!(
             data["completeness"]["reason"],
             "file_not_indexed_or_snapshot_stale"

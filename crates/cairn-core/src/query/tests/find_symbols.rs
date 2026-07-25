@@ -231,6 +231,53 @@ fn find_by_path_prefix_limits_scope() {
 }
 
 #[test]
+fn path_prefix_treats_like_metacharacters_literally() {
+    let (repo, _sha) = init_repo(&[
+        ("src/a_b.rs", "pub fn underscored() {}\n"),
+        ("src/axb.rs", "pub fn underscore_decoy() {}\n"),
+        ("src/100%/mod.rs", "pub fn percent() {}\n"),
+        ("src/100x/mod.rs", "pub fn percent_decoy() {}\n"),
+    ]);
+    let db_tmp = tempfile::tempdir().unwrap();
+    let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+    register_repo(&mut conn, repo.path(), 0).unwrap();
+
+    let underscore = find_symbols(
+        &conn,
+        &AnchorName::head(),
+        &FindSymbolsArgs {
+            path_prefix: Some("src/a_b.rs".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        underscore
+            .iter()
+            .map(|hit| hit.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["underscored"]
+    );
+
+    let percent = find_symbols(
+        &conn,
+        &AnchorName::head(),
+        &FindSymbolsArgs {
+            path_prefix: Some("src/100%/".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        percent
+            .iter()
+            .map(|hit| hit.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["percent"]
+    );
+}
+
+#[test]
 fn limit_caps_results() {
     let (_repo, _db, c) = registered();
     let hits = find_symbols(
