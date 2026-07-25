@@ -17,6 +17,9 @@ use crate::common::{
 
 // ─── shared argument fragments ─────────────────────────────────────────────
 
+/// Serde `skip_serializing_if` predicate that elides a `bool` field
+/// when it holds its default `false`, so a wire payload only carries
+/// the flag when the caller opted in to `true`.
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -118,9 +121,21 @@ pub struct RepoListEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoAggregateStatus {
+    /// No snapshot triggered a degraded verdict — nothing is
+    /// `missing`, `reconciling`, `stale`, or `no_analyzer`, and no
+    /// workspace-analysis job is running for the repository.
     Ready,
+    /// A workspace-analysis job is in flight or at least one snapshot
+    /// is still `reconciling`.
     Indexing,
+    /// At least one snapshot is `stale` (analyzer has more facts to
+    /// land) or `no_analyzer` (a present language has no registered
+    /// analyzer). Precedence is `Error > Indexing > Partial > Ready`,
+    /// so this state is reported when neither `Error` nor `Indexing`
+    /// applies.
     Partial,
+    /// The repository has no snapshots or contains a `missing`
+    /// snapshot — e.g. the default anchor has never been published.
     Error,
 }
 
@@ -144,9 +159,16 @@ pub struct RepoStatusArgs {
 /// Result of `repo_status`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusResult {
+    /// Detailed status for the resolved repository. Always present on
+    /// success — a missing repo is signalled via a top-level error,
+    /// not an empty entry.
     pub repo: RepoStatusEntry,
+    /// Structured facts about degraded state (analyzer errors, stale
+    /// snapshots, missing tiers). Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
+    /// Machine-readable next-step suggestions matched to the
+    /// diagnostics above. Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<Hint>,
     /// Server-side wall time spent producing this response.
@@ -157,15 +179,25 @@ pub struct RepoStatusResult {
 /// Detailed status for one repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusEntry {
+    /// Short alias registered with the daemon.
     pub alias: String,
+    /// Absolute path of the repository root when registered.
     pub root: String,
     /// Whether a missing root is retained instead of auto-pruned.
     #[serde(default)]
     pub persistent: bool,
+    /// Distinct language tags observed across the repository's
+    /// current snapshot view. Sorted / deduplicated by the daemon.
     pub languages: Vec<String>,
+    /// Aggregate snapshot / file / symbol counts for the repository.
     pub summary: RepoStatusSummary,
+    /// Freshness slot for the repository's current (default) snapshot.
     pub current: RepoStatusCurrent,
+    /// Tier-3 analyzer readiness for this repository, plus the
+    /// process-wide roll-up when `verbose_tier3` was requested.
     pub tier3_status: TierRepoStatus,
+    /// Per-anchor snapshot details when `include_snapshots` was set.
+    /// Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshots: Vec<RepoSnapshotEntry>,
     /// PR3 Phase 4: durable reconcile state for the underlying
@@ -177,18 +209,42 @@ pub struct RepoStatusEntry {
     pub reconcile: Option<crate::RepoReconcileStatus>,
 }
 
+/// Aggregate snapshot / file / symbol counts returned inside
+/// [`RepoStatusEntry`]. The `stale` bucket is derived on the
+/// daemon side, so consumers do not need to re-classify snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusSummary {
+    /// Total number of snapshots reachable through the repository's
+    /// live anchors.
     pub snapshot_count: u32,
+    /// Snapshots the daemon classifies as `ready` (the analyzer view
+    /// has caught up).
     pub ready_snapshot_count: u32,
+    /// Snapshots currently classified as either `stale` (analyzer
+    /// results are behind) or `reconciling` (analyzer catch-up in
+    /// flight). The two overlap in intent — "not yet ready" — so
+    /// they share one counter.
     pub stale_snapshot_count: u32,
+    /// File count under the current snapshot's view. `0` when the
+    /// repository has no selectable current snapshot.
     pub current_file_count: u64,
+    /// Symbol count under the current snapshot's view. `0` when the
+    /// repository has no selectable current snapshot.
     pub current_symbol_count: u64,
 }
 
+/// Freshness slot for the repository's current (default) snapshot.
+/// The daemon picks the snapshot with `select_status_snapshot`, then
+/// stamps the anchor label and freshness verdict here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusCurrent {
+    /// User-facing anchor label the current snapshot resolved to
+    /// (`HEAD`, a branch name, `tentative/<id>`). Falls back to
+    /// `"HEAD"` when no snapshot could be selected.
     pub anchor: String,
+    /// Snapshot freshness label — typically `"ready"`, `"stale"`,
+    /// `"reconciling"`, `"no_analyzer"`, or `"missing"` when the
+    /// current snapshot could not be materialised.
     pub status: String,
 }
 
@@ -431,22 +487,50 @@ mod list_repos_tests {
 }
 
 // ─── list_jobs ─────────────────────────────────────────────────────────────
+//
+// Snapshot of analyzer job rows persisted in each store's
+// `workspace_analysis_runs` table, restricted to rows still
+// reachable from a live anchor. The default view keeps only rows
+// that are scheduler-visible today (`queued` / `running`); pass
+// `include_terminal` to also see the completed history. Results are
+// sorted newest-`job_id`-first before `limit` truncation — there is
+// no paging cursor, so scanning further back means overreading with
+// a bigger cap.
 
+/// Arguments to `list_jobs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListJobsArgs {
+    /// Repository filter. `repo = None` enumerates every registered
+    /// repository (unavailable owners are skipped and reflected in
+    /// `completeness`).
     #[serde(flatten)]
     pub scope: RepoScope,
+    /// Restrict rows to a single persisted `state` label
+    /// (`"queued"`, `"running"`, `"succeeded"`, `"failed"`, ...).
+    /// Matched exactly against `workspace_analysis_runs.status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// When `true`, terminal rows (every status other than `queued`
+    /// / `running` — e.g. `succeeded`, `failed`, `skipped`,
+    /// `timed_out`, `cancelled`) are included alongside active ones.
+    /// Defaults to `false`, which keeps the view focused on jobs the
+    /// scheduler is still driving.
     #[serde(default)]
     pub include_terminal: bool,
+    /// Optional result cap. Applied after the newest-first sort, so
+    /// truncation drops the oldest rows in the current view.
     #[serde(flatten)]
     pub pagination: PaginationArgs,
 }
 
+/// Result of `list_jobs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListJobsResult {
+    /// Matching job rows, ordered newest `job_id` first.
     pub jobs: Vec<JobEntry>,
+    /// `Partial` when a repository was skipped (unavailable owner)
+    /// or the `limit` cap truncated the tail; the unavailable-owner
+    /// reason wins over the cap reason when both apply.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Server-side wall time spent producing this response.
@@ -454,19 +538,62 @@ pub struct ListJobsResult {
     pub timing: Timing,
 }
 
+/// One analyzer job entry returned by `list_jobs`.
+///
+/// Field origins:
+///
+/// - **Persisted** (`job_id`, `alias`, `analyzer_id`, `state`,
+///   `run_ms`) come directly from the `workspace_analysis_runs` row.
+/// - **Runtime** (`scheduler_state`, `pool_group`, `queued_ms`,
+///   `pool_wait_ms`, `progress_ticks`, `rate`) are shaped for
+///   `JobRuntimeMetricsStore`-decorated views. The data-RPC
+///   `list_jobs` producer today never consults that store: it emits
+///   `scheduler_state = state`, `pool_group = None`,
+///   `queued_ms = 0`, `pool_wait_ms = 0`, `progress_ticks = 0`, and
+///   `rate = None` as placeholders. Consumers relying on real
+///   scheduler metrics should read the control-plane `jobs.list`
+///   surface instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEntry {
+    /// Scheduler-assigned job identifier (`job_id` column),
+    /// persisted as the row's external id; daemon restart preserves
+    /// unique ids but rewrites ambiguous or tombstoned legacy ids
+    /// during recovery.
     pub job_id: i64,
+    /// Alias of the repository the job belongs to.
     pub alias: String,
+    /// Registered analyzer id (e.g. `"rust-analyzer-lsp"`).
     pub analyzer_id: String,
+    /// Persisted run status — the value stored on
+    /// `workspace_analysis_runs.status` (`"queued"`, `"running"`,
+    /// a terminal `RunStatus` string, ...).
     pub state: String,
+    /// Scheduler-visible state. In principle this can diverge from
+    /// `state` (for example `"waiting_pool_group"` while the persisted
+    /// state is still `"queued"`); consumers should treat it as an
+    /// opaque label for the scheduler's own view.
     pub scheduler_state: String,
+    /// Named pool group that serialises this analyzer's runs, when
+    /// one is assigned. `None` when the analyzer executes without a
+    /// pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_group: Option<String>,
+    /// Milliseconds the job spent queued before its first run window
+    /// opened.
     pub queued_ms: u64,
+    /// Milliseconds spent waiting behind an active `pool_group`
+    /// before executing.
     pub pool_wait_ms: u64,
+    /// Wall-clock time inside the run window, in milliseconds. On
+    /// finished rows this is derived from persisted start / finish
+    /// timestamps (falls back to `0` on clock skew or unfinished
+    /// rows).
     pub run_ms: u64,
+    /// Cumulative progress-tick counter reported by the analyzer.
+    /// This is an absolute count, not a delta between polls.
     pub progress_ticks: u64,
+    /// Optional recent-throughput hint (units per unit-time as
+    /// defined by the analyzer). `None` when no rate is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<f64>,
 }

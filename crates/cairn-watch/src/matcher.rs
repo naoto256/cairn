@@ -1,3 +1,23 @@
+//! Repository-scoped gitignore matcher and git metadata resolver.
+//!
+//! Both the startup [`crate::scan::walk_repo`] pass and the runtime
+//! [`crate::EventClassifier`] rely on this module for two decisions:
+//!
+//! - Where does the repository's git metadata live? A plain checkout
+//!   keeps `.git/` next to the working tree, but a linked worktree
+//!   splits it into a per-worktree `gitdir` plus a shared `commondir`.
+//!   [`resolve_git_metadata`] follows the `.git` file / `commondir`
+//!   trail so `info/exclude` and the watched git roots point at the
+//!   right on-disk locations.
+//! - Is a path ignored, or does it fall in a subtree that never
+//!   belongs to the parent repository? [`RepoIgnoreMatcher`] layers
+//!   `.git/info/exclude` and every discovered `.gitignore` inside
+//!   the working tree, and treats nested repository boundaries
+//!   (a `.git` file or directory below the root) as always-pruned.
+//!
+//! Sharing one matcher between the scanner and the event classifier
+//! keeps the startup snapshot and the live event stream from drifting
+//! on which paths the parent repository owns.
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,6 +27,17 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::scan::ALWAYS_PRUNED_DIR_NAMES;
 
+/// The three git-metadata locations the watcher needs to know about.
+///
+/// - `worktree_git_dir`: the per-worktree git dir. For a plain
+///   checkout this is `<repo>/.git/`; for a linked worktree it is
+///   `<common>/.git/worktrees/<name>/`. HEAD lives here.
+/// - `common_git_dir`: the shared git dir that holds `refs/`,
+///   `packed-refs`, and `info/exclude`. Equal to `worktree_git_dir`
+///   for a plain checkout.
+/// - `info_exclude`: the resolved absolute path of
+///   `<common_git_dir>/info/exclude`. Kept precomputed because the
+///   classifier compares against it on every event.
 #[derive(Debug, Clone)]
 pub(crate) struct GitMetadataPaths {
     pub(crate) worktree_git_dir: PathBuf,
@@ -15,6 +46,11 @@ pub(crate) struct GitMetadataPaths {
 }
 
 impl GitMetadataPaths {
+    /// Synthetic paths used when [`resolve_git_metadata`] fails. Every
+    /// slot points into `<repo_root>/.git/...`, so downstream code
+    /// keeps operating (fail-open) even if the real metadata layout
+    /// cannot be read; the classifier stays permissive rather than
+    /// silently going dark.
     pub(crate) fn fail_open(repo_root: &Path) -> Self {
         let dot_git = repo_root.join(".git");
         Self {
@@ -24,6 +60,11 @@ impl GitMetadataPaths {
         }
     }
 
+    /// Git dirs that should be handed to the OS watcher in addition
+    /// to the working tree. For a plain checkout this is one entry
+    /// (`.git/`); for a linked worktree it is two — the per-worktree
+    /// git dir (for HEAD) and the shared common git dir (for refs,
+    /// packed-refs, and info/exclude).
     pub(crate) fn watch_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.worktree_git_dir.clone()];
         if self.common_git_dir != self.worktree_git_dir {
@@ -33,6 +74,28 @@ impl GitMetadataPaths {
     }
 }
 
+/// Resolve the git metadata layout for `repo_root`.
+///
+/// Handles three cases:
+///
+/// 1. A plain checkout with a `.git/` directory: `worktree_git_dir`
+///    and `common_git_dir` both point at `<repo_root>/.git/`.
+/// 2. A linked worktree, where `.git` is a file containing
+///    `gitdir: <path-to-worktree-git-dir>`. That path is followed
+///    (and canonicalized best-effort) to get the per-worktree git
+///    dir. If a `commondir` file lives alongside it, that entry
+///    resolves the shared common git dir; otherwise the worktree
+///    and common dirs coincide.
+/// 3. Anything malformed — a broken `.git` file, an unreadable
+///    `commondir`, or an I/O error — is surfaced as `Err`. The two
+///    callers handle it differently: the watcher setup falls back
+///    to [`GitMetadataPaths::fail_open`] and continues, while the
+///    scanner records the failure in `ScanErrors`, substitutes the
+///    fixed `<repo_root>/.git/info/exclude` path, and builds a
+///    fail-open matcher rather than a hard stop.
+///
+/// `info_exclude` is derived from the resolved common git dir since
+/// that is where a linked worktree keeps the shared exclude file.
 pub(crate) fn resolve_git_metadata(repo_root: &Path) -> io::Result<GitMetadataPaths> {
     let dot_git = repo_root.join(".git");
     let worktree_git_dir = if try_is_file(&dot_git)? {
@@ -69,6 +132,11 @@ pub(crate) fn resolve_git_metadata(repo_root: &Path) -> io::Result<GitMetadataPa
     })
 }
 
+/// Resolve `candidate` against `base` and canonicalize the result
+/// best-effort. Canonicalization failures (broken symlink, missing
+/// component) fall back to the un-canonicalized join so callers can
+/// still record the intended path even when the target does not yet
+/// exist on disk.
 fn absolutize(base: &Path, candidate: &Path) -> PathBuf {
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -78,12 +146,28 @@ fn absolutize(base: &Path, candidate: &Path) -> PathBuf {
     joined.canonicalize().unwrap_or(joined)
 }
 
+/// One `.gitignore` file discovered inside the working tree, keyed
+/// by the directory it lives in. `matcher` interprets its patterns
+/// with `directory` as the anchor so nested `/foo/` patterns stay
+/// scoped to their own subtree.
 #[derive(Debug)]
 struct IgnoreLayer {
     directory: PathBuf,
     matcher: Gitignore,
 }
 
+/// Hierarchical gitignore matcher shared by the startup scanner and
+/// the runtime event classifier.
+///
+/// Layers are evaluated shallow-to-deep after `info_exclude`, so a
+/// deeper `.gitignore` can override a shallower rule (matching git
+/// semantics). Directory-scoped patterns anchor to the layer's own
+/// directory rather than the repo root.
+///
+/// The set of layers is discovered eagerly by [`Self::build`] and
+/// fixed for the lifetime of the matcher; the classifier hot-swaps
+/// a whole matcher when a `.gitignore` or directory-topology event
+/// arrives (see [`crate::EventClassifier::reload_matcher`]).
 #[derive(Debug)]
 pub(crate) struct RepoIgnoreMatcher {
     repo_root: PathBuf,
@@ -92,6 +176,16 @@ pub(crate) struct RepoIgnoreMatcher {
 }
 
 impl RepoIgnoreMatcher {
+    /// Build a matcher for `repo_root`, loading `info_exclude` plus
+    /// every discovered `.gitignore` in the working tree.
+    ///
+    /// Discovery walks directories eagerly and stops descending into
+    /// nested repository boundaries and always-pruned subtrees, so a
+    /// vendored checkout's own `.gitignore` never joins this matcher.
+    /// Any I/O error while reading a `.gitignore`, listing a
+    /// directory, or probing metadata is surfaced as `Err` and the
+    /// caller decides whether to publish or fall back to
+    /// [`Self::fail_open`].
     pub(crate) fn build(repo_root: &Path, info_exclude: &Path) -> io::Result<Self> {
         let repo_root = repo_root.to_path_buf();
         let info_exclude = load_matcher(&repo_root, info_exclude)?;
@@ -104,6 +198,15 @@ impl RepoIgnoreMatcher {
         Ok(matcher)
     }
 
+    /// Permissive matcher: no `.gitignore` rules and no info/exclude
+    /// rules are applied, so [`Self::is_ignored`] always returns
+    /// `false`. Nested-boundary and always-pruned pruning still
+    /// works because [`Self::is_pruned_path`] does not consult the
+    /// gitignore layers.
+    ///
+    /// Used by the classifier when a matcher build/reload failed, so
+    /// the watcher keeps delivering events (potentially over-broad)
+    /// instead of going silent while the retry thread rebuilds.
     pub(crate) fn fail_open(repo_root: &Path) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
@@ -160,6 +263,15 @@ impl RepoIgnoreMatcher {
         Ok(false)
     }
 
+    /// Return whether `path` is gitignored under this repository's
+    /// combined rules.
+    ///
+    /// Matching walks the ancestor chain from the repo root down to
+    /// (but not including) `path`, so a directory ignored at any
+    /// level ignores everything beneath it — matching git's own
+    /// "an ignored directory hides its contents" rule. Paths that
+    /// are not inside `repo_root` and the root itself both return
+    /// `false`.
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         let Ok(relative) = path.strip_prefix(&self.repo_root) else {
             return false;
@@ -179,6 +291,10 @@ impl RepoIgnoreMatcher {
         self.direct_match(path, is_dir) == MatchDecision::Ignore
     }
 
+    /// Combine `info/exclude` and every `.gitignore` layer whose
+    /// directory covers `path`. Later (deeper) layers override
+    /// earlier ones only when they produce a non-`None` decision,
+    /// matching git's precedence rules.
     fn direct_match(&self, path: &Path, is_dir: bool) -> MatchDecision {
         let mut result = decision(self.info_exclude.matched(path, is_dir));
         for layer in &self.layers {
@@ -193,6 +309,11 @@ impl RepoIgnoreMatcher {
         result
     }
 
+    /// Recursively load every `.gitignore` inside `directory`,
+    /// pushing one [`IgnoreLayer`] per file found. Descent skips
+    /// symlinks, entries already excluded by rules loaded so far,
+    /// and nested repository boundaries — so a vendored subrepo's
+    /// `.gitignore` never joins the parent's matcher.
     fn discover_directory(&mut self, directory: &Path) -> io::Result<()> {
         let ignore_file = directory.join(".gitignore");
         if try_is_file(&ignore_file)? {
@@ -219,6 +340,11 @@ impl RepoIgnoreMatcher {
     }
 }
 
+/// Three-valued outcome of matching a path against a single
+/// gitignore layer. `None` means the layer had no opinion; because
+/// [`RepoIgnoreMatcher::direct_match`] iterates layers shallow →
+/// deep, this preserves whatever decision an already-consulted
+/// shallower layer (or the shared `info/exclude`) has settled on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchDecision {
     None,
@@ -234,6 +360,12 @@ fn decision(matched: Match<&ignore::gitignore::Glob>) -> MatchDecision {
     }
 }
 
+/// Build a `Gitignore` matcher anchored at `root` from the patterns
+/// in `source`. A missing `source` is not an error; it produces an
+/// empty matcher. Parse and build errors are wrapped as
+/// `io::ErrorKind::InvalidData` so callers can distinguish "file
+/// unreadable" from "patterns malformed" only via the underlying
+/// message — both fail the scan or classifier build.
 fn load_matcher(root: &Path, source: &Path) -> io::Result<Gitignore> {
     if !try_is_file(source)? {
         return Ok(Gitignore::empty());
@@ -247,6 +379,10 @@ fn load_matcher(root: &Path, source: &Path) -> io::Result<Gitignore> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
+/// Best-effort "is this an existing regular file?" probe. Swallows
+/// `NotFound` and `NotADirectory` (the latter surfaces when an
+/// intermediate path component is a file) as `Ok(false)`; other
+/// errors propagate.
 fn try_is_file(path: &Path) -> io::Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file()),
@@ -262,6 +398,9 @@ fn try_is_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Return whether `directory` contains a `.git` file or directory.
+/// Either shape (submodule gitfile or full `.git` directory) is a
+/// nested repository boundary.
 fn try_has_git_marker(directory: &Path) -> io::Result<bool> {
     let marker = directory.join(".git");
     match fs::metadata(marker) {
@@ -281,6 +420,14 @@ fn try_has_git_marker(directory: &Path) -> io::Result<bool> {
     }
 }
 
+/// True when `path` is a `.git` marker (file or directory) belonging
+/// to a *nested* repository below `repo_root`.
+///
+/// The registered root's own `.git` marker is deliberately excluded:
+/// changes there are ordinary git activity, not a nested-repo
+/// boundary shift. The classifier uses this to force a rescan when a
+/// nested `.git` appears or disappears, since the ignore matcher's
+/// boundary set is now stale.
 pub(crate) fn is_nested_git_marker_path(repo_root: &Path, path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == ".git")
         && path

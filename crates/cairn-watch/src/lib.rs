@@ -192,6 +192,11 @@ pub fn watch_repo_with_backend(
     Ok(WatcherHandle { debouncer })
 }
 
+/// Bridge between the `notify-debouncer-full` callback and the
+/// classifier. A successful batch is classified per event; an error
+/// batch is collapsed to a single [`RescanReason::WatchError`] edge
+/// after logging each individual error, so a burst of backend
+/// errors does not translate into a burst of rescan events.
 fn handle_debounce_result(classifier: &EventClassifier, result: DebounceEventResult) {
     match result {
         Ok(events) => classifier.handle_batch(&events),
@@ -217,6 +222,24 @@ impl WatcherDebouncer {
     }
 }
 
+/// Turns a debounced batch of raw notify events into the coarser
+/// [`WatchEvent`] stream this crate exposes.
+///
+/// Clones are cheap because most state sits behind `Arc`s — the
+/// debouncer's callback and the matcher-retry thread both need
+/// their own handle. (`tx: Sender` is the exception: it does its
+/// own cheap clone.) `ignore` is `Arc<RwLock<Arc<RepoIgnoreMatcher>>>`:
+/// the read lock protects each matcher call independently, so a
+/// writer waits for that guard, and a swap may occur between the
+/// prune check and the gitignore check because the classify path
+/// reacquires the lock rather than holding one snapshot across the
+/// whole classify.
+///
+/// `retrying_matcher` is a simple flag that serializes matcher
+/// rebuild attempts after a fail-open — see
+/// [`Self::start_matcher_retry`]. `tx` is the outbound event
+/// channel; its `Closed` state is the only shutdown signal this
+/// classifier reacts to.
 #[derive(Clone)]
 struct EventClassifier {
     repo_root: Arc<PathBuf>,
@@ -249,6 +272,25 @@ impl EventClassifier {
         classifier
     }
 
+    /// Classify one debounced batch.
+    ///
+    /// Every event in the batch is tested in order; the batch stops
+    /// at the first event that produces a rescan reason, using this
+    /// per-event precedence:
+    ///
+    /// 1. The backend requested a rescan (`need_rescan()` flag) —
+    ///    [`RescanReason::BackendRequested`].
+    /// 2. Any path is an ignore-control file (info/exclude or a
+    ///    working-tree `.gitignore`) — [`RescanReason::IgnoreRulesChanged`].
+    /// 3. A create/remove/rename touches a nested `.git` marker in
+    ///    the working tree — [`RescanReason::DirectoryTopologyChanged`].
+    /// 4. Any working-tree directory create/remove/rename — same
+    ///    [`RescanReason::DirectoryTopologyChanged`].
+    ///
+    /// When any rescan reason fires, the matcher is reloaded and
+    /// exactly one `Rescan` event is emitted — the per-event
+    /// classification loop is skipped, since the consumer will
+    /// re-read the whole snapshot anyway.
     fn handle_batch(&self, events: &[notify_debouncer_full::DebouncedEvent]) {
         let reason = events.iter().find_map(|event| {
             if event.need_rescan() {
@@ -291,6 +333,11 @@ impl EventClassifier {
         }
     }
 
+    /// Response to a batch of backend errors: reload the ignore
+    /// matcher (the errors may have masked ignore-file writes) and
+    /// emit exactly one [`RescanReason::WatchError`] edge. The
+    /// individual error messages are logged by
+    /// [`handle_debounce_result`] before this is called.
     fn handle_watch_error_batch(&self) {
         self.reload_matcher();
         self.emit(WatchEvent::Rescan {
@@ -298,6 +345,17 @@ impl EventClassifier {
         });
     }
 
+    /// Non-blocking send onto the outgoing channel.
+    ///
+    /// Returns `true` when the caller should keep processing more
+    /// events from the current batch, and `false` when the consumer
+    /// has dropped the receiver (`Closed`). A `Full` channel is
+    /// treated as an already-pending edge and silently coalesced —
+    /// this pairs with the daemon's capacity-1, edge-triggered
+    /// consumer, where an outstanding item already means "the repo
+    /// is dirty, dispatch again". Callers that ignore the return
+    /// value (e.g. [`Self::handle_watch_error_batch`]) accept that
+    /// this one event is dropped when the consumer is gone.
     fn emit(&self, event: WatchEvent) -> bool {
         match self.tx.try_send(event) {
             Ok(()) => true,
@@ -309,6 +367,12 @@ impl EventClassifier {
         }
     }
 
+    /// Rebuild the ignore matcher from the on-disk `.gitignore` set
+    /// and swap it into place. On failure the classifier installs a
+    /// permissive [`RepoIgnoreMatcher::fail_open`] so events keep
+    /// flowing, and hands off to [`Self::start_matcher_retry`] so a
+    /// later rebuild can restore normal filtering — the fail-open
+    /// path is not the terminal state.
     fn reload_matcher(&self) {
         match RepoIgnoreMatcher::build(&self.repo_root, &self.git_metadata.info_exclude) {
             Ok(matcher) => self.replace_matcher(matcher),
@@ -320,10 +384,19 @@ impl EventClassifier {
         }
     }
 
+    /// Replace the current matcher with a permissive
+    /// [`RepoIgnoreMatcher::fail_open`]. Nested-boundary and
+    /// always-pruned pruning still works after this — only the
+    /// gitignore rules go quiet.
     fn install_fail_open(&self) {
         self.replace_matcher(RepoIgnoreMatcher::fail_open(&self.repo_root));
     }
 
+    /// Atomically swap the shared matcher pointer. A reader that
+    /// is mid-matcher-call finishes it against the old matcher;
+    /// the next read-lock acquire in the same classify path may
+    /// observe the new one. A poisoned lock is unwrapped in place
+    /// because writes here are unconditional pointer replacements.
     fn replace_matcher(&self, matcher: RepoIgnoreMatcher) {
         let mut current = self
             .ignore
@@ -332,6 +405,19 @@ impl EventClassifier {
         *current = Arc::new(matcher);
     }
 
+    /// Start a background thread that keeps trying to rebuild a
+    /// real matcher after a fail-open.
+    ///
+    /// At most one retry thread runs at a time — `retrying_matcher`
+    /// gates the spawn via `compare_exchange` and is cleared once
+    /// the thread exits. The retry uses exponential backoff
+    /// starting at 100ms and capped at 2s, and terminates when
+    /// either (a) the outgoing channel closed (the consumer went
+    /// away), or (b) a rebuild succeeded, in which case a
+    /// [`RescanReason::MatcherRecovered`] edge is emitted so the
+    /// consumer knows to re-check anything it observed while the
+    /// classifier was over-broad. Uses `std::thread` so no tokio
+    /// runtime handle needs to reach into the classifier's setup.
     fn start_matcher_retry(&self) {
         if self
             .retrying_matcher
@@ -369,12 +455,23 @@ impl EventClassifier {
         });
     }
 
+    /// True when `path` is a file that changes the ignore rules
+    /// themselves: the resolved `.git/info/exclude`, or any
+    /// `.gitignore` file inside the working tree. A `.gitignore`
+    /// found *inside* a git dir (e.g. `.git/.gitignore`) is
+    /// deliberately not treated as an ignore-control file because
+    /// [`Self::is_working_tree_path`] excludes the git dirs.
     fn is_ignore_control(&self, path: &Path) -> bool {
         path == self.git_metadata.info_exclude
             || (self.is_working_tree_path(path)
                 && path.file_name().is_some_and(|name| name == ".gitignore"))
     }
 
+    /// True when `path` lies inside the working tree but outside any
+    /// of the git dirs (the per-worktree gitdir plus the shared
+    /// common gitdir for a linked worktree). Used to keep ignore
+    /// classification and directory-topology detection scoped to
+    /// user-visible files.
     fn is_working_tree_path(&self, path: &Path) -> bool {
         path.starts_with(self.repo_root.as_path())
             && !self
@@ -384,6 +481,20 @@ impl EventClassifier {
                 .any(|git_root| path.starts_with(git_root))
     }
 
+    /// Reduce one raw notify event into a single [`WatchEvent`], or
+    /// `None` when it should be silently dropped.
+    ///
+    /// Classification order (first match wins):
+    ///
+    /// 1. Path inside any git dir → [`classify_git`] (either a git
+    ///    event, or `None` for internal-only paths like `objects/`).
+    /// 2. Path inside an always-pruned subtree or a nested
+    ///    repository boundary → dropped.
+    /// 3. Path is gitignored → dropped.
+    /// 4. Otherwise, map the raw `EventKind` to a [`WatchEvent::File`]:
+    ///    Create and Modify collapse to `FileChange::Touched` (a
+    ///    Tier-1 reparse is identical either way), Remove becomes
+    ///    `FileChange::Deleted`, and any other kind is dropped.
     fn classify(&self, path: &Path, kind: EventKind) -> Option<WatchEvent> {
         for git_root in self.git_metadata.watch_roots() {
             if path.starts_with(&git_root) {
@@ -416,6 +527,12 @@ impl EventClassifier {
         }
     }
 
+    /// Ask the matcher whether `path` is ignored, filling in the
+    /// `is_dir` hint from what the filesystem or `kind` tell us.
+    /// The `kind`-derived fallback matters for `Remove(Folder)` and
+    /// `Create(Folder)`, where a `path.is_dir()` probe against a
+    /// just-deleted entry (or one whose creation has not settled)
+    /// would misreport the type.
     fn is_gitignored(&self, path: &Path, kind: EventKind) -> bool {
         let is_dir = path.is_dir()
             || matches!(kind, EventKind::Create(CreateKind::Folder))
@@ -427,6 +544,11 @@ impl EventClassifier {
     }
 }
 
+/// True when a raw notify event is a directory-topology change:
+/// a new folder appeared, a folder was removed, or a rename
+/// happened (rename is reported by notify as `Modify(Name(_))`).
+/// These change the set of on-disk `.gitignore` files the matcher
+/// needs to consider, so the classifier reloads on any of them.
 fn is_directory_topology_change(kind: EventKind) -> bool {
     matches!(
         kind,
@@ -436,6 +558,15 @@ fn is_directory_topology_change(kind: EventKind) -> bool {
     )
 }
 
+/// Classify a raw notify event that fired inside `git_dir` into a
+/// [`GitEvent`] variant, or `None` for any path the watcher does
+/// not care about (loose objects, `logs/`, hooks, config, etc.).
+///
+/// Parsing is structural on the path components rather than string
+/// matching, so `refs/heads/feature/x` correctly reads as branch
+/// `feature/x` and `.git/HEAD/anything` is not misread as `HEAD`.
+/// Empty components inside a branch name (`refs/heads//x`) yield
+/// `None` rather than an empty-string branch name.
 fn classify_git(path: &Path, kind: EventKind, git_dir: &Path) -> Option<WatchEvent> {
     let rel = path.strip_prefix(git_dir).ok()?;
     let components: Vec<&std::ffi::OsStr> = rel.iter().collect();

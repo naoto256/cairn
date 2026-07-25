@@ -49,8 +49,21 @@ pub struct LanguageEnrichment {
     /// Short language tag, e.g. `"rust"`, `"python"`, `"markdown"`.
     pub language: String,
     /// Realized tier for this `(snapshot, language)` slice.
+    ///
+    /// Derived from per-blob Tier-2 analyzer stamps
+    /// (`blobs.analyzer_id`) recorded against this snapshot's manifest.
+    /// A registered workspace analyzer (Tier-2.5 / Tier-3) whose
+    /// backend has no in-process Tier-2 analyzer does not upgrade
+    /// this field even after its runs complete; consult
+    /// [`crate::TierStatus`] / `TierRepoStatus` for that view.
     pub tier: SourceTier,
     /// Whether the language's backend declares an analyzer at compile time.
+    ///
+    /// Also set when a workspace analyzer is registered for the
+    /// language's parser id — the daemon-side computation OR-s both
+    /// capabilities together, so a language served only by a
+    /// workspace analyzer still reports `has_analyzer = true` even
+    /// before any run completes.
     pub has_analyzer: bool,
 }
 
@@ -60,6 +73,10 @@ pub struct LanguageEnrichment {
 /// part of this v1 wire shape because the phase taxonomy is still unstable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timing {
+    /// Daemon-side dispatch time in whole milliseconds — measured
+    /// from just before the method body runs to just after it
+    /// returns, and injected into the response afterwards. Envelope
+    /// framing and JSON (de)serialization sit outside the window.
     pub server_ms: u64,
 }
 
@@ -153,34 +170,77 @@ pub enum RefKind {
 }
 
 /// Wire state for one Tier-3 analyzer entry.
+///
+/// Serialized as the `snake_case` variant name. `Ready` is the
+/// successful-completion state; [`TierAnalyzerStatus::is_positive`]
+/// additionally accepts `Skipped` and `NotApplicable`, which
+/// indicate the analyzer intentionally has nothing to contribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalyzerState {
+    /// Analyzer completed successfully. Internal `succeeded` rows are
+    /// normalized to this variant on the wire.
     Ready,
+    /// Analyzer run has been enqueued but has not started yet.
     Queued,
+    /// Analyzer run is currently executing.
     Running,
+    /// Analyzer run has not been recorded for the current view. The
+    /// staleness / scheduling machinery may or may not have enqueued
+    /// one; [`ReasonCode`] carries the specific cause.
     Missing,
+    /// Analyzer run terminated with an error.
     Failed,
+    /// Analyzer intentionally skipped the workspace (e.g. no matching
+    /// files, workspace declared unsuitable). Positive.
     Skipped,
+    /// Recorded run is older than the linked-in analyzer revision and
+    /// is being reprocessed or awaiting reprocessing.
     Stale,
+    /// Analyzer does not apply to this view (e.g. the language has no
+    /// workspace analyzer of the relevant tier). Positive.
     NotApplicable,
 }
 
 /// Machine-readable reason for a non-ready or intentionally skipped
 /// Tier-3 analyzer entry.
+///
+/// Serialized as the `snake_case` variant name. This type has no
+/// `#[serde(other)]` fallback: an unknown string fails
+/// deserialization. Raw-JSON consumers that need to tolerate
+/// forward-added values should treat any unrecognized string as if
+/// it were `Unknown` before decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
+    /// Analyzer binary or service required to run was not found on
+    /// the host.
     BinaryNotFound,
+    /// The workspace contains no files this analyzer applies to.
     NoMatchingFiles,
+    /// The workspace shape (build files, manifest, etc.) is not
+    /// suitable for this analyzer.
     WorkspaceUnsuitable,
+    /// A prior analyzer run terminated with an error.
     AnalyzerFailed,
+    /// A prior analyzer run exceeded the enforced deadline.
     TimedOut,
+    /// The recorded run is older than the current view expects and is
+    /// awaiting reprocessing.
     Stale,
+    /// The recorded run's `analyzer_revision` is older than the
+    /// linked-in build's revision — a narrower form of `Stale`.
     StaleRevision,
+    /// Analyzer is not applicable to this view.
     NotApplicable,
+    /// No matching workspace analysis run row exists for the target.
     NotRecorded,
+    /// No run has been scheduled for the target yet.
     NotScheduled,
+    /// Cause not classifiable into the buckets above. Producers may
+    /// emit this when adding a new cause before consumers know the
+    /// specific string; it is not a forward-compat deserialization
+    /// fallback (see the type-level note above).
     Unknown,
 }
 
@@ -191,31 +251,60 @@ pub enum ReasonCode {
 /// decide how to plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// Stable machine-readable classification.
     pub code: DiagnosticCode,
+    /// Severity bucket the daemon assigned when emitting the entry.
     pub severity: DiagnosticSeverity,
+    /// Human-readable message; not a stable contract, callers should
+    /// key logic on [`Self::code`] instead.
     pub message: String,
+    /// Language tag this diagnostic applies to, when the daemon
+    /// can attribute it to a single language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Analyzer identifier this diagnostic came from, when
+    /// attributable to a specific analyzer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzer_id: Option<String>,
+    /// Repository alias the diagnostic is scoped to. Omitted for
+    /// repo-agnostic diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Repository-relative file path the diagnostic is scoped to,
+    /// when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Free-form structured details. Shape is per-`code` and is
+    /// intentionally open so producers can add fields without a wire
+    /// break; consumers should treat unknown keys as forward-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
 }
 
 /// Stable diagnostic vocabulary for query response envelopes.
+///
+/// Serialized as the `snake_case` variant name. This type has no
+/// `#[serde(other)]` fallback: an unknown string fails
+/// deserialization. Raw-JSON consumers that want to keep working
+/// when new codes appear should key user-facing behavior on the
+/// codes they recognize and ignore the rest before decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCode {
+    /// No workspace analysis run row exists for the target.
     AnalyzerNotRecorded,
+    /// A run has not yet been enqueued for the target.
     AnalyzerNotScheduled,
+    /// The most recent recorded run terminated with an error.
     AnalyzerFailed,
+    /// The recorded run's revision is behind the current build.
     AnalyzerStale,
+    /// The analyzer binary or service was not found on the host.
     AnalyzerBinaryMissing,
+    /// The workspace shape prevents the analyzer from running.
     WorkspaceUnsuitable,
+    /// The query completed with partial results (some analyzers
+    /// failed or timed out); the result is still usable.
     QueryFailedPartial,
     /// A lookup without an exact file target could not prove that its empty
     /// result came from the current fully reconciled snapshot.
@@ -229,11 +318,19 @@ pub enum DiagnosticCode {
 }
 
 /// Severity for structured diagnostics.
+///
+/// Serialized as the `snake_case` variant name. Ordering is
+/// deliberately `Info < Warning < Error` so consumers can compare
+/// values directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
+    /// Informational context; no action required.
     Info,
+    /// Degraded but non-fatal condition worth surfacing to the user.
     Warning,
+    /// Condition that prevents the query from producing a fully
+    /// correct answer.
     Error,
 }
 
@@ -242,35 +339,75 @@ pub enum DiagnosticSeverity {
 /// Hints are options, not plans: callers choose whether and how to use them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hint {
+    /// Stable machine-readable classification.
     pub code: HintCode,
+    /// Human-readable message; consumers should key logic on
+    /// [`Self::code`] instead.
     pub message: String,
+    /// Optional coarse-grained action category the caller could take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<HintAction>,
+    /// Suggested next tool name to invoke, when the hint concretely
+    /// points to a follow-up call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Suggested parameter object to merge into the follow-up call.
+    /// Shape depends on [`Self::tool`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    /// Parameter names the caller should drop from its current
+    /// request when re-issuing. Omitted from the wire (via
+    /// `skip_serializing_if`) when empty; consumers see the field
+    /// absent rather than an empty array.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drop_params: Vec<String>,
+    /// Human-facing target string the hint refers to, e.g. a repo
+    /// alias or symbol name. Omitted when no single target applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
 
 /// Stable hint vocabulary for query response envelopes.
+///
+/// Serialized as the `snake_case` variant name. This type has no
+/// `#[serde(other)]` fallback: an unknown string fails
+/// deserialization. Raw-JSON consumers that want to keep working
+/// when new codes appear should ignore hints whose code they do
+/// not recognize before decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HintCode {
+    /// Query returned no rows; suggest relaxing an active filter.
     EmptyResultRelaxFilter,
+    /// Query returned no rows; suggest retrying with `fuzzy=true`.
     EmptyResultTryFuzzy,
+    /// Query returned no rows; suggest widening the search scope.
     EmptyResultWidenScope,
+    /// Result was truncated at the caller-supplied `limit`; suggest
+    /// raising the limit.
     CappedIncreaseLimit,
+    /// Result was truncated at the caller-supplied `limit`; suggest
+    /// narrowing the filter instead of raising the cap.
     CappedNarrowFilter,
+    /// Tier-3 workspace analyzer indexing is in flight; suggest
+    /// waiting and retrying.
     Tier3IndexingWait,
+    /// Tier-3 workspace analyzer is unavailable; suggest an
+    /// alternative query that does not require it.
     Tier3UnavailableAlternative,
+    /// TSX-specific: suggest using [`RefKind::Instantiate`] instead
+    /// of [`RefKind::Call`] for JSX component invocations.
     TsxCallersUseInstantiate,
+    /// Suggest running `cairn ctl repo reindex <alias>` to refresh
+    /// stale analyzer status.
     ReindexViaCli,
+    /// Daemon is still initializing; suggest retrying once
+    /// `status.initialization` reports `Ready`.
     DaemonNotReady,
+    /// The referenced alias is not registered with the daemon.
     RepoNotRegistered,
+    /// The current snapshot lookup could not prove freshness against
+    /// the reconciled repository state.
     SnapshotStale,
     /// Reconcile the repository or wait for the current snapshot to publish
     /// the requested file before trusting an empty result.
@@ -291,13 +428,22 @@ pub enum HintCode {
 }
 
 /// Optional action category for a hint.
+///
+/// Serialized as the `snake_case` variant name. Actions are advisory
+/// and describe the shape of the follow-up, not a required next step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HintAction {
+    /// Loosen one of the filters passed on the current query.
     RelaxFilter,
+    /// Widen the search scope (e.g. drop a repo or path restriction).
     WidenScope,
+    /// Raise the `limit` parameter on the current query.
     IncreaseLimit,
+    /// Wait for background indexing / analysis to catch up before
+    /// retrying.
     WaitForIndex,
+    /// Try a different query shape or tool for the same information.
     TryAlternativeQuery,
 }
 
@@ -335,6 +481,11 @@ pub struct TierAnalyzerStatus {
 }
 
 impl TierAnalyzerStatus {
+    /// True when the analyzer's state represents a positive terminal
+    /// outcome — `Ready`, or one of the two "intentionally has
+    /// nothing to contribute" states (`Skipped`, `NotApplicable`).
+    /// Used by [`TierStatusBody::from_analyzers`] to fold a set of
+    /// entries into a single `ready` flag.
     #[must_use]
     pub fn is_positive(&self) -> bool {
         matches!(
@@ -387,6 +538,9 @@ impl TierStatus {
         }
     }
 
+    /// Wrap a per-query body without any repo-wide view attached.
+    /// Callers add the repo-wide view later via [`Self::with_repo_wide`]
+    /// when the request opted into it.
     #[must_use]
     pub fn from_body(this_query: TierStatusBody) -> Self {
         Self {
@@ -395,6 +549,8 @@ impl TierStatus {
         }
     }
 
+    /// Attach a repo-wide readiness body, typically emitted when a
+    /// caller passed `verbose_tier3=true`.
     #[must_use]
     pub fn with_repo_wide(mut self, repo_wide: TierStatusBody) -> Self {
         self.repo_wide = Some(repo_wide);
@@ -403,6 +559,9 @@ impl TierStatus {
 }
 
 impl TierStatusBody {
+    /// Trivially ready body: `ready=true` with an empty analyzer
+    /// list. Used when no workspace analyzers are relevant to the
+    /// query.
     #[must_use]
     pub fn ready() -> Self {
         Self {
@@ -411,6 +570,9 @@ impl TierStatusBody {
         }
     }
 
+    /// Construct a body from a set of analyzer entries and derive
+    /// `ready` as "every entry is positive" per
+    /// [`TierAnalyzerStatus::is_positive`].
     #[must_use]
     pub fn from_analyzers(analyzers: Vec<TierAnalyzerStatus>) -> Self {
         Self {

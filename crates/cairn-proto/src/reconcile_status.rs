@@ -113,6 +113,15 @@ pub struct RepoReconcileStatus {
     pub retry_scheduled: bool,
 }
 
+/// Deserialization default when a payload omits `watcher_state`
+/// entirely. Producers on this codebase always populate the field
+/// verbatim from the storage column, so this sentinel is only
+/// reached when reading payloads emitted before the field existed
+/// (or when a future producer somehow drops it). "unknown" is a
+/// deliberately non-DB-value so downstream logic that matches on
+/// the documented DB values (`"starting"` / `"active"` / `"failed"`
+/// / `"stopped"`) does not misclassify a missing field as one of
+/// them.
 fn default_watcher_state() -> String {
     "unknown".to_string()
 }

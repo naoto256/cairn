@@ -185,10 +185,19 @@ pub struct JobsPruneRepoEntry {
 // ─── status ────────────────────────────────────────────────────────────────
 
 /// Stable daemon-startup state exposed by [`StatusReport`].
+///
+/// Wire strings are the `snake_case` variant names (`"initializing"`,
+/// `"ready"`). Older daemons (pre-0.8.0) bound the control socket only
+/// after initialization completed, so the missing-field default on
+/// [`StatusReport::initialization`] resolves to `Ready`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonInitializationState {
+    /// Socket accepts `status` and `shutdown` while the daemon is still
+    /// running through the ordered startup phases below.
     Initializing,
+    /// All seven startup phases have completed and the daemon is
+    /// serving the full control and data surface.
     Ready,
 }
 
@@ -208,6 +217,10 @@ pub enum DaemonInitializationPhase {
 }
 
 impl DaemonInitializationPhase {
+    /// Number of ordered work phases the daemon runs before reaching
+    /// [`Self::Ready`]. Held stable so consumers can render a fixed
+    /// denominator (`completed / TOTAL_PHASES`) regardless of which
+    /// phase is currently in flight.
     pub const TOTAL_PHASES: u8 = 7;
 
     /// Number of work phases completed before this phase became current.
@@ -278,17 +291,36 @@ impl DaemonInitializationDetail {
 }
 
 /// One monotonic daemon-startup observation.
+///
+/// Emitted inside [`StatusReport::initialization`]. Successive samples
+/// have non-decreasing `phase` and `completed_phases`. `detail` is a
+/// closed enum for confidentiality — see [`DaemonInitializationDetail`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonInitializationStatus {
+    /// Coarse-grained bucket. Distinguishes `Initializing` from `Ready`
+    /// without inspecting the phase.
     pub state: DaemonInitializationState,
+    /// Ordered startup phase currently in progress, or `Ready` once
+    /// startup has fully completed.
     pub phase: DaemonInitializationPhase,
+    /// Number of prior phases already completed. Ranges over
+    /// `0..=TOTAL_PHASES`.
     pub completed_phases: u8,
+    /// Total number of ordered work phases. Currently equal to
+    /// [`DaemonInitializationPhase::TOTAL_PHASES`], but carried on the
+    /// wire so clients do not need to hard-code the constant.
     pub total_phases: u8,
+    /// Closed-vocabulary label for the specific operation the daemon
+    /// is executing inside the current phase. Omitted on the wire
+    /// when the daemon has nothing narrower to report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<DaemonInitializationDetail>,
 }
 
 impl DaemonInitializationStatus {
+    /// Build an `Initializing` observation at `phase` with an optional
+    /// narrower `detail`. Panics if `phase` is `Ready` — use
+    /// [`Self::ready`] for that terminal state instead.
     #[must_use]
     pub const fn initializing(
         phase: DaemonInitializationPhase,
@@ -304,6 +336,9 @@ impl DaemonInitializationStatus {
         }
     }
 
+    /// Terminal "startup finished" observation. All counters saturate
+    /// at [`DaemonInitializationPhase::TOTAL_PHASES`] and `detail` is
+    /// cleared.
     #[must_use]
     pub const fn ready() -> Self {
         Self {
@@ -315,6 +350,7 @@ impl DaemonInitializationStatus {
         }
     }
 
+    /// True when the observation reports the terminal `Ready` state.
     #[must_use]
     pub const fn is_ready(&self) -> bool {
         matches!(self.state, DaemonInitializationState::Ready)
@@ -350,6 +386,9 @@ pub struct RepoStatus {
     /// Repository root path as registered with the daemon.
     pub root: String,
     /// Whether a missing root is retained instead of auto-pruned.
+    /// Reflects the daemon's removal-safe lifecycle policy for this
+    /// alias. Absent on the wire from clients that predate the field;
+    /// deserialized as `false` in that case.
     #[serde(default)]
     pub persistent: bool,
     /// Snapshot manifests reachable through this repo's anchors.
@@ -382,29 +421,54 @@ impl RepoStatus {
 }
 
 /// State-count summary for analyzer jobs.
+///
+/// Zero-valued fields are omitted on the wire, so absent buckets
+/// deserialize back as `0`. `total` is populated by the daemon and
+/// is not automatically recomputed from the per-state counts on the
+/// client side.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobSummary {
+    /// Jobs enqueued but not yet running.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub queued: u64,
+    /// Jobs the scheduler currently reports as executing.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub running: u64,
+    /// Jobs that finished successfully — a straight count of rows
+    /// whose persisted status is `succeeded`. There is no separate
+    /// `ready` bucket in the wire shape; the daemon-side summarizer
+    /// only tallies this field, it does not remap categories.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub succeeded: u64,
+    /// Jobs the analyzer intentionally skipped (e.g. no matching
+    /// files, workspace unsuitable).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped: u64,
+    /// Jobs that finished with an error.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub failed: u64,
+    /// Jobs terminated by the timeout enforcement path.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub timed_out: u64,
+    /// Jobs cancelled via `jobs.cancel` or a shutdown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cancelled: u64,
+    /// Catch-all bucket for daemon-side states that do not map to any
+    /// of the named buckets above. Present so future producers can
+    /// contribute new states without a wire break.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub other: u64,
+    /// Total count reported by the daemon. Consumers should treat
+    /// this as authoritative rather than summing the named buckets,
+    /// since additional states may land in `other`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub total: u64,
 }
 
 impl JobSummary {
+    /// True when the daemon reported no analyzer jobs for the enclosing
+    /// scope. Used by [`RepoStatus`] as the `skip_serializing_if` guard
+    /// to keep empty summaries off the wire.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.total == 0
@@ -661,6 +725,19 @@ pub struct RemoveRepoArgs {
 /// have nothing structured to say beyond "it worked". Callers that
 /// only care about success can ignore the body and rely on the
 /// JSON-RPC `result` vs `error` discriminator.
+///
+/// Wire note: the `register_repo` and `reindex_repo` handlers splice
+/// additional fields into the JSON `result` object after serializing
+/// this struct — currently a `jobs` array of queued-job receipts
+/// (`QueuedAnalyzerJob { job_id, analyzer_id, state }` today, where
+/// `job_id` is a JSON number) for both verbs, and a `reconcile`
+/// sub-object for `reindex_repo` when the request went through the
+/// reconcile path. On the reconcile path `jobs` is emitted as an
+/// empty array for wire compatibility; new consumers should read
+/// `reconcile` on that path. These splice fields are not modeled on
+/// this Rust type; consumers that only need the acknowledgement can
+/// deserialize `Ack` and ignore the extras, and consumers that need
+/// the extras should read the JSON value directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ack {
     /// Always true for successful JSON-RPC results using this payload.
@@ -673,12 +750,20 @@ pub struct Ack {
     /// fails. `register_repo` uses this when indexing and alias
     /// registration completed but the live filesystem watcher could
     /// not be installed.
+    ///
+    /// Other mutating verbs (`remove_repo`, `reindex_repo`,
+    /// `shutdown`) leave this `None`, and the field is omitted on
+    /// the wire in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watcher_failed: Option<String>,
 }
 
 impl Ack {
     /// Build a successful acknowledgement with no repo alias.
+    ///
+    /// Used by non-repo-scoped verbs such as `shutdown`; leaves both
+    /// `alias` and `watcher_failed` `None`, so both fields are
+    /// omitted on the wire.
     #[must_use]
     pub fn ok() -> Self {
         Self {
@@ -689,6 +774,10 @@ impl Ack {
     }
 
     /// Build a successful acknowledgement for a repo-scoped operation.
+    ///
+    /// Used by `remove_repo`, `reindex_repo`, and the
+    /// success-without-watcher-failure branch of `register_repo`.
+    /// Leaves `watcher_failed` `None`.
     #[must_use]
     pub fn with_alias(alias: impl Into<String>) -> Self {
         Self {
@@ -700,6 +789,9 @@ impl Ack {
 
     /// Build a successful `register_repo` acknowledgement when the repo was
     /// registered but the live watcher could not be installed.
+    ///
+    /// Currently the only constructor that populates
+    /// [`Ack::watcher_failed`].
     #[must_use]
     pub fn with_alias_and_watcher_failed(alias: impl Into<String>, reason: String) -> Self {
         Self {

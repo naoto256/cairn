@@ -334,6 +334,16 @@ pub trait LanguageBackend: Send + Sync {
 
     /// Optional semantic Analyzer. Returns `None` when the backend has
     /// nothing beyond the syntactic floor.
+    ///
+    /// `None` is a per-backend "no in-process Analyzer" signal — not a
+    /// claim that the language lacks semantic capability entirely.
+    /// Client-facing capability reporting (the `has_analyzer` flag on
+    /// a `LanguageEnrichment`) additionally consults the registered
+    /// workspace-analyzer set, so a backend that returns `None` here
+    /// can still surface `has_analyzer=true` when its `parser_id` is
+    /// claimed by a workspace analyzer. Realized `tier=Semantic` on a
+    /// snapshot, in contrast, is driven only by `blobs.analyzer_id`
+    /// — the in-process pass wired through this method.
     fn analyzer(&self) -> Option<Arc<dyn Analyzer>> {
         None
     }
@@ -354,6 +364,13 @@ pub trait Analyzer: Send + Sync {
 
     /// Monotonic revision for this analyzer's semantic output. Bump
     /// when the same input would produce different semantic facts.
+    ///
+    /// Written to `blobs.analyzer_revision` and checked orthogonally
+    /// to [`LanguageBackend::parser_revision`] by
+    /// `cas::blob::reuse_or_compute`: either dimension drifting
+    /// forces a re-parse of that blob. Forgetting to bump when the
+    /// output shape changes is the classic stale-facts trap — the
+    /// row silently keeps serving pre-change data.
     fn revision(&self) -> u32 {
         1
     }
@@ -367,13 +384,26 @@ pub trait Analyzer: Send + Sync {
     /// Returns [`ExtractError`] when the input cannot be parsed.
     /// A successful but empty result (no impls / imports / doc
     /// overrides) is reported by returning `Ok(SemanticFacts::default())`.
+    ///
+    /// The daemon's `cas::parse` bundler treats a semantic `Err` as
+    /// non-fatal: it debug-logs and stores the blob with
+    /// `semantic: None` so Tier-1 facts remain indexable. The error
+    /// is debug-logged but not returned or persisted as a structured
+    /// diagnostic.
     fn extract_semantic(&self, source: &[u8]) -> Result<SemanticFacts, ExtractError>;
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
+    /// Source buffer was not valid UTF-8. Wraps the underlying
+    /// [`std::str::Utf8Error`] so backends that need a `&str` view
+    /// can `?`-propagate the conversion.
     #[error("invalid utf-8 in source: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
+    /// Backend-specific parse failure. Returned when a parser (tree-sitter
+    /// or an analyzer-side parser such as `syn`) could not produce any
+    /// facts. Partial parses should still return `Ok` — this variant is
+    /// for the "nothing usable at all" case.
     #[error("parser failed: {0}")]
     ParserFailure(String),
 }

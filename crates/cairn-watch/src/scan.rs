@@ -17,6 +17,19 @@ use tracing::warn;
 use crate::matcher::{RepoIgnoreMatcher, resolve_git_metadata};
 
 /// One observed file inside the repo.
+///
+/// Fields:
+/// - `path`: absolute path as reported by the walker (not
+///   canonicalized beyond whatever `repo_root` provided).
+/// - `mtime_ns`: last-modified time in nanoseconds since the Unix
+///   epoch, converted from `Duration::as_nanos()` to `i128` and
+///   saturating the far-future overflow case at `i128::MAX` in
+///   `modified_time_ns` rather than wrapping. Pre-epoch times are
+///   propagated as `Err` upstream rather than silently coerced.
+/// - `size_bytes`: file length from `Metadata::len` at scan time.
+/// - `is_executable`: Unix-only mode-bit check (`0o111`). Always
+///   `false` on non-Unix — the platform-specific `is_executable`
+///   below returns `false` unconditionally there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
     pub path: PathBuf,
@@ -25,10 +38,27 @@ pub struct ScannedFile {
     pub is_executable: bool,
 }
 
+/// Maximum number of retained [`ScanErrorSample`] entries per scan.
+/// Excess errors are counted in [`ScanErrors::total`] but their bodies
+/// are dropped, so a pathological scan cannot blow up memory while
+/// still producing enough diagnostics to explain a failure.
 const MAX_SCAN_ERROR_SAMPLES: usize = 64;
+/// Byte cap for a single sample's `message`. Messages longer than
+/// this are truncated to the nearest char boundary so the retained
+/// text stays valid UTF-8.
 const MAX_SCAN_ERROR_MESSAGE_BYTES: usize = 1024;
 
 /// Filesystem operation that failed during a full scan.
+///
+/// Variants cover every point where a scan can lose information:
+/// resolving git metadata, building the ignore matcher, probing a
+/// nested-boundary marker during walk filtering, an error from the
+/// walker itself, reading per-entry metadata, and reading a
+/// per-entry modified time.
+///
+/// Ordering matters: `ScanErrors::record` uses the derived `Ord`
+/// on `(operation, path, message)` to decide which sample to keep
+/// when `MAX_SCAN_ERROR_SAMPLES` is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScanOperation {
     ResolveGitMetadata,
@@ -56,10 +86,23 @@ pub struct ScanErrors {
 }
 
 impl ScanErrors {
+    /// True when no filesystem operation reported an error during
+    /// the scan, including the ones dropped past the sample cap.
     pub fn is_empty(&self) -> bool {
         self.total == 0
     }
 
+    /// Record one diagnostic.
+    ///
+    /// `total` always advances, even when the sample is dropped
+    /// past [`MAX_SCAN_ERROR_SAMPLES`], so the count stays honest.
+    /// While the sample buffer has room the new sample is appended;
+    /// once full, the buffer keeps the lexicographically smallest
+    /// samples by `(operation, path, message)` by evicting the
+    /// current maximum whenever a strictly smaller candidate
+    /// arrives. This makes retention deterministic and independent
+    /// of the order errors surfaced (see the order-independence
+    /// test).
     fn record(
         &mut self,
         operation: ScanOperation,
@@ -89,12 +132,20 @@ impl ScanErrors {
         }
     }
 
+    /// Sort retained samples so a report snapshot is stable across
+    /// runs — retention is order-independent, but the insertion
+    /// order into the buffer is not.
     fn finish(&mut self) {
         self.samples.sort();
     }
 }
 
 /// Complete result of walking a repository.
+///
+/// `entries` may be non-empty even when `errors` is non-empty —
+/// the walker collects what it can before surfacing failures.
+/// Callers must not publish a partial snapshot; use
+/// [`Self::into_entries`] to enforce that gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanReport {
     pub root: PathBuf,
@@ -248,6 +299,9 @@ pub fn walk_repo(repo_root: &Path) -> ScanReport {
     }
 }
 
+/// Lift a walker entry into a [`ScannedFile`], skipping non-files
+/// (directories, symlinks, unknown types) and recording metadata /
+/// modified-time failures into `errors` before returning `None`.
 fn scanned_from_entry(entry: DirEntry, errors: &Arc<Mutex<ScanErrors>>) -> Option<ScannedFile> {
     if !entry.file_type().is_some_and(|t| t.is_file()) {
         return None;
@@ -282,11 +336,22 @@ fn scanned_from_entry(entry: DirEntry, errors: &Arc<Mutex<ScanErrors>>) -> Optio
     })
 }
 
+/// Convert a `SystemTime` to nanoseconds since the Unix epoch.
+///
+/// Pre-epoch times (which `duration_since(UNIX_EPOCH)` reports as an
+/// error) are propagated rather than clamped to zero, so a broken
+/// clock does not silently look like every file changed at t=0.
+/// Post-epoch values that overflow `i128::MAX` saturate — a
+/// threshold far beyond any realistic filesystem timestamp.
 fn modified_time_ns(modified: std::time::SystemTime) -> Result<i128, std::time::SystemTimeError> {
     let elapsed = modified.duration_since(std::time::UNIX_EPOCH)?;
     Ok(i128::try_from(elapsed.as_nanos()).unwrap_or(i128::MAX))
 }
 
+/// Append one diagnostic under the shared errors mutex. Poisoned
+/// mutexes are unwrapped in place — every write here is monotonic
+/// (counter bump + bounded push), so continuing past a poison does
+/// not leave the accumulator in a torn state.
 fn record_error(
     errors: &Arc<Mutex<ScanErrors>>,
     operation: ScanOperation,
@@ -299,6 +364,12 @@ fn record_error(
     guard.record(operation, path, error.to_string());
 }
 
+/// Extract the accumulated `ScanErrors` back out of the shared
+/// `Arc<Mutex<_>>`. Prefers the unshared path (single owner ⇒ move
+/// out of the mutex) and falls back to a clone under the lock when
+/// another reference still exists (in practice, only if the walker's
+/// filter thread held a stray `Arc` past this point). Poison is
+/// unwrapped in place for the same reason as [`record_error`].
 fn take_errors(errors: Arc<Mutex<ScanErrors>>) -> ScanErrors {
     match Arc::try_unwrap(errors) {
         Ok(mutex) => mutex
@@ -311,6 +382,10 @@ fn take_errors(errors: Arc<Mutex<ScanErrors>>) -> ScanErrors {
     }
 }
 
+/// Recurse through `ignore::Error` wrapper variants to find the
+/// path the walker was inspecting when it failed. Returns `None`
+/// for errors that carry no path (e.g. generic I/O errors reported
+/// against the walk itself); callers substitute the repo root.
 fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
     match error {
         ignore::Error::Partial(errors) => errors.iter().find_map(ignore_error_path),
@@ -323,6 +398,10 @@ fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
     }
 }
 
+/// Truncate `value` to at most `max_bytes`, backing up to the
+/// nearest `char` boundary so the result is still valid UTF-8. Used
+/// only for the retained error `message` — the diagnostic's textual
+/// meaning is preserved for anything under the cap.
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
