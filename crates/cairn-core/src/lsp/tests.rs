@@ -37,6 +37,7 @@ enum FakeMode {
     RequireServerStatusOptIn,
     RequireDidOpen,
     RequireProgressCreateResponse,
+    RequireUnknownRequestResponse,
     RecordDocumentSync(tokio::sync::mpsc::UnboundedSender<Value>),
 }
 
@@ -44,6 +45,7 @@ async fn fake_server(stream: DuplexStream, mode: FakeMode) {
     let (mut reader, mut writer) = split(stream);
     let mut did_open = false;
     let mut progress_create_response = false;
+    let mut unknown_request_response = false;
     let mut pending_definition = None;
     while let Some(message) = read_lsp_message(&mut reader).await.unwrap() {
         let method = message.get("method").and_then(Value::as_str);
@@ -51,6 +53,14 @@ async fn fake_server(stream: DuplexStream, mode: FakeMode) {
         match (method, id) {
             (None, Some(9001)) if matches!(mode, FakeMode::RequireProgressCreateResponse) => {
                 progress_create_response = true;
+                if let Some(id) = pending_definition.take() {
+                    write_definition_result(&mut writer, id).await;
+                }
+            }
+            (None, Some(9002)) if matches!(mode, FakeMode::RequireUnknownRequestResponse) => {
+                assert_eq!(message["error"]["code"], -32601);
+                assert_eq!(message["error"]["message"], "Method not found");
+                unknown_request_response = true;
                 if let Some(id) = pending_definition.take() {
                     write_definition_result(&mut writer, id).await;
                 }
@@ -132,6 +142,19 @@ async fn fake_server(stream: DuplexStream, mode: FakeMode) {
                     .await
                     .unwrap();
                 }
+                if matches!(mode, FakeMode::RequireUnknownRequestResponse) {
+                    write_lsp_message(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": 9002,
+                            "method": "cairn/unsupportedServerRequest",
+                            "params": {}
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
                 if matches!(
                     mode,
                     FakeMode::ProgressCompletes | FakeMode::ProgressNeverEnds
@@ -191,8 +214,10 @@ async fn fake_server(stream: DuplexStream, mode: FakeMode) {
             (Some("textDocument/definition"), Some(id)) => {
                 if matches!(mode, FakeMode::DefinitionTimeout) {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                } else if matches!(mode, FakeMode::RequireProgressCreateResponse)
-                    && !progress_create_response
+                } else if (matches!(mode, FakeMode::RequireProgressCreateResponse)
+                    && !progress_create_response)
+                    || (matches!(mode, FakeMode::RequireUnknownRequestResponse)
+                        && !unknown_request_response)
                 {
                     pending_definition = Some(id);
                 } else if matches!(mode, FakeMode::RequireDidOpen) && !did_open {

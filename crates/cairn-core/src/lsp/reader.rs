@@ -7,6 +7,7 @@
 //! `ProgressState`, which `wait_for_quiescence` consults to decide
 //! when the initial workspace load has settled.
 use std::collections::{HashMap, HashSet};
+use std::future::{Future, ready};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -24,16 +25,16 @@ use super::transport::{read_lsp_message, write_lsp_message};
 /// message.
 ///
 /// Per-message dispatch, first match wins:
-/// - server-to-client requests we support (currently only
-///   `window/workDoneProgress/create`) are answered inline through
-///   `writer`; a failed reply write is ignored here
+/// - server-to-client requests are answered inline through `writer`;
+///   `window/workDoneProgress/create` receives its supported result
+///   and unknown methods receive JSON-RPC `-32601`; a failed reply
+///   write is ignored here
 /// - responses are matched against `pending` by numeric id; a
 ///   response whose waiter is gone (e.g. the request timed out) is
 ///   dropped
 /// - `$/progress` and `rust-analyzer/serverStatus` notifications
 ///   update `progress`
-/// - other notifications are logged at debug level and discarded;
-///   other server requests are silently dropped without a response
+/// - other notifications are logged at debug level and discarded
 ///
 /// On EOF or read error the loop clears `alive` and fails every
 /// pending waiter (see `fail_pending`), so callers blocked on a
@@ -215,7 +216,27 @@ impl ProgressState {
         &self,
         quiet_period: Duration,
     ) -> WorkspaceLoadComplete {
+        self.wait_for_quiescence_inner(quiet_period, || ready(()))
+            .await
+    }
+
+    async fn wait_for_quiescence_inner<F, Fut>(
+        &self,
+        quiet_period: Duration,
+        mut after_snapshot: F,
+    ) -> WorkspaceLoadComplete
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         loop {
+            // Register before reading the snapshot. Otherwise a
+            // begin+end pair can land after a non-ready snapshot but
+            // before `notified().await`, leaving no future event to
+            // wake this waiter.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let ready_seq = {
                 let inner = self.inner.lock().await;
                 if inner.saw_begin && inner.active_tokens.is_empty() {
@@ -224,6 +245,7 @@ impl ProgressState {
                     None
                 }
             };
+            after_snapshot().await;
 
             if let Some(seq) = ready_seq {
                 tokio::select! {
@@ -236,12 +258,26 @@ impl ProgressState {
                             return WorkspaceLoadComplete::ProgressQuiescence;
                         }
                     }
-                    () = self.notify.notified() => {}
+                    () = &mut notified => {}
                 }
             } else {
-                self.notify.notified().await;
+                notified.await;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_for_quiescence_with_snapshot_hook<F, Fut>(
+        &self,
+        quiet_period: Duration,
+        after_snapshot: F,
+    ) -> WorkspaceLoadComplete
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.wait_for_quiescence_inner(quiet_period, after_snapshot)
+            .await
     }
 }
 
@@ -271,22 +307,30 @@ fn is_server_status_notification(message: &Value) -> bool {
         && message.get("method").and_then(Value::as_str) == Some("rust-analyzer/serverStatus")
 }
 
-/// Build the reply for server-to-client requests this client
-/// supports.
+/// Build the reply for a server-to-client request.
 ///
-/// Only `window/workDoneProgress/create` is handled; it is answered
-/// with a `null` result, matching the spec's void response. `None`
-/// means the message is not such a request and dispatch continues.
+/// `window/workDoneProgress/create` is answered with a `null`
+/// result, matching the spec's void response. Other methods receive
+/// JSON-RPC `-32601` so servers do not wait forever for a reply.
+/// `None` means the message is not an id-bearing request and
+/// dispatch continues.
 fn server_request_response(message: &Value) -> Option<Value> {
     let id = message.get("id")?;
     let method = message.get("method")?.as_str()?;
-    if method != "window/workDoneProgress/create" {
-        return None;
+    if method == "window/workDoneProgress/create" {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": Value::Null,
+        }));
     }
     Some(json!({
         "jsonrpc": "2.0",
         "id": id,
-        "result": Value::Null,
+        "error": {
+            "code": -32601,
+            "message": "Method not found",
+        },
     }))
 }
 

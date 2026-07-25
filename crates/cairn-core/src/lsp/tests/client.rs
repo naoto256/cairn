@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn initialize_definition_and_shutdown_roundtrip() {
@@ -501,6 +502,40 @@ async fn server_work_done_progress_request_is_answered_before_definition() {
 }
 
 #[tokio::test]
+async fn unknown_server_request_receives_method_not_found_response() {
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let server = tokio::spawn(fake_server(
+        server_io,
+        FakeMode::RequireUnknownRequestResponse,
+    ));
+    let (client_reader, client_writer) = split(client_io);
+    let client = LspClient::start_with_io(
+        client_reader,
+        client_writer,
+        Path::new("/tmp/cairn fake"),
+        "cfg",
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    let locations = client
+        .definition(
+            &Url::from("file:///tmp/cairn%20fake/src/lib.rs"),
+            Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(locations.len(), 1);
+    client.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn pending_map_is_cleared_on_timeout() {
     // A server that never replies must not leak pending request
     // entries. Drive a definition call against the
@@ -536,6 +571,108 @@ async fn pending_map_is_cleared_on_timeout() {
         client.pending.lock().await.is_empty(),
         "pending map leaked entries on timeout"
     );
+}
+
+#[tokio::test]
+async fn request_timeout_covers_backpressured_stdin_write() {
+    let (client, server) = backpressured_client().await;
+    let large_uri = Url::from(format!("file:///tmp/cairn/{}", "x".repeat(64 * 1024)));
+
+    let err = client
+        .definition(
+            &large_uri,
+            Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::RequestTimeout));
+    assert!(
+        client.pending.lock().await.is_empty(),
+        "timed-out write must reclaim its pending request"
+    );
+    let retry = client
+        .definition(
+            &Url::from("file:///tmp/cairn/src/lib.rs"),
+            Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(retry, Error::ServerExited(_)));
+    server.abort();
+}
+
+#[tokio::test]
+async fn notification_timeout_covers_backpressured_stdin_write() {
+    let (client, server) = backpressured_client().await;
+    let uri = Url::from("file:///tmp/cairn/src/large.rs");
+
+    let err = client
+        .did_open(&uri, "rust", 1, &"x".repeat(64 * 1024))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::RequestTimeout));
+    let retry = client
+        .definition(
+            &Url::from("file:///tmp/cairn/src/lib.rs"),
+            Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(retry, Error::ServerExited(_)));
+    server.abort();
+}
+
+async fn backpressured_client() -> (LspClient, tokio::task::JoinHandle<()>) {
+    let (client_io, server_io) = tokio::io::duplex(256);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut reader, mut writer) = split(server_io);
+        let initialize = read_lsp_message(&mut reader)
+            .await
+            .unwrap()
+            .expect("initialize request");
+        let id = initialize["id"].as_u64().unwrap();
+        write_lsp_message(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "capabilities": {} },
+            }),
+        )
+        .await
+        .unwrap();
+        let initialized = read_lsp_message(&mut reader)
+            .await
+            .unwrap()
+            .expect("initialized notification");
+        assert_eq!(initialized["method"], "initialized");
+        ready_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (client_reader, client_writer) = split(client_io);
+    let client = LspClient::start_with_io(
+        client_reader,
+        client_writer,
+        Path::new("/tmp/cairn"),
+        "cfg",
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+    ready_rx.await.unwrap();
+    (client, server)
 }
 
 fn python3() -> Option<std::path::PathBuf> {
