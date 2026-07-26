@@ -516,6 +516,7 @@ mod tests {
         assert_eq!(lib_entry.blob_sha, git_blob_sha(b"fn x() {}\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn committed_and_worktree_manifests_both_skip_symlinks() {
         let (repo, _) = init_repo(&[("src/real.rs", "fn real() {}\n")]);
