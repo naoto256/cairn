@@ -9,10 +9,13 @@
 //! `restore_from_db`) keeps all runtime-only snapshot fields
 //! `None`, meaning "not tracked by this process".
 //!
-//! Entries are inserted at enqueue time and are not removed when a
-//! job finishes: terminal entries stay readable for `jobs list`
-//! decoration until the daemon exits.
+//! The map has a soft cap of 1,000 entries. Active jobs are never
+//! evicted; terminal jobs are retained for retrospective decoration
+//! while they fit, then the oldest terminal entries are discarded.
+//! If active jobs alone exceed the cap, all of them remain tracked.
 use super::*;
+
+const MAX_RUNTIME_METRICS_ENTRIES: usize = 1_000;
 
 /// Shared handle to the per-job runtime metrics map; `Clone`
 /// copies the handle, not the map.
@@ -47,6 +50,29 @@ struct JobRuntimeMetrics {
 }
 
 impl JobRuntimeMetricsStore {
+    /// Enforce the soft total-entry cap without evicting active jobs.
+    ///
+    /// The `JobId` tiebreaker makes eviction deterministic when
+    /// multiple terminal transitions receive the same timestamp.
+    fn evict_oldest_terminal_over_cap(metrics: &mut HashMap<JobId, JobRuntimeMetrics>) {
+        while metrics.len() > MAX_RUNTIME_METRICS_ENTRIES {
+            let oldest = metrics
+                .iter()
+                .filter_map(|(&job_id, entry)| {
+                    entry
+                        .finished_at_ns
+                        .map(|finished_at| (finished_at, job_id))
+                })
+                .min();
+            let Some((_, job_id)) = oldest else {
+                // Active jobs are protected even when they alone
+                // exceed the configured soft cap.
+                break;
+            };
+            metrics.remove(&job_id);
+        }
+    }
+
     /// Create the job's runtime record at enqueue time. An insert
     /// for an id that already has an entry would reset it
     /// wholesale, but job ids are allocator-unique, so in practice
@@ -57,23 +83,22 @@ impl JobRuntimeMetricsStore {
         pool_group: Option<&'static str>,
         enqueued_at_ns: i64,
     ) {
-        self.inner
-            .lock()
-            .expect("job metrics lock poisoned")
-            .insert(
-                job_id,
-                JobRuntimeMetrics {
-                    enqueued_at_ns,
-                    pool_group: pool_group.map(str::to_string),
-                    scheduler_state: "queued".into(),
-                    pool_wait_started_at_ns: None,
-                    pool_wait_ms: 0,
-                    run_started_at_ns: None,
-                    finished_at_ns: None,
-                    progress_ticks: 0,
-                    last_progress_at_ns: None,
-                },
-            );
+        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
+        metrics.insert(
+            job_id,
+            JobRuntimeMetrics {
+                enqueued_at_ns,
+                pool_group: pool_group.map(str::to_string),
+                scheduler_state: "queued".into(),
+                pool_wait_started_at_ns: None,
+                pool_wait_ms: 0,
+                run_started_at_ns: None,
+                finished_at_ns: None,
+                progress_ticks: 0,
+                last_progress_at_ns: None,
+            },
+        );
+        Self::evict_oldest_terminal_over_cap(&mut metrics);
     }
 
     /// Record that the scheduler observed the job blocked behind
@@ -99,6 +124,7 @@ impl JobRuntimeMetricsStore {
         entry.pool_group = Some(pool_group.to_string());
         entry.scheduler_state = "waiting_pool_group".into();
         entry.pool_wait_started_at_ns.get_or_insert(now);
+        Self::evict_oldest_terminal_over_cap(&mut metrics);
     }
 
     /// Worker-start transition: close any open pool-wait window into
@@ -139,18 +165,15 @@ impl JobRuntimeMetricsStore {
         }
     }
 
-    /// Terminal transition: `state` is the final `RunStatus`
-    /// string. Also closes any still-open pool-wait window — a job
-    /// cancelled while waiting for its group never passed through
-    /// `mark_running`.
+    /// Terminal transition: preserve final metrics for retrospective
+    /// decoration, then evict the oldest terminal entry if the soft
+    /// total-entry cap is exceeded. Also closes any still-open
+    /// pool-wait window — a job cancelled while waiting for its group
+    /// never passed through `mark_running`.
     pub(super) fn mark_finished(&self, job_id: JobId, state: &str) {
         let now = now_ns();
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("job metrics lock poisoned")
-            .get_mut(&job_id)
-        {
+        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
+        if let Some(entry) = metrics.get_mut(&job_id) {
             if let Some(started) = entry.pool_wait_started_at_ns.take() {
                 entry.pool_wait_ms = entry
                     .pool_wait_ms
@@ -159,6 +182,7 @@ impl JobRuntimeMetricsStore {
             entry.scheduler_state = state.to_string();
             entry.finished_at_ns = Some(now);
         }
+        Self::evict_oldest_terminal_over_cap(&mut metrics);
     }
 
     /// Fail a worker run only when no concurrent terminal transition
@@ -166,12 +190,8 @@ impl JobRuntimeMetricsStore {
     /// a cancellation recorded while the blocking worker was active.
     pub(super) fn mark_failed_if_unfinished(&self, job_id: JobId) {
         let now = now_ns();
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("job metrics lock poisoned")
-            .get_mut(&job_id)
-        {
+        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
+        if let Some(entry) = metrics.get_mut(&job_id) {
             if entry.finished_at_ns.is_some() {
                 return;
             }
@@ -183,6 +203,7 @@ impl JobRuntimeMetricsStore {
             entry.scheduler_state = RunStatus::Failed.as_str().to_string();
             entry.finished_at_ns = Some(now);
         }
+        Self::evict_oldest_terminal_over_cap(&mut metrics);
     }
 
     /// Merge this store's entry into a snapshot. No-op when the
@@ -276,6 +297,73 @@ mod tests {
         assert_eq!(snapshot.progress_ticks, Some(120));
         assert!(snapshot.last_progress_at.is_some());
         assert!(snapshot.progress_per_minute.is_some());
+    }
+
+    #[test]
+    fn terminal_metrics_are_retained_below_cap_and_decorate_snapshots() {
+        let metrics = JobRuntimeMetricsStore::default();
+        for job_id in 1..=3 {
+            metrics.mark_enqueued(job_id, None, 1_000_000_000);
+            metrics.mark_running(job_id);
+            metrics.mark_progress(job_id, job_id as u64);
+            metrics.mark_finished(job_id, RunStatus::Succeeded.as_str());
+        }
+
+        assert_eq!(metrics.inner.lock().unwrap().len(), 3);
+        for job_id in 1..=3 {
+            let mut snapshot = job(job_id, "pyright-lsp", "succeeded");
+            metrics.decorate(&mut snapshot, now_ns());
+            assert_eq!(
+                snapshot.scheduler_state.as_deref(),
+                Some(RunStatus::Succeeded.as_str())
+            );
+            assert_eq!(snapshot.progress_ticks, Some(job_id as u64));
+            assert!(snapshot.run_ms.is_some());
+        }
+    }
+
+    #[test]
+    fn cap_evicts_oldest_terminal_entry_and_protects_active_jobs() {
+        let metrics = JobRuntimeMetricsStore::default();
+        for job_id in 1..=(MAX_RUNTIME_METRICS_ENTRIES as i64 - 2) {
+            metrics.mark_enqueued(job_id, None, 1_000_000_000);
+        }
+        let newer_terminal = 2_000;
+        let older_terminal = 2_001;
+        metrics.mark_enqueued(newer_terminal, None, 1_000_000_000);
+        metrics.mark_finished(newer_terminal, RunStatus::Succeeded.as_str());
+        metrics.mark_enqueued(older_terminal, None, 1_000_000_000);
+        metrics.mark_finished(older_terminal, RunStatus::Succeeded.as_str());
+        {
+            let mut stored = metrics.inner.lock().unwrap();
+            stored.get_mut(&newer_terminal).unwrap().finished_at_ns = Some(20);
+            stored.get_mut(&older_terminal).unwrap().finished_at_ns = Some(10);
+        }
+
+        let newest_active = 3_000;
+        metrics.mark_enqueued(newest_active, None, 1_000_000_000);
+
+        let stored = metrics.inner.lock().unwrap();
+        assert_eq!(stored.len(), MAX_RUNTIME_METRICS_ENTRIES);
+        assert!(!stored.contains_key(&older_terminal));
+        assert!(stored.contains_key(&newer_terminal));
+        assert!(stored.contains_key(&newest_active));
+        assert!(
+            (1..=(MAX_RUNTIME_METRICS_ENTRIES as i64 - 2))
+                .all(|job_id| stored.contains_key(&job_id))
+        );
+    }
+
+    #[test]
+    fn active_jobs_may_exceed_soft_cap_without_eviction() {
+        let metrics = JobRuntimeMetricsStore::default();
+        for job_id in 1..=(MAX_RUNTIME_METRICS_ENTRIES as i64 + 1) {
+            metrics.mark_enqueued(job_id, None, 1_000_000_000);
+        }
+
+        let stored = metrics.inner.lock().unwrap();
+        assert_eq!(stored.len(), MAX_RUNTIME_METRICS_ENTRIES + 1);
+        assert!(stored.values().all(|entry| entry.finished_at_ns.is_none()));
     }
 
     #[test]

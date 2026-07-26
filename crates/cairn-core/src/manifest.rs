@@ -414,13 +414,14 @@ fn parse_ls_tree(stdout: &[u8]) -> Result<Vec<TreeEntry>> {
             continue;
         };
         let Some(sha) = parts.next() else { continue };
-        if obj_type != "blob" {
-            // Skip submodules (type=commit). Tree entries don't
-            // appear with -r.
+        if obj_type != "blob" || !matches!(mode, "100644" | "100755") {
+            // Only regular and executable files belong in a manifest.
+            // This skips submodules (type=commit), symlinks
+            // (mode=120000), and any future non-file blob modes.
+            // Worktree capture applies the same policy.
             continue;
         }
-        // 100755 is the only executable blob mode; 100644 (regular)
-        // and 120000 (symlink) blobs are not executable.
+        // 100755 is the only executable blob mode.
         out.push(TreeEntry {
             manifest: ManifestEntry {
                 path: path.to_string(),
@@ -480,6 +481,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_ls_tree_skips_symlinks() {
+        let stdout = b"100644 blob aaaa\tsrc/real.rs\x00100755 blob bbbb\tbin/tool\x00120000 blob cccc\tsrc/linked.rs\x00";
+        let parsed = parse_ls_tree(stdout).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].manifest.path, "src/real.rs");
+        assert!(!parsed[0].is_executable);
+        assert_eq!(parsed[1].manifest.path, "bin/tool");
+        assert!(parsed[1].is_executable);
+    }
+
+    #[test]
     fn build_from_git_tree_persists_filtered_entries() {
         let (_repo_tmp, commit) = init_repo(&[
             ("src/lib.rs", "fn x() {}\n"),
@@ -502,6 +514,48 @@ mod tests {
         // blob_sha must match git's own hash-object for the same content.
         let lib_entry = entries.iter().find(|e| e.path == "src/lib.rs").unwrap();
         assert_eq!(lib_entry.blob_sha, git_blob_sha(b"fn x() {}\n"));
+    }
+
+    #[test]
+    fn committed_and_worktree_manifests_both_skip_symlinks() {
+        let (repo, _) = init_repo(&[("src/real.rs", "fn real() {}\n")]);
+        std::os::unix::fs::symlink("real.rs", repo.path().join("src/linked.rs")).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["-C", repo.path().to_str().unwrap(), "add", "src/linked.rs"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let tree = std::process::Command::new("git")
+            .args(["-C", repo.path().to_str().unwrap(), "write-tree"])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap();
+
+        let (_db_tmp, mut c) = fresh_db();
+        let tx = c.transaction().unwrap();
+        let committed_id = build_from_git_tree(&tx, repo.path(), tree.trim(), 100, |hint| {
+            hint.path.ends_with(".rs")
+        })
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = c.transaction().unwrap();
+        let worktree_id =
+            build_from_worktree(&tx, repo.path(), 101, |hint| hint.path.ends_with(".rs")).unwrap();
+        tx.commit().unwrap();
+
+        let committed = get_entries(&c, committed_id).unwrap();
+        let worktree = get_entries(&c, worktree_id).unwrap();
+        assert_eq!(committed, worktree);
+        assert_eq!(
+            committed
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/real.rs"]
+        );
     }
 
     #[test]

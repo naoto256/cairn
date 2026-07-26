@@ -31,8 +31,10 @@ impl JobManager {
     /// manager applies no gating.
     ///
     /// Runtime-metric fields (`scheduler_state`, `queued_ms`, ...)
-    /// stay `None` for jobs this process never held in memory —
-    /// e.g. terminal rows that predate the last daemon restart.
+    /// are present for active jobs and for terminal jobs retained
+    /// within the process-local 1,000-entry soft cap. Older terminal
+    /// rows evicted from that cache, and rows that predate the last
+    /// daemon restart, keep those fields `None`.
     pub(crate) fn jobs(
         &self,
         alias_filter: Option<&str>,
