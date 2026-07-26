@@ -71,9 +71,10 @@ pub struct QueuedAnalyzerJob {
 /// the row's `started_at_ns`, and `started_at` is always `None` on
 /// this path. The fields from `pool_group`
 /// onward are runtime-only scheduler metrics filled in by
-/// `JobRuntimeMetricsStore::decorate`; they stay `None` for jobs
-/// that predate the current daemon process, because the metrics
-/// store is in-memory only and not persisted across restarts.
+/// `JobRuntimeMetricsStore::decorate`; they are present for active
+/// jobs and terminal jobs retained within the process-local
+/// 1,000-entry soft cap. Evicted terminal jobs and rows that predate
+/// the current daemon process keep these fields `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobSnapshot {
     pub job_id: JobId,
