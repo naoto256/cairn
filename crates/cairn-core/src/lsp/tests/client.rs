@@ -2,6 +2,103 @@ use super::*;
 use tokio::sync::oneshot;
 
 #[tokio::test]
+async fn stale_request_snapshot_does_not_write_to_replacement_transport() {
+    let client = Arc::new(LspClient::configured(
+        Path::new("/unused/fake-lsp"),
+        Vec::new(),
+        Vec::new(),
+        Path::new("/tmp/cairn"),
+        Value::Null,
+        Duration::from_secs(1),
+    ));
+    let (old_client_io, old_server_io) = tokio::io::duplex(4096);
+    let (old_reader, old_writer) = split(old_client_io);
+    client.install_transport(old_reader, old_writer).await;
+
+    let snapshot_seen = Arc::new(tokio::sync::Notify::new());
+    let resume_request = Arc::new(tokio::sync::Notify::new());
+    let snapshot_wait = snapshot_seen.notified();
+    tokio::pin!(snapshot_wait);
+    snapshot_wait.as_mut().enable();
+    let stale_client = Arc::clone(&client);
+    let stale_snapshot_seen = Arc::clone(&snapshot_seen);
+    let stale_resume = Arc::clone(&resume_request);
+    let stale = tokio::spawn(async move {
+        stale_client
+            .request_with_snapshot_hook::<Value, _, _>(
+                "stale/request",
+                Value::Null,
+                move || async move {
+                    stale_snapshot_seen.notify_one();
+                    stale_resume.notified().await;
+                },
+            )
+            .await
+    });
+    snapshot_wait.await;
+
+    drop(old_server_io);
+    timeout(Duration::from_millis(100), async {
+        while client.transport_generation() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old reader did not publish transport exit");
+
+    let (new_client_io, mut new_server_io) = tokio::io::duplex(4096);
+    let (new_reader, new_writer) = split(new_client_io);
+    client.install_transport(new_reader, new_writer).await;
+    resume_request.notify_one();
+
+    let stale_err = timeout(Duration::from_millis(100), stale)
+        .await
+        .expect("stale request did not fail promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(stale_err, Error::ServerExited(_)));
+    assert!(
+        timeout(
+            Duration::from_millis(20),
+            read_lsp_message(&mut new_server_io)
+        )
+        .await
+        .is_err(),
+        "stale request was written to the replacement transport"
+    );
+
+    let replacement_client = Arc::clone(&client);
+    let replacement = tokio::spawn(async move {
+        replacement_client
+            .request_with_snapshot_hook::<Value, _, _>("replacement/request", Value::Null, || {
+                std::future::ready(())
+            })
+            .await
+    });
+    let request = timeout(
+        Duration::from_millis(100),
+        read_lsp_message(&mut new_server_io),
+    )
+    .await
+    .expect("replacement request was not written")
+    .unwrap()
+    .unwrap();
+    assert_eq!(request["method"], "replacement/request");
+    let id = request["id"].as_u64().unwrap();
+    write_lsp_message(
+        &mut new_server_io,
+        &json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replacement.await.unwrap().unwrap(),
+        json!({"ok": true}),
+        "replacement transport must remain usable"
+    );
+}
+
+#[tokio::test]
 async fn initialize_definition_and_shutdown_roundtrip() {
     let (client_io, server_io) = tokio::io::duplex(8192);
     let server = tokio::spawn(fake_server(server_io, FakeMode::Normal));

@@ -644,42 +644,20 @@ fn idle_sweep_preserves_entry_with_active_lease() {
 }
 
 #[test]
-fn final_shutdown_does_not_run_entry_shutdown_concurrently_with_idle_sweep() {
+fn bounded_final_shutdown_bypasses_graceful_shutdown_gate() {
     let pool = Arc::new(pool(1));
     let key = test_key(12);
     drop(acquire(&pool, key.clone()).unwrap());
-    age_record(&pool, &key, Duration::from_secs(11));
     let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
 
-    // Hold the per-entry shutdown gate so the sweep can reserve the
-    // record but cannot begin process cleanup. Final shutdown must
-    // wait behind the same gate and honor its own bound.
+    // Hold the graceful shutdown gate. Bounded final shutdown must
+    // bypass it and use the independent process-control path.
     let gate = pool.runtime.block_on(entry.shutdown_gate.lock());
-    let sweep_pool = Arc::clone(&pool);
-    let sweep = std::thread::spawn(move || {
-        sweep_pool.runtime.block_on(LspClientPool::sweep_idle_once(
-            &sweep_pool.registry,
-            Instant::now(),
-            Duration::from_secs(10),
-            Duration::from_secs(1),
-        ))
-    });
-    assert!(wait_for_record_state(
-        &pool,
-        &key,
-        RecordState::Evicting,
-        Duration::from_secs(1)
-    ));
-
-    let shutdown_err = pool
-        .shutdown_all_bounded(Duration::from_millis(20))
-        .unwrap_err();
-    assert!(shutdown_err.is_termination_unproven());
+    pool.shutdown_all_bounded(Duration::from_millis(20))
+        .expect("bounded final shutdown must not wait on graceful shutdown gate");
     assert_eq!(pool.mode(), PoolMode::Stopped);
 
     drop(gate);
-    assert_eq!(sweep.join().unwrap().unwrap(), 1);
-    assert_eq!(pool.mode(), PoolMode::Stopped);
 }
 
 #[test]
@@ -829,6 +807,34 @@ fn pool_force_shutdown_success_returns_running() {
     // to Running.
     pool.force_shutdown_all(Duration::from_millis(50)).unwrap();
     assert_eq!(pool.mode(), PoolMode::Running);
+}
+
+#[test]
+fn published_drain_remains_visible_to_bounded_shutdown() {
+    let pool = pool(2);
+    drop(acquire(&pool, test_key(31)).unwrap());
+    drop(acquire(&pool, test_key(32)).unwrap());
+
+    let mut registry = pool.registry.lock().unwrap();
+    let drain = registry.publish_live_drain();
+    assert_eq!(drain.entries.len(), 2);
+    assert!(
+        registry.entries.is_empty(),
+        "publish and live-map drain must be atomic under the registry lock"
+    );
+    assert_eq!(
+        registry.draining_entries.get(&drain.id).map(Vec::len),
+        Some(2),
+        "bounded shutdown must observe entries after the live map is drained"
+    );
+
+    let bounded = registry.take_all_for_bounded_shutdown();
+    assert_eq!(bounded.len(), 2);
+    assert!(registry.draining_entries.is_empty());
+    assert!(
+        !registry.finish_published_drain(drain.id),
+        "graceful finalize must not clobber a batch already taken by bounded shutdown"
+    );
 }
 
 #[test]
@@ -1244,6 +1250,91 @@ fn bounded_final_shutdown_reaps_child_while_pass_holds_state_mutex() {
 }
 
 #[test]
+fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
+    let fake = FakeLspBinary::new();
+    let methods_log = fake
+        .pid_file
+        .with_file_name("overlapping-shutdown-methods.log");
+    let pool = Arc::new(pool(1));
+    let key = fake_pool_key(&fake, 1);
+    let spec = LspSpawnSpec {
+        env: fake.env_with_methods_log(&methods_log),
+        ..spawn_spec(&fake, Duration::from_secs(10))
+    };
+    let worker_pool = Arc::clone(&pool);
+    let uri = Url::from("file:///tmp/pool-test/overlapping-shutdown.py");
+    let worker = std::thread::spawn(move || {
+        worker_pool.with_lsp(key, spec, move |pooled| {
+            Box::pin(async move {
+                pooled.sync_document(&uri, "print('waiting')").await?;
+                pooled
+                    .definition(
+                        &uri,
+                        Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    )
+                    .await?;
+                Ok::<(), Error>(())
+            })
+        })
+    });
+
+    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
+    assert!(methods.values().any(|methods| {
+        methods
+            .iter()
+            .any(|method| method == "textDocument/definition")
+    }));
+    let pid = read_pid(
+        &fake.pid_file,
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .expect("fake LSP must publish its PID");
+
+    let force_pool = Arc::clone(&pool);
+    let force = std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(5)));
+    assert!(
+        wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
+        "force shutdown must publish Draining before final shutdown"
+    );
+    {
+        let registry = pool.registry.lock().unwrap();
+        assert!(registry.entries.is_empty());
+        assert_eq!(
+            registry
+                .draining_entries
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            1,
+            "graceful drain must publish the entry before removing it from the live map"
+        );
+    }
+
+    pool.shutdown_all_bounded(Duration::from_secs(2))
+        .expect("bounded path must reap the published draining entry");
+    assert!(wait_until_dead(pid, Duration::from_secs(2)));
+    assert!(pool.registry.lock().unwrap().draining_entries.is_empty());
+
+    let worker_result = worker.join().expect("pass thread must unwind");
+    assert!(matches!(
+        worker_result,
+        Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
+    ));
+    force
+        .join()
+        .expect("force-shutdown thread panicked")
+        .expect("graceful cleanup after bounded reap must be idempotent");
+    assert_eq!(
+        pool.mode(),
+        PoolMode::Stopped,
+        "graceful finalize must not overwrite final bounded shutdown state"
+    );
+}
+
+#[test]
 fn bounded_final_shutdown_rejects_late_process_control_install() {
     let entry = PoolEntry::default();
     let runtime = Runtime::new().unwrap();
@@ -1267,19 +1358,11 @@ fn bounded_final_shutdown_rejects_late_process_control_install() {
 
 #[test]
 fn bounded_entry_shutdown_timeout_message_is_context_neutral() {
-    let entry = PoolEntry::default();
-    let runtime = Runtime::new().unwrap();
-    runtime.block_on(async {
-        let _gate = entry.shutdown_gate.lock().await;
-        let err = entry
-            .shutdown_bounded(Duration::from_millis(1))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "LSP child termination could not be proven: bounded LSP entry shutdown exceeded 1ms"
-        );
-    });
+    let err = bounded_shutdown_timeout_error(Duration::from_millis(1));
+    assert_eq!(
+        err.to_string(),
+        "LSP child termination could not be proven: bounded LSP entry shutdown exceeded 1ms"
+    );
 }
 
 #[cfg(unix)]

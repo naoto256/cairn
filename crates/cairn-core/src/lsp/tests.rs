@@ -1,9 +1,14 @@
 use super::client::{StderrTail, parse_definition_result};
-use super::reader::{ProgressState, WorkspaceLoadComplete, response_result};
+use super::reader::{
+    PendingRequest, ProgressState, SharedWriter, WorkspaceLoadComplete, reader_loop,
+    response_result,
+};
 use super::transport::{MAX_BODY_SIZE, read_lsp_message, write_lsp_message};
 use super::*;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use serde_json::{Value, json};
