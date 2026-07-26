@@ -9,13 +9,24 @@
 //! only the owning user can connect. We do not perform an explicit
 //! per-connection peer-UID check; the parent directory's permissions
 //! already restrict who can reach the sockets to the same uid that
-//! launched the daemon.
+//! launched the daemon. A runtime-scoped advisory lock makes both
+//! sockets one daemon-owned unit; a bounded connection probe protects
+//! live daemons from versions that predate the lockfile.
 
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::io::Errno;
+use rustix::net::sockopt::socket_error;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
 use tokio::net::UnixListener;
+use tracing::warn;
 
 use crate::{Error, Result};
 
@@ -24,6 +35,8 @@ const APP_NAME: &str = "cairn";
 // be enterable), rw for the socket nodes themselves.
 const RUNTIME_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
+const DAEMON_LOCK_FILE: &str = "daemon.lock";
+const LEGACY_DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 // umask(2) is process-global, not per-thread: serialize bind-time
 // umask swaps so concurrent binds (e.g. parallel tests) cannot
 // observe or clobber each other's mask.
@@ -66,13 +79,30 @@ impl SocketPaths {
         }
     }
 
+    /// Claim exclusive ownership of both daemon socket paths.
+    ///
+    /// New daemons coordinate through `daemon.lock`. After acquiring the
+    /// lock, a bounded connection probe also protects a live pre-lockfile
+    /// daemon from having its socket nodes unlinked during an upgrade.
+    ///
+    /// # Errors
+    /// Fails when another daemon owns the lock, a legacy daemon is live, or
+    /// the runtime directory / probe cannot be validated safely.
+    pub(crate) fn acquire_daemon_lock(&self) -> Result<DaemonLockGuard> {
+        create_secure_runtime_dir(&self.runtime_dir)?;
+        let guard = DaemonLockGuard::acquire(&self.runtime_dir.join(DAEMON_LOCK_FILE))?;
+        ensure_no_legacy_daemon(&self.control)?;
+        ensure_no_legacy_daemon(&self.cairn)?;
+        Ok(guard)
+    }
+
     /// Create the runtime directory if missing and verify that it is
     /// owned by the current uid with permissions 0700. Stale socket
     /// files from a previous run are removed.
     ///
     /// Any existing socket node is treated as stale and unlinked, so
-    /// callers must have established that no live daemon is serving
-    /// these paths before calling.
+    /// daemon startup callers must hold the [`DaemonLockGuard`] returned
+    /// by [`SocketPaths::acquire_daemon_lock`].
     ///
     /// # Errors
     /// Filesystem failures.
@@ -82,6 +112,88 @@ impl SocketPaths {
         remove_if_exists(&self.control)?;
         Ok(())
     }
+}
+
+/// Exclusive ownership token for both daemon socket paths.
+///
+/// The kernel releases the advisory lock when this file is dropped, including
+/// after a process crash. The lockfile itself intentionally remains in the
+/// private runtime directory and is harmless on the next startup.
+#[derive(Debug)]
+pub(crate) struct DaemonLockGuard {
+    _file: File,
+}
+
+impl DaemonLockGuard {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(SOCKET_FILE_MODE)
+            .open(path)?;
+        match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(err) if err == Errno::WOULDBLOCK => Err(Error::InvalidArgument(
+                "another cairn daemon already owns this runtime directory".into(),
+            )),
+            Err(err) => Err(errno_to_io(err).into()),
+        }
+    }
+}
+
+/// Refuse to unlink an existing socket when a pre-lockfile daemon can still
+/// accept connections. Connection setup is nonblocking and bounded so a full
+/// legacy listen backlog cannot stall a new daemon indefinitely.
+fn ensure_no_legacy_daemon(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None).map_err(errno_to_io)?;
+    let flags = fcntl_getfl(&socket).map_err(errno_to_io)?;
+    fcntl_setfl(&socket, flags | OFlags::NONBLOCK).map_err(errno_to_io)?;
+    let address = SocketAddrUnix::new(path).map_err(errno_to_io)?;
+    match connect(&socket, &address) {
+        Ok(()) => legacy_daemon_live(path),
+        Err(err) if err == Errno::CONNREFUSED || err == Errno::NOENT => Ok(()),
+        Err(err) if err == Errno::INPROGRESS || err == Errno::WOULDBLOCK => {
+            let mut poll_fd = [PollFd::new(&socket, PollFlags::OUT)];
+            let timeout = Timespec::try_from(LEGACY_DAEMON_PROBE_TIMEOUT).map_err(|_| {
+                Error::Internal("legacy daemon probe timeout does not fit Timespec".into())
+            })?;
+            if poll(&mut poll_fd, Some(&timeout)).map_err(errno_to_io)? == 0 {
+                warn!(
+                    socket_path = %path.display(),
+                    timeout_ms = LEGACY_DAEMON_PROBE_TIMEOUT.as_millis(),
+                    "legacy daemon socket probe timed out"
+                );
+                return Err(Error::InvalidArgument(
+                    "legacy daemon socket probe timed out".into(),
+                ));
+            }
+            match socket_error(&socket).map_err(errno_to_io)? {
+                Ok(()) => legacy_daemon_live(path),
+                Err(err) if err == Errno::CONNREFUSED || err == Errno::NOENT => Ok(()),
+                Err(err) => Err(errno_to_io(err).into()),
+            }
+        }
+        Err(err) => Err(errno_to_io(err).into()),
+    }
+}
+
+fn legacy_daemon_live(path: &Path) -> Result<()> {
+    warn!(
+        socket_path = %path.display(),
+        "legacy daemon socket is accepting connections"
+    );
+    Err(Error::InvalidArgument(
+        "legacy daemon socket detected".into(),
+    ))
+}
+
+fn errno_to_io(err: Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(err.raw_os_error())
 }
 
 /// Bind a Unix listener and force the socket node to 0600.
@@ -141,26 +253,39 @@ fn validate_runtime_dir_security(p: &Path, expected_uid: u32) -> Result<()> {
 
     let metadata = std::fs::symlink_metadata(p)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(Error::InvalidArgument(format!(
-            "runtime socket path {} must be a directory",
-            p.display()
-        )));
+        warn!(
+            runtime_dir = %p.display(),
+            "runtime socket path is not a real directory"
+        );
+        return Err(Error::InvalidArgument(
+            "runtime socket path must be a directory".into(),
+        ));
     }
 
     let owner = metadata.uid();
     if owner != expected_uid {
-        return Err(Error::InvalidArgument(format!(
-            "runtime socket directory {} is owned by uid {owner}, expected uid {expected_uid}",
-            p.display()
-        )));
+        warn!(
+            runtime_dir = %p.display(),
+            actual_uid = owner,
+            expected_uid,
+            "runtime socket directory owner is invalid"
+        );
+        return Err(Error::InvalidArgument(
+            "runtime socket directory owner is invalid".into(),
+        ));
     }
 
     let mode = metadata.permissions().mode() & 0o777;
     if mode != RUNTIME_DIR_MODE {
-        return Err(Error::InvalidArgument(format!(
-            "runtime socket directory {} has mode {mode:o}, expected {RUNTIME_DIR_MODE:o}",
-            p.display()
-        )));
+        warn!(
+            runtime_dir = %p.display(),
+            actual_mode = format_args!("{mode:o}"),
+            expected_mode = format_args!("{RUNTIME_DIR_MODE:o}"),
+            "runtime socket directory permissions are invalid"
+        );
+        return Err(Error::InvalidArgument(
+            "runtime socket directory permissions are invalid".into(),
+        ));
     }
 
     Ok(())
@@ -295,6 +420,66 @@ mod tests {
         paths.ensure().unwrap();
         assert!(dir.is_dir());
         assert!(!paths.cairn.exists());
+    }
+
+    #[test]
+    fn daemon_lock_is_exclusive_until_guard_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+
+        let first = paths.acquire_daemon_lock().unwrap();
+        let err = paths
+            .acquire_daemon_lock()
+            .expect_err("a second daemon must not acquire the runtime");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        drop(first);
+        paths
+            .acquire_daemon_lock()
+            .expect("dropping the guard must release the kernel lock");
+    }
+
+    #[test]
+    fn stale_lockfile_and_socket_are_reusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        paths.ensure().unwrap();
+        std::fs::write(paths.runtime_dir.join(DAEMON_LOCK_FILE), b"old").unwrap();
+
+        let stale_listener = std::os::unix::net::UnixListener::bind(&paths.control).unwrap();
+        drop(stale_listener);
+
+        let _guard = paths
+            .acquire_daemon_lock()
+            .expect("an unlocked file and unserved socket are stale");
+        paths.ensure().unwrap();
+        assert!(!paths.control.exists());
+    }
+
+    #[test]
+    fn legacy_live_socket_preserves_both_daemon_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        paths.ensure().unwrap();
+        std::fs::write(&paths.cairn, b"stale peer").unwrap();
+        let _legacy_control = std::os::unix::net::UnixListener::bind(&paths.control).unwrap();
+
+        let err = paths
+            .acquire_daemon_lock()
+            .expect_err("a live pre-lockfile daemon must block startup");
+        assert!(matches!(
+            err,
+            Error::InvalidArgument(ref message) if message == "legacy daemon socket detected"
+        ));
+        assert!(
+            !err.to_string().contains(&tmp.path().display().to_string()),
+            "client-facing error must not expose the runtime directory"
+        );
+        assert!(
+            paths.cairn.exists(),
+            "one live daemon owns both socket paths"
+        );
+        assert!(paths.control.exists());
     }
 
     #[cfg(unix)]
