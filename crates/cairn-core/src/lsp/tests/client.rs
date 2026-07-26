@@ -14,6 +14,7 @@ async fn stale_request_snapshot_does_not_write_to_replacement_transport() {
     let (old_client_io, old_server_io) = tokio::io::duplex(4096);
     let (old_reader, old_writer) = split(old_client_io);
     client.install_transport(old_reader, old_writer).await;
+    let old_generation = client.transport_generation();
 
     let snapshot_seen = Arc::new(tokio::sync::Notify::new());
     let resume_request = Arc::new(tokio::sync::Notify::new());
@@ -49,6 +50,13 @@ async fn stale_request_snapshot_does_not_write_to_replacement_transport() {
     let (new_client_io, mut new_server_io) = tokio::io::duplex(4096);
     let (new_reader, new_writer) = split(new_client_io);
     client.install_transport(new_reader, new_writer).await;
+    assert!(
+        !client
+            .force_terminate_generation_for_test(old_generation)
+            .await
+            .unwrap(),
+        "stale generation cleanup must not clear replacement transport state"
+    );
     resume_request.notify_one();
 
     let stale_err = timeout(Duration::from_millis(100), stale)
