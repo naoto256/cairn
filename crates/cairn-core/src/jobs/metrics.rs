@@ -2,8 +2,10 @@
 //!
 //! The CAS store persists only coarse job state; everything here —
 //! scheduler state, queue / pool-wait / run timings, progress
-//! ticks — lives in one in-memory map keyed by `JobId` and dies
-//! with the daemon. `decorate` merges an entry into a
+//! ticks — lives in one in-memory state and dies with the daemon.
+//! The `entries` map is the metrics source of truth; a separate
+//! `terminal_order` index orders terminal entries for bounded
+//! eviction. `decorate` merges an entry into a
 //! `JobSnapshot` at read time; a job with no entry (any row that
 //! predates the last restart and was not re-enqueued by
 //! `restore_from_db`) keeps all runtime-only snapshot fields
@@ -18,8 +20,8 @@ use std::collections::BTreeSet;
 
 const MAX_RUNTIME_METRICS_ENTRIES: usize = 1_000;
 
-/// Shared handle to the per-job runtime metrics map; `Clone`
-/// copies the handle, not the map.
+/// Shared handle to the per-job entry map and terminal-order
+/// eviction index; `Clone` copies the handle, not the state.
 #[derive(Debug, Clone, Default)]
 pub(super) struct JobRuntimeMetricsStore {
     inner: Arc<Mutex<JobRuntimeMetricsState>>,
@@ -27,9 +29,12 @@ pub(super) struct JobRuntimeMetricsStore {
 
 #[derive(Debug, Default)]
 struct JobRuntimeMetricsState {
+    /// Runtime metrics keyed by job id. This is the source of truth;
+    /// `terminal_order` contains only eviction keys into this map.
     entries: HashMap<JobId, JobRuntimeMetrics>,
     /// Terminal entries ordered from oldest to newest. Active jobs
-    /// never appear here.
+    /// never appear here, and each terminal job has at most its
+    /// current `(finished_at_ns, JobId)` key.
     terminal_order: BTreeSet<(i64, JobId)>,
 }
 
@@ -81,9 +86,10 @@ impl JobRuntimeMetricsStore {
     }
 
     /// Create the job's runtime record at enqueue time. An insert
-    /// for an id that already has an entry would reset it
-    /// wholesale, but job ids are allocator-unique, so in practice
-    /// each id is created here exactly once.
+    /// for an id that already has an entry resets it wholesale and
+    /// removes its prior terminal-order key. Job ids are normally
+    /// allocator-unique, so reuse is defensive. The soft cap is
+    /// enforced after insertion without evicting active entries.
     pub(super) fn mark_enqueued(
         &self,
         job_id: JobId,
@@ -162,9 +168,10 @@ impl JobRuntimeMetricsStore {
         }
     }
 
-    /// Overwrite the cumulative tick counter and its timestamp.
-    /// `ticks` is the analyzer's absolute progress counter, not a
-    /// delta.
+    /// Overwrite the cumulative tick counter and its timestamp while
+    /// the job is active. Late progress after a terminal transition
+    /// is ignored so retrospective metrics remain stable. `ticks` is
+    /// the analyzer's absolute progress counter, not a delta.
     pub(super) fn mark_progress(&self, job_id: JobId, ticks: u64) {
         let now = now_ns();
         if let Some(entry) = self
@@ -174,6 +181,9 @@ impl JobRuntimeMetricsStore {
             .entries
             .get_mut(&job_id)
         {
+            if entry.finished_at_ns.is_some() {
+                return;
+            }
             entry.progress_ticks = ticks;
             entry.last_progress_at_ns = Some(now);
         }
@@ -294,6 +304,17 @@ mod tests {
     use super::*;
     use crate::jobs::tests::*;
 
+    fn normalize_terminal_time(state: &mut JobRuntimeMetricsState, job_id: JobId, fixed_ns: i64) {
+        let current_ns = state
+            .entries
+            .get(&job_id)
+            .and_then(|entry| entry.finished_at_ns)
+            .expect("test job must be terminal");
+        assert!(state.terminal_order.remove(&(current_ns, job_id)));
+        state.entries.get_mut(&job_id).unwrap().finished_at_ns = Some(fixed_ns);
+        assert!(state.terminal_order.insert((fixed_ns, job_id)));
+    }
+
     #[test]
     fn runtime_metrics_decorate_pool_waiting_job() {
         let metrics = JobRuntimeMetricsStore::default();
@@ -367,36 +388,8 @@ mod tests {
         metrics.mark_finished(older_terminal, RunStatus::Succeeded.as_str());
         {
             let mut stored = metrics.inner.lock().unwrap();
-            let newer_finished = stored
-                .entries
-                .get(&newer_terminal)
-                .unwrap()
-                .finished_at_ns
-                .unwrap();
-            let older_finished = stored
-                .entries
-                .get(&older_terminal)
-                .unwrap()
-                .finished_at_ns
-                .unwrap();
-            stored
-                .terminal_order
-                .remove(&(newer_finished, newer_terminal));
-            stored
-                .terminal_order
-                .remove(&(older_finished, older_terminal));
-            stored
-                .entries
-                .get_mut(&newer_terminal)
-                .unwrap()
-                .finished_at_ns = Some(20);
-            stored
-                .entries
-                .get_mut(&older_terminal)
-                .unwrap()
-                .finished_at_ns = Some(10);
-            stored.terminal_order.insert((20, newer_terminal));
-            stored.terminal_order.insert((10, older_terminal));
+            normalize_terminal_time(&mut stored, newer_terminal, 20);
+            normalize_terminal_time(&mut stored, older_terminal, 10);
         }
 
         let newest_active = 3_000;
@@ -452,5 +445,175 @@ mod tests {
         assert_eq!(entry.scheduler_state, RunStatus::Cancelled.as_str());
         assert_eq!(entry.finished_at_ns, finished_at);
         assert_eq!(entry.run_started_at_ns, None);
+    }
+
+    #[test]
+    fn terminal_metrics_ignore_late_progress() {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(10, None, now_ns());
+        metrics.mark_running(10);
+        metrics.mark_progress(10, 7);
+        metrics.mark_finished(10, RunStatus::Succeeded.as_str());
+
+        let before_entry = metrics
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(&10)
+            .unwrap()
+            .clone();
+        let observed_at = now_ns();
+        let mut before_snapshot = job(10, "pyright-lsp", "succeeded");
+        metrics.decorate(&mut before_snapshot, observed_at);
+
+        metrics.mark_progress(10, 99);
+
+        let after_entry = metrics
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(&10)
+            .unwrap()
+            .clone();
+        let mut after_snapshot = job(10, "pyright-lsp", "succeeded");
+        metrics.decorate(&mut after_snapshot, observed_at);
+
+        assert_eq!(after_entry.progress_ticks, before_entry.progress_ticks);
+        assert_eq!(
+            after_entry.last_progress_at_ns,
+            before_entry.last_progress_at_ns
+        );
+        assert_eq!(after_entry.scheduler_state, before_entry.scheduler_state);
+        assert_eq!(after_entry.finished_at_ns, before_entry.finished_at_ns);
+        assert_eq!(
+            after_snapshot.progress_ticks,
+            before_snapshot.progress_ticks
+        );
+        assert_eq!(
+            after_snapshot.last_progress_at,
+            before_snapshot.last_progress_at
+        );
+        assert_eq!(
+            after_snapshot.progress_per_minute,
+            before_snapshot.progress_per_minute
+        );
+        assert_eq!(
+            after_snapshot.scheduler_state,
+            before_snapshot.scheduler_state
+        );
+    }
+
+    #[test]
+    fn job_id_reuse_removes_prior_terminal_index() {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(11, None, 1_000_000_000);
+        metrics.mark_finished(11, RunStatus::Succeeded.as_str());
+        let old_key = *metrics
+            .inner
+            .lock()
+            .unwrap()
+            .terminal_order
+            .iter()
+            .find(|(_, job_id)| *job_id == 11)
+            .unwrap();
+
+        metrics.mark_enqueued(11, Some("clangd-lsp"), 2_000_000_000);
+
+        let stored = metrics.inner.lock().unwrap();
+        let entry = stored.entries.get(&11).unwrap();
+        assert_eq!(entry.scheduler_state, "queued");
+        assert_eq!(entry.finished_at_ns, None);
+        assert_eq!(entry.progress_ticks, 0);
+        assert!(!stored.terminal_order.contains(&old_key));
+        assert!(
+            stored
+                .terminal_order
+                .iter()
+                .all(|(_, job_id)| *job_id != 11)
+        );
+    }
+
+    #[test]
+    fn duplicate_terminal_transition_replaces_index_key() {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(12, None, 1_000_000_000);
+        metrics.mark_finished(12, RunStatus::Failed.as_str());
+        {
+            let mut stored = metrics.inner.lock().unwrap();
+            normalize_terminal_time(&mut stored, 12, 30);
+        }
+        metrics.mark_finished(12, RunStatus::Cancelled.as_str());
+        {
+            let mut stored = metrics.inner.lock().unwrap();
+            normalize_terminal_time(&mut stored, 12, 20);
+        }
+
+        let stored = metrics.inner.lock().unwrap();
+        let entry = stored.entries.get(&12).unwrap();
+        let keys: Vec<_> = stored
+            .terminal_order
+            .iter()
+            .filter(|(_, job_id)| *job_id == 12)
+            .copied()
+            .collect();
+        assert_eq!(keys, vec![(20, 12)]);
+        assert!(!stored.terminal_order.contains(&(30, 12)));
+        assert!(stored.terminal_order.contains(&(20, 12)));
+        assert_eq!(entry.finished_at_ns, Some(20));
+        assert_eq!(entry.scheduler_state, RunStatus::Cancelled.as_str());
+    }
+
+    #[test]
+    fn reuse_and_duplicate_leave_eviction_order_consistent() {
+        let metrics = JobRuntimeMetricsStore::default();
+
+        let reused_active = 1;
+        metrics.mark_enqueued(reused_active, None, 1_000_000_000);
+        metrics.mark_finished(reused_active, RunStatus::Succeeded.as_str());
+        metrics.mark_enqueued(reused_active, None, 2_000_000_000);
+
+        let newer_terminal = 2;
+        metrics.mark_enqueued(newer_terminal, None, 1_000_000_000);
+        metrics.mark_finished(newer_terminal, RunStatus::Failed.as_str());
+        metrics.mark_finished(newer_terminal, RunStatus::Succeeded.as_str());
+
+        let oldest_terminal = 3;
+        metrics.mark_enqueued(oldest_terminal, None, 1_000_000_000);
+        metrics.mark_finished(oldest_terminal, RunStatus::Succeeded.as_str());
+
+        {
+            let mut stored = metrics.inner.lock().unwrap();
+            normalize_terminal_time(&mut stored, newer_terminal, 20);
+            normalize_terminal_time(&mut stored, oldest_terminal, 10);
+        }
+
+        for job_id in 4..=MAX_RUNTIME_METRICS_ENTRIES as i64 {
+            metrics.mark_enqueued(job_id, None, 1_000_000_000);
+        }
+        let newest_active = MAX_RUNTIME_METRICS_ENTRIES as i64 + 1;
+        metrics.mark_enqueued(newest_active, None, 1_000_000_000);
+
+        let stored = metrics.inner.lock().unwrap();
+        assert_eq!(stored.entries.len(), MAX_RUNTIME_METRICS_ENTRIES);
+        assert!(!stored.entries.contains_key(&oldest_terminal));
+        assert!(stored.entries.contains_key(&newer_terminal));
+        assert!(stored.entries.contains_key(&reused_active));
+        assert!(stored.entries.contains_key(&newest_active));
+        assert!(
+            stored
+                .terminal_order
+                .iter()
+                .all(|(_, job_id)| *job_id != reused_active)
+        );
+        assert_eq!(
+            stored
+                .terminal_order
+                .iter()
+                .filter(|(_, job_id)| *job_id == newer_terminal)
+                .count(),
+            1
+        );
     }
 }

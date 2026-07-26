@@ -441,30 +441,66 @@ fn idle_ttl_defaults_overrides_and_zero_disables_sweeper() {
 }
 
 #[test]
-fn pool_env_warnings_do_not_log_raw_values() {
-    let output = CapturedLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(output.clone())
-        .finish();
-    let sensitive_capacity = "sensitive-capacity-token";
-    let sensitive_ttl = "sensitive-ttl-token";
+fn capacity_env_warnings_do_not_log_raw_values() {
+    let overflow = "9".repeat(40);
+    let cases = [
+        ("sensitive-capacity-token", "invalid", DEFAULT_POOL_CAPACITY),
+        ("-0007", "out_of_range", DEFAULT_POOL_CAPACITY),
+        ("000", "out_of_range", DEFAULT_POOL_CAPACITY),
+        ("00065", "out_of_range", MAX_POOL_CAPACITY),
+        (overflow.as_str(), "overflow", MAX_POOL_CAPACITY),
+    ];
 
-    tracing::subscriber::with_default(subscriber, || {
-        assert_eq!(cap(Some(sensitive_capacity)), DEFAULT_POOL_CAPACITY);
-        assert_eq!(
-            idle_ttl_from_env_value(Some(sensitive_ttl)),
-            Some(DEFAULT_IDLE_TTL)
+    for (raw, reason, expected) in cases {
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(cap(Some(raw)), expected);
+        });
+
+        let captured = output.contents();
+        assert!(captured.contains(POOL_CAPACITY_ENV));
+        assert!(captured.contains(&format!("reason=\"{reason}\"")));
+        assert!(
+            !captured.contains(raw),
+            "capacity warning exposed raw value {raw:?}: {captured}"
         );
-    });
+    }
+}
 
-    let captured = output.contents();
-    assert!(captured.contains(POOL_CAPACITY_ENV));
-    assert!(captured.contains(IDLE_TTL_ENV));
-    assert!(captured.contains("reason=\"invalid\""));
-    assert!(!captured.contains(sensitive_capacity));
-    assert!(!captured.contains(sensitive_ttl));
+#[test]
+fn idle_ttl_env_warnings_do_not_log_raw_values() {
+    let overflow = "9".repeat(40);
+    let cases = [
+        ("sensitive-ttl-token", "invalid"),
+        (overflow.as_str(), "overflow"),
+    ];
+
+    for (raw, reason) in cases {
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(idle_ttl_from_env_value(Some(raw)), Some(DEFAULT_IDLE_TTL));
+        });
+
+        let captured = output.contents();
+        assert!(captured.contains(IDLE_TTL_ENV));
+        assert!(captured.contains(&format!("reason=\"{reason}\"")));
+        assert!(
+            !captured.contains(raw),
+            "idle TTL warning exposed raw value {raw:?}: {captured}"
+        );
+    }
 }
 
 // ─── Force-shutdown outcome classifier ─────────────────────

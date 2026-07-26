@@ -292,31 +292,39 @@ fn reconcile_concurrency_env_accepts_only_configured_range() {
 
 #[test]
 fn reconcile_concurrency_warning_does_not_log_raw_env_value() {
-    let output = CapturedLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(output.clone())
-        .finish();
-    let sensitive = "secret-token-value";
+    let overflow = "9".repeat(40);
+    let cases = [
+        ("secret-token-value", "invalid"),
+        ("00065", "out_of_range"),
+        (overflow.as_str(), "overflow"),
+    ];
 
-    tracing::subscriber::with_default(subscriber, || {
-        assert_eq!(reconcile_max_concurrency_from_env_value(Some(sensitive)), 8);
-    });
+    for (raw, classification) in cases {
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
 
-    let captured = output.contents();
-    assert!(
-        captured.contains("CAIRN_RECONCILE_MAX_CONCURRENCY"),
-        "warning must identify the configuration key"
-    );
-    assert!(
-        captured.contains("classification=\"invalid\""),
-        "warning must retain a non-sensitive failure classification"
-    );
-    assert!(
-        !captured.contains(sensitive),
-        "warning must not persist the raw environment value"
-    );
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(reconcile_max_concurrency_from_env_value(Some(raw)), 8);
+        });
+
+        let captured = output.contents();
+        assert!(
+            captured.contains("CAIRN_RECONCILE_MAX_CONCURRENCY"),
+            "warning must identify the configuration key"
+        );
+        assert!(
+            captured.contains(&format!("classification=\"{classification}\"")),
+            "warning must retain a non-sensitive failure classification"
+        );
+        assert!(
+            !captured.contains(raw),
+            "warning must not persist raw value {raw:?}: {captured}"
+        );
+    }
 }
 
 #[tokio::test]

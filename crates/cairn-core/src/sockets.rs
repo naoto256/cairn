@@ -141,6 +141,23 @@ impl DaemonLockGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyProbeOutcome {
+    Connected,
+    PendingReady,
+    PendingTimeout,
+}
+
+impl LegacyProbeOutcome {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::PendingReady => "pending_ready",
+            Self::PendingTimeout => "pending_timeout",
+        }
+    }
+}
+
 /// Refuse to unlink an existing socket when a pre-lockfile daemon can still
 /// accept connections. Connection setup is nonblocking and bounded so a full
 /// legacy listen backlog cannot stall a new daemon indefinitely.
@@ -154,34 +171,41 @@ fn ensure_no_legacy_daemon(path: &Path) -> Result<()> {
     fcntl_setfl(&socket, flags | OFlags::NONBLOCK).map_err(errno_to_io)?;
     let address = SocketAddrUnix::new(path).map_err(errno_to_io)?;
     match connect(&socket, &address) {
-        Ok(()) => legacy_daemon_live(path),
+        Ok(()) => legacy_daemon_live(path, LegacyProbeOutcome::Connected),
         Err(err) if err == Errno::CONNREFUSED || err == Errno::NOENT => Ok(()),
         Err(err) if err == Errno::INPROGRESS || err == Errno::WOULDBLOCK => {
             let mut poll_fd = [PollFd::new(&socket, PollFlags::OUT)];
             let timeout = Timespec::try_from(LEGACY_DAEMON_PROBE_TIMEOUT).map_err(|_| {
                 Error::Internal("legacy daemon probe timeout does not fit Timespec".into())
             })?;
-            if poll(&mut poll_fd, Some(&timeout)).map_err(errno_to_io)? == 0 {
-                warn!(
-                    socket_path = %path.display(),
-                    timeout_ms = LEGACY_DAEMON_PROBE_TIMEOUT.as_millis(),
-                    "legacy daemon socket probe timed out"
-                );
-            }
+            let outcome = if poll(&mut poll_fd, Some(&timeout)).map_err(errno_to_io)? == 0 {
+                LegacyProbeOutcome::PendingTimeout
+            } else {
+                LegacyProbeOutcome::PendingReady
+            };
             // AF_UNIX does not provide a portable post-poll stale-socket
             // verdict. Once connect reports an in-progress state, preserve
             // the node rather than risking a false-negative unlink.
-            legacy_daemon_live(path)
+            legacy_daemon_live(path, outcome)
         }
         Err(err) => Err(errno_to_io(err).into()),
     }
 }
 
-fn legacy_daemon_live(path: &Path) -> Result<()> {
-    warn!(
-        socket_path = %path.display(),
-        "legacy daemon socket is accepting connections"
-    );
+fn legacy_daemon_live(path: &Path, outcome: LegacyProbeOutcome) -> Result<()> {
+    match outcome {
+        LegacyProbeOutcome::PendingTimeout => warn!(
+            socket_path = %path.display(),
+            reason = outcome.reason(),
+            timeout_ms = LEGACY_DAEMON_PROBE_TIMEOUT.as_millis(),
+            "legacy daemon socket not proven stale; preserving node"
+        ),
+        LegacyProbeOutcome::Connected | LegacyProbeOutcome::PendingReady => warn!(
+            socket_path = %path.display(),
+            reason = outcome.reason(),
+            "legacy daemon socket not proven stale; preserving node"
+        ),
+    }
     Err(Error::InvalidArgument(
         "legacy daemon socket detected".into(),
     ))
@@ -397,6 +421,72 @@ fn remove_if_exists(p: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_warning<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        (result, output.contents())
+    }
+
+    #[test]
+    fn legacy_probe_outcomes_log_reason_without_changing_client_error() {
+        let path = Path::new("/private/cairn-test/control.sock");
+        let cases = [
+            LegacyProbeOutcome::Connected,
+            LegacyProbeOutcome::PendingReady,
+            LegacyProbeOutcome::PendingTimeout,
+        ];
+
+        for outcome in cases {
+            let (result, captured) = capture_warning(|| legacy_daemon_live(path, outcome));
+            let err = result.expect_err("fail-closed probe outcome must block startup");
+            assert!(matches!(
+                err,
+                Error::InvalidArgument(ref message) if message == "legacy daemon socket detected"
+            ));
+            assert!(!err.to_string().contains(&path.display().to_string()));
+            assert!(captured.contains(&path.display().to_string()));
+            assert!(captured.contains(&format!("reason=\"{}\"", outcome.reason())));
+            assert!(captured.contains("legacy daemon socket not proven stale; preserving node"));
+            assert_eq!(
+                captured.contains("timeout_ms=250"),
+                outcome == LegacyProbeOutcome::PendingTimeout
+            );
+        }
+    }
+
     #[test]
     fn ensure_creates_dir_and_removes_stale_sockets() {
         let tmp = tempfile::tempdir().unwrap();
@@ -516,6 +606,87 @@ mod tests {
         let err = validate_runtime_dir_security(tmp.path(), other_uid)
             .expect_err("other-owner runtime dir must fail");
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_validation_keeps_paths_in_server_diagnostics_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        #[derive(Clone, Copy)]
+        enum Case {
+            NonDirectory,
+            WrongOwner,
+            LooseMode,
+        }
+
+        let cases = [
+            (
+                Case::NonDirectory,
+                "runtime socket path must be a directory",
+            ),
+            (
+                Case::WrongOwner,
+                "runtime socket directory owner is invalid",
+            ),
+            (
+                Case::LooseMode,
+                "runtime socket directory permissions are invalid",
+            ),
+        ];
+
+        for (case, expected_message) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime_dir = tmp.path().join("runtime-sensitive-path");
+            let actual_uid = std::fs::metadata(tmp.path()).unwrap().uid();
+            let expected_uid = match case {
+                Case::NonDirectory => {
+                    std::fs::write(&runtime_dir, b"not a directory").unwrap();
+                    actual_uid
+                }
+                Case::WrongOwner => {
+                    std::fs::create_dir(&runtime_dir).unwrap();
+                    actual_uid.wrapping_add(1)
+                }
+                Case::LooseMode => {
+                    std::fs::create_dir(&runtime_dir).unwrap();
+                    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    actual_uid
+                }
+            };
+
+            let (result, captured) =
+                capture_warning(|| validate_runtime_dir_security(&runtime_dir, expected_uid));
+            let err = result.expect_err("insecure runtime directory must be rejected");
+            assert!(matches!(
+                err,
+                Error::InvalidArgument(ref message) if message == expected_message
+            ));
+            let rendered_path = runtime_dir.display().to_string();
+            assert!(
+                !err.to_string().contains(&rendered_path),
+                "client error exposed runtime path: {err}"
+            );
+            assert!(
+                captured.contains(&rendered_path),
+                "server diagnostic omitted runtime path: {captured}"
+            );
+
+            match case {
+                Case::NonDirectory => {
+                    assert!(captured.contains("runtime socket path is not a real directory"));
+                }
+                Case::WrongOwner => {
+                    assert!(captured.contains(&format!("actual_uid={actual_uid}")));
+                    assert!(captured.contains(&format!("expected_uid={expected_uid}")));
+                }
+                Case::LooseMode => {
+                    assert!(captured.contains("actual_mode=755"));
+                    assert!(captured.contains("expected_mode=700"));
+                }
+            }
+        }
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
