@@ -23,7 +23,6 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{FlockOperation, OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
-use rustix::net::sockopt::socket_error;
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
 use tokio::net::UnixListener;
 use tracing::warn;
@@ -168,15 +167,11 @@ fn ensure_no_legacy_daemon(path: &Path) -> Result<()> {
                     timeout_ms = LEGACY_DAEMON_PROBE_TIMEOUT.as_millis(),
                     "legacy daemon socket probe timed out"
                 );
-                return Err(Error::InvalidArgument(
-                    "legacy daemon socket probe timed out".into(),
-                ));
             }
-            match socket_error(&socket).map_err(errno_to_io)? {
-                Ok(()) => legacy_daemon_live(path),
-                Err(err) if err == Errno::CONNREFUSED || err == Errno::NOENT => Ok(()),
-                Err(err) => Err(errno_to_io(err).into()),
-            }
+            // AF_UNIX does not provide a portable post-poll stale-socket
+            // verdict. Once connect reports an in-progress state, preserve
+            // the node rather than risking a false-negative unlink.
+            legacy_daemon_live(path)
         }
         Err(err) => Err(errno_to_io(err).into()),
     }
