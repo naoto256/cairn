@@ -17,15 +17,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha1::{Digest, Sha1};
 use tracing::{debug, warn};
 
 use crate::manifest::{ManifestEntry, ManifestId};
 use crate::{Error, Result};
 
-use super::persist::{persist_resolutions, persist_resolved_refs};
-use super::{AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFile, all_workspace_analyzers};
+use super::persist::{persist_resolutions_in_transaction, persist_resolved_refs_in_transaction};
+use super::{
+    AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, all_workspace_analyzers,
+};
 
 // Timeout is a hang detector, not a total work cap. T3 measured nlohmann's
 // C++ pass advancing through 47.4k definition sites with zero request errors
@@ -184,9 +186,10 @@ pub(crate) struct AnalyzerExecution {
 /// terminal status via [`mark_run`] before returning.
 ///
 /// # Errors
-/// Returns `Err` only for SQLite / persistence failures; the run row
-/// is then left at whatever status was last recorded, which can be
-/// the non-terminal `Running`.
+/// Returns `Err` only for SQLite / persistence failures. Once a run
+/// reaches `Running`, a fact-persistence failure rolls back both fact
+/// shapes and durably transitions the run row to `Failed` before the
+/// error is propagated.
 pub(crate) fn run_one_workspace_analyzer_with_timeout(
     conn: &mut Connection,
     request: AnalyzerRunRequest<'_>,
@@ -364,27 +367,12 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             })
         }
         AnalyzerRun::Completed(Ok(facts)) => {
-            // Persist refs and resolutions before stamping
-            // `Succeeded`; a persistence error propagates as `Err`
-            // and leaves the row at `Running` rather than falsely
-            // marking the run successful.
-            let inserted_refs = persist_resolved_refs(
-                conn,
-                manifest_id,
-                analyzer_id,
-                tier_prefix,
-                parser_id,
-                &facts,
-            )?;
-            persist_resolutions(
-                conn,
-                manifest_id,
-                analyzer_id,
-                tier_prefix,
-                parser_id,
-                &facts,
-            )?;
-            mark_run(
+            // Facts and `Succeeded` publish under one IMMEDIATE
+            // transaction. A failure rolls both fact shapes back,
+            // publishes `Failed` in the same outer transaction, and
+            // still propagates the infrastructure error to the job
+            // runner.
+            let inserted_refs = persist_completed_run_atomically(
                 conn,
                 RunRecord {
                     manifest_id,
@@ -397,6 +385,9 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                     error: None,
                     job_id,
                 },
+                tier_prefix,
+                parser_id,
+                &facts,
             )?;
             Ok(AnalyzerExecution {
                 status: RunStatus::Succeeded,
@@ -482,6 +473,120 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         }
     }
 }
+
+/// Atomically replace both workspace-analyzer fact shapes and publish the
+/// terminal run status.
+///
+/// A savepoint isolates the delete-then-insert work inside the outer
+/// IMMEDIATE transaction. On success, the replacement facts and `Succeeded`
+/// row commit together. On failure, rolling back the savepoint restores the
+/// previous facts, then the outer transaction commits `Failed`; readers can
+/// therefore observe neither a half-replaced fact set nor a terminal status
+/// that disagrees with the visible facts.
+fn persist_completed_run_atomically(
+    conn: &mut Connection,
+    successful_run: RunRecord<'_>,
+    tier_prefix: &str,
+    parser_id: &str,
+    facts: &WorkspaceFacts,
+) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch("SAVEPOINT workspace_analyzer_facts")?;
+    let persisted = (|| -> Result<usize> {
+        let inserted_refs = persist_resolved_refs_in_transaction(
+            &tx,
+            successful_run.manifest_id,
+            successful_run.analyzer_id,
+            tier_prefix,
+            parser_id,
+            facts,
+        )?;
+        test_observe_atomic_persist_midpoint();
+        persist_resolutions_in_transaction(
+            &tx,
+            successful_run.manifest_id,
+            successful_run.analyzer_id,
+            tier_prefix,
+            parser_id,
+            facts,
+        )?;
+        mark_run(&tx, successful_run)?;
+        Ok(inserted_refs)
+    })();
+
+    let rollback_facts = |error: Error| -> Result<usize> {
+        tx.execute_batch("ROLLBACK TO workspace_analyzer_facts; RELEASE workspace_analyzer_facts")
+            .map_err(|rollback| {
+                Error::Internal(format!(
+                    "workspace analyzer persistence failed: {error}; \
+                     savepoint rollback failed: {rollback}"
+                ))
+            })?;
+        Err(error)
+    };
+    let persisted = match persisted {
+        Ok(inserted_refs) => match tx.execute_batch("RELEASE workspace_analyzer_facts") {
+            Ok(()) => Ok(inserted_refs),
+            Err(error) => rollback_facts(error.into()),
+        },
+        Err(error) => rollback_facts(error),
+    };
+
+    match persisted {
+        Ok(inserted_refs) => {
+            tx.commit()?;
+            Ok(inserted_refs)
+        }
+        Err(error) => {
+            let message = format!("workspace analyzer persistence failed: {error}");
+            warn!(
+                analyzer_id = successful_run.analyzer_id,
+                manifest_id = successful_run.manifest_id.0,
+                error = %error,
+                "workspace analyzer persistence rolled back"
+            );
+            mark_run(
+                &tx,
+                RunRecord {
+                    status: RunStatus::Failed,
+                    error: Some(&message),
+                    ..successful_run
+                },
+            )
+            .map_err(|terminal| {
+                Error::Internal(format!(
+                    "{message}; failed to persist terminal status: {terminal}"
+                ))
+            })?;
+            tx.commit().map_err(|terminal| {
+                Error::Internal(format!(
+                    "{message}; failed to commit terminal status: {terminal}"
+                ))
+            })?;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_PERSIST_MIDPOINT_OBSERVER:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(test)]
+fn test_observe_atomic_persist_midpoint() {
+    ATOMIC_PERSIST_MIDPOINT_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().take() {
+            observer();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn test_observe_atomic_persist_midpoint() {}
 
 /// How one analyzer worker finished, as seen by the stall watchdog.
 enum AnalyzerRun {
@@ -1025,7 +1130,12 @@ fn wildcard_matches_bytes(pattern: &[u8], candidate: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_analyzer::WorkspaceFacts;
+    use cairn_proto::RefKind;
+
+    use crate::lsp::{Location, Position, Range, Url};
+    use crate::workspace_analyzer::{
+        ResolutionKind, ResolvedRef, WorkspaceFacts, WorkspaceResolution,
+    };
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1472,6 +1582,169 @@ mod tests {
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .unwrap()
+    }
+
+    fn analyzer_ref_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM refs WHERE source = 'tier25-test-analyzer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn atomic_persist_facts(repo_relative_path: &str) -> WorkspaceFacts {
+        WorkspaceFacts {
+            resolved_refs: vec![ResolvedRef {
+                source_path: repo_relative_path.into(),
+                source_position: Position {
+                    line: 0,
+                    character: 0,
+                },
+                source_byte_range: 0..1,
+                kind: RefKind::Import,
+                target: Location {
+                    uri: Url::from("file:///repo/src/Atomic.kt"),
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                },
+                target_path: Some(repo_relative_path.into()),
+            }],
+            resolutions: vec![WorkspaceResolution {
+                source_path: repo_relative_path.into(),
+                site_byte_range: 0..1,
+                kind: ResolutionKind::Import,
+                semantic_kind: None,
+                target_path: Some(repo_relative_path.into()),
+                target_qualified: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn resolution_persist_failure_rolls_back_all_facts_and_marks_run_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join("store.db");
+        let repo_relative_path = "src/Atomic.kt";
+        let (mut conn, entry) = seed_fixture(&store_path, repo_relative_path);
+        conn.execute(
+            "DELETE FROM resolutions WHERE source = 'tier25-test-analyzer'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_workspace_resolution_insert
+             BEFORE INSERT ON resolutions
+             WHEN NEW.source = 'tier25-test-analyzer'
+              AND EXISTS (
+                  SELECT 1 FROM refs WHERE source = 'tier25-test-analyzer'
+              )
+             BEGIN
+                 SELECT RAISE(FAIL, 'injected resolution failure');
+             END;",
+        )
+        .unwrap();
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        fs::write(repo_root.join(repo_relative_path), b"class Atomic").unwrap();
+
+        let error = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer: Box::new(CallCountingAnalyzer {
+                    requires_materialized: true,
+                    call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    facts: atomic_persist_facts(repo_relative_path),
+                }),
+                repo_root: &repo_root,
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 42,
+                analyzer_stall_timeout: Duration::from_secs(30),
+                job_id: Some(7),
+                progress: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected resolution failure"));
+        assert_eq!(analyzer_ref_count(&conn), 0);
+        assert_eq!(tier25_resolution_count(&conn), 0);
+        let (status, error) = workspace_analysis_run_row(&conn);
+        assert_eq!(status, "failed");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("injected resolution failure"))
+        );
+        let finished_at_ns: Option<i64> = conn
+            .query_row(
+                "SELECT finished_at_ns FROM workspace_analysis_runs
+                 WHERE analyzer_id = 'test-analyzer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(finished_at_ns, Some(42));
+    }
+
+    #[test]
+    fn completed_run_publishes_facts_and_success_as_one_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join("store.db");
+        let repo_relative_path = "src/Atomic.kt";
+        let (mut conn, entry) = seed_fixture(&store_path, repo_relative_path);
+        conn.execute(
+            "DELETE FROM resolutions WHERE source = 'tier25-test-analyzer'",
+            [],
+        )
+        .unwrap();
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        fs::write(repo_root.join(repo_relative_path), b"class Atomic").unwrap();
+
+        let reader_path = store_path.clone();
+        ATOMIC_PERSIST_MIDPOINT_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move || {
+                let reader = crate::cas::store::open_existing(&reader_path).unwrap();
+                assert_eq!(analyzer_ref_count(&reader), 0);
+                assert_eq!(tier25_resolution_count(&reader), 0);
+                assert_eq!(workspace_analysis_run_row(&reader).0, "running");
+            }));
+        });
+
+        let outcome = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer: Box::new(CallCountingAnalyzer {
+                    requires_materialized: true,
+                    call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    facts: atomic_persist_facts(repo_relative_path),
+                }),
+                repo_root: &repo_root,
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 42,
+                analyzer_stall_timeout: Duration::from_secs(30),
+                job_id: Some(7),
+                progress: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(outcome.inserted_refs, 1);
+        assert_eq!(analyzer_ref_count(&conn), 1);
+        assert_eq!(tier25_resolution_count(&conn), 1);
+        assert_eq!(workspace_analysis_run_row(&conn).0, "succeeded");
     }
 
     #[test]

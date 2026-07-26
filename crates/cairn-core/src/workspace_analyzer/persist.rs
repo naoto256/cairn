@@ -1,18 +1,21 @@
 //! CAS persistence for workspace-analyzer facts.
 //!
 //! Two writers live here, one per fact shape:
-//! [`persist_resolved_refs`] lands LSP-resolved definition sites in
-//! the `refs` table, and [`persist_resolutions`] lands
+//! [`persist_resolved_refs_in_transaction`] lands LSP-resolved definition sites
+//! in the `refs` table, and [`persist_resolutions_in_transaction`] lands
 //! resolution-layer rows in the `resolutions` table.
 //!
 //! # Transaction boundary
 //!
-//! Each persist call is one IMMEDIATE transaction covering both the
-//! source-scoped DELETE and every INSERT. Readers never observe a
-//! half-swapped fact set, and a crash mid-persist leaves the previous
-//! rows intact. IMMEDIATE starts the write transaction up front, so a
-//! persist serializes against a concurrent `register_repo` instead of
-//! failing mid-transaction (see the contention test below).
+//! The run driver opens one IMMEDIATE transaction around both fact
+//! shapes and the terminal run-status update. These helpers only
+//! mutate the caller-provided transaction; they never commit on their
+//! own. Readers therefore move atomically from the previous fact set
+//! plus `Running` to either the replacement set plus `Succeeded`, or
+//! the previous set plus `Failed`. IMMEDIATE starts the write
+//! transaction up front, so persistence serializes against a
+//! concurrent `register_repo` instead of failing during a deferred
+//! read-to-write upgrade.
 //!
 //! # Coexistence with Tier-1 rows
 //!
@@ -33,7 +36,9 @@
 use std::path::Path;
 
 use cairn_proto::RefKind;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+#[cfg(test)]
+use rusqlite::TransactionBehavior;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::Result;
 use crate::cas::kind_conv::ref_kind_to_str;
@@ -51,7 +56,7 @@ const LEGACY_RUST_REF_SOURCE: &str = "tier3-rust-analyzer";
 /// Persist LSP-resolved definition sites as `refs` rows for one
 /// manifest.
 ///
-/// Runs one IMMEDIATE transaction that first deletes this analyzer's
+/// Within the caller's transaction, first deletes this analyzer's
 /// previous rows (every source in `ref_sources_to_clear`, restricted
 /// to blobs in this manifest) and then inserts the new facts, so a
 /// reindex replaces rather than accumulates.
@@ -67,15 +72,14 @@ const LEGACY_RUST_REF_SOURCE: &str = "tier3-rust-analyzer";
 ///
 /// `line` is stored 1-based (LSP positions are 0-based). Returns the
 /// number of rows inserted.
-pub(super) fn persist_resolved_refs(
-    conn: &mut Connection,
+pub(super) fn persist_resolved_refs_in_transaction(
+    tx: &Transaction<'_>,
     manifest_id: ManifestId,
     analyzer_id: &str,
     tier_prefix: &str,
     parser_id: &str,
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for source in ref_sources_to_clear(analyzer_id, tier_prefix) {
         tx.execute(
             "DELETE FROM refs
@@ -89,10 +93,10 @@ pub(super) fn persist_resolved_refs(
 
     let mut inserted = 0;
     for r in &facts.resolved_refs {
-        let Some(source_blob) = blob_for_path(&tx, manifest_id, &r.source_path)? else {
+        let Some(source_blob) = blob_for_path(tx, manifest_id, &r.source_path)? else {
             continue;
         };
-        let Some(parser_id) = parser_for_blob(&tx, &source_blob, parser_id)? else {
+        let Some(parser_id) = parser_for_blob(tx, &source_blob, parser_id)? else {
             continue;
         };
         // A `None` target_path means the definition resolved outside
@@ -105,10 +109,10 @@ pub(super) fn persist_resolved_refs(
         // without finding a target symbol. Prove manifest membership
         // first so a malformed or unnormalised analyzer path cannot
         // bypass that fallback and create a ghost edge.
-        let Some(target_blob) = blob_for_path(&tx, manifest_id, target_path)? else {
+        let Some(target_blob) = blob_for_path(tx, manifest_id, target_path)? else {
             continue;
         };
-        let target = target_symbol_for_location(&tx, &target_blob, &parser_id, &r.target)?;
+        let target = target_symbol_for_location(tx, &target_blob, &parser_id, &r.target)?;
         // Import refs (e.g. C/C++/ObjC `#include`) commonly resolve to a
         // file location that sits outside any symbol's byte range — the
         // top of the header itself, before any declaration. Falling
@@ -131,7 +135,7 @@ pub(super) fn persist_resolved_refs(
             None => continue,
         };
         let enclosing_id = enclosing_symbol_for_ref(
-            &tx,
+            tx,
             &source_blob,
             &parser_id,
             r.source_byte_range.start,
@@ -161,6 +165,30 @@ pub(super) fn persist_resolved_refs(
         inserted += 1;
     }
 
+    Ok(inserted)
+}
+
+/// Test-only standalone boundary used by focused persist and writer-contention
+/// carriers. Production callers use [`persist_resolved_refs_in_transaction`]
+/// under the run driver's combined transaction.
+#[cfg(test)]
+pub(super) fn persist_resolved_refs(
+    conn: &mut Connection,
+    manifest_id: ManifestId,
+    analyzer_id: &str,
+    tier_prefix: &str,
+    parser_id: &str,
+    facts: &WorkspaceFacts,
+) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let inserted = persist_resolved_refs_in_transaction(
+        &tx,
+        manifest_id,
+        analyzer_id,
+        tier_prefix,
+        parser_id,
+        facts,
+    )?;
     tx.commit()?;
     Ok(inserted)
 }
@@ -202,7 +230,8 @@ enum PathOrigin {
 
 /// Persist resolution-layer rows emitted by a workspace analyzer.
 ///
-/// Mirrors [`persist_resolved_refs`]'s delete-then-insert pattern: any
+/// Mirrors [`persist_resolved_refs_in_transaction`]'s delete-then-insert
+/// pattern: any
 /// existing rows whose `source` matches `<tier_prefix>-<analyzer_id>` and
 /// whose `manifest_id` equals this manifest (or whose `manifest_id` is
 /// NULL **and** site_blob belongs to this manifest, see below) are
@@ -266,8 +295,8 @@ enum PathOrigin {
 /// - `target_symbol_id` is the source of truth for "which symbol" and is
 ///   resolved best-effort by `resolve_resolution_target`. Failure to find a
 ///   matching symbol does not affect `target_path` persistence.
-pub(super) fn persist_resolutions(
-    conn: &mut Connection,
+pub(super) fn persist_resolutions_in_transaction(
+    tx: &Transaction<'_>,
     manifest_id: ManifestId,
     analyzer_id: &str,
     tier_prefix: &str,
@@ -275,7 +304,6 @@ pub(super) fn persist_resolutions(
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
     let source = format!("{tier_prefix}-{analyzer_id}");
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // v11 DELETE expansion (Layer 2 of the cross-manifest defense
     // documented on this function): remove rows owned by this
     // (source, manifest) pair *and* any leftover legacy NULL row
@@ -302,10 +330,10 @@ pub(super) fn persist_resolutions(
 
     let mut inserted = 0;
     for r in &facts.resolutions {
-        let Some(site_blob) = blob_for_path(&tx, manifest_id, &r.source_path)? else {
+        let Some(site_blob) = blob_for_path(tx, manifest_id, &r.source_path)? else {
             continue;
         };
-        let Some(site_parser) = parser_for_blob(&tx, &site_blob, parser_id)? else {
+        let Some(site_parser) = parser_for_blob(tx, &site_blob, parser_id)? else {
             continue;
         };
 
@@ -330,7 +358,7 @@ pub(super) fn persist_resolutions(
         // hide behind a coincidentally-matching sibling symbol.
         let path_origin = match r.target_path.as_deref() {
             None => PathOrigin::None,
-            Some(path) => match blob_for_path(&tx, manifest_id, path)? {
+            Some(path) => match blob_for_path(tx, manifest_id, path)? {
                 Some(_) => PathOrigin::Valid(path.to_string()),
                 None => {
                     tracing::debug!(
@@ -358,11 +386,11 @@ pub(super) fn persist_resolutions(
         let (mut sanitized_target_path, mut target_symbol_id) = match &path_origin {
             PathOrigin::PhantomDropped => (None, None),
             PathOrigin::Valid(path) => {
-                let id = resolve_resolution_target(&tx, manifest_id, parser_id, r, Some(path))?;
+                let id = resolve_resolution_target(tx, manifest_id, parser_id, r, Some(path))?;
                 (Some(path.clone()), id)
             }
             PathOrigin::None => {
-                let id = resolve_resolution_target(&tx, manifest_id, parser_id, r, None)?;
+                let id = resolve_resolution_target(tx, manifest_id, parser_id, r, None)?;
                 (None, id)
             }
         };
@@ -375,7 +403,7 @@ pub(super) fn persist_resolutions(
         // analyzer-emitted Valid path.
         if matches!(path_origin, PathOrigin::None) && sanitized_target_path.is_none() {
             if let Some(id) = target_symbol_id {
-                match path_for_symbol_id(&tx, manifest_id, id)? {
+                match path_for_symbol_id(tx, manifest_id, id)? {
                     Some(derived) => sanitized_target_path = Some(derived),
                     None => {
                         // 3-state invariant: if we can't recover the
@@ -433,6 +461,30 @@ pub(super) fn persist_resolutions(
         inserted += 1;
     }
 
+    Ok(inserted)
+}
+
+/// Test-only standalone boundary used by focused persist and writer-contention
+/// carriers. Production callers use [`persist_resolutions_in_transaction`]
+/// under the run driver's combined transaction.
+#[cfg(test)]
+pub(super) fn persist_resolutions(
+    conn: &mut Connection,
+    manifest_id: ManifestId,
+    analyzer_id: &str,
+    tier_prefix: &str,
+    parser_id: &str,
+    facts: &WorkspaceFacts,
+) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let inserted = persist_resolutions_in_transaction(
+        &tx,
+        manifest_id,
+        analyzer_id,
+        tier_prefix,
+        parser_id,
+        facts,
+    )?;
     tx.commit()?;
     Ok(inserted)
 }
@@ -561,7 +613,7 @@ fn resolve_resolution_target(
     // manifest-wide lookup, adopting it would silently re-point the
     // import edge to whatever file holds that symbol — turning a
     // "no single target file" import semantic into "specific symbol's
-    // file". The caller (`persist_resolutions`) then back-derives
+    // file". The caller (`persist_resolutions_in_transaction`) then back-derives
     // `target_path` from the adopted symbol id, completing the
     // semantic break. Gate at this branch so the manifest-wide rescue
     // only applies to type / call edges where the symbol is the
