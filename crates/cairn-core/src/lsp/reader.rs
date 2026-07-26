@@ -5,11 +5,14 @@
 //! pending request waiters, a small set of server-to-client requests
 //! is answered inline, and `$/progress` traffic feeds
 //! `ProgressState`, which `wait_for_quiescence` consults to decide
-//! when the initial workspace load has settled.
+//! when the initial workspace load has settled. Reader side effects
+//! are tagged with the installed transport generation so delayed EOF,
+//! responses, or progress from a replaced child cannot affect its
+//! successor.
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, ready};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -20,6 +23,14 @@ use tracing::{debug, info};
 
 use super::error::{Error, Result};
 use super::transport::{read_lsp_message, write_lsp_message};
+
+pub(super) type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+pub(super) type WriterSlot = Arc<Mutex<Option<(u64, SharedWriter)>>>;
+
+pub(super) struct PendingRequest {
+    pub(super) generation: u64,
+    pub(super) sender: oneshot::Sender<Result<Value>>,
+}
 
 /// Drain `reader` until EOF or a transport error, dispatching each
 /// message.
@@ -36,14 +47,16 @@ use super::transport::{read_lsp_message, write_lsp_message};
 ///   update `progress`
 /// - other notifications are logged at debug level and discarded
 ///
-/// On EOF or read error the loop clears `alive` and fails every
-/// pending waiter (see `fail_pending`), so callers blocked on a
-/// response observe the server's death instead of hanging.
+/// Each loop owns one transport generation. On EOF or read error it
+/// clears liveness only when it still owns the current generation and
+/// fails only waiters from its own generation. A delayed reader from a
+/// replaced transport therefore cannot invalidate the replacement.
 pub(super) async fn reader_loop<R>(
     mut reader: R,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
-    alive: Arc<AtomicBool>,
-    writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
+    generation: u64,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    current_generation: Arc<AtomicU64>,
+    writer: SharedWriter,
     progress: Arc<ProgressState>,
 ) where
     R: AsyncRead + Send + Unpin + 'static,
@@ -53,32 +66,44 @@ pub(super) async fn reader_loop<R>(
             Ok(Some(message)) => {
                 log_notification(&message);
                 if let Some(response) = server_request_response(&message) {
-                    if let Some(writer) = writer.lock().await.as_mut() {
-                        let _ = write_lsp_message(writer, &response).await;
-                    }
+                    let mut writer = writer.lock().await;
+                    let _ = write_lsp_message(&mut *writer, &response).await;
                 } else if let Some((id, result)) = response_result(&message) {
-                    let tx = pending.lock().await.remove(&id);
-                    if let Some(tx) = tx {
-                        let _ = tx.send(result);
+                    let request = {
+                        let mut pending = pending.lock().await;
+                        match pending.get(&id) {
+                            Some(request) if request.generation == generation => {
+                                pending.remove(&id)
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(request) = request {
+                        let _ = request.sender.send(result);
                     }
                 } else if is_progress_notification(&message) {
-                    progress.record(&message).await;
+                    progress.record_for_generation(generation, &message).await;
                 } else if is_server_status_notification(&message) {
                     progress.record_server_status(&message).await;
                 }
             }
             Ok(None) => {
-                alive.store(false, Ordering::SeqCst);
-                fail_pending(&pending, Error::ServerExited(None.into())).await;
+                clear_owned_generation(&current_generation, generation);
+                fail_pending_generation(&pending, generation, Error::ServerExited(None.into()))
+                    .await;
                 break;
             }
             Err(err) => {
-                alive.store(false, Ordering::SeqCst);
-                fail_pending(&pending, err).await;
+                clear_owned_generation(&current_generation, generation);
+                fail_pending_generation(&pending, generation, err).await;
                 break;
             }
         }
     }
+}
+
+fn clear_owned_generation(current_generation: &AtomicU64, generation: u64) {
+    let _ = current_generation.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
 fn log_notification(message: &Value) {
@@ -105,6 +130,8 @@ pub(super) struct ProgressState {
 
 #[derive(Default)]
 struct ProgressSnapshot {
+    /// Transport generation that owns this readiness snapshot.
+    generation: u64,
     /// Progress tokens with a `begin` but no matching `end` yet.
     active_tokens: HashSet<String>,
     /// True once any `begin` has been seen since the last `reset`.
@@ -122,8 +149,9 @@ impl ProgressState {
     /// a respawned child inherits `saw_begin = true` from the
     /// prior server and readiness completes prematurely (no
     /// `begin` was actually observed for the new session).
-    pub(super) async fn reset(&self) {
+    pub(super) async fn reset_for_generation(&self, generation: u64) {
         let mut inner = self.inner.lock().await;
+        inner.generation = generation;
         inner.active_tokens.clear();
         inner.saw_begin = false;
         inner.change_seq = 0;
@@ -136,7 +164,7 @@ impl ProgressState {
     /// `change_seq` and wakes waiters, restarting an in-flight quiet
     /// period. Messages without a kind are ignored; a missing token
     /// is bucketed under a `"<missing>"` placeholder.
-    pub(super) async fn record(&self, message: &Value) {
+    pub(super) async fn record_for_generation(&self, generation: u64, message: &Value) {
         let Some(params) = message.get("params") else {
             return;
         };
@@ -164,6 +192,9 @@ impl ProgressState {
         );
 
         let mut inner = self.inner.lock().await;
+        if inner.generation != generation {
+            return;
+        }
         inner.change_seq = inner.change_seq.saturating_add(1);
         match kind {
             "begin" => {
@@ -177,6 +208,16 @@ impl ProgressState {
         }
         drop(inner);
         self.notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(super) async fn reset(&self) {
+        self.reset_for_generation(0).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn record(&self, message: &Value) {
+        self.record_for_generation(0, message).await;
     }
 
     /// Log `rust-analyzer/serverStatus` notifications. Observability
@@ -366,9 +407,13 @@ pub(super) fn response_result(message: &Value) -> Option<(u64, Result<Value>)> {
     ))
 }
 
-/// Fail every in-flight request waiter with a per-receiver copy of
-/// `err`, draining the pending map.
-async fn fail_pending(pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>, err: Error) {
+/// Fail the in-flight request waiters owned by one transport
+/// generation with a per-receiver copy of `err`.
+async fn fail_pending_generation(
+    pending: &Mutex<HashMap<u64, PendingRequest>>,
+    generation: u64,
+    err: Error,
+) {
     // Two shapes reach here:
     //
     // 1. Clean EOF (`read_lsp_message` returns `Ok(None)`) —
@@ -384,11 +429,18 @@ async fn fail_pending(pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value>
     //    failure shape needs variant preservation, add it to the
     //    match rather than extending the Protocol fallback.
     let mut pending = pending.lock().await;
-    for (_, tx) in pending.drain() {
+    let ids = pending
+        .iter()
+        .filter_map(|(id, request)| (request.generation == generation).then_some(*id))
+        .collect::<Vec<_>>();
+    for id in ids {
+        let Some(request) = pending.remove(&id) else {
+            continue;
+        };
         let replica = match &err {
             Error::ServerExited(_) => Error::ServerExited(None.into()),
             other => Error::Protocol(other.to_string()),
         };
-        let _ = tx.send(Err(replica));
+        let _ = request.sender.send(Err(replica));
     }
 }
