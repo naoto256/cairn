@@ -67,27 +67,21 @@ fn reconcile_max_concurrency_from_env_value(raw: Option<&str>) -> usize {
         return DEFAULT_RECONCILE_MAX_CONCURRENCY;
     };
     let trimmed = raw.trim();
-    match trimmed.parse::<usize>() {
-        Ok(value @ 1..=MAX_RECONCILE_MAX_CONCURRENCY) => value,
-        _ => {
-            let classification = match trimmed.parse::<usize>() {
-                Ok(_) => "out_of_range",
-                Err(_)
-                    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) =>
-                {
-                    "overflow"
-                }
-                Err(_) => "invalid",
-            };
-            warn!(
-                env = RECONCILE_MAX_CONCURRENCY_ENV,
-                default = DEFAULT_RECONCILE_MAX_CONCURRENCY,
-                classification,
-                "invalid reconcile concurrency; using default"
-            );
-            DEFAULT_RECONCILE_MAX_CONCURRENCY
+    let classification = match trimmed.parse::<usize>() {
+        Ok(value @ 1..=MAX_RECONCILE_MAX_CONCURRENCY) => return value,
+        Ok(_) => "out_of_range",
+        Err(_) if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) => {
+            "overflow"
         }
-    }
+        Err(_) => "invalid",
+    };
+    warn!(
+        env = RECONCILE_MAX_CONCURRENCY_ENV,
+        default = DEFAULT_RECONCILE_MAX_CONCURRENCY,
+        classification,
+        "invalid reconcile concurrency; using default"
+    );
+    DEFAULT_RECONCILE_MAX_CONCURRENCY
 }
 
 /// Size of the global attempt semaphore, read from the
@@ -1001,10 +995,7 @@ impl RepoReconcileManager {
             self.live_workers.fetch_add(1, Ordering::SeqCst);
             if self.shutting_down.load(Ordering::SeqCst) {
                 self.live_workers.fetch_sub(1, Ordering::SeqCst);
-                let mut runtimes = self.lock_runtimes();
-                if let Some(rt) = runtimes.get_mut(repo_hash) {
-                    rt.worker_running = false;
-                }
+                self.clear_worker_running(repo_hash);
                 debug!(
                     repo_hash = %repo_hash,
                     "reconcile shutting down mid-spawn; aborting new worker"
@@ -1028,6 +1019,16 @@ impl RepoReconcileManager {
             warn!("reconcile manager mutex poisoned; recovering");
             poisoned.into_inner()
         })
+    }
+
+    /// Clear the running marker on unconditional worker exit paths.
+    ///
+    /// A missing runtime is already quiesced and needs no cleanup.
+    fn clear_worker_running(&self, repo_hash: &str) {
+        let mut runtimes = self.lock_runtimes();
+        if let Some(runtime) = runtimes.get_mut(repo_hash) {
+            runtime.worker_running = false;
+        }
     }
 
     /// Returns `true` when the worker may exit — the runtime entry is
@@ -1079,10 +1080,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         // so would leave future requests "waking" a worker that no
         // longer exists, wedging the repo until daemon restart.
         if mgr.shutting_down.load(Ordering::SeqCst) {
-            let mut runtimes = mgr.lock_runtimes();
-            if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                rt.worker_running = false;
-            }
+            mgr.clear_worker_running(&repo_hash);
             return;
         }
 
@@ -1104,10 +1102,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         // registered, so a notification fired before `enable()`
         // would otherwise be missed.
         if mgr.shutting_down.load(Ordering::SeqCst) {
-            let mut runtimes = mgr.lock_runtimes();
-            if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                rt.worker_running = false;
-            }
+            mgr.clear_worker_running(&repo_hash);
             return;
         }
         let permit = tokio::select! {
@@ -1119,28 +1114,19 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                             repo_hash = %repo_hash,
                             "reconcile attempt semaphore closed; worker exiting"
                         );
-                        let mut runtimes = mgr.lock_runtimes();
-                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                            rt.worker_running = false;
-                        }
+                        mgr.clear_worker_running(&repo_hash);
                         return;
                     }
                 }
             }
             _ = shutdown.as_mut() => {
-                let mut runtimes = mgr.lock_runtimes();
-                if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                    rt.worker_running = false;
-                }
+                mgr.clear_worker_running(&repo_hash);
                 return;
             }
         };
         if mgr.shutting_down.load(Ordering::SeqCst) {
             drop(permit);
-            let mut runtimes = mgr.lock_runtimes();
-            if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                rt.worker_running = false;
-            }
+            mgr.clear_worker_running(&repo_hash);
             return;
         }
 
@@ -1156,10 +1142,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         let state_result = load_state(&mgr, &repo_hash).await;
         if mgr.shutting_down.load(Ordering::SeqCst) {
             drop(permit);
-            let mut runtimes = mgr.lock_runtimes();
-            if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                rt.worker_running = false;
-            }
+            mgr.clear_worker_running(&repo_hash);
             return;
         }
         let state = match state_result {
@@ -1170,10 +1153,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     repo_hash = %repo_hash,
                     "reconcile worker: repo row gone; exiting"
                 );
-                let mut runtimes = mgr.lock_runtimes();
-                if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                    rt.worker_running = false;
-                }
+                mgr.clear_worker_running(&repo_hash);
                 return;
             }
             Err(err) => {
@@ -1186,10 +1166,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 tokio::select! {
                     _ = tokio::time::sleep(mgr.retry.base_delay) => continue,
                     _ = shutdown.as_mut() => {
-                        let mut runtimes = mgr.lock_runtimes();
-                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                            rt.worker_running = false;
-                        }
+                        mgr.clear_worker_running(&repo_hash);
                         return;
                     }
                 }
@@ -1213,10 +1190,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
             tokio::select! {
                 _ = notified => continue,
                 _ = shutdown.as_mut() => {
-                    let mut runtimes = mgr.lock_runtimes();
-                    if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                        rt.worker_running = false;
-                    }
+                    mgr.clear_worker_running(&repo_hash);
                     return;
                 }
             }
@@ -1258,10 +1232,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     _ = tokio::time::sleep(sleep) => continue,
                     _ = notified => continue,
                     _ = shutdown.as_mut() => {
-                        let mut runtimes = mgr.lock_runtimes();
-                        if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                            rt.worker_running = false;
-                        }
+                        mgr.clear_worker_running(&repo_hash);
                         return;
                     }
                 }
@@ -1297,10 +1268,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     generation,
                     "reconcile worker handed missing root to lifecycle owner; exiting"
                 );
-                let mut runtimes = mgr.lock_runtimes();
-                if let Some(runtime) = runtimes.get_mut(&repo_hash) {
-                    runtime.worker_running = false;
-                }
+                mgr.clear_worker_running(&repo_hash);
                 return;
             }
             Err(failure) => {
@@ -1321,10 +1289,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     tokio::select! {
                         _ = tokio::time::sleep(mgr.retry.base_delay) => {}
                         _ = shutdown.as_mut() => {
-                            let mut runtimes = mgr.lock_runtimes();
-                            if let Some(rt) = runtimes.get_mut(&repo_hash) {
-                                rt.worker_running = false;
-                            }
+                            mgr.clear_worker_running(&repo_hash);
                             return;
                         }
                     }
