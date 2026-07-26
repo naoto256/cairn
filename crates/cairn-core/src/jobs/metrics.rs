@@ -14,6 +14,7 @@
 //! while they fit, then the oldest terminal entries are discarded.
 //! If active jobs alone exceed the cap, all of them remain tracked.
 use super::*;
+use std::collections::BTreeSet;
 
 const MAX_RUNTIME_METRICS_ENTRIES: usize = 1_000;
 
@@ -21,7 +22,15 @@ const MAX_RUNTIME_METRICS_ENTRIES: usize = 1_000;
 /// copies the handle, not the map.
 #[derive(Debug, Clone, Default)]
 pub(super) struct JobRuntimeMetricsStore {
-    inner: Arc<Mutex<HashMap<JobId, JobRuntimeMetrics>>>,
+    inner: Arc<Mutex<JobRuntimeMetricsState>>,
+}
+
+#[derive(Debug, Default)]
+struct JobRuntimeMetricsState {
+    entries: HashMap<JobId, JobRuntimeMetrics>,
+    /// Terminal entries ordered from oldest to newest. Active jobs
+    /// never appear here.
+    terminal_order: BTreeSet<(i64, JobId)>,
 }
 
 // Runtime-only scheduler metrics make active jobs diagnosable without a CAS
@@ -54,22 +63,20 @@ impl JobRuntimeMetricsStore {
     ///
     /// The `JobId` tiebreaker makes eviction deterministic when
     /// multiple terminal transitions receive the same timestamp.
-    fn evict_oldest_terminal_over_cap(metrics: &mut HashMap<JobId, JobRuntimeMetrics>) {
-        while metrics.len() > MAX_RUNTIME_METRICS_ENTRIES {
-            let oldest = metrics
-                .iter()
-                .filter_map(|(&job_id, entry)| {
-                    entry
-                        .finished_at_ns
-                        .map(|finished_at| (finished_at, job_id))
-                })
-                .min();
-            let Some((_, job_id)) = oldest else {
+    fn evict_oldest_terminal_over_cap(state: &mut JobRuntimeMetricsState) {
+        while state.entries.len() > MAX_RUNTIME_METRICS_ENTRIES {
+            let Some((finished_at, job_id)) = state.terminal_order.pop_first() else {
                 // Active jobs are protected even when they alone
                 // exceed the configured soft cap.
                 break;
             };
-            metrics.remove(&job_id);
+            if state
+                .entries
+                .get(&job_id)
+                .is_some_and(|entry| entry.finished_at_ns == Some(finished_at))
+            {
+                state.entries.remove(&job_id);
+            }
         }
     }
 
@@ -83,8 +90,8 @@ impl JobRuntimeMetricsStore {
         pool_group: Option<&'static str>,
         enqueued_at_ns: i64,
     ) {
-        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
-        metrics.insert(
+        let mut state = self.inner.lock().expect("job metrics lock poisoned");
+        if let Some(previous) = state.entries.insert(
             job_id,
             JobRuntimeMetrics {
                 enqueued_at_ns,
@@ -97,8 +104,11 @@ impl JobRuntimeMetricsStore {
                 progress_ticks: 0,
                 last_progress_at_ns: None,
             },
-        );
-        Self::evict_oldest_terminal_over_cap(&mut metrics);
+        ) && let Some(finished_at) = previous.finished_at_ns
+        {
+            state.terminal_order.remove(&(finished_at, job_id));
+        }
+        Self::evict_oldest_terminal_over_cap(&mut state);
     }
 
     /// Record that the scheduler observed the job blocked behind
@@ -109,22 +119,25 @@ impl JobRuntimeMetricsStore {
     /// `mark_enqueued` normally created the entry already.
     pub(super) fn mark_waiting_pool_group(&self, job_id: JobId, pool_group: &'static str) {
         let now = now_ns();
-        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
-        let entry = metrics.entry(job_id).or_insert_with(|| JobRuntimeMetrics {
-            enqueued_at_ns: now,
-            pool_group: Some(pool_group.to_string()),
-            scheduler_state: "queued".into(),
-            pool_wait_started_at_ns: None,
-            pool_wait_ms: 0,
-            run_started_at_ns: None,
-            finished_at_ns: None,
-            progress_ticks: 0,
-            last_progress_at_ns: None,
-        });
+        let mut state = self.inner.lock().expect("job metrics lock poisoned");
+        let entry = state
+            .entries
+            .entry(job_id)
+            .or_insert_with(|| JobRuntimeMetrics {
+                enqueued_at_ns: now,
+                pool_group: Some(pool_group.to_string()),
+                scheduler_state: "queued".into(),
+                pool_wait_started_at_ns: None,
+                pool_wait_ms: 0,
+                run_started_at_ns: None,
+                finished_at_ns: None,
+                progress_ticks: 0,
+                last_progress_at_ns: None,
+            });
         entry.pool_group = Some(pool_group.to_string());
         entry.scheduler_state = "waiting_pool_group".into();
         entry.pool_wait_started_at_ns.get_or_insert(now);
-        Self::evict_oldest_terminal_over_cap(&mut metrics);
+        Self::evict_oldest_terminal_over_cap(&mut state);
     }
 
     /// Worker-start transition: close any open pool-wait window into
@@ -134,8 +147,8 @@ impl JobRuntimeMetricsStore {
     /// cannot overwrite a completion already recorded by the worker.
     pub(super) fn mark_running(&self, job_id: JobId) {
         let now = now_ns();
-        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
-        if let Some(entry) = metrics.get_mut(&job_id) {
+        let mut state = self.inner.lock().expect("job metrics lock poisoned");
+        if let Some(entry) = state.entries.get_mut(&job_id) {
             if entry.finished_at_ns.is_some() {
                 return;
             }
@@ -158,6 +171,7 @@ impl JobRuntimeMetricsStore {
             .inner
             .lock()
             .expect("job metrics lock poisoned")
+            .entries
             .get_mut(&job_id)
         {
             entry.progress_ticks = ticks;
@@ -170,19 +184,31 @@ impl JobRuntimeMetricsStore {
     /// total-entry cap is exceeded. Also closes any still-open
     /// pool-wait window — a job cancelled while waiting for its group
     /// never passed through `mark_running`.
-    pub(super) fn mark_finished(&self, job_id: JobId, state: &str) {
+    pub(super) fn mark_finished(&self, job_id: JobId, terminal_state: &str) {
         let now = now_ns();
-        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
-        if let Some(entry) = metrics.get_mut(&job_id) {
+        let mut state = self.inner.lock().expect("job metrics lock poisoned");
+        if let Some(previous) = state
+            .entries
+            .get(&job_id)
+            .and_then(|entry| entry.finished_at_ns)
+        {
+            state.terminal_order.remove(&(previous, job_id));
+        }
+        let mut finished_key = None;
+        if let Some(entry) = state.entries.get_mut(&job_id) {
             if let Some(started) = entry.pool_wait_started_at_ns.take() {
                 entry.pool_wait_ms = entry
                     .pool_wait_ms
                     .saturating_add(duration_ms(started, now).unwrap_or(0));
             }
-            entry.scheduler_state = state.to_string();
+            entry.scheduler_state = terminal_state.to_string();
             entry.finished_at_ns = Some(now);
+            finished_key = Some((now, job_id));
         }
-        Self::evict_oldest_terminal_over_cap(&mut metrics);
+        if let Some(key) = finished_key {
+            state.terminal_order.insert(key);
+        }
+        Self::evict_oldest_terminal_over_cap(&mut state);
     }
 
     /// Fail a worker run only when no concurrent terminal transition
@@ -190,8 +216,9 @@ impl JobRuntimeMetricsStore {
     /// a cancellation recorded while the blocking worker was active.
     pub(super) fn mark_failed_if_unfinished(&self, job_id: JobId) {
         let now = now_ns();
-        let mut metrics = self.inner.lock().expect("job metrics lock poisoned");
-        if let Some(entry) = metrics.get_mut(&job_id) {
+        let mut state = self.inner.lock().expect("job metrics lock poisoned");
+        let mut finished_key = None;
+        if let Some(entry) = state.entries.get_mut(&job_id) {
             if entry.finished_at_ns.is_some() {
                 return;
             }
@@ -202,8 +229,12 @@ impl JobRuntimeMetricsStore {
             }
             entry.scheduler_state = RunStatus::Failed.as_str().to_string();
             entry.finished_at_ns = Some(now);
+            finished_key = Some((now, job_id));
         }
-        Self::evict_oldest_terminal_over_cap(&mut metrics);
+        if let Some(key) = finished_key {
+            state.terminal_order.insert(key);
+        }
+        Self::evict_oldest_terminal_over_cap(&mut state);
     }
 
     /// Merge this store's entry into a snapshot. No-op when the
@@ -223,8 +254,8 @@ impl JobRuntimeMetricsStore {
     /// * `progress_per_minute` — rate over `run_ms`; `None` until
     ///   at least one tick and a positive `run_ms` exist.
     pub(super) fn decorate(&self, snapshot: &mut JobSnapshot, observed_at_ns: i64) {
-        let metrics = self.inner.lock().expect("job metrics lock poisoned");
-        let Some(entry) = metrics.get(&snapshot.job_id) else {
+        let state = self.inner.lock().expect("job metrics lock poisoned");
+        let Some(entry) = state.entries.get(&snapshot.job_id) else {
             return;
         };
         snapshot.pool_group = entry.pool_group.clone();
@@ -309,7 +340,7 @@ mod tests {
             metrics.mark_finished(job_id, RunStatus::Succeeded.as_str());
         }
 
-        assert_eq!(metrics.inner.lock().unwrap().len(), 3);
+        assert_eq!(metrics.inner.lock().unwrap().entries.len(), 3);
         for job_id in 1..=3 {
             let mut snapshot = job(job_id, "pyright-lsp", "succeeded");
             metrics.decorate(&mut snapshot, now_ns());
@@ -336,21 +367,49 @@ mod tests {
         metrics.mark_finished(older_terminal, RunStatus::Succeeded.as_str());
         {
             let mut stored = metrics.inner.lock().unwrap();
-            stored.get_mut(&newer_terminal).unwrap().finished_at_ns = Some(20);
-            stored.get_mut(&older_terminal).unwrap().finished_at_ns = Some(10);
+            let newer_finished = stored
+                .entries
+                .get(&newer_terminal)
+                .unwrap()
+                .finished_at_ns
+                .unwrap();
+            let older_finished = stored
+                .entries
+                .get(&older_terminal)
+                .unwrap()
+                .finished_at_ns
+                .unwrap();
+            stored
+                .terminal_order
+                .remove(&(newer_finished, newer_terminal));
+            stored
+                .terminal_order
+                .remove(&(older_finished, older_terminal));
+            stored
+                .entries
+                .get_mut(&newer_terminal)
+                .unwrap()
+                .finished_at_ns = Some(20);
+            stored
+                .entries
+                .get_mut(&older_terminal)
+                .unwrap()
+                .finished_at_ns = Some(10);
+            stored.terminal_order.insert((20, newer_terminal));
+            stored.terminal_order.insert((10, older_terminal));
         }
 
         let newest_active = 3_000;
         metrics.mark_enqueued(newest_active, None, 1_000_000_000);
 
         let stored = metrics.inner.lock().unwrap();
-        assert_eq!(stored.len(), MAX_RUNTIME_METRICS_ENTRIES);
-        assert!(!stored.contains_key(&older_terminal));
-        assert!(stored.contains_key(&newer_terminal));
-        assert!(stored.contains_key(&newest_active));
+        assert_eq!(stored.entries.len(), MAX_RUNTIME_METRICS_ENTRIES);
+        assert!(!stored.entries.contains_key(&older_terminal));
+        assert!(stored.entries.contains_key(&newer_terminal));
+        assert!(stored.entries.contains_key(&newest_active));
         assert!(
             (1..=(MAX_RUNTIME_METRICS_ENTRIES as i64 - 2))
-                .all(|job_id| stored.contains_key(&job_id))
+                .all(|job_id| stored.entries.contains_key(&job_id))
         );
     }
 
@@ -362,8 +421,14 @@ mod tests {
         }
 
         let stored = metrics.inner.lock().unwrap();
-        assert_eq!(stored.len(), MAX_RUNTIME_METRICS_ENTRIES + 1);
-        assert!(stored.values().all(|entry| entry.finished_at_ns.is_none()));
+        assert_eq!(stored.entries.len(), MAX_RUNTIME_METRICS_ENTRIES + 1);
+        assert!(
+            stored
+                .entries
+                .values()
+                .all(|entry| entry.finished_at_ns.is_none())
+        );
+        assert!(stored.terminal_order.is_empty());
     }
 
     #[test]
@@ -375,6 +440,7 @@ mod tests {
             .inner
             .lock()
             .unwrap()
+            .entries
             .get(&9)
             .unwrap()
             .finished_at_ns;
@@ -382,7 +448,7 @@ mod tests {
         metrics.mark_running(9);
 
         let stored = metrics.inner.lock().unwrap();
-        let entry = stored.get(&9).unwrap();
+        let entry = stored.entries.get(&9).unwrap();
         assert_eq!(entry.scheduler_state, RunStatus::Cancelled.as_str());
         assert_eq!(entry.finished_at_ns, finished_at);
         assert_eq!(entry.run_started_at_ns, None);
