@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::Result;
 use crate::jobs::JobManager;
-use crate::sockets::{SocketPaths, bind_socket_with_mode};
+use crate::sockets::{DaemonLockGuard, SocketPaths, bind_socket_with_mode};
 use crate::startup::{ReadyDaemon, StartupControlHandler, StartupDataHandler, StartupGate};
 
 /// Implementations receive one newline-delimited request line at a
@@ -87,9 +87,10 @@ const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Daemon {
     /// Bind both sockets, run accept loops until `shutdown` is
-    /// notified, then drop the listeners and explicitly unlink the
-    /// socket files (dropping a `UnixListener` does not remove its
-    /// path). The shutdown waiter is armed synchronously when this
+    /// notified, then drop the listeners and explicitly unlink the socket
+    /// files (dropping a `UnixListener` does not remove its path). Exclusive
+    /// ownership is acquired before stale-node cleanup and retained through
+    /// final unlink. The shutdown waiter is armed synchronously when this
     /// method is called, before the returned future is first polled.
     ///
     /// # Errors
@@ -106,6 +107,7 @@ impl Daemon {
         // shutdown signal.
         let shutdown_wait = arm_shutdown(self.shutdown.clone());
         async move {
+            let daemon_lock = self.paths.acquire_daemon_lock()?;
             self.paths.ensure()?;
             let cairn = bind_socket_with_mode(&self.paths.cairn)?;
             let ctrl = bind_socket_with_mode(&self.paths.control)?;
@@ -115,6 +117,7 @@ impl Daemon {
             }
             run_bound(
                 self.paths,
+                daemon_lock,
                 cairn,
                 ctrl,
                 self.data_handler,
@@ -134,6 +137,7 @@ impl Daemon {
 /// Daemon sockets bound before runtime initialization completes.
 pub struct InitializingDaemon {
     paths: SocketPaths,
+    daemon_lock: DaemonLockGuard,
     cairn: UnixListener,
     control: UnixListener,
     gate: Arc<StartupGate>,
@@ -141,17 +145,19 @@ pub struct InitializingDaemon {
 }
 
 impl InitializingDaemon {
-    /// Bind both sockets synchronously so callers can begin initialization only
-    /// after transport availability is guaranteed.
+    /// Claim exclusive ownership and bind both sockets synchronously so callers
+    /// can begin initialization only after transport availability is guaranteed.
     pub fn bind(paths: SocketPaths, gate: Arc<StartupGate>, shutdown: Arc<Notify>) -> Result<Self> {
         // Arm synchronously before initialization can race a shutdown signal.
         let shutdown_wait = arm_shutdown(shutdown);
+        let daemon_lock = paths.acquire_daemon_lock()?;
         paths.ensure()?;
         let cairn = bind_socket_with_mode(&paths.cairn)?;
         let control = bind_socket_with_mode(&paths.control)?;
         info!(cairn = %paths.cairn.display(), control = %paths.control.display(), "daemon listening; initialization in progress");
         Ok(Self {
             paths,
+            daemon_lock,
             cairn,
             control,
             gate,
@@ -170,6 +176,7 @@ impl InitializingDaemon {
     async fn run_with_shutdown_timeout(self, shutdown_timeout: Duration) -> Result<()> {
         run_bound(
             self.paths,
+            self.daemon_lock,
             self.cairn,
             self.control,
             Arc::new(StartupDataHandler::new(self.gate.clone())),
@@ -247,11 +254,13 @@ impl RuntimeOwnership {
 
 /// Shared serving + teardown core for both daemon flavors: run the
 /// two accept loops until `shutdown` fires, then execute the ordered
-/// teardown under `shutdown_timeout`. Socket files are unlinked
-/// best-effort on every exit path so the next daemon can bind.
+/// teardown under `shutdown_timeout`. The daemon lock remains held while
+/// socket files are unlinked best-effort on every exit path, so a successor
+/// cannot bind between listener teardown and node cleanup.
 #[allow(clippy::too_many_arguments)]
 async fn run_bound(
     paths: SocketPaths,
+    daemon_lock: DaemonLockGuard,
     cairn: UnixListener,
     control: UnixListener,
     data_handler: Arc<dyn LineHandler>,
@@ -323,6 +332,9 @@ async fn run_bound(
     // socket files explicitly (best-effort) even on failed teardown.
     let _ = std::fs::remove_file(&paths.cairn);
     let _ = std::fs::remove_file(&paths.control);
+    // Keep ownership through removal so a successor cannot bind between
+    // listener teardown and socket-node cleanup.
+    drop(daemon_lock);
     if result.is_ok() {
         info!("daemon stopped");
     }
@@ -707,6 +719,57 @@ mod tests {
 
         shutdown.notify_waiters();
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon_task).await;
+    }
+
+    #[tokio::test]
+    async fn daemon_holds_socket_ownership_until_cleanup_finishes() {
+        let tmp = runtime_tempdir();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
+        let shutdown = Arc::new(Notify::new());
+        let daemon_task = tokio::spawn({
+            let paths = paths.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                Daemon {
+                    paths,
+                    data_handler: Arc::new(EchoHandler),
+                    control_handler: Arc::new(EchoHandler),
+                    shutdown,
+                    job_manager: None,
+                    reconcile: None,
+                    lifecycle: None,
+                }
+                .run()
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !(paths.cairn.exists() && paths.control.exists()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("daemon did not bind both sockets");
+
+        let err = paths
+            .acquire_daemon_lock()
+            .expect_err("a running daemon must retain socket ownership");
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+        assert!(paths.cairn.exists());
+        assert!(paths.control.exists());
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), daemon_task)
+            .await
+            .expect("daemon did not finish cleanup")
+            .expect("daemon task panicked")
+            .expect("daemon cleanup failed");
+        assert!(!paths.cairn.exists());
+        assert!(!paths.control.exists());
+        paths
+            .acquire_daemon_lock()
+            .expect("successor must acquire ownership after cleanup");
     }
 
     #[tokio::test]
