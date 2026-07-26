@@ -149,6 +149,10 @@ impl ProgressState {
     /// a respawned child inherits `saw_begin = true` from the
     /// prior server and readiness completes prematurely (no
     /// `begin` was actually observed for the new session).
+    ///
+    /// The snapshot is re-owned by `generation`; subsequent
+    /// `record_for_generation` calls for any other generation are
+    /// dropped.
     pub(super) async fn reset_for_generation(&self, generation: u64) {
         let mut inner = self.inner.lock().await;
         inner.generation = generation;

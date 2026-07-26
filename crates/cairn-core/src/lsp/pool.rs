@@ -994,7 +994,18 @@ impl LspClientPool {
                 None => Ok(()),
             }
         });
-        self.lock_registry()?.finish_published_drain(drain_id);
+        match self.lock_registry() {
+            Ok(mut reg) => {
+                reg.finish_published_drain(drain_id);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    drain_id,
+                    "lsp pool: could not finalize published shutdown drain"
+                );
+            }
+        }
         result
     }
 
