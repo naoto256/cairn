@@ -144,12 +144,18 @@ impl LspProcessControl {
         child_slot: &mut Option<Child>,
         expected_generation: Option<u64>,
     ) -> Result<bool> {
-        if expected_generation
-            .is_some_and(|expected| self.current_generation.load(Ordering::SeqCst) != expected)
-        {
-            return Ok(false);
+        match expected_generation {
+            Some(expected) => {
+                if self
+                    .current_generation
+                    .compare_exchange(expected, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+            }
+            None => self.current_generation.store(0, Ordering::SeqCst),
         }
-        self.current_generation.store(0, Ordering::SeqCst);
         let termination_err = if let Some(child) = child_slot.as_mut() {
             let _ = child.kill().await;
             child
@@ -452,6 +458,16 @@ impl LspClient {
     #[cfg(test)]
     pub(super) fn transport_generation(&self) -> u64 {
         self.current_generation.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn force_terminate_generation_for_test(
+        &self,
+        generation: u64,
+    ) -> Result<bool> {
+        self.process_control()
+            .force_terminate_generation(generation)
+            .await
     }
 
     pub(super) async fn install_transport<R, W>(&self, reader: R, writer: W)
