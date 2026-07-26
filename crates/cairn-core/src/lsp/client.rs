@@ -3,7 +3,9 @@
 //!
 //! One background reader task (`reader::reader_loop`) owns stdout
 //! and resolves responses into per-request oneshot channels
-//! registered in `pending`; stdin sits behind a writer mutex.
+//! registered in `pending`; stdin sits behind a writer mutex. Each
+//! installed transport has a monotonic generation that scopes reader
+//! liveness, pending failure fan-out, progress, and server replies.
 //! Forced teardown of an installed child is centralized in
 //! `force_terminate`, the fail-closed path when termination cannot
 //! be proven. Clean graceful shutdown reaps inline and delegates
@@ -11,6 +13,7 @@
 //! and missing-stdio failures own and reap their local `Child`
 //! directly.
 use std::collections::HashMap;
+use std::future::{Future, ready};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tracing::info;
 
 use super::error::{Error, Result};
-use super::reader::{ProgressState, reader_loop};
+use super::reader::{PendingRequest, ProgressState, SharedWriter, WriterSlot, reader_loop};
 use super::transport::write_lsp_message;
 use super::types::{Location, LocationLink, Position, Url};
 
@@ -79,17 +82,21 @@ pub struct LspClient {
     // request finds no `pending` entry and is dropped rather than
     // resolving a newer request.
     next_id: AtomicU64,
-    // True while a transport is installed; cleared by the reader
-    // task on stdout EOF / read error and by `force_terminate`.
-    alive: Arc<AtomicBool>,
+    // Generation of the currently installed transport. Zero means
+    // no live transport. Delayed readers may clear only the
+    // generation they own.
+    current_generation: Arc<AtomicU64>,
+    // Monotonic source for non-zero transport generations.
+    next_transport_generation: AtomicU64,
     // One-way latch: once set (shutdown or pool stop), respawns are
     // refused with `PoolStopped`.
     stopping: Arc<AtomicBool>,
-    writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
+    writer: WriterSlot,
     child: Arc<Mutex<Option<Child>>>,
-    // In-flight requests by id. The reader task resolves entries;
-    // every termination path drains the map so callers cannot hang.
-    pub(super) pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    // In-flight requests by id and owning transport generation. A
+    // reader failure drains only its own generation; explicit
+    // process termination drains every entry.
+    pub(super) pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     progress: Arc<ProgressState>,
     stderr_tail: Arc<Mutex<StderrTail>>,
 }
@@ -101,11 +108,11 @@ pub struct LspClient {
 /// pass holds the entry's data-plane mutex for the duration of its work.
 #[derive(Clone)]
 pub(crate) struct LspProcessControl {
-    alive: Arc<AtomicBool>,
+    current_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
-    writer: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
+    writer: WriterSlot,
     child: Arc<Mutex<Option<Child>>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
 }
 
 impl LspProcessControl {
@@ -118,11 +125,31 @@ impl LspProcessControl {
     }
 
     async fn force_terminate(&self) -> Result<()> {
-        self.alive.store(false, Ordering::SeqCst);
         // Kill first. A wedged server can backpressure a pipe write while the
         // writer mutex is held; waiting for that mutex before kill would make
         // the process-control plane depend on the data plane it must unblock.
         let mut child_slot = self.child.lock().await;
+        self.force_terminate_locked(&mut child_slot, None).await?;
+        Ok(())
+    }
+
+    async fn force_terminate_generation(&self, generation: u64) -> Result<bool> {
+        let mut child_slot = self.child.lock().await;
+        self.force_terminate_locked(&mut child_slot, Some(generation))
+            .await
+    }
+
+    async fn force_terminate_locked(
+        &self,
+        child_slot: &mut Option<Child>,
+        expected_generation: Option<u64>,
+    ) -> Result<bool> {
+        if expected_generation
+            .is_some_and(|expected| self.current_generation.load(Ordering::SeqCst) != expected)
+        {
+            return Ok(false);
+        }
+        self.current_generation.store(0, Ordering::SeqCst);
         let termination_err = if let Some(child) = child_slot.as_mut() {
             let _ = child.kill().await;
             child
@@ -134,7 +161,6 @@ impl LspProcessControl {
             None
         };
         *child_slot = None;
-        drop(child_slot);
         {
             let mut writer = self.writer.lock().await;
             *writer = None;
@@ -148,7 +174,7 @@ impl LspProcessControl {
         }
         match termination_err {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => Ok(true),
         }
     }
 }
@@ -258,7 +284,8 @@ impl LspClient {
             max_restarts,
             restarts: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
-            alive: Arc::new(AtomicBool::new(false)),
+            current_generation: Arc::new(AtomicU64::new(0)),
+            next_transport_generation: AtomicU64::new(1),
             stopping: Arc::new(AtomicBool::new(false)),
             writer: Arc::new(Mutex::new(None)),
             child: Arc::new(Mutex::new(None)),
@@ -338,12 +365,6 @@ impl LspClient {
             None => return Err(reap_local_child(&mut child, "missing child stdout").await),
         };
         self.stderr_tail.lock().await.clear();
-        // Clear readiness state before installing the new
-        // transport — otherwise a respawn inherits `saw_begin`
-        // from the prior server and `wait_for_workspace_load`
-        // returns before the new server has actually announced
-        // any `$/progress` begin.
-        self.progress.reset().await;
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(capture_stderr(stderr, Arc::clone(&self.stderr_tail)));
         }
@@ -361,7 +382,7 @@ impl LspClient {
             *child_slot = Some(child);
         }
         self.install_transport(stdout, stdin).await;
-        // `install_transport` re-arms `alive` and the writer. If a
+        // `install_transport` publishes a new generation and writer. If a
         // stop raced in after the child was published, undo that via
         // `force_terminate` (idempotent) and report `PoolStopped`.
         if self.stopping.load(Ordering::SeqCst) {
@@ -420,7 +441,7 @@ impl LspClient {
     /// usable without holding the pool entry's data-plane mutex.
     pub(crate) fn process_control(&self) -> LspProcessControl {
         LspProcessControl {
-            alive: Arc::clone(&self.alive),
+            current_generation: Arc::clone(&self.current_generation),
             stopping: Arc::clone(&self.stopping),
             writer: Arc::clone(&self.writer),
             child: Arc::clone(&self.child),
@@ -428,19 +449,37 @@ impl LspClient {
         }
     }
 
-    async fn install_transport<R, W>(&self, reader: R, writer: W)
+    #[cfg(test)]
+    pub(super) fn transport_generation(&self) -> u64 {
+        self.current_generation.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn install_transport<R, W>(&self, reader: R, writer: W)
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        self.alive.store(true, Ordering::SeqCst);
-        *self.writer.lock().await = Some(Box::new(writer));
+        let generation = self
+            .next_transport_generation
+            .fetch_add(1, Ordering::SeqCst);
+        debug_assert_ne!(generation, 0, "transport generation wrapped");
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
+        self.progress.reset_for_generation(generation).await;
+        *self.writer.lock().await = Some((generation, Arc::clone(&writer)));
+        self.current_generation.store(generation, Ordering::SeqCst);
         let pending = Arc::clone(&self.pending);
-        let alive = Arc::clone(&self.alive);
-        let writer = Arc::clone(&self.writer);
+        let current_generation = Arc::clone(&self.current_generation);
         let progress = Arc::clone(&self.progress);
         tokio::spawn(async move {
-            reader_loop(reader, pending, alive, writer, progress).await;
+            reader_loop(
+                reader,
+                generation,
+                pending,
+                current_generation,
+                writer,
+                progress,
+            )
+            .await;
         });
     }
 
@@ -626,7 +665,7 @@ impl LspClient {
     pub async fn shutdown(self) -> Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
         let mut protocol_err: Option<Error> = None;
-        if self.alive.load(Ordering::SeqCst) {
+        if self.current_generation.load(Ordering::SeqCst) != 0 {
             match self.request::<Value>("shutdown", Value::Null).await {
                 Ok(_) => {
                     if let Err(e) = self.notify("exit", Value::Null).await {
@@ -662,9 +701,9 @@ impl LspClient {
             }
         };
         let cleanup = if graceful_reaped {
-            // Still clear alive/writer/pending so the state is
+            // Still clear liveness/writer/pending so the state is
             // consistent even without a live child.
-            self.alive.store(false, Ordering::SeqCst);
+            self.current_generation.store(0, Ordering::SeqCst);
             {
                 let mut writer = self.writer.lock().await;
                 *writer = None;
@@ -698,7 +737,7 @@ impl LspClient {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(Error::PoolStopped);
         }
-        if self.alive.load(Ordering::SeqCst) {
+        if self.current_generation.load(Ordering::SeqCst) != 0 {
             return Ok(());
         }
         let attempt = self.restarts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -725,9 +764,50 @@ impl LspClient {
     where
         T: DeserializeOwned,
     {
+        self.request_inner(method, params, || ready(())).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn request_with_snapshot_hook<T, F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        after_snapshot: F,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.request_inner(method, params, after_snapshot).await
+    }
+
+    async fn request_inner<T, F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        after_snapshot: F,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let (generation, writer) = self.transport_snapshot().await?;
+        after_snapshot().await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        self.pending.lock().await.insert(
+            id,
+            PendingRequest {
+                generation,
+                sender: tx,
+            },
+        );
+        if !self.transport_is_current(generation).await {
+            self.pending.lock().await.remove(&id);
+            return Err(Error::ServerExited(None.into()));
+        }
         let message = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -736,7 +816,10 @@ impl LspClient {
         });
         let deadline = Instant::now() + self.timeout;
 
-        if let Err(err) = self.write_message_until(deadline, &message).await {
+        if let Err(err) = self
+            .write_message_on_until(deadline, generation, &writer, &message)
+            .await
+        {
             self.pending.lock().await.remove(&id);
             return Err(self.with_stderr_context(err).await);
         }
@@ -780,10 +863,27 @@ impl LspClient {
     /// Cancellation may leave a partial JSON-RPC frame in the pipe,
     /// so a timeout force-terminates the transport before returning.
     async fn write_message_until(&self, deadline: Instant, message: &Value) -> Result<()> {
-        match timeout_at(deadline, self.write_message(message)).await {
+        let (generation, writer) = self.transport_snapshot().await?;
+        self.write_message_on_until(deadline, generation, &writer, message)
+            .await
+    }
+
+    async fn write_message_on_until(
+        &self,
+        deadline: Instant,
+        generation: u64,
+        writer: &SharedWriter,
+        message: &Value,
+    ) -> Result<()> {
+        match timeout_at(deadline, Self::write_message_on(writer, message)).await {
             Ok(result) => result,
-            Err(_) => match self.force_terminate().await {
-                Ok(()) => Err(Error::RequestTimeout),
+            Err(_) => match self
+                .process_control()
+                .force_terminate_generation(generation)
+                .await
+            {
+                Ok(true) => Err(Error::RequestTimeout),
+                Ok(false) => Err(Error::ServerExited(None.into())),
                 Err(cleanup) => Err(Error::OperationWithCleanupFailure {
                     original: Box::new(Error::RequestTimeout),
                     cleanup: Box::new(cleanup),
@@ -792,15 +892,29 @@ impl LspClient {
         }
     }
 
-    /// Serialize and frame one message onto stdin. A `None` writer
-    /// means the transport was torn down; reported as
-    /// `ServerExited` rather than a protocol error.
-    async fn write_message(&self, message: &Value) -> Result<()> {
-        let mut writer = self.writer.lock().await;
-        let Some(writer) = writer.as_mut() else {
-            return Err(Error::ServerExited(None.into()));
-        };
-        write_lsp_message(writer, message).await
+    /// Snapshot the installed generation and writer under one mutex.
+    async fn transport_snapshot(&self) -> Result<(u64, SharedWriter)> {
+        self.writer
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::ServerExited(None.into()))
+    }
+
+    async fn transport_is_current(&self, generation: u64) -> bool {
+        if self.current_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        self.writer
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(installed, _)| *installed == generation)
+    }
+
+    async fn write_message_on(writer: &SharedWriter, message: &Value) -> Result<()> {
+        let mut writer = writer.lock().await;
+        write_lsp_message(&mut *writer, message).await
     }
 
     /// Attach captured stderr to the error shapes where it aids

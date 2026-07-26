@@ -25,15 +25,19 @@
 //!   lease release. Expired Ready entries with no active leases use
 //!   the same `Evicting` reservation and fail-closed termination
 //!   handling as capacity LRU.
+//! - Graceful drain: entries are published in a registry-owned
+//!   draining batch before they leave the live map. This keeps their
+//!   independent process-control handles discoverable while cleanup
+//!   waits on a data-plane or graceful-shutdown mutex.
 //! - Force-shutdown: transitions `Running → Draining`, rejects new
-//!   acquisitions, iterates cleanup with a per-entry timeout, and
-//!   transitions back to `Running` on complete success; if any entry
-//!   cleanup times out, the pool becomes `Poisoned` and permanently
-//!   rejects new acquisitions until the daemon restarts (the daemon
-//!   cannot silently spawn a replacement child alongside a
-//!   possibly-still-live orphan).
-//! - Final shutdown transitions to `Stopped` and rejects new
-//!   acquisitions.
+//!   acquisitions, and gives the published entries a per-entry
+//!   graceful timeout. It returns to `Running` on complete success;
+//!   if termination cannot be proven, the pool becomes `Poisoned`
+//!   until daemon restart.
+//! - Final bounded shutdown transitions to `Stopped`, takes both live
+//!   and published draining entries, and drives process control
+//!   without waiting on graceful cleanup. Concurrent kill/reap is
+//!   idempotently serialized by each client's child mutex.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -201,10 +205,62 @@ pub struct LspClientPool {
 struct PoolRegistry {
     mode: PoolMode,
     entries: HashMap<PoolKey, PoolRecord>,
+    /// Entries removed from the live map by an in-flight graceful
+    /// drain. Final bounded shutdown takes these published batches
+    /// so process control remains reachable while graceful cleanup
+    /// waits on an entry mutex.
+    draining_entries: HashMap<u64, Vec<Arc<PoolEntry>>>,
+    next_drain_id: u64,
     /// Monotonic counter; every acquire bumps it and stamps the
     /// record's `last_used`. Overflow at `u64::MAX` is a
     /// (theoretical) fail-closed error rather than a wrap.
     access_seq: u64,
+}
+
+struct PublishedDrain {
+    id: u64,
+    entries: Vec<Arc<PoolEntry>>,
+}
+
+impl PoolRegistry {
+    /// Publish the entries to the bounded-shutdown control plane
+    /// before removing them from the live map. Both steps occur
+    /// under the registry mutex, so no observer can see an entry in
+    /// neither collection.
+    fn publish_live_drain(&mut self) -> PublishedDrain {
+        let id = self.next_drain_id;
+        self.next_drain_id = self.next_drain_id.wrapping_add(1);
+        let entries = self
+            .entries
+            .values()
+            .map(|record| Arc::clone(&record.entry))
+            .collect::<Vec<_>>();
+        self.draining_entries.insert(id, entries.clone());
+        self.entries.clear();
+        PublishedDrain { id, entries }
+    }
+
+    /// Remove a graceful drain only when it is still owned by that
+    /// path. A final bounded drain may already have taken it.
+    fn finish_published_drain(&mut self, id: u64) -> bool {
+        self.draining_entries.remove(&id).is_some()
+    }
+
+    /// Permanently take both live and already-published entries for
+    /// daemon-final bounded process cleanup.
+    fn take_all_for_bounded_shutdown(&mut self) -> Vec<Arc<PoolEntry>> {
+        let mut entries = self
+            .entries
+            .drain()
+            .map(|(_, record)| record.entry)
+            .collect::<Vec<_>>();
+        entries.extend(
+            self.draining_entries
+                .drain()
+                .flat_map(|(_, entries)| entries),
+        );
+        entries
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,8 +268,8 @@ enum PoolMode {
     /// Normal operation. Acquire, evict, insert all permitted.
     Running,
     /// A `force_shutdown_all` is in flight. New acquires reject
-    /// with `PoolDraining`; the drain iterator has already taken
-    /// the entries out of the registry.
+    /// with `PoolDraining`; entries have moved from the live map to
+    /// a published draining batch.
     Draining,
     /// A prior `force_shutdown_all` could not prove that at least
     /// one child terminated. All future acquires reject.
@@ -538,6 +594,8 @@ impl LspClientPool {
         let registry = Arc::new(StdMutex::new(PoolRegistry {
             mode: PoolMode::Running,
             entries: HashMap::new(),
+            draining_entries: HashMap::new(),
+            next_drain_id: 1,
             access_seq: 0,
         }));
         let idle_sweeper = idle_ttl.map(|idle_ttl| {
@@ -906,20 +964,19 @@ impl LspClientPool {
     /// Returns the first LSP shutdown error observed after
     /// attempting every entry.
     pub fn shutdown_all(&self) -> Result<()> {
-        let entries = {
+        let drain = {
             let mut reg = self.lock_registry()?;
             reg.mode = PoolMode::Stopped;
-            reg.entries
-                .drain()
-                .map(|(_, r)| r.entry)
-                .collect::<Vec<_>>()
+            reg.publish_live_drain()
         };
-        self.runtime.block_on(async move {
+        let drain_id = drain.id;
+        let result = self.runtime.block_on(async move {
             // Shutdown entries concurrently — same rationale as
             // `force_shutdown_all` (independent children, no
             // cross-entry contention).
             let results: Vec<_> = futures::future::join_all(
-                entries
+                drain
+                    .entries
                     .into_iter()
                     .map(|entry| async move { entry.shutdown().await }),
             )
@@ -936,7 +993,9 @@ impl LspClientPool {
                 Some(e) => Err(e),
                 None => Ok(()),
             }
-        })
+        });
+        self.lock_registry()?.finish_published_drain(drain_id);
+        result
     }
 
     /// Permanently stop the pool and force-terminate every child through its
@@ -955,10 +1014,7 @@ impl LspClientPool {
         let entries = {
             let mut reg = self.lock_registry()?;
             reg.mode = PoolMode::Stopped;
-            reg.entries
-                .drain()
-                .map(|(_, record)| record.entry)
-                .collect::<Vec<_>>()
+            reg.take_all_for_bounded_shutdown()
         };
         self.runtime.block_on(async move {
             let results = futures::future::join_all(
@@ -1004,7 +1060,7 @@ impl LspClientPool {
     ///   signal was a clean protocol failure whose child was
     ///   still reaped.
     pub fn force_shutdown_all(&self, entry_timeout: Duration) -> Result<()> {
-        let entries = {
+        let drain = {
             let mut reg = self.lock_registry()?;
             match reg.mode {
                 PoolMode::Running => reg.mode = PoolMode::Draining,
@@ -1012,12 +1068,13 @@ impl LspClientPool {
                 PoolMode::Poisoned => return Err(Error::PoolPoisoned),
                 PoolMode::Stopped => return Err(Error::PoolStopped),
             }
-            reg.entries
-                .drain()
-                .map(|(_, r)| r.entry)
-                .collect::<Vec<_>>()
+            reg.publish_live_drain()
         };
-        debug!(entries = entries.len(), "lsp pool: force-shutdown begin");
+        let drain_id = drain.id;
+        debug!(
+            entries = drain.entries.len(),
+            "lsp pool: force-shutdown begin"
+        );
         // Cleanup entries CONCURRENTLY: the wall-clock cost of a
         // force-shutdown is bounded by ~one entry timeout rather
         // than `capacity × entry_timeout`. Each entry owns its own
@@ -1029,15 +1086,15 @@ impl LspClientPool {
         // per-entry timeout fired" — those are DIFFERENT causes
         // of `termination_unproven` and only the second one
         // warrants a synthetic "timeout" error message.
-        let outcome = self.runtime.block_on(async move {
-            let results: Vec<_> = futures::future::join_all(
-                entries
-                    .into_iter()
-                    .map(|entry| async move { timeout(entry_timeout, entry.shutdown()).await }),
-            )
-            .await;
-            classify_force_shutdown_results(results, entry_timeout)
-        });
+        let outcome =
+            self.runtime.block_on(async move {
+                let results: Vec<_> =
+                    futures::future::join_all(drain.entries.into_iter().map(|entry| async move {
+                        timeout(entry_timeout, entry.shutdown()).await
+                    }))
+                    .await;
+                classify_force_shutdown_results(results, entry_timeout)
+            });
         let termination_unproven = outcome.termination_unproven();
         let ForceShutdownOutcome {
             first_regular_err,
@@ -1055,6 +1112,10 @@ impl LspClientPool {
         // during our drain — do we apply our local outcome.
         let final_mode = {
             let mut reg = self.lock_registry()?;
+            // Final bounded shutdown may already have taken this
+            // published batch. Removing only our own id cannot
+            // clobber its Stopped/Poisoned mode or another drain.
+            reg.finish_published_drain(drain_id);
             match reg.mode {
                 PoolMode::Stopped => PoolMode::Stopped,
                 PoolMode::Poisoned => PoolMode::Poisoned,
@@ -1177,9 +1238,9 @@ struct PoolEntry {
     /// readiness wait, and the caller's work — so concurrent
     /// acquires of the same key serialize here, not in the registry.
     state: Mutex<PoolEntryState>,
-    /// Serializes normal, idle-sweep, and final shutdown paths for
-    /// this entry. Final shutdown may race a reserved eviction, but
-    /// the child process must never receive concurrent stop attempts.
+    /// Serializes graceful shutdown paths for this entry. Bounded
+    /// process-control cleanup deliberately bypasses this gate and is
+    /// serialized by the child mutex instead.
     shutdown_gate: Mutex<()>,
     /// Child-process control is deliberately independent from `state`. Normal
     /// work holds `state` across an analyzer pass, but final daemon shutdown
@@ -1400,12 +1461,13 @@ impl PoolEntry {
     /// Bounded entry shutdown that never waits for the data-plane state mutex.
     /// Used both by `shutdown_all_bounded` (daemon-final shutdown) and by the
     /// idle sweeper's per-victim eviction, so it is not final-shutdown-only.
-    /// The independent process-control handle first disables respawn, then
-    /// kills and reaps the child. Dropping the pool record later discards any
+    /// It also bypasses the graceful `shutdown_gate`: the independent
+    /// process-control handle serializes kill/reap through the child mutex, so
+    /// a concurrent graceful cleanup becomes an idempotent no-op after the
+    /// bounded path reaps first. Dropping the pool record later discards any
     /// document state still held by a pass that is unwinding.
     async fn shutdown_bounded(&self, entry_timeout: Duration) -> Result<()> {
         let shutdown = async {
-            let _shutdown_guard = self.shutdown_gate.lock().await;
             let control = {
                 let mut slot = self
                     .process_control
@@ -1421,10 +1483,7 @@ impl PoolEntry {
         };
         match timeout(entry_timeout, shutdown).await {
             Ok(result) => result,
-            Err(_) => Err(Error::ChildTerminationFailed(format!(
-                "bounded LSP entry shutdown exceeded {}ms",
-                entry_timeout.as_millis()
-            ))),
+            Err(_) => Err(bounded_shutdown_timeout_error(entry_timeout)),
         }
     }
 
@@ -1478,6 +1537,13 @@ where
         }
         ReadinessStrategy::InitializeResponseOnly => Ok(()),
     }
+}
+
+fn bounded_shutdown_timeout_error(entry_timeout: Duration) -> Error {
+    Error::ChildTerminationFailed(format!(
+        "bounded LSP entry shutdown exceeded {}ms",
+        entry_timeout.as_millis()
+    ))
 }
 
 static GLOBAL_POOL: OnceLock<LspClientPool> = OnceLock::new();
