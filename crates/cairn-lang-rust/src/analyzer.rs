@@ -30,6 +30,7 @@ use cairn_lang_api::{
     Analyzer, DocOverride, ExtractError, ImplFact, ImportFact, RefFact, RefKind, SemanticFacts,
     SymbolKind, SyntacticKind, TypeRole,
 };
+use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
@@ -40,6 +41,12 @@ pub struct RustAnalyzer;
 impl Analyzer for RustAnalyzer {
     fn name(&self) -> &'static str {
         "rust-syn"
+    }
+
+    fn revision(&self) -> u32 {
+        // v2: non-path impl self types use source-like tokens instead
+        // of syn's internal Debug representation.
+        2
     }
 
     fn extract_semantic(&self, source: &[u8]) -> Result<SemanticFacts, ExtractError> {
@@ -716,22 +723,7 @@ fn type_path_string(ty: &syn::Type) -> String {
 }
 
 fn quote_type(ty: &syn::Type) -> String {
-    // syn doesn't expose ToTokens without `quote`; we reach into the
-    // source-text-equivalent form via `Spanned + ToTokens` semantics
-    // by formatting through `quote::ToTokens` — but to avoid pulling
-    // `quote` we use a tiny fallback.
-    format!("{}", TypeDisplay(ty))
-}
-
-struct TypeDisplay<'a>(&'a syn::Type);
-
-impl<'a> std::fmt::Display for TypeDisplay<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // syn's Type implements Debug; not ideal but stable enough
-        // for the fallback (only reached for non-path types in the
-        // self_ty of an impl, which is uncommon).
-        write!(f, "{:?}", self.0)
-    }
+    ty.to_token_stream().to_string()
 }
 
 fn collapse_whitespace(s: &str) -> String {
@@ -826,6 +818,38 @@ mod tests {
         assert_eq!(i.type_qualified, "Foo");
         assert_eq!(i.interface_qualified.as_deref(), Some("std::fmt::Display"));
         assert_eq!(i.kind, "trait");
+    }
+
+    #[test]
+    fn non_path_impl_type_uses_source_like_tokens() {
+        let f = run("trait Marker {} struct Foo; impl Marker for &Foo {}");
+        assert_eq!(f.impls.len(), 1);
+        assert_eq!(f.impls[0].type_qualified, "& Foo");
+        assert!(!f.impls[0].type_qualified.contains("Type::"));
+        assert_eq!(RustAnalyzer.revision(), 2);
+    }
+
+    #[test]
+    fn type_display_emits_parseable_tokens_for_major_variants() {
+        for source in [
+            "&Foo",
+            "[Foo; 2]",
+            "(Foo, Bar)",
+            "*const Foo",
+            "fn(Foo) -> Bar",
+            "impl Marker",
+        ] {
+            let ty = syn::parse_str::<syn::Type>(source).unwrap();
+            let rendered = type_path_string(&ty);
+            assert!(
+                syn::parse_str::<syn::Type>(&rendered).is_ok(),
+                "{source:?} rendered as non-Rust tokens: {rendered:?}"
+            );
+            assert!(!rendered.contains("Type::"));
+        }
+
+        let path = syn::parse_str::<syn::Type>("std::fmt::Display").unwrap();
+        assert_eq!(type_path_string(&path), "std::fmt::Display");
     }
 
     #[test]

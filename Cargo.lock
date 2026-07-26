@@ -548,6 +548,7 @@ dependencies = [
  "cairn-lang-treesitter-generic",
  "linkme",
  "proc-macro2",
+ "quote",
  "syn",
  "tree-sitter",
  "tree-sitter-rust",

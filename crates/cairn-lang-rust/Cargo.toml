@@ -23,6 +23,7 @@ linkme.workspace = true
 # pull the source line of each impl / use item) available on stable.
 syn = { version = "2", features = ["full", "extra-traits", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 
 [lints]
 workspace = true
