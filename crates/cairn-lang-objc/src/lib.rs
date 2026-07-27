@@ -73,6 +73,12 @@ impl LanguageBackend for ObjcBackend {
         "tree-sitter-objc"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // v3 invalidates cached facts because unmarked ivars now use the
+        // Objective-C default for their owning declaration.
+        3
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_objc::LANGUAGE.into();
         // Blank known Apple SDK decoration macros (NS_ASSUME_NONNULL_BEGIN,
@@ -99,9 +105,9 @@ static REGISTER_OBJC: fn() -> Box<dyn LanguageBackend> = || Box::new(ObjcBackend
 
 struct ObjcVisitor {
     nesting: NestingTracker,
-    /// Tracks the running ivar visibility inside an `instance_variables`
-    /// block. Reset at every block entry so a `@private` in one class
-    /// does not bleed into the next.
+    /// Tracks the running visibility within one ivar block. Each block
+    /// derives its initial value from its owning declaration, and leaving
+    /// the block clears the state before another declaration is visited.
     ivar_visibility: Visibility,
     ivar_block_end: Option<usize>,
 }
@@ -150,7 +156,7 @@ impl Visitor for ObjcVisitor {
                 self.emit_property(node, source, facts);
             }
             "instance_variables" => {
-                self.ivar_visibility = Visibility::Public;
+                self.ivar_visibility = ivar_default_visibility(node);
                 self.ivar_block_end = Some(node.end_byte());
             }
             "instance_variable" => {
@@ -828,6 +834,17 @@ fn visibility_from_specifier(node: Node<'_>, source: &[u8]) -> Visibility {
     }
 }
 
+/// Objective-C assigns unmarked interface ivars protected visibility and
+/// implementation ivars private visibility. The grammar makes the owning
+/// declaration the direct parent of its `instance_variables` block.
+fn ivar_default_visibility(node: Node<'_>) -> Visibility {
+    match node.parent().map(|parent| parent.kind()) {
+        Some("class_interface") => Visibility::Crate,
+        Some("class_implementation") => Visibility::Private,
+        _ => Visibility::Public,
+    }
+}
+
 fn default_visibility(node: Node<'_>, source: &[u8]) -> Visibility {
     // Methods and properties declared inside an interface / protocol
     // are public API surface by ObjC convention. The C backend's
@@ -919,6 +936,15 @@ mod tests {
         ObjcBackend.extract_syntactic(src).unwrap()
     }
 
+    fn assert_parse_root_clean(src: &[u8]) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_objc::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        assert!(!tree.root_node().has_error());
+    }
+
     fn find<'a>(facts: &'a SyntacticFacts, qualified: &str) -> &'a SymbolFact {
         facts
             .symbols
@@ -930,6 +956,11 @@ mod tests {
     #[test]
     fn parser_id_is_stable() {
         assert_eq!(ObjcBackend.parser_id(), "tree-sitter-objc");
+    }
+
+    #[test]
+    fn parser_revision_tracks_ivar_default_visibility() {
+        assert_eq!(ObjcBackend.parser_revision(), 3);
     }
 
     #[test]
@@ -1061,16 +1092,23 @@ mod tests {
     #[test]
     fn ivar_visibility_tracks_specifier_runs() {
         let src = br#"
-@interface Foo : NSObject {
+__attribute__((objc_root_class))
+@interface Foo {
 @public
     int pubVar;
 @private
     int privVar;
 @protected
     int protVar;
+@package
+    int packageVar;
 }
 @end
+
+@implementation Foo
+@end
 "#;
+        assert_parse_root_clean(src);
         let facts = facts(src);
         assert_eq!(
             find(&facts, "Foo.pubVar").visibility,
@@ -1085,11 +1123,77 @@ mod tests {
             Some(Visibility::Crate),
             "@protected maps to the closest analog cairn exposes"
         );
+        assert_eq!(
+            find(&facts, "Foo.packageVar").visibility,
+            Some(Visibility::Crate),
+            "@package maps to the closest analog cairn exposes"
+        );
         assert!(facts.symbols.iter().all(|s| s.kind != SymbolKind::Field
             || matches!(
                 s.qualified.as_str(),
-                "Foo.pubVar" | "Foo.privVar" | "Foo.protVar"
+                "Foo.pubVar" | "Foo.privVar" | "Foo.protVar" | "Foo.packageVar"
             )));
+    }
+
+    #[test]
+    fn ivar_default_visibility_follows_owning_declaration() {
+        let src = br#"
+__attribute__((objc_root_class))
+@interface InterfaceBox {
+    int interfaceDefault;
+}
+@end
+
+@implementation InterfaceBox
+@end
+
+__attribute__((objc_root_class))
+@interface ImplementationBox
+@end
+
+@implementation ImplementationBox {
+    int implementationDefault;
+    @public
+    int implementationPublic;
+}
+@end
+
+__attribute__((objc_root_class))
+@interface ResetBox {
+    int resetDefault;
+}
+@end
+
+@implementation ResetBox
+@end
+"#;
+        assert_parse_root_clean(src);
+        let facts = facts(src);
+
+        let interface_default = find(&facts, "InterfaceBox.interfaceDefault");
+        assert_eq!(interface_default.visibility, Some(Visibility::Crate));
+        assert_eq!(
+            facts.symbols[interface_default.parent_idx.unwrap()].qualified,
+            "InterfaceBox"
+        );
+
+        let implementation_default = find(&facts, "ImplementationBox.implementationDefault");
+        assert_eq!(implementation_default.visibility, Some(Visibility::Private));
+        assert_eq!(
+            facts.symbols[implementation_default.parent_idx.unwrap()].qualified,
+            "ImplementationBox"
+        );
+        assert_eq!(
+            find(&facts, "ImplementationBox.implementationPublic").visibility,
+            Some(Visibility::Public)
+        );
+
+        let reset_default = find(&facts, "ResetBox.resetDefault");
+        assert_eq!(reset_default.visibility, Some(Visibility::Crate));
+        assert_eq!(
+            facts.symbols[reset_default.parent_idx.unwrap()].qualified,
+            "ResetBox"
+        );
     }
 
     #[test]
