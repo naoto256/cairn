@@ -71,6 +71,12 @@ impl LanguageBackend for CppBackend {
         "tree-sitter-cpp"
     }
 
+    fn parser_revision(&self) -> u32 {
+        // v3 invalidates cached facts because class-body typedef
+        // declarations now emit TypeAlias facts.
+        3
+    }
+
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
         extract(source, &language, CppVisitor::new())
@@ -197,7 +203,7 @@ impl Visitor for CppVisitor {
             "declaration" if at_namespace_or_top(node) => {
                 self.handle_declaration(node, source, facts);
             }
-            "type_definition" if at_namespace_or_top(node) => {
+            "type_definition" if at_namespace_or_top(node) || at_aggregate_member_scope(node) => {
                 self.handle_typedef(node, source, facts);
             }
             "alias_declaration" if at_namespace_or_top(node) || self.in_class() => {
@@ -797,6 +803,23 @@ fn at_namespace_or_top(node: Node<'_>) -> bool {
     false
 }
 
+/// True when a declaration belongs to an aggregate member list. Only
+/// conditional-preprocessor wrappers are transparent; other parents stop
+/// the search so method-local declarations cannot become members.
+fn at_aggregate_member_scope(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "field_declaration_list" => return true,
+            "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif" => {
+                current = parent.parent();
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Slice from the (possibly template-wrapping) parent's start byte up to
 /// the body, so the signature carries `template<typename T>` prefixes.
 fn template_aware_signature(
@@ -944,6 +967,11 @@ mod tests {
     #[test]
     fn parser_id_is_stable() {
         assert_eq!(CppBackend.parser_id(), "tree-sitter-cpp");
+    }
+
+    #[test]
+    fn parser_revision_covers_class_body_typedefs() {
+        assert_eq!(CppBackend.parser_revision(), 3);
     }
 
     #[test]
@@ -1139,6 +1167,58 @@ namespace n {
         assert_eq!(symbol(&f, "your_int").kind, SymbolKind::TypeAlias);
         assert_eq!(symbol(&f, "ll").qualified, "n::ll");
         assert_eq!(symbol(&f, "uint").qualified, "n::uint");
+    }
+
+    #[test]
+    fn class_body_typedef_and_alias_preserve_owner_and_visibility() {
+        let source = r#"
+class Widget {
+public:
+    typedef int Index;
+    using Alias = long;
+};
+"#;
+        let language: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+
+        let f = facts(source);
+        let widget_idx = f
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "Widget")
+            .expect("Widget missing");
+        for name in ["Index", "Alias"] {
+            let alias = symbol(&f, name);
+            assert_eq!(alias.kind, SymbolKind::TypeAlias);
+            assert_eq!(alias.qualified, format!("Widget::{name}"));
+            assert_eq!(alias.parent_idx, Some(widget_idx));
+            assert_eq!(alias.visibility, Some(Visibility::Public));
+        }
+    }
+
+    #[test]
+    fn method_local_typedef_is_not_a_class_member() {
+        let source = r#"
+class Widget {
+public:
+    void method() { typedef int Local; }
+};
+"#;
+        let language: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+
+        let f = facts(source);
+        assert!(
+            f.symbols.iter().all(|symbol| symbol.name != "Local"),
+            "{:#?}",
+            f.symbols
+        );
     }
 
     #[test]
