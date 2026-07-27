@@ -76,7 +76,10 @@ impl LanguageBackend for RubyBackend {
         // shared one immutable, single-read payload.
         // v6: bare visibility markers only affect
         // class/module/singleton-class bodies.
-        6
+        // v7: root-qualified class/module declarations no longer inherit
+        // an outer lexical owner, and their descendants publish under the
+        // absolute owner. Re-parse cached symbols and parent links.
+        7
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -256,6 +259,23 @@ impl RubyVisitor {
         }
     }
 
+    /// Qualify a child from its immediate published parent.
+    ///
+    /// Ruby's leading `::` resets lexical ownership. Using the
+    /// published parent identity also keeps descendants of an absolute
+    /// declaration rooted there while [`NestingTracker`] restores the
+    /// outer parent after that declaration ends.
+    fn qualified(&self, name: &str, facts: &SyntacticFacts) -> String {
+        if name.starts_with("::") {
+            name.to_string()
+        } else {
+            match self.nesting.current_parent() {
+                Some(idx) => format!("{}::{name}", facts.symbols[idx].qualified),
+                None => name.to_string(),
+            }
+        }
+    }
+
     fn emit(
         &mut self,
         node: Node<'_>,
@@ -268,12 +288,11 @@ impl RubyVisitor {
             name,
             qualified,
             body_start,
+            parent_idx,
         } = spec;
         let signature = signature_slice(node, source, body_start.or(Some(node.end_byte())));
         let visibility = Some(self.symbol_visibility(&kind, node, source));
         let doc = extract_doc(node, source);
-        let parent_idx = self.nesting.current_parent();
-
         let idx = facts.symbols.len();
         facts.symbols.push(SymbolFact {
             name,
@@ -302,7 +321,12 @@ impl RubyVisitor {
         };
         // `module A::B` keeps the compound name verbatim.
         let name = node_text(name_node, source).to_string();
-        let qualified = self.nesting.qualified_for(&name, facts);
+        let qualified = self.qualified(&name, facts);
+        let parent_idx = if name.starts_with("::") {
+            None
+        } else {
+            self.nesting.current_parent()
+        };
         let body_start = container_body_start(node);
         let idx = self.emit(
             node,
@@ -313,6 +337,7 @@ impl RubyVisitor {
                 name,
                 qualified,
                 body_start,
+                parent_idx,
             },
         );
         self.nesting.push(idx, node.end_byte());
@@ -338,6 +363,7 @@ impl RubyVisitor {
                 name,
                 qualified,
                 body_start,
+                parent_idx: self.nesting.current_parent(),
             },
         );
     }
@@ -367,6 +393,7 @@ impl RubyVisitor {
                 name,
                 qualified,
                 body_start,
+                parent_idx: self.nesting.current_parent(),
             },
         );
     }
@@ -381,7 +408,7 @@ impl RubyVisitor {
             return;
         }
         let name = node_text(left, source).to_string();
-        let qualified = self.nesting.qualified_for(&name, facts);
+        let qualified = self.qualified(&name, facts);
         self.emit(
             node,
             source,
@@ -391,6 +418,7 @@ impl RubyVisitor {
                 name,
                 qualified,
                 body_start: None,
+                parent_idx: self.nesting.current_parent(),
             },
         );
     }
@@ -489,6 +517,7 @@ impl RubyVisitor {
                 name,
                 qualified,
                 body_start,
+                parent_idx: self.nesting.current_parent(),
             },
         );
     }
@@ -501,6 +530,7 @@ struct EmitSpec {
     name: String,
     qualified: String,
     body_start: Option<usize>,
+    parent_idx: Option<usize>,
 }
 
 impl Visitor for RubyVisitor {
@@ -708,6 +738,11 @@ mod tests {
     }
 
     #[test]
+    fn parser_revision_covers_absolute_declaration_nesting() {
+        assert_eq!(RubyBackend.parser_revision(), 7);
+    }
+
+    #[test]
     fn claims_ruby_paths_and_shebangs() {
         use cairn_lang_api::{pick_backend_for_path, pick_backend_for_shebang};
         let backends: Vec<Box<dyn LanguageBackend>> = vec![Box::new(RubyBackend)];
@@ -760,6 +795,53 @@ end
         let build = symbol(&facts, "build");
         assert_eq!(build.kind, SymbolKind::Method);
         assert_eq!(build.qualified, "Outer::Inner::Greeter.build");
+    }
+
+    #[test]
+    fn absolute_declaration_resets_and_restores_nesting() {
+        let src = "\
+module Outer
+  class ::Alpha
+    VALUE = 1
+    class Nested
+      def self.work; end
+    end
+    def self.run; end
+  end
+  class Sibling
+    def self.after; end
+  end
+end
+";
+        let facts = syntactic(src);
+
+        let alpha = symbol(&facts, "::Alpha");
+        assert_eq!(alpha.qualified, "::Alpha");
+        assert_eq!(alpha.parent_idx, None);
+
+        let value = symbol(&facts, "VALUE");
+        assert_eq!(value.qualified, "::Alpha::VALUE");
+        assert_eq!(
+            value.parent_idx,
+            Some(
+                facts
+                    .symbols
+                    .iter()
+                    .position(|s| s.name == "::Alpha")
+                    .unwrap()
+            )
+        );
+
+        let nested = symbol(&facts, "Nested");
+        assert_eq!(nested.qualified, "::Alpha::Nested");
+        assert_eq!(facts.symbols[nested.parent_idx.unwrap()].name, "::Alpha");
+        assert_eq!(symbol(&facts, "work").qualified, "::Alpha::Nested.work");
+        assert_eq!(symbol(&facts, "run").qualified, "::Alpha.run");
+
+        let sibling = symbol(&facts, "Sibling");
+        assert_eq!(sibling.qualified, "Outer::Sibling");
+        assert_eq!(facts.symbols[sibling.parent_idx.unwrap()].name, "Outer");
+        assert_eq!(symbol(&facts, "after").qualified, "Outer::Sibling.after");
     }
 
     #[test]

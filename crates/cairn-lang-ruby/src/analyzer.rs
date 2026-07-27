@@ -15,17 +15,18 @@
 //!   name-level only: a method call's receiver type is unknown without
 //!   Tier-3, so `target_qualified` stays `None` for cross-file callees.
 //!   As a same-file best effort, a post-pass fills `target_qualified`
-//!   when the call name matches a method defined in this file — `Foo#m`
-//!   (instance), `Foo.m` (singleton), or the bare top-level name. When
-//!   both instance and singleton variants share a short name, the first
-//!   one seen in source order wins (the call site lacks a receiver type
-//!   to disambiguate). Cross-file callees keep `target_qualified: None`,
-//!   which hides them from `find_references`' default outgoing view
-//!   (visible with `include_noise`). Paren-less zero-arg calls are
-//!   indistinguishable from local-variable reads in the grammar (both
-//!   parse as `identifier`) and are deliberately not emitted. Dynamic
-//!   dispatch (`send(:name)`, `method_missing`) is not resolved — `send`
-//!   itself appears as the call target.
+//!   for an exact constant receiver such as `Foo.m`, or when a
+//!   receiver-less call name matches a method defined in this file —
+//!   `Foo#m` (instance), `Foo.m` (singleton), or the bare top-level
+//!   name. Dynamic receivers remain unresolved. When a receiver-less
+//!   call has both instance and singleton candidates, the first one
+//!   seen in source order wins. Cross-file callees keep
+//!   `target_qualified: None`, which hides them from `find_references`'
+//!   default outgoing view (visible with `include_noise`). Paren-less
+//!   zero-arg calls are indistinguishable from local-variable reads in
+//!   the grammar (both parse as `identifier`) and are deliberately not
+//!   emitted. Dynamic dispatch (`send(:name)`, `method_missing`) is not
+//!   resolved — `send` itself appears as the call target.
 //!
 //! - **type refs** — the base-class name in `class Dog < Animal` and the
 //!   mixin module names in `include M` / `extend M` / `prepend M` are
@@ -54,7 +55,7 @@
 //! and `ImplFact.type_qualified` resolvable against
 //! `symbols.qualified`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cairn_lang_api::{
@@ -75,6 +76,13 @@ impl Analyzer for RubyAnalyzer {
         "ruby-treesitter"
     }
 
+    fn revision(&self) -> u32 {
+        // v2 resolves relative and absolute constant receivers through
+        // same-file lexical owners, then maps the canonical lookup back
+        // to the published singleton symbol.
+        2
+    }
+
     fn extract_semantic(&self, source: &[u8]) -> Result<SemanticFacts, ExtractError> {
         let language: tree_sitter::Language = tree_sitter_ruby::LANGUAGE.into();
         let mut parser = Parser::new();
@@ -86,34 +94,253 @@ impl Analyzer for RubyAnalyzer {
             .ok_or_else(|| ExtractError::ParserFailure("parse returned None".into()))?;
 
         let mut facts = SemanticFacts::default();
-        let mut scope_stack: Vec<String> = Vec::new();
-        let mut methods: HashMap<String, String> = HashMap::new();
+        let mut scope_stack = ScopeStack::default();
+        let mut resolver = SameFileResolver::default();
         walk(
             tree.root_node(),
             source,
             &mut scope_stack,
             None,
-            &mut methods,
+            &mut resolver,
             &mut facts,
         );
-        resolve_same_file_callees(&methods, &mut facts);
+        resolver.resolve(&mut facts);
         Ok(facts)
     }
 }
 
-/// Fill `target_qualified` for call refs whose callee is a method
-/// defined in the same file. `methods` maps short method name →
-/// qualified name (first definition wins; ties between instance and
-/// singleton variants are unresolvable without a receiver type at the
-/// call site). Cross-file callees keep `target_qualified: None`, which
-/// hides them from `find_references`' default outgoing view (visible
-/// with `include_noise`).
-fn resolve_same_file_callees(methods: &HashMap<String, String>, facts: &mut SemanticFacts) {
-    for r in facts.refs.iter_mut() {
-        if r.kind == RefKind::Call && r.target_qualified.is_none() {
-            if let Some(qualified) = methods.get(r.target_name.as_str()) {
-                r.target_qualified = Some(qualified.clone());
+#[derive(Default)]
+struct SameFileResolver {
+    short_names: HashMap<String, String>,
+    singleton_methods: HashMap<String, SingletonTarget>,
+    constant_owners: HashSet<String>,
+    receiver_authorities: HashMap<usize, ReceiverAuthority>,
+}
+
+struct SingletonTarget {
+    published_qualified: String,
+    definitions: usize,
+}
+
+#[derive(Default)]
+struct ScopeStack {
+    segments: Vec<String>,
+}
+
+enum ScopeFrame {
+    Nested,
+    Absolute(Vec<String>),
+}
+
+enum MethodDefinitionAuthority {
+    Instance,
+    /// The enclosing scope proves the singleton owner (`def self.x` or
+    /// `class << self; def x`), so it can enter the exact index.
+    ScopedSingleton,
+    /// `def Alpha.x` may name a lexically relative constant. Keep it
+    /// available to the legacy short-name fallback, but do not treat
+    /// its raw object text as an exact owner.
+    ExplicitObjectSingleton,
+}
+
+impl ScopeStack {
+    /// Enter one declaration scope and return the state needed to
+    /// restore its caller. A leading `::` starts at Ruby's root rather
+    /// than inheriting the surrounding lexical owner.
+    fn enter(&mut self, name: String) -> ScopeFrame {
+        let frame = if name.starts_with("::") {
+            ScopeFrame::Absolute(std::mem::take(&mut self.segments))
+        } else {
+            ScopeFrame::Nested
+        };
+        self.segments.push(name);
+        frame
+    }
+
+    fn exit(&mut self, frame: ScopeFrame) {
+        match frame {
+            ScopeFrame::Nested => {
+                self.segments.pop();
             }
+            ScopeFrame::Absolute(previous) => self.segments = previous,
+        }
+    }
+
+    fn qualified(&self, name: &str) -> String {
+        if name.starts_with("::") || self.segments.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{name}", self.segments.join("::"))
+        }
+    }
+
+    fn method_qualified(&self, name: &str, singleton: bool) -> String {
+        if self.segments.is_empty() {
+            name.to_string()
+        } else {
+            format!(
+                "{}{}{name}",
+                self.segments.join("::"),
+                method_separator(singleton)
+            )
+        }
+    }
+
+    fn as_slice(&self) -> &[String] {
+        &self.segments
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+}
+
+impl SameFileResolver {
+    fn record_owner(&mut self, qualified: &str) {
+        self.constant_owners
+            .insert(qualified.trim_start_matches("::").to_string());
+    }
+
+    fn record_method(&mut self, name: &str, qualified: &str, authority: MethodDefinitionAuthority) {
+        self.short_names
+            .entry(name.to_string())
+            .or_insert_with(|| qualified.to_string());
+        if matches!(authority, MethodDefinitionAuthority::ScopedSingleton) {
+            let canonical = qualified.trim_start_matches("::").to_string();
+            let target =
+                self.singleton_methods
+                    .entry(canonical)
+                    .or_insert_with(|| SingletonTarget {
+                        published_qualified: qualified.to_string(),
+                        definitions: 0,
+                    });
+            target.definitions += 1;
+        }
+    }
+
+    /// Push a call fact and its receiver authority at the same index.
+    ///
+    /// Keeping both writes together prevents later non-call refs from
+    /// shifting the receiver metadata away from its call fact.
+    fn push_call(
+        &mut self,
+        facts: &mut SemanticFacts,
+        fact: RefFact,
+        receiver: Option<Node<'_>>,
+        source: &[u8],
+        scope_stack: &ScopeStack,
+    ) {
+        let index = facts.refs.len();
+        if let Some(receiver) = receiver {
+            let authority = match receiver.kind() {
+                "constant" | "scope_resolution" => {
+                    let owner = node_text(receiver, source)
+                        .trim_start_matches("::")
+                        .to_string();
+                    if absolute_scope_resolution(receiver) {
+                        ReceiverAuthority::Absolute { owner }
+                    } else {
+                        ReceiverAuthority::Lexical {
+                            owner,
+                            scope: scope_stack.as_slice().to_vec(),
+                        }
+                    }
+                }
+                // Preserve the existing self/super short-name behavior.
+                "self" | "super" => {
+                    facts.refs.push(fact);
+                    return;
+                }
+                _ => ReceiverAuthority::Dynamic,
+            };
+            self.receiver_authorities.insert(index, authority);
+        }
+        facts.refs.push(fact);
+    }
+
+    fn lexical_owner(&self, owner: &str, scope: &[String]) -> Option<String> {
+        for depth in (0..=scope.len()).rev() {
+            let prefix = scope[..depth].join("::");
+            let prefix = prefix.trim_start_matches("::");
+            let candidate = if prefix.is_empty() {
+                owner.to_string()
+            } else {
+                format!("{prefix}::{owner}")
+            };
+            if self.constant_owners.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Resolve same-file calls after every definition is indexed.
+    ///
+    /// Absolute receivers use their canonical owner. Relative
+    /// receivers use the nearest same-file lexical owner and never
+    /// fall through a shadowing owner to a global method. Dynamic
+    /// receivers fail closed. Calls without an explicit receiver
+    /// retain the existing first-definition short-name fallback.
+    fn resolve(&self, facts: &mut SemanticFacts) {
+        for (index, r) in facts.refs.iter_mut().enumerate() {
+            if r.kind == RefKind::Call && r.target_qualified.is_none() {
+                match self.receiver_authorities.get(&index) {
+                    Some(ReceiverAuthority::Absolute { owner }) => {
+                        self.resolve_owned_singleton(owner, r);
+                    }
+                    Some(ReceiverAuthority::Lexical { owner, scope }) => {
+                        if let Some(owner) = self.lexical_owner(owner, scope) {
+                            self.resolve_owned_singleton(&owner, r);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(qualified) = self.short_names.get(r.target_name.as_str()) {
+                            r.target_qualified = Some(qualified.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_owned_singleton(&self, owner: &str, r: &mut RefFact) {
+        if !self.constant_owners.contains(owner) {
+            return;
+        }
+        let qualified = format!("{owner}.{}", r.target_name);
+        if let Some(target) = self
+            .singleton_methods
+            .get(&qualified)
+            .filter(|target| target.definitions == 1)
+        {
+            r.target_qualified = Some(target.published_qualified.clone());
+        }
+    }
+}
+
+enum ReceiverAuthority {
+    /// Leading `::` fixes lookup at the top-level namespace.
+    Absolute { owner: String },
+    /// Relative constant lookup starts from this lexical scope.
+    Lexical { owner: String, scope: Vec<String> },
+    /// Receiver type cannot be proven by this analyzer.
+    Dynamic,
+}
+
+/// True when a scope-resolution receiver starts with Ruby's root `::`.
+///
+/// tree-sitter-ruby 0.23.1 represents the root segment as the only
+/// `scope_resolution` in the chain without a `scope` field.
+fn absolute_scope_resolution(mut node: Node<'_>) -> bool {
+    if node.kind() != "scope_resolution" {
+        return false;
+    }
+    loop {
+        match child_by_field(node, "scope") {
+            Some(scope) if scope.kind() == "scope_resolution" => node = scope,
+            Some(_) => return false,
+            None => return true,
         }
     }
 }
@@ -144,18 +371,17 @@ const DECLARATIVE_CALLS: &[&str] = &[
 ];
 
 /// Recursive walk maintaining:
-/// - `scope_stack`: enclosing class / module names (joined with `::`
-///   for qualified names), mirroring the syntactic pass's
-///   `NestingTracker`.
+/// - `scope_stack`: enclosing class / module names, with an explicit
+///   reset/restore frame for root-qualified declarations.
 /// - `enclosing`: qualified name of the nearest enclosing method /
 ///   class / module, or `None` at top level. Refs attach this as
 ///   `enclosing_qualified`.
 fn walk(
     node: Node<'_>,
     source: &[u8],
-    scope_stack: &mut Vec<String>,
+    scope_stack: &mut ScopeStack,
     enclosing: Option<&str>,
-    methods: &mut HashMap<String, String>,
+    resolver: &mut SameFileResolver,
     facts: &mut SemanticFacts,
 ) {
     match node.kind() {
@@ -164,13 +390,14 @@ fn walk(
                 return;
             };
             let name = node_text(name_node, source).to_string();
-            let qualified = qualify(scope_stack, &name);
+            let qualified = scope_stack.qualified(&name);
+            resolver.record_owner(&qualified);
             if node.kind() == "class" {
                 emit_superclass(node, source, &qualified, facts);
             }
-            scope_stack.push(name);
-            recurse(node, source, scope_stack, Some(&qualified), methods, facts);
-            scope_stack.pop();
+            let frame = scope_stack.enter(name);
+            recurse(node, source, scope_stack, Some(&qualified), resolver, facts);
+            scope_stack.exit(frame);
             return;
         }
         "method" => {
@@ -178,11 +405,15 @@ fn walk(
                 return;
             };
             let name = node_text(name_node, source);
-            let qualified = method_qualify(scope_stack, name, within_singleton_class(node));
-            methods
-                .entry(name.to_string())
-                .or_insert_with(|| qualified.clone());
-            recurse(node, source, scope_stack, Some(&qualified), methods, facts);
+            let singleton = within_singleton_class(node);
+            let qualified = scope_stack.method_qualified(name, singleton);
+            let authority = if singleton {
+                MethodDefinitionAuthority::ScopedSingleton
+            } else {
+                MethodDefinitionAuthority::Instance
+            };
+            resolver.record_method(name, &qualified, authority);
+            recurse(node, source, scope_stack, Some(&qualified), resolver, facts);
             return;
         }
         "singleton_method" => {
@@ -193,33 +424,35 @@ fn walk(
             // `def self.x` qualifies under the enclosing container,
             // `def Foo.x` under the explicit constant — mirroring the
             // syntactic pass.
-            let qualified = match child_by_field(node, "object") {
-                Some(obj) if obj.kind() != "self" => {
-                    format!("{}.{name}", node_text(obj, source))
-                }
-                _ => method_qualify(scope_stack, name, true),
+            let (qualified, authority) = match child_by_field(node, "object") {
+                Some(obj) if obj.kind() != "self" => (
+                    format!("{}.{name}", node_text(obj, source)),
+                    MethodDefinitionAuthority::ExplicitObjectSingleton,
+                ),
+                _ => (
+                    scope_stack.method_qualified(name, true),
+                    MethodDefinitionAuthority::ScopedSingleton,
+                ),
             };
-            methods
-                .entry(name.to_string())
-                .or_insert_with(|| qualified.clone());
-            recurse(node, source, scope_stack, Some(&qualified), methods, facts);
+            resolver.record_method(name, &qualified, authority);
+            recurse(node, source, scope_stack, Some(&qualified), resolver, facts);
             return;
         }
         "call" => {
-            handle_call(node, source, scope_stack, enclosing, facts);
+            handle_call(node, source, scope_stack, enclosing, resolver, facts);
             // fall through to recurse into receiver / arguments / block.
         }
         _ => {}
     }
-    recurse(node, source, scope_stack, enclosing, methods, facts);
+    recurse(node, source, scope_stack, enclosing, resolver, facts);
 }
 
 fn recurse(
     node: Node<'_>,
     source: &[u8],
-    scope_stack: &mut Vec<String>,
+    scope_stack: &mut ScopeStack,
     enclosing: Option<&str>,
-    methods: &mut HashMap<String, String>,
+    resolver: &mut SameFileResolver,
     facts: &mut SemanticFacts,
 ) {
     let mut cursor = node.walk();
@@ -230,33 +463,13 @@ fn recurse(
                 source,
                 scope_stack,
                 enclosing,
-                methods,
+                resolver,
                 facts,
             );
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
-    }
-}
-
-fn qualify(scope_stack: &[String], name: &str) -> String {
-    if scope_stack.is_empty() {
-        name.to_string()
-    } else {
-        format!("{}::{name}", scope_stack.join("::"))
-    }
-}
-
-fn method_qualify(scope_stack: &[String], name: &str, singleton: bool) -> String {
-    if scope_stack.is_empty() {
-        name.to_string()
-    } else {
-        format!(
-            "{}{}{name}",
-            scope_stack.join("::"),
-            method_separator(singleton)
-        )
     }
 }
 
@@ -310,19 +523,27 @@ fn emit_superclass(
 fn handle_call(
     call_node: Node<'_>,
     source: &[u8],
-    scope_stack: &[String],
+    scope_stack: &ScopeStack,
     enclosing: Option<&str>,
+    resolver: &mut SameFileResolver,
     facts: &mut SemanticFacts,
 ) {
     let Some(method) = child_by_field(call_node, "method") else {
         return;
     };
-    let has_receiver = child_by_field(call_node, "receiver").is_some();
+    let receiver = child_by_field(call_node, "receiver");
+    let has_receiver = receiver.is_some();
     let method_name = node_text(method, source);
 
     if !has_receiver {
         if matches!(method_name, "include" | "extend" | "prepend") && !scope_stack.is_empty() {
-            emit_mixins(call_node, source, method_name, scope_stack, facts);
+            emit_mixins(
+                call_node,
+                source,
+                method_name,
+                scope_stack.as_slice(),
+                facts,
+            );
             return;
         }
         if DECLARATIVE_CALLS.contains(&method_name) {
@@ -339,16 +560,22 @@ fn handle_call(
     if method_name.is_empty() {
         return;
     }
-    facts.refs.push(RefFact {
-        target_name: method_name.to_string(),
-        target_qualified: None,
-        kind: RefKind::Call,
-        type_role: None,
-        enclosing_idx: None,
-        enclosing_qualified: enclosing.map(str::to_string),
-        byte_range: method.byte_range(),
-        line: line_of(method),
-    });
+    resolver.push_call(
+        facts,
+        RefFact {
+            target_name: method_name.to_string(),
+            target_qualified: None,
+            kind: RefKind::Call,
+            type_role: None,
+            enclosing_idx: None,
+            enclosing_qualified: enclosing.map(str::to_string),
+            byte_range: method.byte_range(),
+            line: line_of(method),
+        },
+        receiver,
+        source,
+        scope_stack,
+    );
 }
 
 /// `include A, B` → one [`ImplFact`] per constant argument with
@@ -419,9 +646,27 @@ pub fn analyzer() -> Arc<dyn Analyzer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_lang_api::{LanguageBackend, SymbolKind};
+
+    fn assert_clean_parse(src: &str) {
+        let language: tree_sitter::Language = tree_sitter_ruby::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src.as_bytes(), None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+    }
 
     fn semantic(src: &str) -> SemanticFacts {
-        RubyAnalyzer.extract_semantic(src.as_bytes()).unwrap()
+        assert_clean_parse(src);
+        crate::RubyBackend
+            .analyzer()
+            .expect("Ruby semantic analyzer")
+            .extract_semantic(src.as_bytes())
+            .unwrap()
     }
 
     fn calls(f: &SemanticFacts) -> Vec<&RefFact> {
@@ -585,6 +830,405 @@ end
             .find(|r| r.target_name == "run")
             .expect("run call missing");
         assert_eq!(hit.target_qualified.as_deref(), Some("W#run"));
+    }
+
+    #[test]
+    fn explicit_constant_receivers_resolve_independent_of_definition_order() {
+        for src in [
+            "\
+class Alpha
+  def self.run; end
+end
+class Beta
+  def self.run; end
+end
+Alpha.run()
+Beta.run()
+",
+            "\
+class Beta
+  def self.run; end
+end
+class Alpha
+  def self.run; end
+end
+Alpha.run()
+Beta.run()
+",
+        ] {
+            let facts = semantic(src);
+            let targets: Vec<Option<&str>> = calls(&facts)
+                .into_iter()
+                .filter(|r| r.target_name == "run")
+                .map(|r| r.target_qualified.as_deref())
+                .collect();
+            assert_eq!(targets, [Some("Alpha.run"), Some("Beta.run")]);
+        }
+    }
+
+    #[test]
+    fn relative_receiver_uses_nearest_lexical_owner() {
+        let src = "\
+class Alpha
+  def self.run; end
+end
+module Outer
+  class Alpha
+    def self.run; end
+  end
+  def self.invoke
+    Alpha.run()
+  end
+end
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Outer::Alpha.run"));
+    }
+
+    #[test]
+    fn lexical_owner_without_method_blocks_global_fallback() {
+        let src = "\
+class Alpha
+  def self.run; end
+end
+module Outer
+  class Alpha
+  end
+  def self.invoke
+    Alpha.run()
+  end
+end
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified, None);
+    }
+
+    #[test]
+    fn absolute_receiver_uses_canonical_owner() {
+        let src = "\
+module Outer
+  class Nested
+    def self.run; end
+  end
+end
+::Outer::Nested.run()
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Outer::Nested.run"));
+    }
+
+    #[test]
+    fn absolute_declaration_target_matches_published_symbol() {
+        let src = "\
+class ::Alpha
+  def self.run; end
+end
+::Alpha.run()
+";
+        let syntactic = crate::RubyBackend
+            .extract_syntactic(src.as_bytes())
+            .unwrap();
+        let published = syntactic
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Method)
+            .expect("singleton run symbol missing")
+            .qualified
+            .as_str();
+        let facts = semantic(src);
+        let target = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing")
+            .target_qualified
+            .as_deref();
+        assert_eq!(target, Some(published));
+    }
+
+    #[test]
+    fn nested_absolute_declaration_target_matches_published_symbol() {
+        let src = "\
+module Outer
+  class ::Alpha
+    class Nested
+      def self.work; end
+    end
+    def self.run; end
+    def self.invoke
+      Nested.work()
+    end
+  end
+end
+::Alpha.run()
+::Alpha::Nested.work()
+";
+        let syntactic = crate::RubyBackend
+            .extract_syntactic(src.as_bytes())
+            .unwrap();
+        let published = |name: &str| {
+            syntactic
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::Method)
+                .expect("singleton symbol missing")
+                .qualified
+                .as_str()
+        };
+        let facts = semantic(src);
+        let run = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(run.target_qualified.as_deref(), Some(published("run")));
+
+        let work_targets: Vec<_> = calls(&facts)
+            .into_iter()
+            .filter(|r| r.target_name == "work")
+            .map(|r| r.target_qualified.as_deref())
+            .collect();
+        assert_eq!(
+            work_targets,
+            [Some(published("work")), Some(published("work"))]
+        );
+    }
+
+    #[test]
+    fn relative_qualified_receiver_requires_same_file_owner() {
+        let src = "\
+module Outer
+  module Inner
+    class Nested
+      def self.run; end
+    end
+  end
+  def self.invoke
+    Inner::Nested.run()
+    Missing::Nested.run()
+  end
+end
+";
+        let facts = semantic(src);
+        let targets: Vec<Option<&str>> = calls(&facts)
+            .into_iter()
+            .filter(|r| r.target_name == "run")
+            .map(|r| r.target_qualified.as_deref())
+            .collect();
+        assert_eq!(targets, [Some("Outer::Inner::Nested.run"), None]);
+    }
+
+    #[test]
+    fn non_static_explicit_receivers_stay_unresolved() {
+        let src = "\
+class Alpha
+  def self.run; end
+end
+Missing.run()
+def invoke(obj)
+  obj.run()
+end
+";
+        let facts = semantic(src);
+        let targets: Vec<Option<&str>> = calls(&facts)
+            .into_iter()
+            .filter(|r| r.target_name == "run")
+            .map(|r| r.target_qualified.as_deref())
+            .collect();
+        assert_eq!(targets, [None, None]);
+    }
+
+    #[test]
+    fn ambiguous_qualified_receiver_stays_unresolved() {
+        let src = "\
+class Alpha
+  def self.run; end
+  def self.run; end
+end
+Alpha.run()
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified, None);
+    }
+
+    #[test]
+    fn explicit_object_singleton_definition_stays_out_of_exact_index() {
+        let src = "\
+class Alpha; end
+module Outer
+  class Alpha; end
+  def Alpha.run; end
+  Alpha.run()
+end
+::Alpha.run()
+";
+        let facts = semantic(src);
+        let targets: Vec<_> = calls(&facts)
+            .into_iter()
+            .filter(|r| r.target_name == "run")
+            .map(|r| r.target_qualified.as_deref())
+            .collect();
+        assert_eq!(targets, [None, None]);
+    }
+
+    #[test]
+    fn explicit_object_singleton_keeps_receiverless_fallback() {
+        let src = "\
+module Outer
+  class Alpha; end
+  def Alpha.run; end
+end
+run()
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Alpha.run"));
+    }
+
+    #[test]
+    fn semantic_absolute_scope_exit_restores_outer_owner() {
+        let src = "\
+module Outer
+  class ::Alpha
+    def self.run; end
+  end
+  class Sibling
+    def self.after; end
+    def self.invoke
+      Sibling.after()
+    end
+  end
+end
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "after")
+            .expect("after call missing");
+        assert_eq!(
+            hit.target_qualified.as_deref(),
+            Some("Outer::Sibling.after")
+        );
+    }
+
+    #[test]
+    fn singleton_class_method_enters_exact_index() {
+        let src = "\
+class Alpha
+  class << self
+    def run; end
+  end
+end
+Alpha.run()
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Alpha.run"));
+    }
+
+    #[test]
+    fn receiverless_call_keeps_short_name_best_effort() {
+        let src = "\
+class Alpha
+  def self.run; end
+end
+run()
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Alpha.run"));
+    }
+
+    #[test]
+    fn self_receiver_keeps_existing_short_name_resolution() {
+        let src = "\
+class Alpha
+  def self.run; end
+  def self.invoke
+    self.run()
+  end
+end
+";
+        let facts = semantic(src);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Alpha.run"));
+    }
+
+    #[test]
+    fn super_keeps_existing_non_call_behavior() {
+        let src = "\
+class Parent
+  def run; end
+end
+class Child < Parent
+  def run
+    super()
+  end
+end
+";
+        let facts = semantic(src);
+        assert!(
+            calls(&facts).into_iter().all(|r| r.target_name != "super"),
+            "super should remain outside this analyzer's call facts"
+        );
+    }
+
+    #[test]
+    fn super_receiver_keeps_ref_index_alignment() {
+        let src = "\
+class Parent
+  def run; end
+end
+class Child < Parent
+  def run
+    super.run()
+  end
+end
+";
+        let facts = semantic(src);
+        assert_eq!(facts.refs[0].kind, RefKind::Type);
+        let hit = calls(&facts)
+            .into_iter()
+            .find(|r| r.target_name == "run")
+            .expect("super.run call missing");
+        assert_eq!(hit.target_qualified.as_deref(), Some("Parent#run"));
+    }
+
+    #[test]
+    fn analyzer_revision_covers_receiver_qualified_resolution() {
+        assert_eq!(
+            crate::RubyBackend
+                .analyzer()
+                .expect("Ruby semantic analyzer")
+                .revision(),
+            2
+        );
     }
 
     #[test]
