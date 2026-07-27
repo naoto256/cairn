@@ -72,9 +72,9 @@ impl LanguageBackend for CppBackend {
     }
 
     fn parser_revision(&self) -> u32 {
-        // v3 invalidates cached facts because class-body typedef
-        // declarations now emit TypeAlias facts.
-        3
+        // v4 invalidates cached facts because aggregate typedefs under
+        // C++23 #elifdef/#elifndef wrappers now emit TypeAlias facts.
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -811,7 +811,8 @@ fn at_aggregate_member_scope(node: Node<'_>) -> bool {
     while let Some(parent) = current {
         match parent.kind() {
             "field_declaration_list" => return true,
-            "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif" => {
+            "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif"
+            | "preproc_elifdef" => {
                 current = parent.parent();
             }
             _ => return false,
@@ -971,7 +972,7 @@ mod tests {
 
     #[test]
     fn parser_revision_covers_class_body_typedefs() {
-        assert_eq!(CppBackend.parser_revision(), 3);
+        assert_eq!(CppBackend.parser_revision(), 4);
     }
 
     #[test]
@@ -1216,6 +1217,51 @@ public:
         let f = facts(source);
         assert!(
             f.symbols.iter().all(|symbol| symbol.name != "Local"),
+            "{:#?}",
+            f.symbols
+        );
+    }
+
+    #[test]
+    fn elifdef_class_typedef_is_member_but_method_local_is_not() {
+        let source = r#"
+class Widget {
+public:
+#if 0
+    typedef int Never;
+#elifdef FLAG
+    typedef int Conditional;
+#endif
+    void method() {
+#if 0
+        typedef int NeverLocal;
+#elifndef FLAG
+        typedef int ConditionalLocal;
+#endif
+    }
+};
+"#;
+        let language: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error(), "{}", tree.root_node());
+
+        let f = facts(source);
+        let widget_idx = f
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "Widget")
+            .expect("Widget missing");
+        let conditional = symbol(&f, "Conditional");
+        assert_eq!(conditional.kind, SymbolKind::TypeAlias);
+        assert_eq!(conditional.qualified, "Widget::Conditional");
+        assert_eq!(conditional.parent_idx, Some(widget_idx));
+        assert_eq!(conditional.visibility, Some(Visibility::Public));
+        assert!(
+            f.symbols
+                .iter()
+                .all(|symbol| symbol.name != "ConditionalLocal"),
             "{:#?}",
             f.symbols
         );
