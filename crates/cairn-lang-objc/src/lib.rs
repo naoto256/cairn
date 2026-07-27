@@ -74,9 +74,9 @@ impl LanguageBackend for ObjcBackend {
     }
 
     fn parser_revision(&self) -> u32 {
-        // v3 invalidates cached facts because unmarked ivars now use the
-        // Objective-C default for their owning declaration.
-        3
+        // v4 invalidates cached facts because class-extension ivars now
+        // use Objective-C's private default.
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -838,11 +838,29 @@ fn visibility_from_specifier(node: Node<'_>, source: &[u8]) -> Visibility {
 /// implementation ivars private visibility. The grammar makes the owning
 /// declaration the direct parent of its `instance_variables` block.
 fn ivar_default_visibility(node: Node<'_>) -> Visibility {
-    match node.parent().map(|parent| parent.kind()) {
-        Some("class_interface") => Visibility::Crate,
-        Some("class_implementation") => Visibility::Private,
+    match node.parent() {
+        Some(parent)
+            if parent.kind() == "class_interface" && class_interface_is_extension(parent) =>
+        {
+            Visibility::Private
+        }
+        Some(parent) if parent.kind() == "class_interface" => Visibility::Crate,
+        Some(parent) if parent.kind() == "class_implementation" => Visibility::Private,
         _ => Visibility::Public,
     }
+}
+
+/// tree-sitter-objc 3.0.2 represents primary interfaces, class extensions,
+/// and named categories as `class_interface`. An empty category field leaves
+/// the literal `(` child as the structural discriminator for an extension.
+/// Named categories retain the interface fallback because Objective-C rejects
+/// ivars in that form.
+fn class_interface_is_extension(node: Node<'_>) -> bool {
+    if node.kind() != "class_interface" || child_by_field(node, "category").is_some() {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == "(")
 }
 
 fn default_visibility(node: Node<'_>, source: &[u8]) -> Visibility {
@@ -960,7 +978,7 @@ mod tests {
 
     #[test]
     fn parser_revision_tracks_ivar_default_visibility() {
-        assert_eq!(ObjcBackend.parser_revision(), 3);
+        assert_eq!(ObjcBackend.parser_revision(), 4);
     }
 
     #[test]
@@ -1193,6 +1211,56 @@ __attribute__((objc_root_class))
         assert_eq!(
             facts.symbols[reset_default.parent_idx.unwrap()].qualified,
             "ResetBox"
+        );
+    }
+
+    #[test]
+    fn class_extension_ivar_defaults_private() {
+        let src = br#"
+__attribute__((objc_root_class))
+@interface Foo
+@end
+
+@interface Foo () {
+    int extensionDefault;
+}
+@end
+
+@implementation Foo
+@end
+"#;
+        assert_parse_root_clean(src);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_objc::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let extension = root
+            .named_children(&mut cursor)
+            .find(|node| {
+                node.kind() == "class_interface"
+                    && node
+                        .named_child(1)
+                        .is_some_and(|child| child.kind() == "instance_variables")
+            })
+            .expect("class extension missing");
+        assert!(child_by_field(extension, "category").is_none());
+        let mut extension_cursor = extension.walk();
+        assert!(
+            extension
+                .children(&mut extension_cursor)
+                .any(|child| child.kind() == "(")
+        );
+
+        let facts = facts(src);
+        let extension_default = find(&facts, "Foo.extensionDefault");
+        assert_eq!(extension_default.visibility, Some(Visibility::Private));
+        assert_eq!(
+            facts.symbols[extension_default.parent_idx.unwrap()].qualified,
+            "Foo"
         );
     }
 
