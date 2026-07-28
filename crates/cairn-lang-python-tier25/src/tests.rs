@@ -1,11 +1,17 @@
 //! Unit tests for the Python Tier-2.5 resolver.
 
+use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    AnalyzerProgress, ResolutionKind, WorkspaceFile, WorkspaceResolution,
+    AnalyzerProgress, ResolutionKind, WorkspaceAnalyzer, WorkspaceFile, WorkspaceResolution,
 };
+use tree_sitter::Parser;
 
-use crate::analyze_files;
-use crate::const_resolver::parse_file;
+use crate::const_resolver::{ImportKind, ModuleIndex, parse_file};
+use crate::require_graph::RequireGraph;
+use crate::{
+    ANALYZER_REVISION, AliasAuthority, AliasAuthorityEvent, PythonTier25Analyzer, TypeAliasEvents,
+    alias_authority_at, analyze_files, type_alias_authority,
+};
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
@@ -32,6 +38,18 @@ fn run(root: &std::path::Path, files: &[(&str, &str)]) -> Vec<WorkspaceResolutio
     analyze_files(&wsf, &AnalyzerProgress::default())
 }
 
+fn run_published(
+    root: &std::path::Path,
+    manifest_id: ManifestId,
+    files: &[(&str, &str)],
+) -> Vec<WorkspaceResolution> {
+    let files = write_files(root, files);
+    PythonTier25Analyzer
+        .analyze_workspace(root, manifest_id, &files, &AnalyzerProgress::default())
+        .unwrap()
+        .resolutions
+}
+
 fn imports_of(res: &[WorkspaceResolution], source: &str) -> Vec<WorkspaceResolution> {
     res.iter()
         .filter(|r| r.source_path == source && r.kind == ResolutionKind::Import)
@@ -53,7 +71,261 @@ fn calls_of(res: &[WorkspaceResolution], source: &str) -> Vec<WorkspaceResolutio
         .collect()
 }
 
+fn assert_python_root_clean(source: &str) {
+    let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    assert!(
+        !tree.root_node().has_error(),
+        "fixture must parse without recovery: {}",
+        tree.root_node().to_sexp()
+    );
+}
+
 // ─── const_resolver (lexical / module-globals / aliases) ─────────────────
+
+#[test]
+fn analyzer_revision_tracks_pathless_alias_resolution() {
+    assert_eq!(ANALYZER_REVISION, 6);
+    assert_eq!(PythonTier25Analyzer.revision(), 6);
+}
+
+#[test]
+fn pathless_alias_preserves_qualified_identity_without_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = "\
+class _Dynamic:
+    pass
+
+def __getattr__(name):
+    if name == \"Dynamic\":
+        return _Dynamic
+    raise AttributeError(name)
+";
+    let caller = "\
+class p:
+    class Dynamic:
+        pass
+
+import provider as p
+
+class Child(p.Dynamic):
+    pass
+";
+    assert_python_root_clean(provider);
+    assert_python_root_clean(caller);
+
+    let provider_facts =
+        parse_file(provider.as_bytes(), Some("provider".to_string()), false).unwrap();
+    let caller_facts = parse_file(caller.as_bytes(), Some("caller".to_string()), false).unwrap();
+    let per_file = vec![
+        (
+            "provider.py".to_string(),
+            provider.as_bytes().to_vec(),
+            provider_facts,
+        ),
+        (
+            "caller.py".to_string(),
+            caller.as_bytes().to_vec(),
+            caller_facts,
+        ),
+    ];
+    let module_index = ModuleIndex::build(&per_file);
+    assert!(
+        module_index.lookup("provider.Dynamic").is_none(),
+        "the dynamic module attribute must not have a concrete symbol path"
+    );
+    assert_eq!(
+        module_index
+            .lookup("caller.p.Dynamic")
+            .map(|hit| hit.path.as_str()),
+        Some("caller.py"),
+        "the same-module decoy must make fallback observable"
+    );
+
+    let require_graph = RequireGraph::build(&per_file, &module_index);
+    let binding = per_file[1]
+        .2
+        .import_bindings
+        .iter()
+        .find(|binding| binding.local == "p")
+        .expect("import provider as p should produce an ImportBinding");
+    assert_eq!(binding.module, "provider");
+    assert_eq!(
+        require_graph
+            .resolve_binding("caller.py", binding)
+            .as_deref(),
+        Some("provider"),
+        "the import alias is the authority for the dotted reference"
+    );
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(1),
+        &[("provider.py", provider), ("caller.py", caller)],
+    );
+    let target = resolutions
+        .iter()
+        .find(|resolution| {
+            resolution.source_path == "caller.py" && resolution.kind == ResolutionKind::Type
+        })
+        .expect("Child(p.Dynamic) should emit a Type resolution");
+    assert_eq!(target.target_path, None);
+    assert_eq!(
+        target.target_qualified.as_deref(),
+        Some("provider.Dynamic"),
+        "alias authority must preserve the canonical identity without falling back to caller.p.Dynamic"
+    );
+    assert!(
+        resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution.source_path == "caller.py" && resolution.kind == ResolutionKind::Import
+            })
+            .all(|resolution| resolution.target_qualified.is_none()),
+        "Import rows retain their path-only contract"
+    );
+}
+
+#[test]
+fn dynamic_from_import_does_not_invent_module_identity_or_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = "\
+class _Dynamic:
+    pass
+
+def __getattr__(name):
+    if name == \"Dynamic\":
+        return _Dynamic
+    raise AttributeError(name)
+";
+    let caller = "\
+class D:
+    pass
+
+from provider import Dynamic as D
+
+class Child(D):
+    pass
+";
+    assert_python_root_clean(provider);
+    assert_python_root_clean(caller);
+
+    let provider_facts =
+        parse_file(provider.as_bytes(), Some("provider".to_string()), false).unwrap();
+    let caller_facts = parse_file(caller.as_bytes(), Some("caller".to_string()), false).unwrap();
+    let per_file = vec![
+        (
+            "provider.py".to_string(),
+            provider.as_bytes().to_vec(),
+            provider_facts,
+        ),
+        (
+            "caller.py".to_string(),
+            caller.as_bytes().to_vec(),
+            caller_facts,
+        ),
+    ];
+    let module_index = ModuleIndex::build(&per_file);
+    assert!(module_index.lookup("provider.Dynamic").is_none());
+    assert_eq!(
+        module_index
+            .lookup("caller.D")
+            .map(|target| target.path.as_str()),
+        Some("caller.py"),
+        "the same-module decoy makes forbidden fallback observable"
+    );
+
+    let binding = per_file[1]
+        .2
+        .import_bindings
+        .iter()
+        .find(|binding| binding.local == "D")
+        .expect("from provider import Dynamic as D should produce a binding");
+    assert!(matches!(binding.kind, ImportKind::From));
+    assert_eq!(binding.module, "provider");
+    assert_eq!(binding.imported.as_deref(), Some("Dynamic"));
+    let require_graph = RequireGraph::build(&per_file, &module_index);
+    assert_eq!(
+        require_graph
+            .resolve_binding("caller.py", binding)
+            .as_deref(),
+        Some("provider"),
+        "module-only fallback is import-edge evidence, not member identity"
+    );
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(3),
+        &[("provider.py", provider), ("caller.py", caller)],
+    );
+    let target = resolutions
+        .iter()
+        .find(|resolution| {
+            resolution.source_path == "caller.py" && resolution.kind == ResolutionKind::Type
+        })
+        .expect("Child(D) should emit a fail-closed Type resolution");
+    assert_eq!(target.target_path, None);
+    assert_eq!(
+        target.target_qualified, None,
+        "a dynamic from-import miss must not become provider or caller.D"
+    );
+}
+
+#[test]
+fn absolute_from_import_submodule_proves_module_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = "";
+    let submodule = "class Base:\n    pass\n";
+    let caller = "from pkg import sub\n\nclass Child(sub.Base):\n    pass\n";
+    assert_python_root_clean(package);
+    assert_python_root_clean(submodule);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(4),
+        &[
+            ("pkg/__init__.py", package),
+            ("pkg/sub.py", submodule),
+            ("caller.py", caller),
+        ],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .find(|resolution| resolution.target_qualified.is_some())
+        .expect("sub.Base should resolve through the imported submodule");
+    assert_eq!(target.target_path.as_deref(), Some("pkg/sub.py"));
+    assert_eq!(target.target_qualified.as_deref(), Some("pkg.sub.Base"));
+}
+
+#[test]
+fn relative_from_import_submodule_proves_module_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = "";
+    let submodule = "class Base:\n    pass\n";
+    let caller = "from . import sub\n\nclass Child(sub.Base):\n    pass\n";
+    assert_python_root_clean(package);
+    assert_python_root_clean(submodule);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(5),
+        &[
+            ("pkg/__init__.py", package),
+            ("pkg/sub.py", submodule),
+            ("pkg/caller.py", caller),
+        ],
+    );
+    let target = types_of(&resolutions, "pkg/caller.py")
+        .into_iter()
+        .find(|resolution| resolution.target_qualified.is_some())
+        .expect("relative sub.Base should resolve through the sibling module");
+    assert_eq!(target.target_path.as_deref(), Some("pkg/sub.py"));
+    assert_eq!(target.target_qualified.as_deref(), Some("pkg.sub.Base"));
+}
 
 #[test]
 fn module_level_class_resolves_in_same_file() {
@@ -87,8 +359,14 @@ fn from_import_with_explicit_alias() {
     let tmp = tempfile::tempdir().unwrap();
     let widget = "class Widget:\n    pass\n";
     let caller = "from widget import Widget as W\n\nclass Sub(W):\n    pass\n";
-    let res = run(tmp.path(), &[("widget.py", widget), ("caller.py", caller)]);
-    let types = types_of(&res, "caller.py");
+    assert_python_root_clean(widget);
+    assert_python_root_clean(caller);
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(6),
+        &[("widget.py", widget), ("caller.py", caller)],
+    );
+    let types = types_of(&resolutions, "caller.py");
     let hit = types
         .iter()
         .find(|t| t.target_qualified.as_deref() == Some("widget.Widget"))
@@ -101,13 +379,361 @@ fn import_module_as_alias() {
     let tmp = tempfile::tempdir().unwrap();
     let widget = "class Widget:\n    pass\n";
     let caller = "import widget as w\n\nclass Sub(w.Widget):\n    pass\n";
-    let res = run(tmp.path(), &[("widget.py", widget), ("caller.py", caller)]);
-    let types = types_of(&res, "caller.py");
+    assert_python_root_clean(widget);
+    assert_python_root_clean(caller);
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(2),
+        &[("widget.py", widget), ("caller.py", caller)],
+    );
+    let types = types_of(&resolutions, "caller.py");
     let hit = types
         .iter()
         .find(|t| t.target_qualified.as_deref() == Some("widget.Widget"))
         .expect("w.Widget via `import widget as w` should resolve");
     assert_eq!(hit.target_path.as_deref(), Some("widget.py"));
+}
+
+#[test]
+fn plain_dotted_import_binds_the_top_level_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = "class Dynamic:\n    pass\n";
+    let submodule = "class Base:\n    pass\n";
+    let caller = "import pkg.sub\n\nclass Child(pkg.Dynamic):\n    pass\n";
+    assert_python_root_clean(package);
+    assert_python_root_clean(submodule);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(7),
+        &[
+            ("pkg/__init__.py", package),
+            ("pkg/sub.py", submodule),
+            ("caller.py", caller),
+        ],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .find(|resolution| resolution.target_qualified.is_some())
+        .expect("pkg.Dynamic should resolve through the bound top-level package");
+    assert_eq!(target.target_path.as_deref(), Some("pkg/__init__.py"));
+    assert_eq!(target.target_qualified.as_deref(), Some("pkg.Dynamic"));
+}
+
+#[test]
+fn plain_dotted_import_retains_nested_module_lookup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = "";
+    let submodule = "class Base:\n    pass\n";
+    let caller = "import pkg.sub\n\nclass Child(pkg.sub.Base):\n    pass\n";
+    assert_python_root_clean(package);
+    assert_python_root_clean(submodule);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(8),
+        &[
+            ("pkg/__init__.py", package),
+            ("pkg/sub.py", submodule),
+            ("caller.py", caller),
+        ],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .find(|resolution| resolution.target_qualified.is_some())
+        .expect("pkg.sub.Base should resolve through the dotted import");
+    assert_eq!(target.target_path.as_deref(), Some("pkg/sub.py"));
+    assert_eq!(target.target_qualified.as_deref(), Some("pkg.sub.Base"));
+}
+
+#[test]
+fn aliased_dotted_import_binds_the_full_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = "";
+    let submodule = "class Base:\n    pass\n";
+    let caller = "import pkg.sub as p\n\nclass Child(p.Base):\n    pass\n";
+    assert_python_root_clean(package);
+    assert_python_root_clean(submodule);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(9),
+        &[
+            ("pkg/__init__.py", package),
+            ("pkg/sub.py", submodule),
+            ("caller.py", caller),
+        ],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .find(|resolution| resolution.target_qualified.is_some())
+        .expect("p.Base should resolve through the full aliased module");
+    assert_eq!(target.target_path.as_deref(), Some("pkg/sub.py"));
+    assert_eq!(target.target_qualified.as_deref(), Some("pkg.sub.Base"));
+}
+
+#[test]
+fn unresolved_aliased_import_blocks_same_module_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = "\
+class ext:
+    class Dynamic:
+        pass
+
+import external as ext
+
+class Child(ext.Dynamic):
+    pass
+";
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(tmp.path(), ManifestId(10), &[("caller.py", caller)]);
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .next()
+        .expect("Child(ext.Dynamic) should emit a fail-closed Type resolution");
+    assert_eq!(target.target_path, None);
+    assert_eq!(target.target_qualified, None);
+}
+
+#[test]
+fn unresolved_plain_import_blocks_same_module_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = "\
+class external:
+    class Dynamic:
+        pass
+
+import external
+
+class Child(external.Dynamic):
+    pass
+";
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(tmp.path(), ManifestId(11), &[("caller.py", caller)]);
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .next()
+        .expect("Child(external.Dynamic) should emit a fail-closed Type resolution");
+    assert_eq!(target.target_path, None);
+    assert_eq!(target.target_qualified, None);
+}
+
+#[test]
+fn unresolved_plain_dotted_import_blocks_same_module_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = "\
+class external:
+    class sub:
+        class Base:
+            pass
+
+import external.sub
+
+class Child(external.sub.Base):
+    pass
+";
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(tmp.path(), ManifestId(12), &[("caller.py", caller)]);
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .next()
+        .expect("Child(external.sub.Base) should emit a fail-closed Type resolution");
+    assert_eq!(target.target_path, None);
+    assert_eq!(target.target_qualified, None);
+}
+
+#[test]
+fn wildcard_import_does_not_create_a_literal_alias_authority() {
+    let source = "from external import *\n";
+    assert_python_root_clean(source);
+    let facts = parse_file(source.as_bytes(), Some("caller".to_string()), false).unwrap();
+    let binding = facts
+        .import_bindings
+        .iter()
+        .find(|binding| binding.local == "*")
+        .expect("wildcard imports retain an import-edge binding")
+        .clone();
+    assert!(matches!(binding.kind, ImportKind::From));
+    assert_eq!(binding.imported, None);
+
+    let per_file = vec![("caller.py".to_string(), source.as_bytes().to_vec(), facts)];
+    let module_index = ModuleIndex::build(&per_file);
+    let require_graph = RequireGraph::build(&per_file, &module_index);
+    let resolved = require_graph.resolve_binding("caller.py", &binding);
+    assert!(
+        type_alias_authority(&binding, resolved, &module_index).is_none(),
+        "wildcard imports do not bind the literal local name `*`"
+    );
+}
+
+#[test]
+fn later_unresolved_import_shadows_a_resolved_occurrence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = "class Dynamic:\n    pass\n";
+    let caller = "\
+import workspace as dep
+import external_provider as dep
+
+class Child(dep.Dynamic):
+    pass
+";
+    assert_python_root_clean(workspace);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(13),
+        &[("workspace.py", workspace), ("caller.py", caller)],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .next()
+        .expect("Child(dep.Dynamic) should emit a fail-closed Type resolution");
+    assert_eq!(target.target_path, None);
+    assert_eq!(target.target_qualified, None);
+}
+
+#[test]
+fn later_resolved_import_replaces_an_unresolved_occurrence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = "class Dynamic:\n    pass\n";
+    let caller = "\
+import external_provider as dep
+import workspace as dep
+
+class Child(dep.Dynamic):
+    pass
+";
+    assert_python_root_clean(workspace);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(14),
+        &[("workspace.py", workspace), ("caller.py", caller)],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .next()
+        .expect("the later workspace binding should resolve dep.Dynamic");
+    assert_eq!(target.target_path.as_deref(), Some("workspace.py"));
+    assert_eq!(
+        target.target_qualified.as_deref(),
+        Some("workspace.Dynamic")
+    );
+}
+
+#[test]
+fn type_references_see_only_preceding_import_occurrences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = "class Dynamic:\n    pass\n";
+    let caller = "\
+import workspace as dep
+
+class Before(dep.Dynamic):
+    pass
+
+import external_provider as dep
+
+class After(dep.Dynamic):
+    pass
+";
+    assert_python_root_clean(workspace);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(15),
+        &[("workspace.py", workspace), ("caller.py", caller)],
+    );
+    let mut targets = types_of(&resolutions, "caller.py");
+    targets.sort_by_key(|resolution| resolution.site_byte_range.start);
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].target_path.as_deref(), Some("workspace.py"));
+    assert_eq!(
+        targets[0].target_qualified.as_deref(),
+        Some("workspace.Dynamic")
+    );
+    assert_eq!(targets[1].target_path, None);
+    assert_eq!(targets[1].target_qualified, None);
+}
+
+#[test]
+fn same_statement_rebinding_uses_the_later_occurrence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = "class Dynamic:\n    pass\n";
+    let caller = "\
+import workspace as dep, external_provider as dep
+
+class Child(dep.Dynamic):
+    pass
+";
+    assert_python_root_clean(workspace);
+    assert_python_root_clean(caller);
+
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(16),
+        &[("workspace.py", workspace), ("caller.py", caller)],
+    );
+    let target = types_of(&resolutions, "caller.py")
+        .into_iter()
+        .next()
+        .expect("the later same-statement binding should own dep");
+    assert_eq!(target.target_path, None);
+    assert_eq!(target.target_qualified, None);
+}
+
+#[test]
+fn same_site_alias_events_use_vector_ordinal() {
+    let mut events = TypeAliasEvents::new();
+    events.insert(
+        "dep".to_string(),
+        vec![
+            AliasAuthorityEvent {
+                site_byte_start: 10,
+                ordinal: 0,
+                authority: AliasAuthority::Module("workspace".to_string()),
+            },
+            AliasAuthorityEvent {
+                site_byte_start: 10,
+                ordinal: 1,
+                authority: AliasAuthority::UnresolvedImport,
+            },
+        ],
+    );
+
+    assert!(matches!(
+        alias_authority_at(&events, "dep", 20),
+        Some(AliasAuthority::UnresolvedImport)
+    ));
+}
+
+#[test]
+fn unaliased_dotted_reference_keeps_same_module_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = "\
+class p:
+    class Dynamic:
+        pass
+
+class Child(p.Dynamic):
+    pass
+";
+    assert_python_root_clean(caller);
+    let res = run(tmp.path(), &[("caller.py", caller)]);
+    let target = types_of(&res, "caller.py")
+        .into_iter()
+        .find(|resolution| resolution.target_qualified.is_some())
+        .expect("unaliased p.Dynamic should use the same-module index");
+    assert_eq!(target.target_path.as_deref(), Some("caller.py"));
+    assert_eq!(target.target_qualified.as_deref(), Some("caller.p.Dynamic"));
 }
 
 #[test]
@@ -398,7 +1024,7 @@ fn module_attribute_call_via_import_module() {
 
 // ─── require_graph (imports → workspace files) ───────────────────────────
 //
-// Phase 1 contract: persisted Import resolutions carry `target_path`
+// Import-edge contract: persisted resolutions carry `target_path`
 // only — `target_qualified` is always `None` (matches Ruby /
 // JavaScript). The qualified name still lives on the require_graph
 // internally for binding lookup; we just don't leak it into the row,
@@ -530,7 +1156,7 @@ fn absolute_dotted_import_resolves() {
 
 #[test]
 fn import_target_qualified_is_none_even_when_require_graph_resolved() {
-    // Regression for CodeRabbit PR #231 finding C-2 (python): even
+    // Import rows remain path-only even
     // when the require_graph internally resolves a qualified target
     // (here "widget.Widget"), the persisted Import
     // WorkspaceResolution must carry `target_qualified = None`.

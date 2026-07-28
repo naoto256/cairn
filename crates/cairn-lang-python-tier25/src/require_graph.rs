@@ -49,7 +49,7 @@ impl RequireGraph {
             let module = facts.module.as_deref();
             for b in &facts.import_bindings {
                 let resolved =
-                    resolve_binding_into_qualified(b, module, facts.is_package_init, module_index);
+                    resolve_binding_occurrence(b, module, facts.is_package_init, module_index);
                 let (target_path, target_qualified) = match &resolved {
                     Some(q) => {
                         // Try symbol first, fall back to module.
@@ -92,8 +92,11 @@ impl RequireGraph {
     }
 }
 
-/// Given an `ImportBinding` from `file_module`, return the workspace
-/// qualified name it should resolve to (if any).
+/// Resolve one exact `ImportBinding` without consulting the graph's
+/// final per-local binding map.
+///
+/// Given a binding from `file_module`, return the workspace qualified
+/// name it should resolve to (if any).
 ///
 /// The mapping is:
 ///
@@ -105,7 +108,7 @@ impl RequireGraph {
 /// `from ..pkg import sub`   → pop two parent segments, then `pkg.sub`
 ///
 /// Wildcard `from m import *` resolves to the module itself.
-fn resolve_binding_into_qualified(
+pub(crate) fn resolve_binding_occurrence(
     b: &ImportBinding,
     file_module: Option<&str>,
     is_package_init: bool,
