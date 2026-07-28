@@ -1,17 +1,16 @@
 //! Method Resolution Order computation for Python.
 //!
 //! Python's MRO is officially C3 linearization (multiple inheritance
-//! with consistent left-to-right + monotonic ordering). For Stage 1 we
+//! with consistent left-to-right + monotonic ordering). We
 //! implement a best-effort:
 //!
 //!   * The class itself.
-//!   * Linearized C3 over the **workspace-resolvable** bases (we
-//!     intentionally skip bases we cannot resolve to a workspace
-//!     class — those are typically stdlib types like `object`,
-//!     `Exception`, `abc.ABC`, etc., and Tier-2.5 should not invent
-//!     edges for them).
-//!   * On C3 conflict (the linearization is not consistent), we fall
-//!     back to a stable DFS so callers always see a deterministic
+//!   * Linearized C3 over bases whose authority resolves through the
+//!     workspace import graph. Imported bases without a workspace
+//!     class fact remain leaf entries; unbound external bases are
+//!     omitted rather than invented.
+//!   * When bounded C3 cannot produce a chain, we fall back to a
+//!     stable, left-to-right DFS so callers always see a deterministic
 //!     ancestor list rather than no chain at all.
 //!
 //! `super().method()` resolution is driven by the same chain: it walks
@@ -72,7 +71,7 @@ impl Mro {
         let mut chain: HashMap<String, Vec<String>> = HashMap::new();
         for class in &classes {
             let computed = c3_linearize(class, &parents, &classes)
-                .unwrap_or_else(|| dfs_ancestors(class, &parents, &classes));
+                .unwrap_or_else(|| dfs_ancestors(class, &parents));
             chain.insert(class.clone(), computed);
         }
 
@@ -80,7 +79,7 @@ impl Mro {
     }
 
     /// Ancestors innermost-first, used for both instance and static
-    /// dispatch in Stage 1.
+    /// dispatch in the workspace analyzer.
     pub fn ancestors(&self, class: &str) -> Vec<String> {
         self.chain
             .get(class)
@@ -225,12 +224,8 @@ fn c3_linearize(
     linearize(class, parents, classes, 0)
 }
 
-/// Stable DFS fallback when C3 cannot linearize.
-fn dfs_ancestors(
-    class: &str,
-    parents: &HashMap<String, Vec<String>>,
-    classes: &HashSet<String>,
-) -> Vec<String> {
+/// Stable DFS fallback when bounded C3 cannot produce a chain.
+fn dfs_ancestors(class: &str, parents: &HashMap<String, Vec<String>>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = vec![class.to_string()];
@@ -245,16 +240,12 @@ fn dfs_ancestors(
         }
         out.push(cur.clone());
         if let Some(bases) = parents.get(&cur) {
-            // push in reverse so we visit left-to-right (workspace
-            // bases first, matching readable inheritance order).
+            // Put every base on the same stack in reverse order so
+            // workspace and unresolved imported bases both retain
+            // Python's left-to-right authority.
             for b in bases.iter().rev() {
-                if classes.contains(b) {
+                if !seen.contains(b) {
                     stack.push(b.clone());
-                } else if !seen.contains(b) {
-                    // record non-workspace bases in the chain so super()
-                    // walks have a deterministic next step.
-                    seen.insert(b.clone());
-                    out.push(b.clone());
                 }
             }
         }
