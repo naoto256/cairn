@@ -83,7 +83,10 @@ pub const TIER_PREFIX: &str = "tier25";
 // now set `target_qualified = None` to honor the `WorkspaceResolution`
 // contract (path-scoped lookup no longer pins symbol_id for imports).
 // Cached runs need invalidation.
-pub const ANALYZER_REVISION: u32 = 4;
+// Qualified extension owners now retain their complete dotted identity.
+// Cached runs may otherwise publish members under the first path component
+// and omit `self` dispatch for extensions of nested types.
+pub const ANALYZER_REVISION: u32 = 5;
 pub const PARSER_ID: &str = "tree-sitter-swift";
 pub const RESOLUTION_SOURCE: &str = "tier25-swift-resolver";
 

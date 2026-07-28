@@ -1,10 +1,12 @@
 //! Unit tests for the Swift Tier-2.5 resolver.
 
+use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
-    AnalyzerProgress, ResolutionKind, WorkspaceFile, WorkspaceResolution,
+    AnalyzerProgress, ResolutionKind, WorkspaceAnalyzer, WorkspaceFile, WorkspaceResolution,
 };
 
-use crate::analyze_files;
+use crate::const_resolver::{SwiftTypeKind, parse_file};
+use crate::{SwiftTier25Analyzer, analyze_files};
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
@@ -557,7 +559,8 @@ fn analyzer_id_and_revision_are_stable() {
     use crate::{ANALYZER_ID, ANALYZER_REVISION, PARSER_ID, RESOLUTION_SOURCE, TIER_PREFIX};
     assert_eq!(ANALYZER_ID, "swift-resolver");
     assert_eq!(TIER_PREFIX, "tier25");
-    assert_eq!(ANALYZER_REVISION, 4);
+    assert_eq!(ANALYZER_REVISION, 5);
+    assert_eq!(SwiftTier25Analyzer.revision(), 5);
     assert_eq!(PARSER_ID, "tree-sitter-swift");
     assert_eq!(RESOLUTION_SOURCE, "tier25-swift-resolver");
 }
@@ -591,5 +594,129 @@ func caller() {
             .any(|c| c.target_qualified.as_deref() == Some("Store.reload")),
         "Store.reload() should resolve via extension method index; got {:#?}",
         calls
+    );
+}
+
+#[test]
+fn qualified_extension_preserves_owner_and_self_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = "\
+struct Outer {
+    struct Inner {
+        func step() {}
+    }
+}
+
+extension Outer.Inner {
+    func run() {
+        self.step()
+    }
+}
+";
+
+    let language: tree_sitter::Language = tree_sitter_swift::LANGUAGE.into();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    assert!(!tree.root_node().has_error());
+    let root = tree.root_node();
+    let mut root_cursor = root.walk();
+    let extension = root
+        .named_children(&mut root_cursor)
+        .find(|node| {
+            node.kind() == "class_declaration"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.kind() == "user_type")
+        })
+        .expect("qualified extension should parse as a user_type owner");
+    let owner = extension.child_by_field_name("name").unwrap();
+    let mut owner_cursor = owner.walk();
+    let owner_parts = owner
+        .named_children(&mut owner_cursor)
+        .filter(|part| part.kind() == "type_identifier")
+        .map(|part| &source[part.byte_range()])
+        .collect::<Vec<_>>();
+    assert_eq!(owner_parts, ["Outer", "Inner"]);
+
+    let parsed = parse_file(source.as_bytes()).unwrap();
+    let files = write_files(tmp.path(), &[("QualifiedExtension.swift", source)]);
+    let workspace = SwiftTier25Analyzer
+        .analyze_workspace(
+            tmp.path(),
+            ManifestId(1),
+            &files,
+            &AnalyzerProgress::default(),
+        )
+        .unwrap();
+    let calls = calls_of(&workspace.resolutions, "QualifiedExtension.swift");
+    assert!(parsed.class_defs.iter().any(|definition| {
+        definition.kind == SwiftTypeKind::Extension && definition.qualified == "Outer.Inner"
+    }));
+    assert!(
+        parsed.method_defs.iter().any(|method| {
+            method.owner == "Outer.Inner" && method.qualified == "Outer.Inner.run"
+        })
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| { call.target_qualified.as_deref() == Some("Outer.Inner.step") })
+    );
+}
+
+#[test]
+fn qualified_extension_owners_with_the_same_leaf_do_not_collide() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = "\
+struct ModuleA {
+    struct Foo {
+        func step() {}
+    }
+}
+
+struct ModuleB {
+    struct Foo {
+        func step() {}
+    }
+}
+
+extension ModuleA.Foo {
+    func run() {
+        self.step()
+    }
+}
+
+extension ModuleB.Foo {
+    func run() {
+        self.step()
+    }
+}
+";
+
+    let language: tree_sitter::Language = tree_sitter_swift::LANGUAGE.into();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    assert!(!tree.root_node().has_error());
+
+    let files = write_files(tmp.path(), &[("SameLeaf.swift", source)]);
+    let workspace = SwiftTier25Analyzer
+        .analyze_workspace(
+            tmp.path(),
+            ManifestId(2),
+            &files,
+            &AnalyzerProgress::default(),
+        )
+        .unwrap();
+    let mut targets = calls_of(&workspace.resolutions, "SameLeaf.swift")
+        .into_iter()
+        .filter_map(|call| call.target_qualified)
+        .collect::<Vec<_>>();
+    targets.sort();
+    assert_eq!(
+        targets,
+        ["ModuleA.Foo.step", "ModuleB.Foo.step"],
+        "qualified extension owners must not collapse to their shared leaf"
     );
 }

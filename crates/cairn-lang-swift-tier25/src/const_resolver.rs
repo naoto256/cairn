@@ -560,7 +560,8 @@ impl<'a> Visitor<'a> {
 
 /// Name of a `class_declaration` / `protocol_declaration`. Nominal
 /// types carry a `type_identifier`; extensions carry a `user_type`
-/// whose first `type_identifier` is the extended base name.
+/// whose complete dotted path is the owner identity. Keeping only
+/// the first component would merge unrelated nested extension owners.
 fn declared_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     let name = find_field(node, "name")?;
     match name.kind() {
@@ -569,13 +570,7 @@ fn declared_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
                 .ok()?
                 .to_string(),
         ),
-        "user_type" => {
-            let mut cursor = name.walk();
-            name.named_children(&mut cursor)
-                .find(|c| c.kind() == "type_identifier")
-                .and_then(|c| std::str::from_utf8(&source[c.byte_range()]).ok())
-                .map(str::to_string)
-        }
+        "user_type" => type_parts(name, source).map(|parts| parts.join(".")),
         _ => std::str::from_utf8(&source[name.byte_range()])
             .ok()
             .map(str::to_string),
