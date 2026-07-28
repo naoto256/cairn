@@ -224,30 +224,42 @@ fn tsx_component_usage_hint() -> Hint {
     }
 }
 
+const JSX_SYMBOL_EXISTS_SQL: &str = "SELECT EXISTS (
+     SELECT 1
+       FROM symbols s
+       JOIN manifest_entries me
+         ON me.manifest_id = ?1
+        AND me.blob_sha = s.blob_sha
+      WHERE s.scope = 'top_level'
+        AND (
+             s.name = ?2
+          OR s.qualified = ?2
+        )
+        AND (
+             substr(me.path, -4) = '.tsx'
+          OR substr(me.path, -4) = '.jsx'
+        )
+ )";
+
 /// Ask the pinned snapshot whether `name` is defined in a
-/// `.tsx` / `.jsx` file. The match compares against `name` and the
-/// last segment of `qualified` so nested declarations (e.g.
-/// `Module::Foo`) still qualify. Only used to gate the JSX-usage
-/// hint after an empty caller scan.
+/// `.tsx` / `.jsx` file by exact bare or qualified name. This is a
+/// complete existence probe: the JSX-usage hint must not depend on
+/// an arbitrary symbol-result page size.
 fn symbol_defined_in_jsx_snapshot(
     conn: &rusqlite::Connection,
     anchor: &crate::anchor::AnchorName,
     name: &str,
 ) -> Result<bool> {
-    let q = crate::query::FindSymbolsArgs {
-        query: Some(name.to_string()),
-        fuzzy: false,
-        kind: None,
-        container: None,
-        path_prefix: None,
-        limit: Some(20),
-    };
-    Ok(query::find_symbols(conn, anchor, &q)?
-        .into_iter()
-        .any(|hit| {
-            (hit.name == name || hit.qualified.rsplit("::").next() == Some(name))
-                && (hit.path.ends_with(".tsx") || hit.path.ends_with(".jsx"))
-        }))
+    let manifest_id =
+        crate::anchor::resolve(conn, anchor)?.ok_or_else(|| Error::AnchorNotFound {
+            name: anchor.as_str().to_string(),
+        })?;
+    let exists = conn.query_row(
+        JSX_SYMBOL_EXISTS_SQL,
+        rusqlite::params![manifest_id.0, name],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(exists)
 }
 
 #[cfg(test)]
@@ -324,6 +336,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_callers_tsx_hint_is_not_capped_by_non_jsx_definitions() {
+        let mut owned_files = (0..20)
+            .map(|index| {
+                (
+                    format!("src/decoy_{index:02}.js"),
+                    "export function LineageFlow() {}\n".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        owned_files.push((
+            "src/zz_target.tsx".to_string(),
+            "export function LineageFlow() { return <div />; }\n".to_string(),
+        ));
+        let files = owned_files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>();
+        let fixture = fixture_from_files(&files);
+
+        let result = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "LineageFlow", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        assert_eq!(result["completeness"]["status"], "complete");
+        let hints = result["hints"].as_array().unwrap();
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint["code"] == "tsx_callers_use_instantiate"),
+            "expected JSX definition hint after all non-JSX decoys: {hints:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_callers_emits_tsx_hint_for_jsx_definition() {
+        let fixture = fixture_from_files(&[(
+            "src/App.jsx",
+            "export function LineageFlow() { return <div />; }\n",
+        )]);
+        let result = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "LineageFlow", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        assert!(
+            result["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["code"] == "tsx_callers_use_instantiate")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_callers_emits_tsx_hint_for_fully_qualified_definition() {
+        let fixture = fixture_from_files(&[(
+            "src/App.tsx",
+            "export class Widgets {\n\
+                 static LineageFlow() { return <div />; }\n\
+             }\n",
+        )]);
+        let result = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "name": "Widgets.LineageFlow",
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["items"].as_array().unwrap().is_empty());
+        assert!(
+            result["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["code"] == "tsx_callers_use_instantiate")
+        );
+    }
+
+    #[tokio::test]
     async fn find_callers_does_not_emit_tsx_hint_when_lowercase_symbol() {
         let fixture = fixture_from_files(&[(
             "src/App.tsx",
@@ -363,6 +468,35 @@ mod tests {
             hints
                 .iter()
                 .all(|hint| hint["code"] != "tsx_callers_use_instantiate")
+        );
+    }
+
+    #[test]
+    fn jsx_definition_probe_is_manifest_scoped_without_symbol_table_scan() {
+        let data = tempfile::tempdir().unwrap();
+        let conn = cas_store::open(&data.path().join("store.db")).unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {JSX_SYMBOL_EXISTS_SQL}"))
+            .unwrap()
+            .query_map(rusqlite::params![1_i64, "LineageFlow"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let joined = plan.join(" | ");
+
+        assert!(
+            joined.contains("SEARCH me") && joined.contains("(manifest_id=?)"),
+            "probe must start from the pinned manifest: {joined}"
+        );
+        assert!(
+            joined.contains("idx_symbols_blob"),
+            "probe must join symbols by manifest blob: {joined}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN s")),
+            "probe must not scan the global symbol table: {joined}"
         );
     }
 
