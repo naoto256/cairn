@@ -6,7 +6,7 @@
 //! emits resolution-layer rows (`source = "tier25-python-resolver"`)
 //! for the cases that the grammar can pin without LSP help.
 //!
-//! Scope (Stage 1, 3rd wave):
+//! Resolution scope:
 //!
 //! * Class / module lookup: lexical (module globals) → `from x import y`
 //!   bindings → `import x as y` bindings. Workspace-local only — no
@@ -76,10 +76,12 @@ pub const TIER_PREFIX: &str = "tier25";
 // Cached runs need invalidation.
 // Bumped to 5: explicit-operand super calls remain unresolved, and nested
 // functions inside class methods no longer enter the method index.
-// Bumped to 6: alias-authoritative type references now retain their
-// canonical qualified identity even when no concrete workspace path
-// exists. Cached pathless resolutions from revision 5 omitted it.
-pub const ANALYZER_REVISION: u32 = 6;
+// Bumped to 6: alias-authoritative type references retain their canonical
+// qualified identity even when no concrete workspace path exists.
+// Bumped to 7: bounded-C3 fallback now preserves left-to-right base
+// authority when workspace classes and unresolved imported bases are
+// mixed. Cached dispatch chains from revision 6 may have reversed them.
+pub const ANALYZER_REVISION: u32 = 7;
 pub const PARSER_ID: &str = "tree-sitter-python";
 pub const RESOLUTION_SOURCE: &str = "tier25-python-resolver";
 
@@ -297,7 +299,7 @@ pub fn analyze_files(
 }
 
 fn read_blob(file: &WorkspaceFile) -> Option<Vec<u8>> {
-    // v0.7.0 D PR: the runner pre-reads workspace files for
+    // The runner pre-reads workspace files for
     // Tier-2.5 analyzers (`requires_materialized_files() == true`)
     // and attaches the bytes here. Reading `worktree_path` directly
     // would re-open a race window between the runner's readability

@@ -7,6 +7,7 @@ use cairn_core::workspace_analyzer::{
 use tree_sitter::Parser;
 
 use crate::const_resolver::{ImportKind, ModuleIndex, parse_file};
+use crate::mro::Mro;
 use crate::require_graph::RequireGraph;
 use crate::{
     ANALYZER_REVISION, AliasAuthority, AliasAuthorityEvent, PythonTier25Analyzer, TypeAliasEvents,
@@ -83,12 +84,25 @@ fn assert_python_root_clean(source: &str) {
     );
 }
 
+fn mro_for(files: &[(&str, &str)]) -> Mro {
+    let mut per_file = Vec::new();
+    for (path, source) in files {
+        let module = crate::file_to_module(path);
+        let is_package_init = path.ends_with("/__init__.py") || *path == "__init__.py";
+        let facts = parse_file(source.as_bytes(), module, is_package_init).unwrap();
+        per_file.push(((*path).to_string(), source.as_bytes().to_vec(), facts));
+    }
+    let module_index = ModuleIndex::build(&per_file);
+    let require_graph = RequireGraph::build(&per_file, &module_index);
+    Mro::build(&per_file, &module_index, &require_graph)
+}
+
 // ─── const_resolver (lexical / module-globals / aliases) ─────────────────
 
 #[test]
-fn analyzer_revision_tracks_pathless_alias_resolution() {
-    assert_eq!(ANALYZER_REVISION, 6);
-    assert_eq!(PythonTier25Analyzer.revision(), 6);
+fn analyzer_revision_tracks_mro_fallback_ordering() {
+    assert_eq!(ANALYZER_REVISION, 7);
+    assert_eq!(PythonTier25Analyzer.revision(), 7);
 }
 
 #[test]
@@ -804,6 +818,124 @@ class C(A, B):
         .expect("self.go should resolve to some target");
     // C3: C -> A -> B -> object — so A.go wins.
     assert_eq!(go.target_qualified.as_deref(), Some("m.A.go"));
+}
+
+#[test]
+fn deep_fallback_preserves_left_to_right_mixed_base_order() {
+    let provider = "\
+class _Dynamic:
+    pass
+
+def __getattr__(name):
+    if name == \"Dynamic\":
+        return _Dynamic
+    raise AttributeError(name)
+";
+    let mut source = String::from(
+        "import provider as p\n\nclass C0:\n    def ping(self):\n        return \"local\"\n\n",
+    );
+    for index in 1..=64 {
+        source.push_str(&format!("class C{index}(C{}): pass\n", index - 1));
+    }
+    source.push_str(
+        "\nclass Leaf(C64, p.Dynamic):\n    def call(self):\n        return self.ping()\n",
+    );
+    assert_python_root_clean(provider);
+    assert_python_root_clean(&source);
+
+    let mro = mro_for(&[("provider.py", provider), ("m.py", &source)]);
+    let chain = mro.ancestors("m.Leaf");
+    assert_eq!(
+        chain.get(1).map(String::as_str),
+        Some("m.C64"),
+        "fallback must preserve Python's left-to-right base authority"
+    );
+    assert_eq!(chain.iter().position(|owner| owner == "m.C0"), Some(65));
+    assert_eq!(
+        chain.iter().position(|owner| owner == "provider.Dynamic"),
+        Some(66)
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(17),
+        &[("provider.py", provider), ("m.py", &source)],
+    );
+    assert!(
+        calls_of(&resolutions, "m.py")
+            .iter()
+            .any(|call| call.target_qualified.as_deref() == Some("m.C0.ping")),
+        "published dispatch must keep resolving the local left base"
+    );
+}
+
+#[test]
+fn normal_c3_diamond_keeps_left_to_right_order() {
+    let source = "\
+class Root:
+    def ping(self):
+        return \"root\"
+
+class Left(Root):
+    pass
+
+class Right(Root):
+    pass
+
+class Leaf(Left, Right):
+    def call(self):
+        return self.ping()
+";
+    assert_python_root_clean(source);
+
+    let mro = mro_for(&[("m.py", source)]);
+    assert_eq!(
+        mro.ancestors("m.Leaf"),
+        ["m.Leaf", "m.Left", "m.Right", "m.Root"]
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let resolutions = run_published(tmp.path(), ManifestId(18), &[("m.py", source)]);
+    assert!(
+        calls_of(&resolutions, "m.py")
+            .iter()
+            .any(|call| call.target_qualified.as_deref() == Some("m.Root.ping"))
+    );
+}
+
+#[test]
+fn same_leaf_bases_follow_inheritance_order_not_file_order() {
+    let left = "class Base:\n    def pick(self):\n        return \"left\"\n";
+    let right = "class Base:\n    def pick(self):\n        return \"right\"\n";
+    let caller = "\
+import left as L
+import right as R
+
+class Leaf(L.Base, R.Base):
+    def call(self):
+        return self.pick()
+";
+    assert_python_root_clean(left);
+    assert_python_root_clean(right);
+    assert_python_root_clean(caller);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let resolutions = run_published(
+        tmp.path(),
+        ManifestId(19),
+        &[
+            ("right.py", right),
+            ("left.py", left),
+            ("caller.py", caller),
+        ],
+    );
+    assert!(
+        calls_of(&resolutions, "caller.py")
+            .iter()
+            .any(|call| call.target_qualified.as_deref() == Some("left.Base.pick")),
+        "same-leaf owners must follow the declared base order"
+    );
 }
 
 #[test]
