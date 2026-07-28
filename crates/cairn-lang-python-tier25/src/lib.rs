@@ -54,10 +54,10 @@ pub mod require_graph;
 #[cfg(test)]
 mod tests;
 
-use const_resolver::{FileConstFacts, ModuleIndex};
+use const_resolver::{FileConstFacts, ImportBinding, ImportKind, ModuleIndex};
 use dispatch::MethodIndex;
 use mro::Mro;
-use require_graph::RequireGraph;
+use require_graph::{RequireGraph, resolve_binding_occurrence};
 
 pub const ANALYZER_ID: &str = "python-resolver";
 pub const TIER_PREFIX: &str = "tier25";
@@ -70,13 +70,16 @@ pub const TIER_PREFIX: &str = "tier25";
 // so existing workspace_analysis_runs need to be invalidated and the
 // analyzer re-run to repopulate rows with manifest_id Some. Analyzer
 // logic itself is unchanged.
-// Bumped to 4 for CodeRabbit follow-up #2: import-edge resolutions
+// Bumped to 4: import-edge resolutions
 // now set `target_qualified = None` to honor the `WorkspaceResolution`
 // contract (path-scoped lookup no longer pins symbol_id for imports).
 // Cached runs need invalidation.
 // Bumped to 5: explicit-operand super calls remain unresolved, and nested
 // functions inside class methods no longer enter the method index.
-pub const ANALYZER_REVISION: u32 = 5;
+// Bumped to 6: alias-authoritative type references now retain their
+// canonical qualified identity even when no concrete workspace path
+// exists. Cached pathless resolutions from revision 5 omitted it.
+pub const ANALYZER_REVISION: u32 = 6;
 pub const PARSER_ID: &str = "tree-sitter-python";
 pub const RESOLUTION_SOURCE: &str = "tier25-python-resolver";
 
@@ -167,7 +170,7 @@ pub fn analyze_files(
     // 3. Emit Import resolutions for `import` / `from ... import ...`
     // statements whose target lives in the workspace.
     //
-    // Phase 1 contract (matches Ruby / JavaScript): Import-edge rows
+    // Import-edge contract (shared with Ruby / JavaScript): rows
     // record `target_path` only; `target_qualified` is forced to
     // `None`. The require_graph still computes the qualified name
     // internally for binding resolution, but leaking it into the
@@ -197,31 +200,57 @@ pub fn analyze_files(
     let mro = Mro::build(&per_file, &module_index, &require_graph);
     let methods = MethodIndex::build(&per_file);
 
-    // Per-file alias map: short-name → fully-qualified workspace symbol.
-    // Built from the require-graph (only edges that resolved to a
-    // workspace target contribute aliases).
-    let mut alias_maps: HashMap<&str, HashMap<String, String>> = HashMap::new();
+    // Method dispatch retains the require-graph's existing final
+    // per-local alias strings. Type resolution retains each binding
+    // occurrence so a later unresolved import can shadow an earlier
+    // resolved one without changing dispatch or MRO behavior.
+    let mut dispatch_alias_maps: HashMap<&str, HashMap<String, String>> = HashMap::new();
+    let mut type_alias_event_maps: HashMap<&str, TypeAliasEvents> = HashMap::new();
     for (path, _, facts) in &per_file {
-        let mut m: HashMap<String, String> = HashMap::new();
-        for binding in &facts.import_bindings {
-            // The require-graph stores resolved qualifieds keyed by
-            // binding range; re-walk facts and ask the graph for the
-            // resolved qualified.
-            if let Some(q) = require_graph.resolve_binding(path, binding) {
-                m.insert(binding.local.clone(), q);
+        let mut dispatch_aliases: HashMap<String, String> = HashMap::new();
+        let mut type_alias_events = TypeAliasEvents::new();
+        for (ordinal, binding) in facts.import_bindings.iter().enumerate() {
+            if let Some(qualified) = require_graph.resolve_binding(path, binding) {
+                dispatch_aliases.insert(binding.local.clone(), qualified.clone());
+            }
+            let occurrence = resolve_binding_occurrence(
+                binding,
+                facts.module.as_deref(),
+                facts.is_package_init,
+                &module_index,
+            );
+            let authority = type_alias_authority(binding, occurrence, &module_index);
+            if let Some(authority) = authority {
+                type_alias_events
+                    .entry(binding.local.clone())
+                    .or_default()
+                    .push(AliasAuthorityEvent {
+                        site_byte_start: binding.site_byte_start,
+                        ordinal,
+                        authority,
+                    });
             }
         }
-        alias_maps.insert(path.as_str(), m);
+        dispatch_alias_maps.insert(path.as_str(), dispatch_aliases);
+        type_alias_event_maps.insert(path.as_str(), type_alias_events);
     }
 
     for (path, _, facts) in &per_file {
-        let aliases = alias_maps.get(path.as_str()).cloned().unwrap_or_default();
+        let dispatch_aliases = dispatch_alias_maps
+            .get(path.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let type_alias_events = type_alias_event_maps.get(path.as_str());
 
         // Type references (base classes, `Foo()` constructions, etc.).
         for tref in &facts.type_refs {
+            let authority = tref.parts.first().and_then(|head| {
+                type_alias_events
+                    .and_then(|events| alias_authority_at(events, head, tref.byte_start))
+            });
             let resolved = resolve_dotted(
                 &tref.parts,
-                &aliases,
+                authority,
                 facts.module.as_deref(),
                 &module_index,
             );
@@ -230,17 +259,24 @@ pub fn analyze_files(
                 site_byte_range: tref.byte_start..tref.byte_end,
                 kind: ResolutionKind::Type,
                 semantic_kind: None,
-                target_path: resolved.as_ref().map(|r| r.0.clone()),
-                target_qualified: resolved.map(|r| r.1),
+                target_path: resolved
+                    .as_ref()
+                    .and_then(|resolution| resolution.target_path.clone()),
+                target_qualified: resolved.map(|resolution| resolution.target_qualified),
             });
         }
 
         // Method calls — only static / self / super / module-attribute
         // shapes where the receiver type is pinnable from the grammar.
         for call in &facts.method_calls {
-            let Some(resolved) =
-                dispatch::resolve_call(call, &module_index, &mro, &methods, &aliases, facts)
-            else {
+            let Some(resolved) = dispatch::resolve_call(
+                call,
+                &module_index,
+                &mro,
+                &methods,
+                &dispatch_aliases,
+                facts,
+            ) else {
                 // Unresolvable (`obj.method()`, `getattr`, etc.) —
                 // Tier-2.5 does NOT emit a "site observed" row for
                 // these. They belong to Tier-3.
@@ -298,22 +334,127 @@ fn file_to_module(path: &str) -> Option<String> {
     Some(normalised.join("."))
 }
 
+/// Path and qualified identity are independent: an import alias can
+/// prove the canonical name even when no concrete workspace symbol
+/// supplies a path.
+struct DottedResolution {
+    target_path: Option<String>,
+    target_qualified: String,
+}
+
+/// Resolution authority retained from the import form.
+#[derive(Clone)]
+enum AliasAuthority {
+    /// A direct module import or proven imported submodule owns the
+    /// module identity, so a dotted member can retain its qualified
+    /// name without a path.
+    Module(String),
+    /// `from module import member` is authoritative only after the
+    /// workspace index proves the imported member itself.
+    ConcreteSymbol(String),
+    /// The import still owns its local name and therefore blocks
+    /// fallback, but does not prove a publishable target identity.
+    UnresolvedImport,
+}
+
+struct AliasAuthorityEvent {
+    site_byte_start: u32,
+    ordinal: usize,
+    authority: AliasAuthority,
+}
+
+type TypeAliasEvents = HashMap<String, Vec<AliasAuthorityEvent>>;
+
+/// Select the latest import event visible before one type reference.
+///
+/// Byte order is the authority available in the current file-level
+/// model. The ordinal makes multiple bindings at the same import site
+/// deterministic without claiming conditional or function-scope
+/// dominance.
+fn alias_authority_at<'a>(
+    events: &'a TypeAliasEvents,
+    head: &str,
+    reference_byte_start: u32,
+) -> Option<&'a AliasAuthority> {
+    events
+        .get(head)?
+        .iter()
+        .filter(|event| event.site_byte_start <= reference_byte_start)
+        .max_by_key(|event| (event.site_byte_start, event.ordinal))
+        .map(|event| &event.authority)
+}
+
+/// Preserve the name that each import form actually binds.
+///
+/// A plain dotted import binds its first segment, while an aliased
+/// dotted import binds the full resolved module. From-imports require
+/// proof of the imported leaf because their graph fallback may identify
+/// only the containing module.
+fn type_alias_authority(
+    binding: &ImportBinding,
+    resolved: Option<String>,
+    module_index: &ModuleIndex,
+) -> Option<AliasAuthority> {
+    // A wildcard affects the module namespace but does not bind the
+    // literal parser placeholder as a local identifier.
+    if matches!(binding.kind, ImportKind::From)
+        && binding.local == "*"
+        && binding.imported.is_none()
+    {
+        return None;
+    }
+
+    match binding.kind {
+        ImportKind::Plain => Some(match resolved {
+            Some(qualified) if module_index.module_path(&qualified).is_some() => {
+                match qualified.split('.').next() {
+                    Some(top_level) if !top_level.is_empty() => {
+                        AliasAuthority::Module(top_level.to_string())
+                    }
+                    _ => AliasAuthority::UnresolvedImport,
+                }
+            }
+            _ => AliasAuthority::UnresolvedImport,
+        }),
+        ImportKind::Aliased => Some(match resolved {
+            Some(qualified) if module_index.module_path(&qualified).is_some() => {
+                AliasAuthority::Module(qualified)
+            }
+            _ => AliasAuthority::UnresolvedImport,
+        }),
+        ImportKind::From => Some(match resolved {
+            Some(qualified)
+                if qualified.rsplit('.').next() == binding.imported.as_deref()
+                    && module_index.module_path(&qualified).is_some() =>
+            {
+                AliasAuthority::Module(qualified)
+            }
+            Some(qualified)
+                if qualified.rsplit('.').next() == binding.imported.as_deref()
+                    && module_index.lookup(&qualified).is_some() =>
+            {
+                AliasAuthority::ConcreteSymbol(qualified)
+            }
+            _ => AliasAuthority::UnresolvedImport,
+        }),
+    }
+}
+
 /// Best-effort resolution of a dotted reference under Python lexical
 /// rules: alias-map (covers `from x import Y` and `import x as Y`) →
 /// in-module lookup → workspace global module-index lookup.
 ///
-/// Returns `(target_path, target_qualified)` when resolution
-/// succeeds, mirroring the shape `WorkspaceResolution` records.
+/// Once an alias binds the head, failure to find a concrete path does
+/// not permit fallback under another authority.
 fn resolve_dotted(
     parts: &[String],
-    aliases: &HashMap<String, String>,
+    authority: Option<&AliasAuthority>,
     module: Option<&str>,
     module_index: &ModuleIndex,
-) -> Option<(String, String)> {
+) -> Option<DottedResolution> {
     if parts.is_empty() {
         return None;
     }
-    let head = &parts[0];
     let tail = if parts.len() > 1 {
         Some(parts[1..].join("."))
     } else {
@@ -321,31 +462,46 @@ fn resolve_dotted(
     };
 
     // 1. Alias substitution: `head` was bound by an import.
-    if let Some(target) = aliases.get(head) {
+    if let Some(authority) = authority {
+        let (target, pathless_authoritative) = match authority {
+            AliasAuthority::Module(target) => (target, true),
+            AliasAuthority::ConcreteSymbol(target) => (target, false),
+            AliasAuthority::UnresolvedImport => return None,
+        };
         let qualified = match &tail {
             Some(t) => format!("{target}.{t}"),
             None => target.clone(),
         };
         if let Some(hit) = module_index.lookup(&qualified) {
-            return Some((hit.path.clone(), hit.qualified.clone()));
+            return Some(DottedResolution {
+                target_path: Some(hit.path.clone()),
+                target_qualified: hit.qualified.clone(),
+            });
         }
-        // Resolved by alias but no concrete symbol — record qualified
-        // without a path so consumers can still see the resolved name.
-        return Some((String::new(), qualified)).filter(|(p, _)| !p.is_empty());
+        return pathless_authoritative.then_some(DottedResolution {
+            target_path: None,
+            target_qualified: qualified,
+        });
     }
 
     // 2. Same-module lookup: prepend the file's own module name.
     if let Some(m) = module.filter(|m| !m.is_empty()) {
         let candidate = format!("{m}.{}", parts.join("."));
         if let Some(hit) = module_index.lookup(&candidate) {
-            return Some((hit.path.clone(), hit.qualified.clone()));
+            return Some(DottedResolution {
+                target_path: Some(hit.path.clone()),
+                target_qualified: hit.qualified.clone(),
+            });
         }
     }
 
     // 3. Global lookup against the workspace index.
     let qualified = parts.join(".");
     if let Some(hit) = module_index.lookup(&qualified) {
-        return Some((hit.path.clone(), hit.qualified.clone()));
+        return Some(DottedResolution {
+            target_path: Some(hit.path.clone()),
+            target_qualified: hit.qualified.clone(),
+        });
     }
 
     None
