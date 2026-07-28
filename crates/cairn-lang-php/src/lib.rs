@@ -67,7 +67,10 @@ impl LanguageBackend for PhpBackend {
         // `find_imports` can LEFT JOIN it.
         // v3: invalidate rows produced before worktree hashing and parsing
         // shared one immutable, single-read payload.
-        3
+        // v4: `define()` emits both single- and double-quoted static
+        // names, while interpolated or escaped names no longer publish
+        // a partial constant. Re-parse cached constant facts.
+        4
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -415,8 +418,13 @@ fn php_visibility(node: Node<'_>, source: &[u8], kind: &SymbolKind) -> Option<Vi
     }
 }
 
-/// First string argument of a call — the constant name in
+/// Static first string argument of a call — the constant name in
 /// `define('NAME', ...)`.
+///
+/// Both PHP string node forms are accepted only when the grammar
+/// exposes exactly one non-empty `string_content` child.
+/// Interpolation and escapes add other fragments; rejecting them keeps
+/// the extractor from inventing a partially decoded constant name.
 fn first_string_argument(call: Node<'_>, source: &[u8]) -> Option<String> {
     let args = child_by_field(call, "arguments")?;
     let mut cursor = args.walk();
@@ -424,13 +432,13 @@ fn first_string_argument(call: Node<'_>, source: &[u8]) -> Option<String> {
         .named_children(&mut cursor)
         .find(|c| c.kind() == "argument")?;
     let string = first.named_child(0)?;
-    if string.kind() != "string" {
+    if !matches!(string.kind(), "string" | "encapsed_string") || string.named_child_count() != 1 {
         return None;
     }
-    let mut sc = string.walk();
-    let content = string
-        .named_children(&mut sc)
-        .find(|c| c.kind() == "string_content")?;
+    let content = string.named_child(0)?;
+    if content.kind() != "string_content" {
+        return None;
+    }
     let text = node_text(content, source).to_string();
     (!text.is_empty()).then_some(text)
 }
@@ -592,6 +600,93 @@ mod tests {
         assert_eq!(PhpBackend.parser_id(), "tree-sitter-php");
     }
 
+    fn define_name_shape(source: &[u8]) -> (String, Vec<String>) {
+        fn find_define_name<'tree>(node: Node<'tree>, source: &[u8]) -> Option<Node<'tree>> {
+            if node.kind() == "function_call_expression"
+                && child_by_field(node, "function")
+                    .is_some_and(|function| node_text(function, source) == "define")
+            {
+                let args = child_by_field(node, "arguments")?;
+                let argument = args.named_child(0)?;
+                return argument.named_child(0);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(found) = find_define_name(child, source) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let language: tree_sitter::Language = tree_sitter_php::LANGUAGE_PHP.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let name = find_define_name(tree.root_node(), source).expect("define name missing");
+        let mut cursor = name.walk();
+        let children = name
+            .named_children(&mut cursor)
+            .map(|child| child.kind().to_string())
+            .collect();
+        (name.kind().to_string(), children)
+    }
+
+    #[test]
+    fn define_string_ast_shapes_are_pinned() {
+        let cases: &[(&[u8], &str, &[&str])] = &[
+            (
+                br#"<?php define('SINGLE', 1);"#,
+                "string",
+                &["string_content"],
+            ),
+            (
+                br#"<?php define("DOUBLE", 1);"#,
+                "encapsed_string",
+                &["string_content"],
+            ),
+            (
+                br#"<?php define("BASIC_$name", 1);"#,
+                "encapsed_string",
+                &["string_content", "variable_name"],
+            ),
+            (
+                br#"<?php define("BRACED_{$name}", 1);"#,
+                "encapsed_string",
+                &["string_content", "variable_name"],
+            ),
+            (
+                br#"<?php define('ESCAPED_\'QUOTE', 1);"#,
+                "string",
+                &["string_content", "escape_sequence", "string_content"],
+            ),
+            (
+                br#"<?php define("ESCAPED_\"QUOTE", 1);"#,
+                "encapsed_string",
+                &["string_content", "escape_sequence", "string_content"],
+            ),
+            (br#"<?php define('', 1);"#, "string", &[]),
+            (br#"<?php define($name, 1);"#, "variable_name", &["name"]),
+        ];
+        for (source, expected_kind, expected_children) in cases {
+            let (kind, children) = define_name_shape(source);
+            assert_eq!(kind, *expected_kind);
+            assert_eq!(
+                children,
+                expected_children
+                    .iter()
+                    .map(|kind| (*kind).to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn parser_revision_covers_static_define_literals() {
+        assert_eq!(PhpBackend.parser_revision(), 4);
+    }
+
     #[test]
     fn extracts_class_interface_trait_enum_function() {
         let src = br#"<?php
@@ -743,6 +838,28 @@ const TOP_LEVEL = 2;
 
         assert_eq!(symbol(&facts, "APP_VERSION").kind, SymbolKind::Constant);
         assert_eq!(symbol(&facts, "TOP_LEVEL").kind, SymbolKind::Constant);
+    }
+
+    #[test]
+    fn define_accepts_only_unescaped_static_string_literals() {
+        let source = br#"<?php
+define('SINGLE_NAME', 1);
+define("DOUBLE_NAME", 1);
+define("BASIC_$name", 1);
+define("BRACED_{$name}", 1);
+define('ESCAPED_\'QUOTE', 1);
+define("ESCAPED_\"QUOTE", 1);
+define('', 1);
+define($name, 1);
+"#;
+        let facts = PhpBackend.extract_syntactic(source).unwrap();
+        let constants: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::Constant)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(constants, ["SINGLE_NAME", "DOUBLE_NAME"]);
     }
 
     #[test]
