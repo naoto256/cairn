@@ -170,9 +170,9 @@ impl ControlMethod for Doctor {
                 checks.extend(parser_revision_stale_checks(&store_probes));
                 checks.extend(analyzer_rerun_health_checks(&store_probes));
                 checks.extend(tier3_run_checks(&store_probes));
-                // PR3 Phase 4: durable reconcile-state health.
-                // Deduped by repo_hash so a repo with two aliases
-                // does not produce two identical warnings.
+                // Reconcile health belongs to the canonical repository.
+                // Deduping by repo_hash prevents aliases for the same repo
+                // from producing identical warnings.
                 let reconcile_data_dir = ctx.cas_data_dir.clone();
                 let reconcile_res = tokio::task::spawn_blocking(move || {
                     reconcile_state_checks(&reconcile_data_dir)
@@ -337,13 +337,11 @@ struct AliasStoreState {
     stale_parser_revisions: Vec<ParserStaleRevision>,
     /// `analyzer_id -> expected revision` for every analyzer the
     /// current build expects to run on this manifest. Lets
-    /// `parser_drift_rerun_check` actually verify that a row whose
-    /// `status = succeeded` is at the current revision (R2 catch:
-    /// inferring "current" from the absence of a `StaleRevision`
-    /// entry is fragile — the parser-drift check would otherwise
-    /// declare a `succeeded` row at any revision as "current" and
-    /// misclassify analyzer-stale rows as the D PR safety-net Case A
-    /// Fail).
+    /// `parser_drift_rerun_check` verify that a row whose
+    /// `status = succeeded` is at the current revision. Inferring
+    /// "current" from the absence of a `StaleRevision` entry is
+    /// insufficient: a `succeeded` row at an older revision must not
+    /// satisfy the parser-drift safety-net Case A.
     expected_analyzer_revisions: HashMap<String, u32>,
 }
 
@@ -545,11 +543,10 @@ fn probe_manifest(
     let stale_parser_revisions =
         compute_parser_stale_revisions(conn, ManifestId(manifest_id), root_path)?;
 
-    // Capture the expected revision for every analyzer so the
-    // parser-drift cross-reference can verify a `succeeded` row's
-    // revision directly (R2 catch on PR #228 v1: relying on the
-    // absence of `stale_revisions` to imply "current" would let
-    // analyzer-stale rows masquerade as the D PR safety-net Case A).
+    // Capture every expected analyzer revision so the parser-drift
+    // cross-reference can verify a `succeeded` row directly. The
+    // absence of `stale_revisions` does not prove that a persisted
+    // analyzer run used the current revision.
     let mut expected_analyzer_revisions: HashMap<String, u32> = HashMap::new();
     for analyzer in &expected_analyzers {
         expected_analyzer_revisions.insert(analyzer.id().to_string(), analyzer.revision());
@@ -946,27 +943,24 @@ fn parser_revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> 
         .collect()
 }
 
-/// v0.7.0 C PR — cross-references drift detection (`stale_revisions`
-/// and `stale_parser_revisions`) against the actual state of
+/// Cross-references analyzer and parser drift against
 /// `workspace_analysis_runs` for the alias's current tentative
-/// manifest. Surfaces the **post-enqueue lifecycle** the operator
-/// otherwise has to reconstruct from logs:
+/// manifest. This surfaces the post-enqueue lifecycle that an
+/// operator would otherwise have to reconstruct from logs:
 ///
 /// - **Case A (`Fail`, drift + run at expected revision succeeded)**:
 ///   the drift detector reports the alias as still stale, yet the
 ///   corresponding `workspace_analysis_runs` row is `succeeded` at
 ///   the current build's revision. For analyzer-revision drift this
 ///   contradicts the single-row `(manifest_id, analyzer_id)` PK and
-///   should never fire under v0.7.0 invariants — surfacing it
-///   defensively catches a future refactor that breaks the
-///   classifier. For parser-revision drift this is the D PR silent
-///   data loss class's observability safety net: analyzer runs all
-///   succeeded at their expected revision, yet `blobs.parser_revision`
-///   still mismatches. The reindex chain
+///   should never fire while the persisted-state invariants hold.
+///   Surfacing it defensively catches a future classifier regression.
+///   For parser-revision drift, analyzer runs all succeeded at their
+///   expected revision while `blobs.parser_revision` still mismatches.
+///   That means the reindex chain
 ///   (`scanner` → `enqueue_full_repo_reindex` → `register_repo_inner`
 ///   → pre-publication Tier-1 parse) wrote the new analyzer rows without
-///   updating the parser layer, which means a transiently-inaccessible
-///   worktree (D PR's bug class) leaked through.
+///   updating the parser layer.
 ///
 /// - **Case B (`Warn`, run at current revision failed/timed_out/cancelled)**:
 ///   the rerun reached the worker and terminated with a failure that
@@ -983,12 +977,11 @@ fn parser_revision_stale_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> 
 /// - **Case E (silent)**: no drift on this alias → no rerun-health
 ///   check emitted. Doctor output noise is kept minimal.
 ///
-/// Each emitted check carries a remediation string with explicit
-/// operator next-steps (R1 MF-3). The parser-drift evaluation walks
-/// every analyzer in `expected_tier3_analyzer_ids` so a mixed
-/// state — e.g. analyzer A succeeded, analyzer B failed — surfaces
-/// the failure rather than misclassifying as Case A on the succeeded
-/// half (R2 must-add detail B).
+/// Each emitted check carries explicit operator remediation. The
+/// parser-drift evaluation walks every analyzer in
+/// `expected_tier3_analyzer_ids` so a mixed state — for example,
+/// analyzer A succeeded while analyzer B failed — surfaces the
+/// failure instead of being classified from the succeeded row alone.
 fn analyzer_rerun_health_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
     let mut out = Vec::new();
     for probe in probes {
@@ -1079,7 +1072,7 @@ fn analyzer_drift_rerun_check(
                         stale.expected_rev
                     )),
                     Some(format!(
-                        "Run `cairn ctl repo reindex {alias}` to recover (legacy state from before v0.7.0 D PR ship is possible). If this recurs after a fresh reindex with the D PR binary, it is a structural bug — please file an issue.",
+                        "Run `cairn ctl repo reindex {alias}` to rebuild persisted state at the current parser and analyzer revisions; older persisted state may need this one-time refresh. If this recurs after a fresh reindex with the current binary, it is a structural bug — please file an issue.",
                     )),
                 ),
                 ("succeeded", false) => doctor_check(
@@ -1213,9 +1206,9 @@ fn parser_drift_rerun_check(
             Some(run) => {
                 match run.status.as_str() {
                     "succeeded" => {
-                        // R2 catch (PR #228 v1): `succeeded` alone is
-                        // not "current succeeded" — the revision must
-                        // match the current build's expectation. A
+                        // `succeeded` alone does not mean the current
+                        // revision succeeded; the row must match the
+                        // current build's expectation. A
                         // `succeeded` row at an older revision is the
                         // "rerun never landed" case (Case D-like) and
                         // must NOT count toward the Case A safety net.
@@ -1250,8 +1243,8 @@ fn parser_drift_rerun_check(
                         every_succeeded_at_current = false;
                     }
                     "queued" | "running" => {
-                        // R2 v0.7.0 finding #5: a `queued` / `running`
-                        // row at an OLDER revision (or with no expected
+                        // A `queued` / `running` row at an older
+                        // revision (or with no expected
                         // revision known) is NOT an in-flight current
                         // rerun — `JobManager::enqueue_analyzer_run`
                         // stamps the current `analyzer_revision` on
@@ -1296,8 +1289,9 @@ fn parser_drift_rerun_check(
         .join("; ");
 
     // Case A — every expected analyzer succeeded at its current
-    // revision, yet parser drift remains. This is the D PR silent
-    // data loss class observability safety net.
+    // revision, yet parser drift remains. This is the safety net for
+    // a reindex chain that published analyzer output without bringing
+    // the parser layer to the expected revision.
     if every_succeeded_at_current {
         return doctor_check(
             name,
@@ -1306,7 +1300,7 @@ fn parser_drift_rerun_check(
                 "every expected analyzer succeeded at its current revision but parser drift remains ({parser_summary}) — the parser-drift / full-reindex chain is broken (analyzer succeeded but parser_revision was not updated)",
             )),
             Some(format!(
-                "Run `cairn ctl repo reindex {alias}` to recover (legacy state from before v0.7.0 D PR ship is possible). If this recurs after a fresh reindex with the D PR binary, it is a structural bug — please file an issue.",
+                "Run `cairn ctl repo reindex {alias}` to rebuild persisted state at the current parser and analyzer revisions; older persisted state may need this one-time refresh. If this recurs after a fresh reindex with the current binary, it is a structural bug — please file an issue.",
             )),
         );
     }
@@ -1325,10 +1319,10 @@ fn parser_drift_rerun_check(
         );
     }
     // Case B-like — at least one analyzer is `queued` / `running`
-    // at a stale (or unknown) revision. R2 v0.7.0 finding #5: this
-    // would otherwise be masked by Case C Pass because the prior
-    // implementation lumped all pending into a single flag without
-    // checking the row's `analyzer_revision`. A stale pending row is
+    // at a stale (or unknown) revision. This must be checked before
+    // Case C because treating all pending rows as one flag without
+    // checking `analyzer_revision` would mask this state. A stale
+    // pending row is
     // NOT an in-flight current rerun (the JobManager stamps the
     // current revision on enqueue), so the operator must be warned.
     if let Some((analyzer_id, status, persisted, expected_rev)) = any_pending_stale {
@@ -1346,9 +1340,9 @@ fn parser_drift_rerun_check(
             )),
         );
     }
-    // Case D — at least one analyzer row missing.
-    // R2 v0.7.0 finding #5: must run BEFORE Case C Pass so a mixed
-    // (pending-current + missing-row) state surfaces as Warn rather
+    // Case D — at least one analyzer row missing. This must run
+    // before Case C so a mixed (pending-current + missing-row) state
+    // surfaces as Warn rather
     // than being masked by the pending Pass.
     if any_row_missing {
         return doctor_check(
@@ -1365,11 +1359,11 @@ fn parser_drift_rerun_check(
     // Case D-like — every row is `succeeded` but at least one is at
     // a revision older than what the current build expects. The
     // scanner did not enqueue the analyzer-revision rerun, or it
-    // was dropped before the worker landed it (R2 catch: this state
-    // would otherwise be misclassified as the safety-net Case A
-    // because all rows are `succeeded`). Must run BEFORE Case C Pass
-    // (R2 v0.7.0 finding #5) so a mixed pending-current + stale-
-    // succeeded state surfaces as Warn rather than masked by Pass.
+    // was dropped before the worker landed it. Checking the persisted
+    // revision prevents all-`succeeded` rows from being mistaken for
+    // the safety-net Case A. This must run before Case C so a mixed
+    // pending-current + stale-succeeded state surfaces as Warn rather
+    // than being masked by Pass.
     if let Some((stale_analyzer, persisted, expected_rev)) = any_stale_succeeded {
         return doctor_check(
             name,
@@ -1717,7 +1711,7 @@ impl ExpectedRegistry {
     }
 }
 
-// ─── PR3 Phase 4: reconcile-state doctor group ────────────────
+// Reconcile-state doctor group.
 
 /// A dirty gap older than this without any in-flight attempt or
 /// scheduled retry is warned about — the manager should pick up
@@ -1839,10 +1833,9 @@ fn classify_reconcile_state(
 ) -> Vec<DoctorCheck> {
     let mut out = Vec::new();
 
-    // Fail-closed on impossible invariant relationships (PR3
-    // Phase 1's helper WHERE + affected-rows contract should
-    // make these unreachable, but doctor is the operator's
-    // safety net).
+    // Fail closed on impossible invariant relationships. Mutation
+    // predicates and affected-row checks should make these
+    // unreachable, but doctor remains the operator's safety net.
     if let Some(violation) = state.invariant_violations().into_iter().next() {
         out.push(doctor_check(
             format!("reconcile invariants: {label}"),
@@ -1907,8 +1900,7 @@ fn classify_reconcile_state(
     }
 
     // Dirty gap without attempt and without scheduled retry —
-    // the manager didn't pick it up. This is the "stuck backlog"
-    // case; MF-6.
+    // the manager did not pick it up. This is a stuck backlog.
     if let Some(dirty_age) = state.dirty_gap_ns(now_ns) {
         if dirty_age > RECONCILE_DIRTY_GAP_WARN_NS {
             out.push(doctor_check(
@@ -2993,15 +2985,9 @@ mod tests {
         );
     }
 
-    // ───────────────────────────────────────────────────────────────
-    // v0.7.0 C PR — analyzer_rerun_health_checks
-    // ───────────────────────────────────────────────────────────────
-    //
-    // Cross-references drift detection (analyzer + parser) against
-    // `workspace_analysis_runs` state and surfaces the post-enqueue
-    // lifecycle. 10 tests: 4 analyzer-drift cases + 4 parser-drift
-    // cases + Case E silence + Case A wording assertion (R1 / R2
-    // catches).
+    // Analyzer rerun health checks cross-reference analyzer and parser
+    // drift with `workspace_analysis_runs`, including mixed states
+    // where one analyzer succeeded and another never ran or failed.
 
     fn analyzer_drift_probe(
         alias: &str,
@@ -3075,8 +3061,8 @@ mod tests {
     /// is structurally impossible under the v0.7.0 invariants
     /// (`(manifest_id, analyzer_id)` PK + the stale-revision
     /// detector compares the single persisted row), so surfacing
-    /// catches a future refactor that breaks the classifier — but it
-    /// is also the D PR safety net analog on the analyzer side.
+    /// catches a future refactor that breaks the classifier. It is
+    /// the analyzer-side counterpart of the parser-drift safety net.
     #[test]
     fn analyzer_drift_succeeded_at_current_revision_is_fail() {
         let probes = vec![analyzer_drift_probe(
@@ -3096,8 +3082,8 @@ mod tests {
         let remediation = checks[0].remediation.as_deref().unwrap_or("");
         assert!(remediation.contains("cairn ctl repo reindex moshi"));
         assert!(
-            remediation.contains("legacy state"),
-            "Case A remediation must mention legacy-state framing (R1 MF-3 less-aggressive wording): {remediation}"
+            remediation.contains("older persisted state"),
+            "Case A remediation must describe older persisted state without overstating a structural failure: {remediation}"
         );
         assert!(
             remediation.contains("structural bug") && remediation.contains("file an issue"),
@@ -3152,8 +3138,8 @@ mod tests {
     }
 
     /// Test 4: analyzer drift + no run row at all → Case D `Warn`
-    /// with the "enqueued / dropped / lost" framing and the daemon-
-    /// log grep hint (R1 MF-3).
+    /// with the "enqueued / dropped / lost" framing and a daemon-log
+    /// grep hint.
     #[test]
     fn analyzer_drift_no_run_row_is_warn_lost_or_dropped() {
         let probes = vec![analyzer_drift_probe("moshi", "kotlin-resolver", 5, None)];
@@ -3177,10 +3163,10 @@ mod tests {
     }
 
     /// Test 5: parser drift + every expected analyzer succeeded at
-    /// the current revision → Case A `Fail`. This is the D PR
-    /// silent data loss class observability safety net: the analyzer
-    /// chain is green but the parser layer is still stale, so the
-    /// full-reindex chain broke somewhere between
+    /// the current revision → Case A `Fail`. This is the observability
+    /// safety net for an analyzer chain that is green while the parser
+    /// layer remains stale, which means the full-reindex chain broke
+    /// somewhere between
     /// `enqueue_full_repo_reindex` and the pre-publication Tier-1 parse.
     #[test]
     fn parser_drift_all_analyzers_succeeded_is_fail_chain_bug() {
@@ -3198,17 +3184,17 @@ mod tests {
         let detail = checks[0].detail.as_deref().unwrap_or("");
         assert!(
             detail.contains("parser drift remains") && detail.contains("not updated"),
-            "Case A parser-drift detail must call out the chain-bug framing (R2 catch): {detail}"
+            "Case A parser-drift detail must call out the broken reindex-chain framing: {detail}"
         );
         assert!(detail.contains("tree-sitter-kotlin"));
         let remediation = checks[0].remediation.as_deref().unwrap_or("");
         assert!(remediation.contains("cairn ctl repo reindex moshi"));
-        assert!(remediation.contains("legacy state"));
+        assert!(remediation.contains("older persisted state"));
     }
 
     /// Test 6: parser drift + mixed analyzer states (one succeeded,
-    /// one failed) → Case B `Warn` on the failure, NOT Case A on
-    /// the succeeded slice (R2 must-add detail B). The failed
+    /// one failed) → Case B `Warn` on the failure, not Case A on
+    /// the succeeded slice. The failed
     /// analyzer's status / error must surface so the operator gets a
     /// targeted lead.
     #[test]
@@ -3234,7 +3220,7 @@ mod tests {
     }
 
     /// Test 7: parser drift + mixed analyzer states (one succeeded,
-    /// one queued) → Case C `Pass` pending (R2 must-add detail B).
+    /// one queued) → Case C `Pass` pending.
     /// Same anti-misclassification invariant as test 6, this time on
     /// the queued / running path.
     #[test]
@@ -3277,8 +3263,8 @@ mod tests {
         );
     }
 
-    /// Test 9 (R2 must-add detail A — Case E): no drift on this
-    /// alias produces ZERO `analyzer-rerun health` checks. The
+    /// Test 9 (Case E): no drift on this alias produces zero
+    /// `analyzer-rerun health` checks. The
     /// noise-prevention invariant: doctor must not warn on every
     /// alias just because the cross-reference function exists.
     #[test]
@@ -3326,8 +3312,8 @@ mod tests {
         );
     }
 
-    /// **R2 must-fix on PR #228 v1**: parser drift + every analyzer
-    /// row `succeeded` but at an **older** revision than the current
+    /// Parser drift plus every analyzer row `succeeded` at an older
+    /// revision than the current
     /// build expects → MUST surface as `Warn` (rerun never landed),
     /// NOT as the safety-net Case A `Fail`. The Case A framing
     /// implies "the parser-drift / full-reindex chain is broken,"
@@ -3378,8 +3364,7 @@ mod tests {
         assert!(remediation.contains("cairn ctl repo reindex moshi"));
     }
 
-    /// **R2 must-fix on PR #228 v1, cross-emission pin**: the same
-    /// probe carries `stale_revisions` (analyzer drift on
+    /// The same probe carries `stale_revisions` (analyzer drift on
     /// `kotlin-resolver`) AND `stale_parser_revisions` (parser
     /// drift). The two checks the helper emits must classify
     /// correctly side-by-side:
@@ -3546,25 +3531,22 @@ mod tests {
         );
     }
 
-    // ───────────────────────────────────────────────────────────────
-    // v0.7.0 R2 findings #4 / #5 — pin the stale-pending fixes
-    // ───────────────────────────────────────────────────────────────
+    // Stale-pending regression coverage.
     //
-    // The C PR's rerun-health framework treated any `queued` /
+    // Treating every `queued` /
     // `running` row as an in-flight current rerun and returned Pass.
     // `JobManager::enqueue_analyzer_run` stamps the current
     // `analyzer_revision` on enqueue, so a pending row at an OLDER
     // revision is NOT an in-flight current rerun — it is a stuck
     // old-binary row, a `restore_from_db` artifact, or a coalesced
-    // enqueue. These tests pin that the fixed code surfaces Warn for
-    // those cases (analyzer-side: finding #4, parser-side: finding
-    // #5) and that mixed parser-drift cases (pending-current plus
-    // missing-row or stale-succeeded) are no longer masked by the
-    // Case C Pass.
+    // enqueue. These tests pin that stale analyzer and parser rows
+    // surface Warn, and that mixed parser-drift states
+    // (pending-current plus missing-row or stale-succeeded) are not
+    // masked by the Case C Pass.
 
-    /// Finding #4 — analyzer drift + `queued` at stale revision MUST
-    /// be `Warn`. The prior code matched `("queued" | "running", _)`
-    /// unconditionally Pass, hiding stuck old-binary rows.
+    /// Analyzer drift plus `queued` at a stale revision must be
+    /// `Warn`. Treating `("queued" | "running", _)` as an
+    /// unconditional Pass hides stuck old-binary rows.
     #[test]
     fn analyzer_drift_queued_at_stale_revision_is_warn_not_pass() {
         let probes = vec![analyzer_drift_probe(
@@ -3592,8 +3574,8 @@ mod tests {
         assert!(remediation.contains("cairn ctl repo reindex moshi"));
     }
 
-    /// Finding #4 sibling — analyzer drift + `running` at stale
-    /// revision MUST be `Warn` (queued/running share the branch).
+    /// Analyzer drift plus `running` at a stale revision must be
+    /// `Warn` because queued and running share this branch.
     #[test]
     fn analyzer_drift_running_at_stale_revision_is_warn_not_pass() {
         let probes = vec![analyzer_drift_probe(
@@ -3616,8 +3598,8 @@ mod tests {
         );
     }
 
-    /// Finding #5 — parser drift cascade: one analyzer queued at the
-    /// current revision PLUS another analyzer with no row MUST be
+    /// In the parser-drift cascade, one analyzer queued at the current
+    /// revision plus another analyzer with no row must be
     /// `Warn`. The prior cascade returned Case C Pass on `any_pending`
     /// before checking `any_row_missing`, masking the missing-row
     /// failure mode.
@@ -3643,8 +3625,8 @@ mod tests {
         );
     }
 
-    /// Finding #5 — pending-current PLUS another analyzer succeeded
-    /// at an OLD revision MUST be `Warn`. The prior cascade returned
+    /// Pending-current plus another analyzer succeeded at an old
+    /// revision must be `Warn`. A pending-first cascade would return
     /// Case C Pass on `any_pending` before checking
     /// `any_stale_succeeded`, masking the "rerun never landed" mode.
     #[test]
@@ -3675,8 +3657,8 @@ mod tests {
         );
     }
 
-    /// Finding #5 — single analyzer `queued` at an OLD revision (no
-    /// other analyzers) MUST be `Warn`. The prior queued/running
+    /// A single analyzer `queued` at an old revision (with no other
+    /// analyzers) must be `Warn`. A broad queued/running
     /// branch did not split on `analyzer_revision == expected_rev`
     /// and would have returned Case C Pass.
     #[test]
@@ -3702,7 +3684,7 @@ mod tests {
         );
     }
 
-    // ─── PR3 Phase 4 doctor reconcile-state suite ─────────────────
+    // Reconcile-state doctor suite.
 
     fn seeded_cas(alias_pairs: &[(&str, &str, &str)]) -> (tempfile::TempDir, Arc<CasDataDir>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3754,8 +3736,8 @@ mod tests {
         );
     }
 
-    /// MF-6 (doctor dirty-gap classification): desired>applied,
-    /// no attempt, no retry, old dirty_since -> Warn.
+    /// A dirty generation gap with no attempt or retry is `Warn`
+    /// after the age threshold.
     #[test]
     fn mf6_doctor_dirty_gap_old_since_warns() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3782,8 +3764,8 @@ mod tests {
         assert!(dirty.detail.as_deref().unwrap_or("").contains("desired=1"));
     }
 
-    /// MF-6 fresh dirty gap must not warn — the manager is
-    /// expected to pick it up within seconds.
+    /// A fresh dirty generation gap must not warn because the manager
+    /// is expected to pick it up within seconds.
     #[test]
     fn mf6_doctor_dirty_gap_fresh_silent() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3809,8 +3791,8 @@ mod tests {
         );
     }
 
-    /// MF-7 doctor retry/backoff: consecutive_failures>0 +
-    /// next_retry_at future + last_error -> Warn.
+    /// A failed reconcile with a scheduled retry reports `Warn` and
+    /// preserves the last error for the operator.
     #[test]
     fn mf7_doctor_retry_backoff_warns() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3835,8 +3817,8 @@ mod tests {
         assert!(retry.detail.as_deref().unwrap_or("").contains("EMFILE"));
     }
 
-    /// MF-8 doctor stuck attempt: attempt_generation Some +
-    /// last_attempt_ns older than threshold -> Warn.
+    /// An in-flight reconcile attempt older than the threshold reports
+    /// `Warn`.
     #[test]
     fn mf8_doctor_stuck_attempt_warns() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3865,7 +3847,7 @@ mod tests {
         assert!(stuck.detail.as_deref().unwrap_or("").contains("wedged"));
     }
 
-    /// MF-8 fresh attempt: recent last_attempt_ns must not warn.
+    /// A recently started reconcile attempt must not warn.
     #[test]
     fn mf8_doctor_fresh_attempt_silent() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3893,7 +3875,7 @@ mod tests {
         );
     }
 
-    /// MF-9 doctor watcher failed -> Warn with watcher_error.
+    /// A failed watcher reports `Warn` with its persisted error.
     #[test]
     fn mf9_doctor_watcher_failed_warns() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3921,7 +3903,7 @@ mod tests {
         );
     }
 
-    /// MF-9 watcher active does not fire.
+    /// An active watcher does not emit a warning.
     #[test]
     fn mf9_doctor_watcher_active_silent() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3943,8 +3925,8 @@ mod tests {
         );
     }
 
-    /// MF-10 corrupt-invariant fail-closed: applied > desired
-    /// should never happen but doctor catches it.
+    /// Doctor fails closed when persisted generations violate
+    /// `applied <= desired`.
     #[test]
     fn mf10_doctor_applied_over_desired_fails() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
@@ -3971,10 +3953,9 @@ mod tests {
         assert_eq!(inv.status, DoctorStatus::Fail);
     }
 
-    /// MF-11 multi-alias dedup: two aliases share one
-    /// `repo_hash`; doctor emits ONE reconcile check per repo,
-    /// not two identical alias-level duplicates. The label lists
-    /// both aliases.
+    /// When aliases share one `repo_hash`, doctor emits one reconcile
+    /// check per repo, not identical alias-level duplicates. The
+    /// label lists both aliases.
     #[test]
     fn mf11_doctor_multi_alias_reconcile_dedup() {
         let (_t, cas) = seeded_cas(&[("a", "/p", "h"), ("b", "/p", "h")]);
