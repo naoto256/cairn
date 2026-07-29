@@ -10,7 +10,7 @@ daemon-backed structural index of the repos you've registered —
 definitions, references, impls, imports, source bodies — so agents can
 ask precise code questions without waking a full IDE or scraping text.
 
-Status: **0.8.1**. Wire schemas (JSON-RPC + MCP), on-disk format,
+Status: **0.8.2**. Wire schemas (JSON-RPC + MCP), on-disk format,
 and CLI flags follow SemVer 0.x rules — minor releases may break
 compatibility. 1.0 will tag once these surfaces stabilize.
 
@@ -64,7 +64,7 @@ tar -xzf cairn-v<version>-<target>.tar.gz
 install cairn-v<version>-<target>/cairn ~/.local/bin/
 ```
 
-#### From source (Rust 1.85+, working `git`)
+#### From source (Rust 1.88+, working `git`)
 
 ```sh
 cargo install --git https://github.com/naoto256/cairn cairn
@@ -143,7 +143,9 @@ MCP client. It gives AI coding agents structural tools over the repos
 you register:
 
 - list registered repos and snapshot health
-- find symbols by exact name, fuzzy query, kind, container, or path
+- find symbols by exact name, fuzzy query, kind, container, or path;
+  with `container`, opt into `include_inherited` to add transitive inherited,
+  implemented, and mixed-in declarations without claiming dispatch order
 - read an outline of one file or a directory
 - fetch the source body for a specific qualified symbol
 - ask who calls a function (`find_callers`) and what it calls
