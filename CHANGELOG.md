@@ -5,6 +5,117 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.2] — 2026-07-30
+
+> Compatibility: no source-code or wire-shape breaking changes. The existing
+> `find_symbols.include_inherited` opt-in is now honored and still defaults to
+> `false`, so requests that omit it retain their prior behavior. Operational
+> JSON-RPC failures now use fixed client-facing messages instead of exposing raw
+> internal details. Affected parser and analyzer revisions are bumped so cached
+> facts are refreshed automatically.
+
+### Added
+
+- **Symbol searches can include inherited declarations.** MCP callers can set
+  `include_inherited = true` together with `container` to union declarations
+  from transitive inheritance, implementation, and mixin edges. Child and
+  ancestor declarations are both retained; this is declaration lookup, not an
+  MRO or dispatch-winner contract. Expansion is manifest-scoped, cycle-safe,
+  diamond-deduplicated by physical symbol identity, and applies query, kind,
+  path, deterministic ordering, and limits after the union. Ambiguous
+  fact-only ancestry fails closed while preserving proven rows as a partial
+  result.
+
+### Changed
+
+- **Repository readiness follows completed semantic work, including valid
+  zero-symbol results.** `list_repos`, `repo_status`, and Doctor distinguish
+  missing worktree registration, missing tentative ownership, and completed
+  analysis without inferring a fallback that the selected snapshot does not
+  prove.
+
+- **Partial inherited queries preserve independent truncation feedback.** When
+  semantic incompleteness and a result cap coincide, the semantic reason keeps
+  priority while `capped_increase_limit` remains present exactly once. Because
+  `find_symbols` has no cursor, callers can raise the limit or narrow filters.
+
+- **Operational errors expose bounded recovery information.** JSON-RPC clients
+  receive stable messages and structured recovery data; internal paths,
+  environment values, and transport details remain in server-side diagnostics.
+
+### Fixed
+
+- **Watcher reconciliation no longer amplifies analyzer work.** Ruby LSP's
+  generated `.ruby-lsp` subtree is pruned consistently by full scans and both
+  native and polling watcher paths, without hiding ordinary nested Git
+  repositories. Non-forced same-content reconciliations reuse the existing
+  tentative manifest, and current identified queued or running analyzer jobs
+  own their pass. Generation receipts still converge, while duplicate
+  manifests, runs, and jobs are avoided; terminal, stale, forced, and
+  configuration-changed analyzers remain retryable.
+
+- **Daemon, scheduler, and LSP lifecycle transitions are bounded and
+  race-safe.** Early shutdown notifications are armed before polling, startup
+  and reconcile failures use bounded retry pacing, and pending removal intent
+  survives recovery. LSP writes and shutdown are generation-aware, stalled
+  stdin operations are bounded, unknown server requests receive
+  `MethodNotFound`, pool initialization is serialized but retryable, and
+  draining children remain visible to forced reap.
+
+- **Analyzer facts and completion status publish atomically.** References,
+  resolutions, and a successful workspace-analysis run commit in one immediate
+  transaction. Persistence failure rolls back the whole fact set and records a
+  failed terminal run instead of exposing partial semantic state.
+
+- **Daemon socket ownership is explicit.** A runtime-directory lock is held
+  before stale socket adoption and through cleanup. Legacy live sockets are
+  probed with bounded nonblocking I/O, so concurrent daemons cannot unlink or
+  claim one another's endpoints.
+
+- **Job and query surfaces are deterministic and bounded.** Alias-shared stores
+  are deduplicated for unscoped job operations, running state begins only when
+  worker execution starts, terminal metrics stay immutable and use bounded LRU
+  retention, SQLite path prefixes treat `%`, `_`, and `\` literally, and
+  reference queries have a stable final tie-breaker. Escaping analyzer paths
+  and imports outside the selected manifest are rejected.
+
+- **Manifest capture and Rust type display match source authority.** Committed
+  snapshots exclude symlinks and gitlinks just like worktree capture, while
+  Rust type facts use source-like token rendering instead of debug output.
+
+- **Language backends resolve more source forms accurately.**
+  - C++ indexes class- and struct-body `typedef` declarations without treating
+    method-local aliases as members, including C++23 conditional forms.
+  - Objective-C applies protected interface-ivar and private
+    implementation-ivar defaults while preserving explicit visibility.
+  - Ruby resolves proven constant-receiver singleton calls without
+    source-order dependence and tightens visibility, lexical-scope, `super`,
+    require-path, and cyclic-MRO handling.
+  - PHP recognizes static single- and double-quoted `define()` names while
+    rejecting interpolated, escaped, fragmented, or empty names.
+  - Swift preserves fully qualified extension owners and aligns method and
+    `self` dispatch with that owner.
+  - Python preserves import-alias authority per lexical occurrence, excludes
+    nested functions from method definitions, restricts `super` references to
+    zero-argument calls, fails closed on unresolved imports, and keeps
+    left-to-right base order in the bounded deep-hierarchy fallback.
+  - Go, Rust, and TypeScript fix Unicode export detection, grouped-variable
+    documentation, adjacent test attributes, source-like types, and duplicate
+    generic-head references.
+
+- **JSX definition hints no longer depend on a capped symbol probe.** A
+  snapshot-bounded indexed existence query now finds late JSX and TSX
+  definitions, including qualified names, without scanning the full store.
+
+### PRs
+
+- Internal contract documentation and corrections: #275–#285, #306
+- Runtime, storage, LSP, job, query, and socket hardening: #286–#289, #291–#295
+- Language backend correctness: #290, #296–#303
+- Repository readiness and Doctor diagnostics: #304
+- Inherited symbol queries and cap feedback: #305
+- Watcher and analyzer re-enqueue convergence: #307
+
 ## [0.8.1] — 2026-07-24
 
 ### Fixed
