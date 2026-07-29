@@ -742,6 +742,7 @@ pub(crate) fn build_snapshot_aware_feedback(
 ) -> (Vec<Diagnostic>, Vec<Hint>) {
     let mut diagnostics = build_diagnostics(ctx);
     let mut hints = build_hints(ctx);
+    append_missing_cap_hints(ctx, capped, &mut hints);
     if freshness_issues.is_empty() {
         return (diagnostics, hints);
     }
@@ -770,22 +771,6 @@ pub(crate) fn build_snapshot_aware_feedback(
                 | HintCode::EmptyResultWidenScope
         )
     });
-    // Cap advice is snapshot-independent: rebuild it against a
-    // synthesised `Cap` completeness so it survives even when the
-    // outer completeness is `file_not_indexed_or_snapshot_stale`.
-    if capped {
-        let cap = Completeness::partial_truncated(PartialReason::Cap);
-        let cap_ctx = EmissionContext {
-            completeness: &cap,
-            ..*ctx
-        };
-        hints.extend(build_hints(&cap_ctx).into_iter().filter(|hint| {
-            matches!(
-                hint.code,
-                HintCode::CappedIncreaseLimit | HintCode::CappedNarrowFilter
-            )
-        }));
-    }
     // Lead with the freshness advisory so agents see the "wait or
     // reindex" step before anything else.
     hints.insert(
@@ -806,6 +791,30 @@ pub(crate) fn build_snapshot_aware_feedback(
     );
     hints.dedup_by_key(|hint| hint.code);
     (diagnostics, hints)
+}
+
+/// Preserve the independent truncation signal when another partial reason
+/// owns the response's single completeness-reason slot.
+fn append_missing_cap_hints(ctx: &EmissionContext<'_>, capped: bool, hints: &mut Vec<Hint>) {
+    if !capped {
+        return;
+    }
+
+    let cap = Completeness::partial_truncated(PartialReason::Cap);
+    let cap_ctx = EmissionContext {
+        completeness: &cap,
+        ..*ctx
+    };
+    for hint in build_hints(&cap_ctx).into_iter().filter(|hint| {
+        matches!(
+            hint.code,
+            HintCode::CappedIncreaseLimit | HintCode::CappedNarrowFilter
+        )
+    }) {
+        if !hints.iter().any(|existing| existing.code == hint.code) {
+            hints.push(hint);
+        }
+    }
 }
 
 /// Map one tier analyzer status onto a wire diagnostic, or `None` when
