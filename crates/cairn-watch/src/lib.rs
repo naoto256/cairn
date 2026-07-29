@@ -499,16 +499,23 @@ impl EventClassifier {
     }
 
     /// True when a working-tree path is owned by the fixed shared
-    /// prune policy. Nested repository boundaries stay out of this
-    /// prepass because their marker events must rebuild topology.
+    /// prune policy. A nested `.git` marker remains observable when
+    /// its parent is not fixed-pruned because that marker changes
+    /// repository topology. Inside an already-pruned parent, the
+    /// marker inherits the parent's ownership and is dropped here.
     fn is_always_pruned_working_tree_path(&self, path: &Path) -> bool {
-        self.is_working_tree_path(path)
-            && !is_nested_git_marker_path(&self.repo_root, path)
-            && self
-                .ignore
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_always_pruned_path(path)
+        if !self.is_working_tree_path(path) {
+            return false;
+        }
+        let matcher = self
+            .ignore
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let topology_owned_marker = is_nested_git_marker_path(&self.repo_root, path)
+            && path
+                .parent()
+                .is_some_and(|parent| !matcher.is_always_pruned_path(parent));
+        !topology_owned_marker && matcher.is_always_pruned_path(path)
     }
 
     /// Reduce one raw notify event into a single [`WatchEvent`], or
@@ -952,6 +959,10 @@ mod tests {
             notify::Event::new(EventKind::Create(CreateKind::Folder)).add_path(ruby_lsp.clone()),
             notify::Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(ruby_lsp.join("nested/.gitignore")),
+            notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(ruby_lsp.join("nested/.git")),
+            notify::Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(ruby_lsp.join("nested/.git")),
             notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
                 .add_path(ruby_lsp.join("old"))
                 .add_path(ruby_lsp.join("new")),
@@ -982,7 +993,10 @@ mod tests {
             notify::Event::new(EventKind::Create(CreateKind::File)).add_path(marker.clone());
         classifier.handle_batch(&[debounced(create)]);
         assert_eq!(
-            rx.recv().await,
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .ok()
+                .flatten(),
             Some(WatchEvent::Rescan {
                 reason: RescanReason::DirectoryTopologyChanged
             })
@@ -993,7 +1007,10 @@ mod tests {
             notify::Event::new(EventKind::Remove(RemoveKind::File)).add_path(marker.clone());
         classifier.handle_batch(&[debounced(remove)]);
         assert_eq!(
-            rx.recv().await,
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .ok()
+                .flatten(),
             Some(WatchEvent::Rescan {
                 reason: RescanReason::DirectoryTopologyChanged
             })
@@ -1004,7 +1021,10 @@ mod tests {
             notify::Event::new(EventKind::Create(CreateKind::Folder)).add_path(marker.clone());
         classifier.handle_batch(&[debounced(create_directory)]);
         assert_eq!(
-            rx.recv().await,
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .ok()
+                .flatten(),
             Some(WatchEvent::Rescan {
                 reason: RescanReason::DirectoryTopologyChanged
             })
@@ -1015,7 +1035,10 @@ mod tests {
             notify::Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(marker);
         classifier.handle_batch(&[debounced(remove_directory)]);
         assert_eq!(
-            rx.recv().await,
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .ok()
+                .flatten(),
             Some(WatchEvent::Rescan {
                 reason: RescanReason::DirectoryTopologyChanged
             })
@@ -1231,11 +1254,20 @@ mod tests {
 
         std::fs::write(root.join(".ruby-lsp/.gitignore"), "*\n").unwrap();
         std::fs::write(root.join(".ruby-lsp/nested/Gemfile.lock"), "generated\n").unwrap();
+        std::fs::write(root.join(".ruby-lsp/nested/.git"), "gitdir: elsewhere\n").unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         let leaked = rx.try_recv();
         assert!(
             matches!(leaked, Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
             "polling backend leaked a File or Rescan edge from .ruby-lsp: {leaked:?}"
+        );
+
+        std::fs::remove_file(root.join(".ruby-lsp/nested/.git")).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let leaked = rx.try_recv();
+        assert!(
+            matches!(leaked, Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+            "polling backend leaked a File or Rescan edge from removed .ruby-lsp marker: {leaked:?}"
         );
 
         let probe = root.join("ordinary.rs");
