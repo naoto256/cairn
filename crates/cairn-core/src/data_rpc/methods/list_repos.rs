@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use cairn_lang_api::{LanguageBackend, all_backends};
-use cairn_proto::common::LanguageEnrichment;
+use cairn_proto::common::{LanguageEnrichment, SourceTier};
 use cairn_proto::methods::{
     ListReposArgs, ListReposResult, RepoAggregateStatus, RepoListEntry, RepoSnapshotEntry,
     RepoStatusCurrent, RepoStatusSummary,
@@ -541,15 +541,19 @@ pub(super) fn apply_current_freshness(
 }
 
 /// Per-snapshot status label. In order of check:
-/// `empty` (no files in the manifest), `ready` (has symbols),
-/// `stale` (analyzer exists for some language but no symbols
-/// landed yet), else `no_analyzer` (no analyzer registered for any
-/// language present).
+/// `empty` (no files in the manifest), `ready` (has symbols or
+/// completed semantic analysis), `stale` (analyzer exists for some
+/// language but neither result evidence has landed yet), else
+/// `no_analyzer` (no analyzer registered for any language present).
 fn derive_status(file_count: i64, symbol_count: i64, enrichment: &[LanguageEnrichment]) -> String {
     if file_count == 0 {
         return "empty".into();
     }
-    if symbol_count > 0 {
+    if symbol_count > 0
+        || enrichment
+            .iter()
+            .any(|entry| entry.tier == SourceTier::Semantic)
+    {
         return "ready".into();
     }
     if enrichment.iter().any(|e| e.has_analyzer) {
@@ -572,6 +576,34 @@ mod tests {
     use crate::lifecycle::RepoLifecycleManager;
     use crate::register::register_repo;
     use crate::testutil::init_repo;
+
+    #[test]
+    fn snapshot_status_uses_realized_analysis_instead_of_symbol_presence() {
+        let syntactic_with_analyzer = [LanguageEnrichment {
+            language: "python".into(),
+            tier: SourceTier::Syntactic,
+            has_analyzer: true,
+        }];
+        let semantic_without_symbols = [LanguageEnrichment {
+            language: "python".into(),
+            tier: SourceTier::Semantic,
+            has_analyzer: true,
+        }];
+        let syntactic_without_analyzer = [LanguageEnrichment {
+            language: "markdown".into(),
+            tier: SourceTier::Syntactic,
+            has_analyzer: false,
+        }];
+
+        assert_eq!(derive_status(0, 0, &[]), "empty");
+        assert_eq!(derive_status(1, 1, &syntactic_with_analyzer), "ready");
+        assert_eq!(derive_status(1, 0, &semantic_without_symbols), "ready");
+        assert_eq!(derive_status(1, 0, &syntactic_with_analyzer), "stale");
+        assert_eq!(
+            derive_status(1, 0, &syntactic_without_analyzer),
+            "no_analyzer"
+        );
+    }
 
     #[test]
     fn list_repos_emits_lightweight_inventory() {

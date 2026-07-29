@@ -364,6 +364,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_symbol_free_python_snapshot_is_ready() {
+        let fixture =
+            test_support::registered_fixture_with_files(&[("comments.py", "# comment only\n")]);
+        let canonical = std::fs::canonicalize(fixture._repo.path()).unwrap();
+        let repo_hash = crate::paths::path_hash(&canonical);
+        let store =
+            cas_store::open_existing(&fixture.ctx.cas_data_dir.store_db_path(&repo_hash)).unwrap();
+        let manifest_id: i64 = store
+            .query_row(
+                "SELECT manifest_id FROM anchors
+                  WHERE anchor_name LIKE 'tentative/%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (files, symbols, parser_id, analyzer_id): (i64, i64, String, Option<String>) = store
+            .query_row(
+                "SELECT COUNT(DISTINCT me.path),
+                        COUNT(DISTINCT s.id),
+                        b.parser_id,
+                        b.analyzer_id
+                   FROM manifest_entries me
+                   JOIN blobs b ON b.blob_sha = me.blob_sha
+                   LEFT JOIN symbols s
+                     ON s.blob_sha = me.blob_sha
+                    AND s.parser_id = b.parser_id
+                  WHERE me.manifest_id = ?1",
+                [manifest_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        let value = RepoStatus
+            .dispatch(
+                &fixture.ctx,
+                serde_json::json!({"repo": "demo", "include_snapshots": true}),
+            )
+            .await
+            .unwrap();
+        let result: RepoStatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(files, 1);
+        assert_eq!(symbols, 0);
+        assert_eq!(parser_id, "tree-sitter-python");
+        assert!(
+            analyzer_id.is_some(),
+            "blob analyzer stamp is completion evidence"
+        );
+        assert_eq!(result.repo.current.status, "ready");
+    }
+
+    #[tokio::test]
     async fn repo_status_generation_gap_is_reconciling_and_not_tier_ready() {
         let fixture = test_support::registered_fixture();
         let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
