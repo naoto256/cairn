@@ -304,6 +304,10 @@ fn alias_watcher_checks(
 struct AliasStoreProbe {
     alias: String,
     store_path: PathBuf,
+    /// Whether `root_path` still has a worktree row in this store.
+    /// Kept separately from the tentative anchor so doctor can name
+    /// the missing ownership layer precisely.
+    worktree_registered: bool,
     result: std::result::Result<AliasStoreState, String>,
 }
 
@@ -384,10 +388,15 @@ fn probe_alias_store(
     entry: &cas_registry::AliasEntry,
 ) -> AliasStoreProbe {
     let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
-    let result = probe_alias_store_inner(&store_path, &entry.root_path).map_err(|e| e.to_string());
+    let (worktree_registered, result) = match probe_alias_store_inner(&store_path, &entry.root_path)
+    {
+        Ok((worktree_registered, state)) => (worktree_registered, Ok(state)),
+        Err(error) => (false, Err(error.to_string())),
+    };
     AliasStoreProbe {
         alias: entry.alias.clone(),
         store_path,
+        worktree_registered,
         result,
     }
 }
@@ -405,7 +414,7 @@ fn probe_alias_store(
 /// 4. Otherwise resolve the `tentative/<worktree_id>` anchor and
 ///    delegate to [`probe_manifest`] for the tier3-run rows, drift
 ///    vectors, and expected-revision map.
-fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasStoreState> {
+fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<(bool, AliasStoreState)> {
     if !store_path.exists() {
         return Err(crate::Error::InvalidArgument(format!(
             "CAS store does not exist: {}",
@@ -446,14 +455,17 @@ fn probe_alias_store_inner(store_path: &Path, root_path: &str) -> Result<AliasSt
             HashMap::new(),
         ),
     };
-    Ok(AliasStoreState {
-        tentative_manifest_id,
-        tier3_runs,
-        expected_tier3_analyzer_ids,
-        stale_revisions,
-        stale_parser_revisions,
-        expected_analyzer_revisions,
-    })
+    Ok((
+        worktree_id.is_some(),
+        AliasStoreState {
+            tentative_manifest_id,
+            tier3_runs,
+            expected_tier3_analyzer_ids,
+            stale_revisions,
+            stale_parser_revisions,
+            expected_analyzer_revisions,
+        },
+    ))
 }
 
 /// Loads the current `workspace_analysis_runs` rows for
@@ -552,12 +564,13 @@ fn probe_manifest(
     ))
 }
 
-/// Three outcomes per alias: `Pass` when a tentative anchor
-/// resolves to a manifest, `Warn` when the store opened cleanly but
-/// no tentative anchor exists yet (reads still work but fall back
-/// to HEAD), and `Fail` when any store-probe step errored — store
-/// file missing / DB open failure, or downstream anchor / manifest
-/// / workspace-run / parser-revision probe error.
+/// Four outcomes per alias: `Pass` when a tentative anchor resolves
+/// to a manifest; distinct `Warn`s when either the alias root has no
+/// worktree registration or a registered worktree has no tentative
+/// anchor; and `Fail` when any store-probe step errored. Only the
+/// missing-anchor warning proves that default reads fall back to
+/// HEAD; without the worktree row this probe cannot relate the root
+/// to any surviving tentative anchor.
 fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
     probes
         .iter()
@@ -568,6 +581,18 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                     DoctorStatus::Pass,
                     Some(format!("tentative anchor -> manifest_id {manifest_id}")),
                     None,
+                ),
+                None if !probe.worktree_registered => doctor_check(
+                    format!("repo `{}` tentative snapshot present", probe.alias),
+                    DoctorStatus::Warn,
+                    Some(
+                        "no worktree registration for the alias root; root-to-tentative ownership cannot be resolved"
+                            .into(),
+                    ),
+                    Some(format!(
+                        "Run `cairn ctl repo reindex {}` to restore the alias root's worktree registration before relying on tentative ownership.",
+                        probe.alias
+                    )),
                 ),
                 None => doctor_check(
                     format!("repo `{}` tentative snapshot present", probe.alias),
@@ -2080,11 +2105,12 @@ mod tests {
     }
 
     #[test]
-    fn tentative_snapshot_checks_cover_present_missing_and_store_error() {
+    fn tentative_snapshot_checks_distinguish_missing_worktree_and_anchor() {
         let probes = vec![
             AliasStoreProbe {
                 alias: "ok".into(),
                 store_path: PathBuf::from("/tmp/ok/store.db"),
+                worktree_registered: true,
                 result: Ok(AliasStoreState {
                     tentative_manifest_id: Some(7),
                     tier3_runs: Vec::new(),
@@ -2095,8 +2121,22 @@ mod tests {
                 }),
             },
             AliasStoreProbe {
-                alias: "missing".into(),
-                store_path: PathBuf::from("/tmp/missing/store.db"),
+                alias: "missing-anchor".into(),
+                store_path: PathBuf::from("/tmp/missing-anchor/store.db"),
+                worktree_registered: true,
+                result: Ok(AliasStoreState {
+                    tentative_manifest_id: None,
+                    tier3_runs: Vec::new(),
+                    expected_tier3_analyzer_ids: Vec::new(),
+                    stale_revisions: Vec::new(),
+                    stale_parser_revisions: Vec::new(),
+                    expected_analyzer_revisions: HashMap::new(),
+                }),
+            },
+            AliasStoreProbe {
+                alias: "missing-worktree".into(),
+                store_path: PathBuf::from("/tmp/missing-worktree/store.db"),
+                worktree_registered: false,
                 result: Ok(AliasStoreState {
                     tentative_manifest_id: None,
                     tier3_runs: Vec::new(),
@@ -2109,6 +2149,7 @@ mod tests {
             AliasStoreProbe {
                 alias: "bad".into(),
                 store_path: PathBuf::from("/tmp/bad/store.db"),
+                worktree_registered: false,
                 result: Err("not a database".into()),
             },
         ];
@@ -2135,10 +2176,26 @@ mod tests {
                 .unwrap()
                 .contains("repo reindex")
         );
-        assert_eq!(checks[2].status, DoctorStatus::Fail);
-        assert_eq!(checks[2].detail.as_deref(), Some("not a database"));
+        assert_eq!(checks[2].status, DoctorStatus::Warn);
+        assert_eq!(
+            checks[2].detail.as_deref(),
+            Some(
+                "no worktree registration for the alias root; root-to-tentative ownership cannot be resolved"
+            )
+        );
         assert!(
             checks[2]
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("restore the alias root's worktree registration")
+        );
+        assert_ne!(checks[1].detail, checks[2].detail);
+        assert_ne!(checks[1].remediation, checks[2].remediation);
+        assert_eq!(checks[3].status, DoctorStatus::Fail);
+        assert_eq!(checks[3].detail.as_deref(), Some("not a database"));
+        assert!(
+            checks[3]
                 .remediation
                 .as_deref()
                 .unwrap()
@@ -2493,6 +2550,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn doctor_dispatch_reports_missing_worktree_separately_from_missing_anchor() {
+        let fixture = DoctorFixture::new();
+        fixture.seed_alias("missing-worktree", true, None, None);
+        fixture.seed_alias("missing-anchor", false, None, None);
+        let store =
+            cas_store::open(&fixture.cas_data_dir.store_db_path("missing-worktree-hash")).unwrap();
+        let worktree_id: i64 = store
+            .query_row("SELECT worktree_id FROM worktrees", [], |row| row.get(0))
+            .unwrap();
+        store.execute("DELETE FROM worktrees", []).unwrap();
+        let selected = crate::anchor::resolve_explicit_or_default(&store, None, None).unwrap();
+
+        let report = fixture.run_doctor().await;
+        let worktree = find_check(
+            &report,
+            "repo `missing-worktree` tentative snapshot present",
+        );
+        let anchor = find_check(&report, "repo `missing-anchor` tentative snapshot present");
+
+        assert_eq!(worktree.status, DoctorStatus::Warn);
+        assert_eq!(anchor.status, DoctorStatus::Warn);
+        assert_eq!(
+            selected.as_str(),
+            format!("tentative/{worktree_id}"),
+            "a surviving tentative anchor remains the default independently of the worktree row"
+        );
+        assert_eq!(
+            worktree.detail.as_deref(),
+            Some(
+                "no worktree registration for the alias root; root-to-tentative ownership cannot be resolved"
+            )
+        );
+        assert_eq!(
+            anchor.detail.as_deref(),
+            Some("no tentative anchor yet (reads will fall back to HEAD)")
+        );
+        assert_ne!(worktree.remediation, anchor.remediation);
+    }
+
     struct DoctorFixture {
         _tmp: tempfile::TempDir,
         cas_data_dir: Arc<CasDataDir>,
@@ -2642,6 +2739,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "myrepo".into(),
             store_path: PathBuf::from("/tmp/myrepo/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: Vec::new(),
@@ -2680,6 +2778,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "clean".into(),
             store_path: PathBuf::from("/tmp/clean/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: vec![Tier3Run {
@@ -2712,6 +2811,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "myrepo".into(),
             store_path: PathBuf::from("/tmp/myrepo/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: Vec::new(),
@@ -2761,6 +2861,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "gappy".into(),
             store_path: PathBuf::from("/tmp/gappy/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: Vec::new(),
@@ -2796,6 +2897,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "clean".into(),
             store_path: PathBuf::from("/tmp/clean/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: Vec::new(),
@@ -2831,6 +2933,7 @@ mod tests {
         AliasStoreProbe {
             alias: alias.into(),
             store_path: PathBuf::from(format!("/tmp/{alias}/store.db")),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: run.into_iter().collect(),
@@ -2865,6 +2968,7 @@ mod tests {
         AliasStoreProbe {
             alias: alias.into(),
             store_path: PathBuf::from(format!("/tmp/{alias}/store.db")),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: runs,
@@ -3103,6 +3207,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "clean".into(),
             store_path: PathBuf::from("/tmp/clean/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: vec![run_row("kotlin-resolver", 5, "succeeded", None)],
@@ -3210,6 +3315,7 @@ mod tests {
         let probes = vec![AliasStoreProbe {
             alias: "moshi".into(),
             store_path: PathBuf::from("/tmp/moshi/store.db"),
+            worktree_registered: true,
             result: Ok(AliasStoreState {
                 tentative_manifest_id: Some(1),
                 tier3_runs: vec![

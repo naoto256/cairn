@@ -128,11 +128,11 @@ pub enum RepoAggregateStatus {
     /// A workspace-analysis job is in flight or at least one snapshot
     /// is still `reconciling`.
     Indexing,
-    /// At least one snapshot is `stale` (analyzer has more facts to
-    /// land) or `no_analyzer` (a present language has no registered
-    /// analyzer). Precedence is `Error > Indexing > Partial > Ready`,
-    /// so this state is reported when neither `Error` nor `Indexing`
-    /// applies.
+    /// At least one snapshot is `stale` (analyzer capability exists
+    /// but no symbol or completed-analysis evidence has landed) or
+    /// `no_analyzer` (a present language has no registered analyzer).
+    /// Precedence is `Error > Indexing > Partial > Ready`, so this
+    /// state is reported when neither `Error` nor `Indexing` applies.
     Partial,
     /// The repository has no snapshots or contains a `missing`
     /// snapshot — e.g. the default anchor has never been published.
@@ -255,7 +255,9 @@ pub struct RepoSnapshotEntry {
     /// anchors are rendered as `<name>`; `HEAD` and `tentative/<id>` remain
     /// explicit.
     pub branches: Vec<String>,
-    /// Snapshot readiness string reported by the daemon.
+    /// Snapshot readiness string reported by the daemon. `ready`
+    /// includes completed semantic analysis that legitimately
+    /// produced zero symbols.
     pub status: String,
     /// Per-language analyzer tier matrix for this snapshot.
     pub enrichment: Vec<LanguageEnrichment>,
