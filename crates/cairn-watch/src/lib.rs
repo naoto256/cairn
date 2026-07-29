@@ -274,9 +274,11 @@ impl EventClassifier {
 
     /// Classify one debounced batch.
     ///
-    /// Every event in the batch is tested in order; the batch stops
-    /// at the first event that produces a rescan reason, using this
-    /// per-event precedence:
+    /// Events whose paths are wholly inside a shared-pruned
+    /// working-tree subtree are removed before topology and
+    /// ignore-control checks. Every remaining event is tested in
+    /// order; the batch stops at the first event that produces a
+    /// rescan reason, using this per-event precedence:
     ///
     /// 1. The backend requested a rescan (`need_rescan()` flag) —
     ///    [`RescanReason::BackendRequested`].
@@ -294,30 +296,40 @@ impl EventClassifier {
     /// skipped, since the consumer will re-read the whole snapshot
     /// anyway.
     fn handle_batch(&self, events: &[notify_debouncer_full::DebouncedEvent]) {
-        let reason = events.iter().find_map(|event| {
-            if event.need_rescan() {
-                return Some(RescanReason::BackendRequested);
-            }
-            if event.paths.iter().any(|path| self.is_ignore_control(path)) {
-                return Some(RescanReason::IgnoreRulesChanged);
-            }
-            if matches!(
-                event.kind,
-                EventKind::Create(_)
-                    | EventKind::Remove(_)
-                    | EventKind::Modify(ModifyKind::Name(_))
-            ) && event.paths.iter().any(|path| {
-                self.is_working_tree_path(path) && is_nested_git_marker_path(&self.repo_root, path)
-            }) {
-                return Some(RescanReason::DirectoryTopologyChanged);
-            }
-            (is_directory_topology_change(event.kind)
-                && event
-                    .paths
-                    .iter()
-                    .any(|path| self.is_working_tree_path(path)))
-            .then_some(RescanReason::DirectoryTopologyChanged)
-        });
+        let reason = events
+            .iter()
+            .filter(|event| {
+                event.paths.is_empty()
+                    || !event
+                        .paths
+                        .iter()
+                        .all(|path| self.is_always_pruned_working_tree_path(path))
+            })
+            .find_map(|event| {
+                if event.need_rescan() {
+                    return Some(RescanReason::BackendRequested);
+                }
+                if event.paths.iter().any(|path| self.is_ignore_control(path)) {
+                    return Some(RescanReason::IgnoreRulesChanged);
+                }
+                if matches!(
+                    event.kind,
+                    EventKind::Create(_)
+                        | EventKind::Remove(_)
+                        | EventKind::Modify(ModifyKind::Name(_))
+                ) && event.paths.iter().any(|path| {
+                    self.is_working_tree_path(path)
+                        && is_nested_git_marker_path(&self.repo_root, path)
+                }) {
+                    return Some(RescanReason::DirectoryTopologyChanged);
+                }
+                (is_directory_topology_change(event.kind)
+                    && event
+                        .paths
+                        .iter()
+                        .any(|path| self.is_working_tree_path(path)))
+                .then_some(RescanReason::DirectoryTopologyChanged)
+            });
         if let Some(reason) = reason {
             self.reload_matcher();
             self.emit(WatchEvent::Rescan { reason });
@@ -484,6 +496,19 @@ impl EventClassifier {
                 .watch_roots()
                 .iter()
                 .any(|git_root| path.starts_with(git_root))
+    }
+
+    /// True when a working-tree path is owned by the fixed shared
+    /// prune policy. Nested repository boundaries stay out of this
+    /// prepass because their marker events must rebuild topology.
+    fn is_always_pruned_working_tree_path(&self, path: &Path) -> bool {
+        self.is_working_tree_path(path)
+            && !is_nested_git_marker_path(&self.repo_root, path)
+            && self
+                .ignore
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_always_pruned_path(path)
     }
 
     /// Reduce one raw notify event into a single [`WatchEvent`], or
@@ -762,7 +787,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let classifier = classifier_for(root);
-        for dir in ["target", "node_modules", ".claude"] {
+        for dir in ["target", "node_modules", ".claude", ".ruby-lsp"] {
             let path = root.join(dir).join("nested").join("file.rs");
             let ev = classifier.classify(&path, EventKind::Modify(notify::event::ModifyKind::Any));
             assert_eq!(ev, None, "expected {dir} subtree to be pruned");
@@ -912,6 +937,33 @@ mod tests {
             Some(WatchEvent::Rescan {
                 reason: RescanReason::DirectoryTopologyChanged
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn ruby_lsp_topology_and_ignore_events_are_pruned_before_rescan_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let ruby_lsp = root.join(".ruby-lsp");
+
+        for event in [
+            notify::Event::new(EventKind::Create(CreateKind::Folder)).add_path(ruby_lsp.clone()),
+            notify::Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(ruby_lsp.join("nested/.gitignore")),
+            notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(ruby_lsp.join("old"))
+                .add_path(ruby_lsp.join("new")),
+            notify::Event::new(EventKind::Remove(RemoveKind::Folder))
+                .add_path(ruby_lsp.join("nested")),
+        ] {
+            classifier.handle_batch(&[debounced(event)]);
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "events wholly inside an always-pruned subtree must not emit File or Rescan edges"
         );
     }
 
@@ -1161,5 +1213,47 @@ mod tests {
             probe_event.is_some(),
             "watcher delivered no Touched event for .probe within 10s of retries"
         );
+    }
+
+    #[tokio::test]
+    async fn polling_watcher_suppresses_ruby_lsp_subtree_but_keeps_ordinary_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".ruby-lsp/nested")).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle =
+            watch_repo_with_backend(&root, Duration::from_millis(50), tx, WatchBackend::Poll)
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        while rx.try_recv().is_ok() {}
+
+        std::fs::write(root.join(".ruby-lsp/.gitignore"), "*\n").unwrap();
+        std::fs::write(root.join(".ruby-lsp/nested/Gemfile.lock"), "generated\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let leaked = rx.try_recv();
+        assert!(
+            matches!(leaked, Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+            "polling backend leaked a File or Rescan edge from .ruby-lsp: {leaked:?}"
+        );
+
+        let probe = root.join("ordinary.rs");
+        let ordinary = wait_for_probe_with_retries(
+            &mut rx,
+            &probe,
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+        )
+        .await;
+        assert!(
+            matches!(
+                ordinary,
+                Some(WatchEvent::File { path, .. })
+                    if path.file_name() == probe.file_name()
+            ),
+            "ordinary working-tree files must remain observable"
+        );
+        drop(handle);
     }
 }

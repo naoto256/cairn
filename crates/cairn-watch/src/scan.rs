@@ -205,8 +205,9 @@ impl std::error::Error for ScanFailure {}
 /// fall into three buckets:
 ///
 /// - `.git` — tool metadata, never indexable as source.
-/// - `target`, `node_modules` — build outputs / dependency caches
-///   that would dominate the walk for zero indexing value.
+/// - `target`, `node_modules`, `.ruby-lsp` — build outputs,
+///   dependency caches, and language-server state that would dominate
+///   the walk for zero indexing value.
 /// - `.claude` — the Claude harness's per-project state, including
 ///   `.claude/worktrees/<id>/<full-repo-checkout>`. Walking into
 ///   those would re-index the whole repo once per sub-agent
@@ -214,7 +215,8 @@ impl std::error::Error for ScanFailure {}
 ///
 /// The watcher (`crate::EventClassifier`) uses the same list to
 /// filter inbound notify events so the two surfaces stay consistent.
-pub(crate) const ALWAYS_PRUNED_DIR_NAMES: &[&str] = &[".git", "target", "node_modules", ".claude"];
+pub(crate) const ALWAYS_PRUNED_DIR_NAMES: &[&str] =
+    &[".git", "target", "node_modules", ".claude", ".ruby-lsp"];
 
 /// Walk `repo_root`, honoring `.gitignore` and `.git/info/exclude`,
 /// and collect every regular file found. Directories listed in
@@ -656,7 +658,7 @@ mod tests {
         let root = tmp.path();
         // Plant one file inside each always-pruned directory and one
         // file at the root that should be retained.
-        for dir in [".git", "target", "node_modules", ".claude"] {
+        for dir in [".git", "target", "node_modules", ".claude", ".ruby-lsp"] {
             fs::create_dir(root.join(dir)).unwrap();
             fs::write(root.join(dir).join("planted.rs"), "fn x() {}").unwrap();
         }
@@ -674,7 +676,7 @@ mod tests {
 
         let paths: Vec<PathBuf> = scan_entries(root).into_iter().map(|f| f.path).collect();
         assert!(paths.iter().any(|p| p.ends_with("keep.rs")));
-        for dir in [".git", "target", "node_modules", ".claude"] {
+        for dir in [".git", "target", "node_modules", ".claude", ".ruby-lsp"] {
             assert!(
                 paths.iter().all(|p| !p.iter().any(|c| c == dir)),
                 "{dir} should be pruned but appeared in: {paths:?}"

@@ -836,6 +836,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ruby_lsp_writes_do_not_advance_reconcile_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, "h", root.path());
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_from_hook = attempts.clone();
+        reconcile.set_test_register_hook(Arc::new(move |_, _, _, _| {
+            attempts_from_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let manager = WatchManager::with_backend_and_reconcile(
+            cas.clone(),
+            WatchBackend::Poll,
+            reconcile.clone(),
+        );
+        manager
+            .watch_repository("h".into(), root.path().to_path_buf())
+            .unwrap();
+
+        std::fs::create_dir_all(root.path().join(".ruby-lsp/generated")).unwrap();
+        std::fs::write(root.path().join(".ruby-lsp/.gitignore"), "*\n").unwrap();
+        std::fs::write(
+            root.path().join(".ruby-lsp/generated/Gemfile.lock"),
+            "generated\n",
+        )
+        .unwrap();
+        tokio::time::sleep(WATCH_COALESCE_WINDOW * 2 + Duration::from_millis(300)).await;
+        assert_eq!(desired_generation(&cas, "h"), Some(0));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        std::fs::write(root.path().join("ordinary.rs"), "fn ordinary() {}\n").unwrap();
+        wait_for_desired(&cas, "h", 1).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if attempts.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("ordinary file change did not reach reconcile");
+
+        manager.unwatch_repository("h");
+        reconcile.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn continuous_events_do_not_starve_dirty_generation() {
         let root = tempfile::tempdir().unwrap();
         let data_root = tempfile::tempdir().unwrap();

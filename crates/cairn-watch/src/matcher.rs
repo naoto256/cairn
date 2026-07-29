@@ -234,20 +234,29 @@ impl RepoIgnoreMatcher {
         })
     }
 
+    /// Return whether `path` contains one of the fixed directory names
+    /// that the scanner and watcher always exclude. Nested repository
+    /// boundaries are intentionally separate because topology events
+    /// for their `.git` markers must still rebuild the matcher.
+    pub(crate) fn is_always_pruned_path(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.repo_root) else {
+            return false;
+        };
+        !relative.as_os_str().is_empty()
+            && relative.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| ALWAYS_PRUNED_DIR_NAMES.contains(&name))
+            })
+    }
+
     /// Fallible form of [`Self::is_pruned_path`] for full-scan callers.
     pub(crate) fn try_is_pruned_path(&self, path: &Path) -> io::Result<bool> {
-        let Ok(relative) = path.strip_prefix(&self.repo_root) else {
-            return Ok(false);
-        };
-        if relative.as_os_str().is_empty() {
+        if !path.starts_with(&self.repo_root) {
             return Ok(false);
         }
-        if relative.components().any(|component| {
-            component
-                .as_os_str()
-                .to_str()
-                .is_some_and(|name| ALWAYS_PRUNED_DIR_NAMES.contains(&name))
-        }) {
+        if self.is_always_pruned_path(path) {
             return Ok(true);
         }
 

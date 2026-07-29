@@ -57,10 +57,9 @@ pub fn expected_analyzers_for_manifest(
 /// An analyzer needs a re-run when its `workspace_analysis_runs` row is
 /// missing, its revision differs from the linked-in `revision()`, its
 /// configuration hash differs from the current files under `repo_root`, or
-/// its status is anything other than `succeeded`. Queued / running / failed /
-/// skipped / cancelled / timed_out rows therefore all force that analyzer to
-/// re-run, because any of those states can leave its resolutions empty or
-/// partially populated.
+/// it has no current succeeded or identified in-flight run. Current queued
+/// and running jobs are left to finish; terminal failed, skipped, cancelled,
+/// and timed-out rows remain eligible for retry.
 ///
 /// If `expected_analyzers_for_manifest` is empty (no language we analyze
 /// at workspace tier appears in the manifest), the returned vector is
@@ -75,10 +74,10 @@ pub(crate) fn workspace_analyzers_needing_rerun(
         return Ok(Vec::new());
     }
 
-    let mut existing: HashMap<String, (i64, String, String)> = HashMap::new();
+    let mut existing: HashMap<String, (i64, String, String, Option<i64>)> = HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT analyzer_id, analyzer_revision, status, config_hash
+            "SELECT analyzer_id, analyzer_revision, status, config_hash, job_id
                FROM workspace_analysis_runs
               WHERE manifest_id = ?1",
         )?;
@@ -88,11 +87,12 @@ pub(crate) fn workspace_analyzers_needing_rerun(
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
             ))
         })?;
         for row in rows {
-            let (analyzer_id, revision, status, config_hash) = row?;
-            existing.insert(analyzer_id, (revision, status, config_hash));
+            let (analyzer_id, revision, status, config_hash, job_id) = row?;
+            existing.insert(analyzer_id, (revision, status, config_hash, job_id));
         }
     }
 
@@ -100,17 +100,19 @@ pub(crate) fn workspace_analyzers_needing_rerun(
         .into_iter()
         .filter(|analyzer| {
             // Rerun condition 1: no run row at all for this analyzer.
-            let Some((revision, status, stored_hash)) = existing.get(analyzer.id()) else {
+            let Some((revision, status, stored_hash, job_id)) = existing.get(analyzer.id()) else {
                 return true;
             };
             // Defensive clamp mirroring the staleness scanner: the
             // column is INTEGER but writers bound it to u32.
             let revision = u32::try_from(*revision).unwrap_or(u32::MAX);
-            // Conditions 2-4: non-succeeded status, revision-stale,
-            // config-stale. The revision test is `!=` (not the
+            // Conditions 2-4: no current completed or identified
+            // in-flight run, revision-stale, or config-stale. The revision test is `!=` (not the
             // startup scanner's rollback-safe `<`): on this path a
             // revision rollback also forces a rerun.
-            status != "succeeded"
+            let current_or_in_flight = status == "succeeded"
+                || (matches!(status.as_str(), "queued" | "running") && job_id.is_some());
+            !current_or_in_flight
                 || revision != analyzer.revision()
                 || stored_hash != &config_hash(repo_root, analyzer.config_paths())
         })
@@ -350,6 +352,16 @@ mod tests {
         ids
     }
 
+    fn identify_run(conn: &rusqlite::Connection, manifest_id: ManifestId, job_id: i64) {
+        conn.execute(
+            "UPDATE workspace_analysis_runs
+             SET job_id = ?2
+             WHERE manifest_id = ?1",
+            params![manifest_id.0, job_id],
+        )
+        .unwrap();
+    }
+
     /// Vacuous case: a manifest whose parsers don't match any
     /// registered analyzer returns an empty re-run set.
     #[test]
@@ -446,12 +458,34 @@ mod tests {
         );
     }
 
-    /// R2 must-fix #2 pin: queued / running / failed / skipped /
-    /// cancelled / timed_out must all force the analyzer to re-run
-    /// (the currency filter returns `true` for them) even when the
-    /// revision matches. A half-finished pass leaves the resolutions
-    /// table either empty or partially populated, so it must not
-    /// masquerade as up-to-date.
+    /// A current queued or running job owns the unfinished pass, so a
+    /// no-op reconcile must not select the same analyzer again.
+    #[test]
+    fn workspace_analyzers_needing_rerun_skips_identified_current_in_flight_jobs() {
+        for status in ["queued", "running"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
+            insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+            insert_run(
+                &conn,
+                tmp.path(),
+                ManifestId(1),
+                "fake-workspace",
+                7,
+                status,
+            );
+            identify_run(&conn, ManifestId(1), 101);
+
+            assert!(
+                rerun_ids(&conn, ManifestId(1), tmp.path()).is_empty(),
+                "current identified {status:?} job must own the analyzer pass"
+            );
+        }
+    }
+
+    /// Unidentified in-flight rows and every terminal non-success
+    /// state remain retryable. They cannot prove that a live job owns
+    /// the incomplete analyzer pass.
     #[test]
     fn workspace_analyzers_needing_rerun_returns_only_non_succeeded_status() {
         for status in [
@@ -478,6 +512,39 @@ mod tests {
                 rerun_ids(&conn, ManifestId(1), tmp.path()),
                 ["fake-workspace"],
                 "status {status:?} must require that analyzer to re-run"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_analyzers_needing_rerun_retries_stale_in_flight_jobs() {
+        for (revision, config_hash) in [(6, None), (7, Some("stale-config-hash"))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
+            insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+            match config_hash {
+                Some(config_hash) => insert_run_with_config_hash(
+                    &conn,
+                    ManifestId(1),
+                    "fake-workspace",
+                    revision,
+                    "running",
+                    config_hash,
+                ),
+                None => insert_run(
+                    &conn,
+                    tmp.path(),
+                    ManifestId(1),
+                    "fake-workspace",
+                    revision,
+                    "running",
+                ),
+            }
+            identify_run(&conn, ManifestId(1), 101);
+
+            assert_eq!(
+                rerun_ids(&conn, ManifestId(1), tmp.path()),
+                ["fake-workspace"]
             );
         }
     }
