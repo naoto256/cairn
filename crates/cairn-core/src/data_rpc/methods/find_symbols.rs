@@ -598,6 +598,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capped_inheritance_unresolved_keeps_semantic_reason_and_cap_hint() {
+        let fixture = registered_fixture_with_files(&[(
+            "src/types.ts",
+            "class Base { inherited() {} }\n\
+             class Child extends Base { ownA() {} ownB() {} }\n",
+        )]);
+        let conn = demo_store(&fixture);
+        duplicate_owner(&conn, "Base");
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "kind": "method",
+                    "container": "Child",
+                    "include_inherited": true,
+                    "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value["items"].as_array().unwrap().len(), 1);
+        assert_eq!(value["completeness"]["status"], "partial");
+        assert_eq!(value["completeness"]["reason"], "inheritance_unresolved");
+        assert_single_cap_hint(&value);
+    }
+
+    #[tokio::test]
     async fn resolved_parent_identity_beats_ambiguous_fact_spelling() {
         let fixture = registered_fixture_with_files(&[(
             "src/types.ts",
@@ -663,6 +693,64 @@ mod tests {
         assert_eq!(item_names(&value), vec!["own"]);
         assert_eq!(value["completeness"]["status"], "partial");
         assert_eq!(value["completeness"]["reason"], "tier2_warming");
+        assert_eq!(hint_count(&value, "capped_increase_limit"), 0);
+    }
+
+    #[tokio::test]
+    async fn capped_tier2_warming_keeps_semantic_reason_and_cap_hint() {
+        let fixture = registered_fixture_with_files(&[(
+            "src/types.ts",
+            "class Child { ownA() {} ownB() {} }\n",
+        )]);
+        let conn = demo_store(&fixture);
+        conn.execute("UPDATE blobs SET analyzer_id = NULL", [])
+            .unwrap();
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "kind": "method",
+                    "container": "Child",
+                    "include_inherited": true,
+                    "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value["items"].as_array().unwrap().len(), 1);
+        assert_eq!(value["completeness"]["status"], "partial");
+        assert_eq!(value["completeness"]["reason"], "tier2_warming");
+        assert_single_cap_hint(&value);
+    }
+
+    #[tokio::test]
+    async fn cap_only_emits_one_cap_hint() {
+        let fixture = registered_fixture_with_files(&[(
+            "src/types.ts",
+            "class Child { ownA() {} ownB() {} }\n",
+        )]);
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "kind": "method",
+                    "container": "Child",
+                    "include_inherited": false,
+                    "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value["items"].as_array().unwrap().len(), 1);
+        assert_eq!(value["completeness"]["status"], "partial");
+        assert_eq!(value["completeness"]["reason"], "cap");
+        assert_single_cap_hint(&value);
     }
 
     #[tokio::test]
@@ -892,6 +980,27 @@ mod tests {
             .iter()
             .map(|item| item["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn hint_count(value: &Value, code: &str) -> usize {
+        value
+            .get("hints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|hint| hint["code"] == code)
+            .count()
+    }
+
+    fn assert_single_cap_hint(value: &Value) {
+        assert_eq!(hint_count(value, "capped_increase_limit"), 1, "{value:#}");
+        let hint = value["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hint| hint["code"] == "capped_increase_limit")
+            .unwrap();
+        assert_eq!(hint["action"], "increase_limit");
     }
 
     fn demo_store(fixture: &DataRpcFixture) -> Connection {

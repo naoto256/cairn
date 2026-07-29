@@ -751,7 +751,11 @@ pub struct FindSymbolArgs {
     /// A syntactic-only snapshot reports `tier2_warming`. An ambiguous
     /// fact-only ancestor stops that branch without guessing and
     /// reports `inheritance_unresolved`; declarations from proven
-    /// branches remain usable.
+    /// branches remain usable. Completeness carries one reason, so
+    /// either semantic reason takes priority when the result is also
+    /// capped. In that case `capped_increase_limit` with action
+    /// `increase_limit` preserves the truncation signal. There is no
+    /// cursor; retry with a larger limit or narrower filters.
     #[serde(default)]
     pub include_inherited: bool,
     /// File-path **string** prefix (relative to the repo root). Only
