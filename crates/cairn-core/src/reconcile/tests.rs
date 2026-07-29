@@ -16,6 +16,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::anchor::{self, AnchorName};
 use crate::cas::registry as cas_registry;
 use crate::cas::store as cas_store;
+use crate::jobs::JobManager;
 use crate::lifecycle::{RegistrationReconcilePolicy, RepoLifecycleManager};
 use crate::manifest::ManifestId;
 use crate::paths::CasDataDir;
@@ -1056,6 +1057,108 @@ async fn incomplete_full_scan_preserves_durable_generation_gap() {
             .is_some_and(|error| error.contains("scan:"))
     );
     assert!(state.next_retry_at_ns.is_some());
+    mgr.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn unchanged_reconcile_reuses_manifest_and_converges_without_duplicate_jobs() {
+    let (repo, _commit) = init_repo(&[("src/lib.rs", "pub fn indexed() {}\n")]);
+    let (_tmp, cas) = fresh_cas();
+    seed_repo(
+        &cas,
+        "demo",
+        &repo.path().to_string_lossy(),
+        "unchanged-repo",
+    );
+    cas_store::open(&cas.store_db_path("unchanged-repo")).unwrap();
+    let clock = ManualClock::new(1_000_000);
+    let job_manager = JobManager::new(Arc::clone(&cas));
+    let mgr = RepoReconcileManager::with_config(
+        Arc::clone(&cas),
+        Some(job_manager),
+        clock,
+        RetryPolicy::default(),
+    );
+
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || read_state(&cas, "unchanged-repo").applied_generation == 1,
+        5000,
+        "first production reconcile",
+    )
+    .await;
+
+    let store = cas_store::open_existing(&cas.store_db_path("unchanged-repo")).unwrap();
+    let first_manifest = anchor::resolve(&store, &AnchorName::tentative(1))
+        .unwrap()
+        .unwrap();
+    let runs_before: i64 = store
+        .query_row("SELECT COUNT(*) FROM workspace_analysis_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let identified_jobs_before: i64 = store
+        .query_row(
+            "SELECT COUNT(*) FROM workspace_analysis_runs WHERE job_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(runs_before > 0);
+    drop(store);
+
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || read_state(&cas, "unchanged-repo").applied_generation == 2,
+        5000,
+        "second production reconcile",
+    )
+    .await;
+
+    let store = cas_store::open_existing(&cas.store_db_path("unchanged-repo")).unwrap();
+    assert_eq!(
+        anchor::resolve(&store, &AnchorName::tentative(1))
+            .unwrap()
+            .unwrap(),
+        first_manifest
+    );
+    assert_eq!(
+        store
+            .query_row("SELECT COUNT(*) FROM workspace_analysis_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        runs_before
+    );
+    assert_eq!(
+        store
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs WHERE job_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        identified_jobs_before
+    );
+    assert_eq!(
+        store
+            .query_row(
+                "SELECT COUNT(*) FROM manifests WHERE kind = 'tentative'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let state = read_state(&cas, "unchanged-repo");
+    assert_eq!(state.desired_generation, 2);
+    assert_eq!(state.applied_generation, 2);
+    assert!(state.attempt_generation.is_none());
+
     mgr.shutdown(Duration::from_secs(2)).await;
 }
 

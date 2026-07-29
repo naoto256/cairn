@@ -62,13 +62,13 @@ pub struct RegisterOutcome {
     /// `true` iff the workspace analyzer pass was skipped because the
     /// tentative manifest entries were byte-identical to the prior
     /// tentative, no blobs were re-parsed by the pre-publication parse pass,
-    /// and no expected analyzer needs a re-run. An expected analyzer needs a
-    /// re-run when its row is absent, non-succeeded, at a stale revision, or
-    /// at a stale config hash (its `config_paths` content changed) — so an
-    /// unchanged config hash, matching current analyzer currency, is part of
-    /// what makes the skip safe. All three gates must hold — entries-unchanged
-    /// alone is not enough to skip (it would let a parser_revision bump leave
-    /// the resolutions table stale under a reused `manifest_id`).
+    /// and no expected analyzer needs a re-run. Current succeeded runs and
+    /// current queued or running runs with an identified job satisfy the last
+    /// gate. Missing, terminal, unidentified in-flight, stale-revision, and
+    /// stale-config runs require another enqueue. All three gates must hold —
+    /// entries-unchanged alone is not enough to skip (it would let a
+    /// parser_revision bump leave the resolutions table stale under a reused
+    /// `manifest_id`).
     pub skip_analyzers_for_unchanged_manifest: bool,
     /// Analyzer jobs enqueued by the `*_enqueue_*` entry points;
     /// always empty for the inline-run variants.
@@ -437,7 +437,7 @@ where
     // now gated separately below.
     let entries_unchanged = dedupe_unchanged_tentative
         && match prior_tentative {
-            Some(prior) => manifest::get_entries(&tx, prior)? == tentative_entries,
+            Some(prior) => manifests_have_same_entries(&tx, prior, built_tentative)?,
             None => false,
         };
     let (tentative, tentative_entries) = if entries_unchanged {
@@ -499,12 +499,13 @@ where
     // skip decision. Running it after would observe a post-skip state and let
     // drift slip through.
     // Gate #3 (per-analyzer currency): when the manifest and Tier-1
-    // facts are unchanged, run only expected analyzers whose row is
-    // missing, non-succeeded, at a stale revision, or at a stale
-    // configuration hash. A permanently failing analyzer must not
-    // amplify into re-running every healthy analyzer on each watcher
-    // tick. Changed inputs still run the full registered set so newly
-    // applicable analyzers are not missed.
+    // facts are unchanged, current succeeded runs and current queued
+    // or running runs with an identified job need no replacement.
+    // Missing, terminal, unidentified in-flight, stale-revision, and
+    // stale-config runs are selected. A permanently failing analyzer
+    // must not amplify into re-running every healthy analyzer on each
+    // watcher tick. Changed inputs still run the full registered set
+    // so newly applicable analyzers are not missed.
     let analyzers_to_run = if entries_unchanged && blobs_parsed == 0 {
         workspace_analyzers_needing_rerun(conn, tentative, worktree_path)?
     } else {
@@ -556,6 +557,41 @@ where
         blobs_parsed,
         publication: publication_receipt,
     })
+}
+
+/// Compare the persisted `(path, blob_sha)` sets that define two manifests.
+///
+/// Gate #1 is an identity decision over manifest contents, not over the
+/// incidental order in which a filesystem walk produced those contents.
+/// Both directions are required so a proper subset cannot be reused.
+fn manifests_have_same_entries(
+    conn: &Connection,
+    left: ManifestId,
+    right: ManifestId,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT
+             NOT EXISTS (
+                 SELECT path, blob_sha
+                 FROM manifest_entries
+                 WHERE manifest_id = ?1
+                 EXCEPT
+                 SELECT path, blob_sha
+                 FROM manifest_entries
+                 WHERE manifest_id = ?2
+             )
+             AND NOT EXISTS (
+                 SELECT path, blob_sha
+                 FROM manifest_entries
+                 WHERE manifest_id = ?2
+                 EXCEPT
+                 SELECT path, blob_sha
+                 FROM manifest_entries
+                 WHERE manifest_id = ?1
+             )",
+        params![left.0, right.0],
+        |row| row.get(0),
+    )?)
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -875,6 +911,9 @@ mod tests {
     use cairn_lang_rust as _;
     use std::cell::Cell;
     use std::fs;
+    use std::sync::Arc;
+
+    use crate::paths::CasDataDir;
 
     fn python_backends() -> Vec<Box<dyn LanguageBackend>> {
         vec![Box::new(PythonBackend)]
@@ -1102,6 +1141,98 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_reconcile_with_current_jobs_reuses_manifest_and_enqueues_nothing() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let data_tmp = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
+        cas_data_dir.ensure().unwrap();
+        let job_manager = JobManager::new(cas_data_dir);
+
+        let first = register_repo_reconcile_enqueue_analyzers(
+            &mut conn,
+            ReconcileRegistration {
+                alias: "repo",
+                repo_hash: "repo-hash",
+                worktree_path: repo.path(),
+                now_ns: 10,
+                generation: 1,
+                forced: false,
+            },
+            &job_manager,
+        )
+        .unwrap();
+        assert!(
+            !first.analyzer_jobs.is_empty(),
+            "the first registration must establish current in-flight ownership"
+        );
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        let runs_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_analysis_runs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let identified_jobs_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs WHERE job_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let second = register_repo_reconcile_enqueue_analyzers(
+            &mut conn,
+            ReconcileRegistration {
+                alias: "repo",
+                repo_hash: "repo-hash",
+                worktree_path: repo.path(),
+                now_ns: 20,
+                generation: 2,
+                forced: false,
+            },
+            &job_manager,
+        )
+        .unwrap();
+
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+        assert!(second.skip_analyzers_for_unchanged_manifest);
+        assert!(second.analyzer_jobs.is_empty());
+        assert_eq!(
+            second
+                .publication
+                .as_ref()
+                .map(|receipt| receipt.generation),
+            Some(2)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM workspace_analysis_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            runs_before
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs WHERE job_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            identified_jobs_before
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM manifests WHERE kind = 'tentative'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn analyzer_failure_after_publication_leaves_durable_receipt() {
         let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
         let db_tmp = tempfile::tempdir().unwrap();
@@ -1277,6 +1408,54 @@ mod tests {
 
         let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
             panic!("all current analyzers must be skipped")
+        })
+        .unwrap();
+
+        assert!(second.skip_analyzers_for_unchanged_manifest);
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+    }
+
+    #[test]
+    fn unchanged_manifest_with_current_in_flight_analyzers_runs_none() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+
+        let first = register_repo_inner(&mut conn, repo.path(), 1, true, |_, _, _, _, _, _| {
+            Ok(Vec::new())
+        })
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "queued",
+        );
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "running",
+        );
+        conn.execute(
+            "UPDATE workspace_analysis_runs
+             SET job_id = CASE analyzer_id
+                 WHEN 'fake-workspace' THEN 101
+                 WHEN 'second-fake-workspace' THEN 102
+             END
+             WHERE manifest_id = ?1",
+            params![first.tentative_manifest.0],
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let second = register_repo_inner(&mut conn, repo.path(), 2, true, |_, _, _, _, _, _| {
+            panic!("current queued and running analyzers must not be enqueued again")
         })
         .unwrap();
 
