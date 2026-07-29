@@ -568,9 +568,10 @@ fn probe_manifest(
 /// to a manifest; distinct `Warn`s when either the alias root has no
 /// worktree registration or a registered worktree has no tentative
 /// anchor; and `Fail` when any store-probe step errored. Only the
-/// missing-anchor warning proves that default reads fall back to
-/// HEAD; without the worktree row this probe cannot relate the root
-/// to any surviving tentative anchor.
+/// A missing per-worktree anchor does not by itself prove HEAD
+/// fallback: default selection may use another tentative anchor in
+/// the same store. Without the worktree row this probe cannot relate
+/// the root to any surviving tentative anchor.
 fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
     probes
         .iter()
@@ -597,7 +598,10 @@ fn tentative_snapshot_checks(probes: &[AliasStoreProbe]) -> Vec<DoctorCheck> {
                 None => doctor_check(
                     format!("repo `{}` tentative snapshot present", probe.alias),
                     DoctorStatus::Warn,
-                    Some("no tentative anchor yet (reads will fall back to HEAD)".into()),
+                    Some(
+                        "no tentative anchor for this alias worktree; default reads may use another tentative anchor in this store, otherwise HEAD"
+                            .into(),
+                    ),
                     Some(format!(
                         "Run `cairn ctl repo reindex {}` to build the tentative snapshot.",
                         probe.alias
@@ -2167,7 +2171,9 @@ mod tests {
         assert_eq!(checks[1].status, DoctorStatus::Warn);
         assert_eq!(
             checks[1].detail.as_deref(),
-            Some("no tentative anchor yet (reads will fall back to HEAD)")
+            Some(
+                "no tentative anchor for this alias worktree; default reads may use another tentative anchor in this store, otherwise HEAD"
+            )
         );
         assert!(
             checks[1]
@@ -2539,7 +2545,9 @@ mod tests {
         assert_eq!(tentative.status, DoctorStatus::Warn);
         assert_eq!(
             tentative.detail.as_deref(),
-            Some("no tentative anchor yet (reads will fall back to HEAD)")
+            Some(
+                "no tentative anchor for this alias worktree; default reads may use another tentative anchor in this store, otherwise HEAD"
+            )
         );
         assert!(
             tentative
@@ -2562,6 +2570,10 @@ mod tests {
             .unwrap();
         store.execute("DELETE FROM worktrees", []).unwrap();
         let selected = crate::anchor::resolve_explicit_or_default(&store, None, None).unwrap();
+        let missing_anchor_store =
+            cas_store::open(&fixture.cas_data_dir.store_db_path("missing-anchor-hash")).unwrap();
+        let head_selected =
+            crate::anchor::resolve_explicit_or_default(&missing_anchor_store, None, None).unwrap();
 
         let report = fixture.run_doctor().await;
         let worktree = find_check(
@@ -2585,9 +2597,76 @@ mod tests {
         );
         assert_eq!(
             anchor.detail.as_deref(),
-            Some("no tentative anchor yet (reads will fall back to HEAD)")
+            Some(
+                "no tentative anchor for this alias worktree; default reads may use another tentative anchor in this store, otherwise HEAD"
+            )
+        );
+        assert_eq!(
+            head_selected.as_str(),
+            "HEAD",
+            "default selection falls back to HEAD when the store has no tentative anchors"
         );
         assert_ne!(worktree.remediation, anchor.remediation);
+    }
+
+    #[tokio::test]
+    async fn doctor_missing_anchor_allows_another_worktree_tentative_default() {
+        let fixture = DoctorFixture::new();
+        fixture.seed_alias("target", true, None, None);
+
+        let other_path = fixture.repo_path("other");
+        std::fs::create_dir_all(&other_path).unwrap();
+
+        let store = cas_store::open(&fixture.cas_data_dir.store_db_path("target-hash")).unwrap();
+        let target_path = fixture.repo_path("target");
+        let target_worktree_id: i64 = store
+            .query_row(
+                "SELECT worktree_id FROM worktrees WHERE path = ?1",
+                params![target_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .execute(
+                "INSERT INTO worktrees (path, registered_at_ns) VALUES (?1, 0)",
+                params![other_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let other_worktree_id = store.last_insert_rowid();
+        store
+            .execute(
+                "INSERT INTO anchors (anchor_name, manifest_id, last_updated_ns)
+                 VALUES (?1, 1, 0)",
+                params![format!("tentative/{other_worktree_id}")],
+            )
+            .unwrap();
+        store
+            .execute(
+                "DELETE FROM anchors WHERE anchor_name = ?1",
+                params![format!("tentative/{target_worktree_id}")],
+            )
+            .unwrap();
+
+        let selected = crate::anchor::resolve_explicit_or_default(&store, None, None).unwrap();
+        let report = fixture.run_doctor().await;
+        let target = find_check(&report, "repo `target` tentative snapshot present");
+
+        assert_eq!(selected.as_str(), format!("tentative/{other_worktree_id}"));
+        assert_eq!(target.status, DoctorStatus::Warn);
+        assert_eq!(
+            target.detail.as_deref(),
+            Some(
+                "no tentative anchor for this alias worktree; default reads may use another tentative anchor in this store, otherwise HEAD"
+            )
+        );
+        assert!(
+            !target
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("reads will fall back to HEAD"),
+            "the alias-local probe cannot prove that default reads select HEAD"
+        );
     }
 
     struct DoctorFixture {
