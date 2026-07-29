@@ -1,10 +1,12 @@
 //! `find_symbols` — workspace-scoped symbol lookup by name / kind /
 //! container / path prefix.
 //!
-//! Reads directly from Tier-1 `symbols` and does not consult the
-//! resolution layer: this query answers "where is X declared?" rather
-//! than "what does X resolve to?". Rows are scoped to blobs visible
-//! from the anchor's manifest via `manifest_entries`, and to
+//! Ordinary lookups read directly from Tier-1 `symbols`: this query
+//! answers "where is X declared?" rather than "what does X resolve
+//! to?". `include_inherited` is the narrow exception: resolution
+//! authority selects the transitive owner set, while the returned rows
+//! remain declarations. Rows are scoped to blobs visible from the
+//! anchor's manifest via `manifest_entries`, and to
 //! `scope = 'top_level'` so nested (function-local) declarations do
 //! not surface as workspace-addressable hits — the file-structure
 //! view in [`crate::query::get_outline`] keeps them.
@@ -14,6 +16,8 @@
 //! blob promotes the row to Semantic, matching the Tier-2 native
 //! enricher convention documented in
 //! [`crate::workspace_analyzer`].
+use std::collections::{HashMap, HashSet};
+
 use cairn_lang_api::Visibility;
 use cairn_proto::common::{SourceTier, SymbolKind};
 use rusqlite::{Connection, ToSql};
@@ -22,6 +26,7 @@ use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas::kind_conv::{symbol_kind_from_str, visibility_from_str};
 use crate::manifest::ManifestId;
+use crate::workspace_analyzer::source_rank_case_sql;
 
 /// One symbol hit. Mirrors the public-fact subset of
 /// `cairn_proto::methods::FindSymbolHit` but skips the wire-format
@@ -55,6 +60,15 @@ pub struct FindSymbolsArgs {
     pub limit: Option<u32>,
 }
 
+/// Query rows plus semantic-partiality discovered while expanding an
+/// inherited-member request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FindSymbolsOutcome {
+    pub(crate) hits: Vec<SymbolHit>,
+    pub(crate) inheritance_unresolved: bool,
+    pub(crate) tier2_warming: bool,
+}
+
 /// Query the symbols visible from `anchor`. `anchor` resolves to one
 /// manifest; the join scopes hits to blobs that appear in that
 /// manifest.
@@ -67,6 +81,17 @@ pub fn find_symbols(
     anchor: &AnchorName,
     args: &FindSymbolsArgs,
 ) -> Result<Vec<SymbolHit>> {
+    Ok(find_symbols_with_status(conn, anchor, args, false)?.hits)
+}
+
+/// [`find_symbols`] with the semantic state needed by the public data
+/// method to report a usable-but-partial inherited-member union.
+pub(crate) fn find_symbols_with_status(
+    conn: &Connection,
+    anchor: &AnchorName,
+    args: &FindSymbolsArgs,
+    include_inherited: bool,
+) -> Result<FindSymbolsOutcome> {
     let any_filter = args.query.as_deref().is_some_and(|q| !q.is_empty())
         || args.kind.as_deref().is_some_and(|k| !k.is_empty())
         || args.container.as_deref().is_some_and(|c| !c.is_empty())
@@ -84,7 +109,18 @@ pub fn find_symbols(
             name: anchor.as_str().to_string(),
         })?;
 
-    run_find_symbols(conn, manifest_id, args)
+    if include_inherited
+        && let Some(container) = args.container.as_deref()
+        && !container.is_empty()
+    {
+        return run_find_symbols_inherited(conn, manifest_id, args, container);
+    }
+
+    Ok(FindSymbolsOutcome {
+        hits: run_find_symbols(conn, manifest_id, args)?,
+        inheritance_unresolved: false,
+        tier2_warming: false,
+    })
 }
 
 fn run_find_symbols(
@@ -208,6 +244,449 @@ fn run_find_symbols(
     Ok(rows?)
 }
 
+#[derive(Debug, Clone)]
+struct IndexedSymbol {
+    hit: SymbolHit,
+    raw_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OwnerIdentity {
+    parser_id: String,
+    qualified: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InheritanceEdge {
+    child_qualified: String,
+    parent_spelling: String,
+    parser_id: String,
+    target_symbol_id: Option<i64>,
+}
+
+const MANIFEST_INHERITANCE_EDGES_SQL: &str = "
+    WITH manifest_blobs AS MATERIALIZED (
+        SELECT DISTINCT me.blob_sha
+          FROM manifest_entries me
+         WHERE me.manifest_id = ?1
+    ),
+    manifest_sites AS MATERIALIZED (
+        SELECT i.id, i.blob_sha, i.parser_id,
+               i.type_qualified, i.interface_qualified, i.kind,
+               i.interface_byte_start, i.interface_byte_end
+          FROM manifest_blobs mb
+          JOIN implementations i INDEXED BY idx_impls_blob
+            ON i.blob_sha = mb.blob_sha
+    ),
+    resolved_sites AS MATERIALIZED (
+        SELECT s.*,
+               COALESCE(
+                   (
+                       SELECT r.id
+                         FROM resolutions r
+                              INDEXED BY idx_resolutions_manifest_site
+                        WHERE r.manifest_id = ?1
+                          AND r.kind = 'type'
+                          AND r.site_blob_sha = s.blob_sha
+                          AND r.site_parser_id = s.parser_id
+                          AND r.site_byte_start = s.interface_byte_start
+                          AND r.site_byte_end = s.interface_byte_end
+                        ORDER BY {source_rank}, r.id
+                        LIMIT 1
+                   ),
+                   (
+                       SELECT r.id
+                         FROM resolutions r
+                              INDEXED BY idx_resolutions_blob_scoped_site
+                        WHERE r.manifest_id IS NULL
+                          AND r.kind = 'type'
+                          AND r.site_blob_sha = s.blob_sha
+                          AND r.site_parser_id = s.parser_id
+                          AND r.site_byte_start = s.interface_byte_start
+                          AND r.site_byte_end = s.interface_byte_end
+                        ORDER BY {source_rank}, r.id
+                        LIMIT 1
+                   )
+               ) AS resolution_id
+          FROM manifest_sites s
+    )
+    SELECT s.type_qualified, s.interface_qualified, s.parser_id,
+           r.target_symbol_id
+      FROM resolved_sites s
+      LEFT JOIN resolutions r
+        ON r.id = s.resolution_id
+     WHERE COALESCE(r.semantic_kind, s.kind)
+           IN ('inherit', 'implement', 'mixin')";
+
+fn manifest_inheritance_edges_sql() -> String {
+    MANIFEST_INHERITANCE_EDGES_SQL.replace("{source_rank}", &source_rank_case_sql("r.source"))
+}
+
+/// Expand inherited-member ownership from one immutable manifest, then
+/// apply the ordinary symbol filters to the complete owner union.
+///
+/// The two bulk reads below deliberately avoid per-ancestor queries.
+/// Edge traversal only decides which already-loaded declaration rows
+/// are eligible; query, kind, path, and limit remain result filters.
+fn run_find_symbols_inherited(
+    conn: &Connection,
+    manifest_id: ManifestId,
+    args: &FindSymbolsArgs,
+    container: &str,
+) -> Result<FindSymbolsOutcome> {
+    let symbols = load_manifest_symbols(conn, manifest_id)?;
+    let edges = load_manifest_inheritance_edges(conn, manifest_id)?;
+    let fuzzy_ids = if args.fuzzy
+        && let Some(query) = args.query.as_deref()
+        && !query.is_empty()
+    {
+        Some(load_fuzzy_symbol_ids(conn, query)?)
+    } else {
+        None
+    };
+
+    let mut owner_symbols_by_id = HashMap::<i64, &IndexedSymbol>::new();
+    let mut exact_owners = HashMap::<(String, String), HashMap<i64, &IndexedSymbol>>::new();
+    let mut named_owners = HashMap::<(String, String), HashMap<i64, &IndexedSymbol>>::new();
+    for symbol in &symbols {
+        if !is_type_owner_kind(&symbol.raw_kind) {
+            continue;
+        }
+        owner_symbols_by_id.insert(symbol.hit.id, symbol);
+        let family = parser_family(&symbol.hit.parser_id).to_string();
+        exact_owners
+            .entry((family.clone(), symbol.hit.qualified.clone()))
+            .or_default()
+            .insert(symbol.hit.id, symbol);
+        named_owners
+            .entry((family, symbol.hit.name.clone()))
+            .or_default()
+            .insert(symbol.hit.id, symbol);
+    }
+
+    let mut edges_by_child = HashMap::<(String, String), Vec<&InheritanceEdge>>::new();
+    for edge in &edges {
+        edges_by_child
+            .entry((
+                parser_family(&edge.parser_id).to_string(),
+                edge.child_qualified.clone(),
+            ))
+            .or_default()
+            .push(edge);
+    }
+
+    // A container symbol is normally present, but prefix rows keep
+    // ownership discoverable for backends that only publish members.
+    let mut seeds = HashSet::<OwnerIdentity>::new();
+    let mut seed_has_semantic_rows = HashMap::<OwnerIdentity, bool>::new();
+    for symbol in &symbols {
+        if !belongs_to_container(&symbol.hit.qualified, container)
+            && symbol.hit.qualified != container
+        {
+            continue;
+        }
+        let seed = OwnerIdentity {
+            parser_id: symbol.hit.parser_id.clone(),
+            qualified: container.to_string(),
+        };
+        seed_has_semantic_rows
+            .entry(seed.clone())
+            .and_modify(|semantic| {
+                *semantic |= symbol.hit.source_tier == SourceTier::Semantic;
+            })
+            .or_insert(symbol.hit.source_tier == SourceTier::Semantic);
+        seeds.insert(seed);
+    }
+    for edge in &edges {
+        if edge.child_qualified == container {
+            seeds.insert(OwnerIdentity {
+                parser_id: edge.parser_id.clone(),
+                qualified: container.to_string(),
+            });
+        }
+    }
+
+    // No declaration or relation identifies a parser family. Preserve
+    // the ordinary container lookup instead of inventing graph scope.
+    if seeds.is_empty() {
+        return Ok(FindSymbolsOutcome {
+            hits: run_find_symbols(conn, manifest_id, args)?,
+            inheritance_unresolved: false,
+            tier2_warming: false,
+        });
+    }
+
+    let mut selected_owners = HashSet::<OwnerIdentity>::new();
+    let mut visited = HashSet::<OwnerIdentity>::new();
+    let mut stack = seeds.iter().cloned().collect::<Vec<_>>();
+    let mut inheritance_unresolved = false;
+    while let Some(owner) = stack.pop() {
+        if !visited.insert(owner.clone()) {
+            continue;
+        }
+        selected_owners.insert(owner.clone());
+
+        let family = parser_family(&owner.parser_id).to_string();
+        let Some(outgoing) = edges_by_child.get(&(family.clone(), owner.qualified.clone())) else {
+            continue;
+        };
+        for edge in outgoing {
+            let target = if let Some(target_id) = edge.target_symbol_id {
+                owner_symbols_by_id
+                    .get(&target_id)
+                    .copied()
+                    .filter(|symbol| parser_family(&symbol.hit.parser_id) == family)
+                    .map(|symbol| OwnerIdentity {
+                        parser_id: symbol.hit.parser_id.clone(),
+                        qualified: symbol.hit.qualified.clone(),
+                    })
+            } else {
+                let exact_key = (family.clone(), edge.parent_spelling.clone());
+                let candidate = if let Some(candidates) = exact_owners.get(&exact_key) {
+                    unique_owner(candidates)
+                } else if let Some(candidates) = named_owners.get(&exact_key) {
+                    unique_owner(candidates)
+                } else {
+                    Ok(None)
+                };
+                match candidate {
+                    Ok(Some(symbol)) => Some(OwnerIdentity {
+                        parser_id: symbol.hit.parser_id.clone(),
+                        qualified: symbol.hit.qualified.clone(),
+                    }),
+                    Ok(None) => None,
+                    Err(()) => {
+                        inheritance_unresolved = true;
+                        None
+                    }
+                }
+            };
+
+            // A relation back to the same owner is not an ancestor. The
+            // visited set independently makes longer cycles finite.
+            if let Some(target) = target
+                && target.qualified != owner.qualified
+            {
+                stack.push(target);
+            }
+        }
+    }
+
+    // When a syntactic-only seed has no usable relation row, absence of
+    // an ancestor cannot be distinguished from Tier-2 still warming.
+    let tier2_warming = seeds.iter().any(|seed| {
+        !seed_has_semantic_rows.get(seed).copied().unwrap_or(false)
+            && !edges_by_child.contains_key(&(
+                parser_family(&seed.parser_id).to_string(),
+                seed.qualified.clone(),
+            ))
+    });
+
+    let mut hits = symbols
+        .into_iter()
+        .filter(|symbol| {
+            selected_owners.iter().any(|owner| {
+                owner.parser_id == symbol.hit.parser_id
+                    && belongs_to_container(&symbol.hit.qualified, &owner.qualified)
+            })
+        })
+        .filter(|symbol| matches_result_filters(symbol, args, fuzzy_ids.as_ref()))
+        .map(|symbol| symbol.hit)
+        .collect::<Vec<_>>();
+
+    // One blob can appear at multiple paths in a manifest. The public
+    // contract deduplicates the physical symbol id before sorting and
+    // applying the caller's limit.
+    hits.sort_by(symbol_hit_cmp);
+    let mut seen = HashSet::<i64>::new();
+    hits.retain(|hit| seen.insert(hit.id));
+    hits.truncate(args.limit.unwrap_or(50).max(1) as usize);
+
+    Ok(FindSymbolsOutcome {
+        hits,
+        inheritance_unresolved,
+        tier2_warming,
+    })
+}
+
+fn load_manifest_symbols(conn: &Connection, manifest_id: ManifestId) -> Result<Vec<IndexedSymbol>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.name, s.qualified, s.kind, s.signature, s.visibility,
+                me.path, s.line_start, s.blob_sha, s.parser_id,
+                CASE
+                  WHEN b.analyzer_id IS NULL THEN NULL
+                  WHEN b.parser_id LIKE 'tree-sitter-%@%' THEN
+                    substr(
+                      substr(b.parser_id, 13),
+                      1,
+                      instr(substr(b.parser_id, 13), '@') - 1
+                    )
+                  WHEN b.parser_id LIKE 'tree-sitter-%' THEN substr(b.parser_id, 13)
+                  ELSE b.parser_id
+                END AS language,
+                b.analyzer_id IS NOT NULL
+           FROM symbols s
+           JOIN manifest_entries me
+             ON me.manifest_id = ?1
+            AND me.blob_sha = s.blob_sha
+           JOIN blobs b
+             ON b.blob_sha = s.blob_sha
+            AND b.parser_id = s.parser_id
+          WHERE s.scope = 'top_level'",
+    )?;
+    let rows = stmt
+        .query_map([manifest_id.0], |row| {
+            let raw_kind = row.get::<_, String>(3)?;
+            Ok(IndexedSymbol {
+                hit: SymbolHit {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    qualified: row.get(2)?,
+                    kind: symbol_kind_from_str(&raw_kind),
+                    signature: row.get(4)?,
+                    visibility: row
+                        .get::<_, Option<String>>(5)?
+                        .as_deref()
+                        .map(visibility_from_str),
+                    path: row.get(6)?,
+                    line: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    blob_sha: row.get(8)?,
+                    parser_id: row.get(9)?,
+                    language: row.get(10)?,
+                    source_tier: if row.get::<_, bool>(11)? {
+                        SourceTier::Semantic
+                    } else {
+                        SourceTier::Syntactic
+                    },
+                },
+                raw_kind,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn load_manifest_inheritance_edges(
+    conn: &Connection,
+    manifest_id: ManifestId,
+) -> Result<Vec<InheritanceEdge>> {
+    let sql = manifest_inheritance_edges_sql();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([manifest_id.0], |row| {
+            Ok(InheritanceEdge {
+                child_qualified: row.get(0)?,
+                parent_spelling: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                parser_id: row.get(2)?,
+                target_symbol_id: row.get(3)?,
+            })
+        })?
+        .filter_map(|row| match row {
+            Ok(edge) if !edge.parent_spelling.is_empty() => Some(Ok(edge)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn load_fuzzy_symbol_ids(conn: &Connection, query: &str) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?1")?;
+    Ok(stmt
+        .query_map([query], |row| row.get(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
+fn unique_owner<'a>(
+    candidates: &'a HashMap<i64, &'a IndexedSymbol>,
+) -> std::result::Result<Option<&'a IndexedSymbol>, ()> {
+    if candidates.len() == 1 {
+        Ok(candidates.values().next().copied())
+    } else {
+        Err(())
+    }
+}
+
+fn is_type_owner_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class"
+            | "struct"
+            | "enum"
+            | "union"
+            | "trait"
+            | "interface"
+            | "type_alias"
+            | "module"
+            | "namespace"
+            | "package"
+    )
+}
+
+fn parser_family(parser_id: &str) -> &str {
+    let parser_id = parser_id
+        .split_once('@')
+        .map_or(parser_id, |(base, _)| base);
+    match parser_id {
+        "tree-sitter-tsx" => "tree-sitter-typescript",
+        "tree-sitter-jsx" => "tree-sitter-javascript",
+        _ => parser_id,
+    }
+}
+
+fn belongs_to_container(qualified: &str, container: &str) -> bool {
+    qualified
+        .strip_prefix(container)
+        .is_some_and(|tail| tail.starts_with("::") || tail.starts_with('.'))
+}
+
+fn matches_result_filters(
+    symbol: &IndexedSymbol,
+    args: &FindSymbolsArgs,
+    fuzzy_ids: Option<&HashSet<i64>>,
+) -> bool {
+    if let Some(query) = args.query.as_deref()
+        && !query.is_empty()
+    {
+        if args.fuzzy {
+            if !fuzzy_ids.is_some_and(|ids| ids.contains(&symbol.hit.id)) {
+                return false;
+            }
+        } else if symbol.hit.name != query && symbol.hit.qualified != query {
+            return false;
+        }
+    }
+    if let Some(kind) = args.kind.as_deref()
+        && !kind.is_empty()
+        && symbol.raw_kind != kind
+    {
+        return false;
+    }
+    if let Some(path) = args.path_prefix.as_deref()
+        && !path.is_empty()
+        && !symbol.hit.path.starts_with(path)
+    {
+        return false;
+    }
+    true
+}
+
+fn symbol_hit_cmp(a: &SymbolHit, b: &SymbolHit) -> std::cmp::Ordering {
+    language_sort_key(a.language.as_deref())
+        .cmp(&language_sort_key(b.language.as_deref()))
+        .then_with(|| a.path.cmp(&b.path))
+        .then_with(|| a.line.cmp(&b.line))
+        .then_with(|| a.qualified.cmp(&b.qualified))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn language_sort_key(language: Option<&str>) -> (bool, &str) {
+    match language {
+        Some(language) => (false, language),
+        None => (true, ""),
+    }
+}
+
 fn escape_like(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -318,5 +797,177 @@ mod scope_filter_tests {
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "outer");
+    }
+}
+
+#[cfg(test)]
+mod inheritance_plan_tests {
+    use rusqlite::{Connection, params};
+
+    use super::*;
+    use crate::cas::store;
+
+    #[test]
+    fn inheritance_edge_plan_is_manifest_and_site_bounded() {
+        let (_tmp, mut conn, manifest_id) = fixture_store();
+        let expected = load_manifest_inheritance_edges(&conn, manifest_id).unwrap();
+        assert_eq!(expected.len(), 1);
+
+        let plan_before = explain_inheritance_plan(&conn, manifest_id);
+        assert_manifest_bounded_plan(&plan_before);
+
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (777, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        for ordinal in 0..128 {
+            let blob = format!("unrelated-{ordinal:03}");
+            let path = format!("noise/{ordinal:03}.ts");
+            tx.execute(
+                "INSERT INTO blobs
+                    (blob_sha, parser_id, parser_revision, parsed_at_ns)
+                 VALUES (?1, 'tree-sitter-typescript', 1, 0)",
+                [&blob],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+                 VALUES (777, ?1, ?2)",
+                params![path, blob],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO implementations
+                    (blob_sha, parser_id, type_qualified, interface_qualified,
+                     kind, line, interface_byte_start, interface_byte_end)
+                 VALUES
+                    (?1, 'tree-sitter-typescript', ?2, ?3,
+                     'inherit', 1, 10, 20)",
+                params![
+                    blob,
+                    format!("NoiseChild{ordinal}"),
+                    format!("NoiseParent{ordinal}")
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO resolutions
+                    (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                     kind, semantic_kind, target_symbol_id, source, manifest_id)
+                 VALUES
+                    (?1, 'tree-sitter-typescript', 10, 20,
+                     'type', 'inherit', NULL, 'tier2-direct-noise', NULL)",
+                [&blob],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        assert_eq!(
+            load_manifest_inheritance_edges(&conn, manifest_id).unwrap(),
+            expected,
+            "unrelated manifests must not change the selected edge set"
+        );
+        let plan_after = explain_inheritance_plan(&conn, manifest_id);
+        assert_eq!(plan_after, plan_before);
+        assert_manifest_bounded_plan(&plan_after);
+    }
+
+    fn fixture_store() -> (tempfile::TempDir, Connection, ManifestId) {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = store::open(&tmp.path().join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs
+                (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('selected-child', 'tree-sitter-typescript', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'src/child.ts', 'selected-child')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO implementations
+                (blob_sha, parser_id, type_qualified, interface_qualified,
+                 kind, line, interface_byte_start, interface_byte_end)
+             VALUES
+                ('selected-child', 'tree-sitter-typescript', 'Child', 'Base',
+                 'inherit', 1, 10, 20)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolutions
+                (site_blob_sha, site_parser_id, site_byte_start, site_byte_end,
+                 kind, semantic_kind, target_symbol_id, source, manifest_id)
+             VALUES
+                ('selected-child', 'tree-sitter-typescript', 10, 20,
+                 'type', 'inherit', NULL, 'tier25-test', 1),
+                ('selected-child', 'tree-sitter-typescript', 10, 20,
+                 'type', 'inherit', NULL, 'tier2-direct-test', NULL)",
+            [],
+        )
+        .unwrap();
+        (tmp, conn, ManifestId(1))
+    }
+
+    fn explain_inheritance_plan(conn: &Connection, manifest_id: ManifestId) -> Vec<String> {
+        let sql = format!("EXPLAIN QUERY PLAN {}", manifest_inheritance_edges_sql());
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([manifest_id.0], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn assert_manifest_bounded_plan(plan: &[String]) {
+        let rendered = plan.join("\n");
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("manifest_entries") && detail.contains("manifest_id=?")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH i USING INDEX idx_impls_blob")),
+            "{rendered}"
+        );
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("idx_resolutions_manifest_site")
+                    && detail.contains("site_blob_sha=?")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("idx_resolutions_blob_scoped_site")
+                    && detail.contains("site_blob_sha=?")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.starts_with("SCAN i")),
+            "{rendered}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN resolutions")),
+            "{rendered}"
+        );
     }
 }
