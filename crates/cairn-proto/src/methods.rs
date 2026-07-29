@@ -741,10 +741,17 @@ pub struct FindSymbolArgs {
     /// members are union-ed in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
-    /// Walk the `implementations` table from `container` upward and
-    /// include members from every base type. Ignored when `container`
-    /// is absent. Requires Tier-2 enrichment; on a syntactic-only
-    /// snapshot the response is reported as `partial`.
+    /// Walk the selected manifest's inheritance, implementation, and
+    /// mixin edges transitively from `container`, then add every
+    /// reachable owner's declarations to the ordinary result set.
+    /// Child and ancestor declarations are both retained; traversal
+    /// order is not a dispatch/MRO contract. Filters and `limit` apply
+    /// after the union. Ignored when `container` is absent.
+    ///
+    /// A syntactic-only snapshot reports `tier2_warming`. An ambiguous
+    /// fact-only ancestor stops that branch without guessing and
+    /// reports `inheritance_unresolved`; declarations from proven
+    /// branches remain usable.
     #[serde(default)]
     pub include_inherited: bool,
     /// File-path **string** prefix (relative to the repo root). Only

@@ -15,10 +15,10 @@
 //!   surface a `kind_source` provenance string (either the resolution
 //!   `source` when covered, or the sentinel `KIND_SOURCE_FACT`
 //!   (`"tier2-fact"`) when only the fact row is available).
-//! * **Fact-only** — `find_symbols`, `get_outline`, and
-//!   `get_symbol_source` read directly from the fact tables; they
-//!   describe declarations rather than cross-file edges, so there is no
-//!   resolution layer to consult.
+//! * **Declaration reads** — `get_outline` and `get_symbol_source`
+//!   read directly from fact tables. `find_symbols` does the same for
+//!   ordinary lookups; only `include_inherited` consults resolution
+//!   authority to decide which owners' declarations join the result.
 
 mod find_impls;
 mod find_imports;
@@ -32,6 +32,7 @@ pub use find_impls::{
 };
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};
+pub(crate) use find_symbols::find_symbols_with_status;
 pub use find_symbols::{FindSymbolsArgs, SymbolHit, find_symbols};
 pub use get_outline::{OutlineFilter, OutlineItem, get_outline, get_outline_under_path};
 pub use get_symbol_source::{SymbolSourceRow, get_symbol_source_row, get_symbol_source_rows};
