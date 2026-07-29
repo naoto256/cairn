@@ -172,16 +172,16 @@ pub struct ImplFact {
     pub kind: String,
     /// Grammar-direct classification of the edge — the fact layer's
     /// "what the source literally says" (e.g. `extends` vs `implements`
-    /// vs `: Base` vs `< Base`). The resolution layer (Tier-2.5+) will
-    /// read this in Phase 3 to derive a `semantic_kind` per language
-    /// rules. Wired in Phase 2; `None` is allowed for backends that
-    /// have not yet been migrated.
+    /// vs `: Base` vs `< Base`). The resolution layer (Tier-2.5+) uses
+    /// this to derive a `semantic_kind` according to each language's
+    /// rules. `None` is allowed for backends that do not emit this
+    /// classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syntactic_kind: Option<SyntacticKind>,
     pub line: u32,
     /// Byte range of the *base / interface token* (e.g. the `Foo` in
     /// `extends Foo`, the `Bar` in `class X < Bar`, the `Mod` in
-    /// `include Mod`). Used by the resolution layer (Phase 3) as the
+    /// `include Mod`). Used by the resolution layer as the
     /// `site_byte_start` / `site_byte_end` of the direct-translation
     /// `resolutions` row. `None` is allowed for backends or call
     /// sites that have not been migrated yet, or where no single base
@@ -361,6 +361,15 @@ pub trait LanguageBackend: Send + Sync {
 /// the separate analyzer protocol path is the right mechanism, not
 /// this trait.
 pub trait Analyzer: Send + Sync {
+    /// Stable identifier for this analyzer's persisted semantic output.
+    ///
+    /// The value is stored in `blobs.analyzer_id`, participates with
+    /// [`Self::revision`] in CAS reuse decisions, and identifies
+    /// realized semantic enrichment in status reporting. Keep it
+    /// stable while the analyzer represents the same output lineage.
+    /// Renaming it creates a new persisted identity, so existing
+    /// semantic rows no longer satisfy cache or enrichment checks for
+    /// the renamed analyzer and must be recomputed.
     fn name(&self) -> &'static str;
 
     /// Monotonic revision for this analyzer's semantic output. Bump
