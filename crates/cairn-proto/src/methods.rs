@@ -200,9 +200,9 @@ pub struct RepoStatusEntry {
     /// Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshots: Vec<RepoSnapshotEntry>,
-    /// PR3 Phase 4: durable reconcile state for the underlying
-    /// canonical repo. Additive — older daemons omit it and older
-    /// consumers deserialize existing payloads unchanged. Two
+    /// Durable reconcile state for the underlying canonical repo.
+    /// Additive — older daemons omit it; older consumers deserialize
+    /// existing payloads unchanged. Two
     /// alias entries in the same response with equal
     /// `reconcile.repo_hash` carry the same object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -998,7 +998,7 @@ pub struct ImplHit {
     /// `"tier25-py-resolver"`, `"tier3-pyright-lsp"`) when the kind
     /// came through the `resolutions` table, or `"tier2-fact"` when
     /// the Tier-2 `implementations.kind` was used as fallback. Older
-    /// daemons that predate Phase 4 of the Tier-2.5 prep work emit no
+    /// daemons without resolution-layer implementation joins emit no
     /// resolutions and so always report `"tier2-fact"`; the default
     /// here keeps deserialization of those payloads green.
     #[serde(default = "default_kind_source")]
@@ -1012,7 +1012,7 @@ pub struct ImplHit {
     /// Java, Swift → Objective-C, etc.) populate `target_path`
     /// whenever the persist layer's uniqueness-checked symbol
     /// fallback found a unique sibling-parser match. Additive field
-    /// — older daemons that predate the Phase 1 target_path surface
+    /// — older daemons that predate the `target_path` field
     /// omit it and the default `None` keeps deserialization of those
     /// payloads green.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1085,9 +1085,8 @@ pub struct ImportHit {
     /// `"tier25-ruby-resolver"`, `"tier3-pyright-lsp"`) when
     /// a Tier-2.5+ require-graph resolver pinned the site, or
     /// `"tier2-fact"` when the bare Tier-2 `imports` row was used as
-    /// fallback. Older daemons that predate Stage 1 of the Tier-2.5
-    /// imports work emit no resolution joins and so always report
-    /// `"tier2-fact"`; the default keeps deserialization of those
+    /// fallback. Older daemons without import resolution joins always
+    /// report `"tier2-fact"`; the default keeps deserialization of those
     /// payloads green.
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
@@ -1097,8 +1096,8 @@ pub struct ImportHit {
     /// (`require_relative './db'`, `import './foo'`, etc.); `None`
     /// for bare specifiers, node:builtin / stdlib imports, external
     /// packages, and any site that fell back to `tier2-fact`.
-    /// Additive field — older daemons that predate the Phase 1
-    /// target_path surface omit it and the default `None` keeps
+    /// Additive field — older daemons that predate the `target_path`
+    /// field omit it and the default `None` keeps
     /// deserialization of those payloads green.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_path: Option<String>,
@@ -1213,21 +1212,20 @@ pub struct FindReferenceHit {
     /// `"tier25-ruby-resolver"`, `"tier3-pyright-lsp"`) when the
     /// row's qualified target / kind came through the `resolutions`
     /// table, or `"tier2-fact"` when only the Tier-2 `refs` row was
-    /// available. Older daemons that predate Phase 4 of the Tier-2.5
-    /// prep work emit no resolution-layer joins for refs and so always
-    /// report `"tier2-fact"`; the default here keeps deserialization of
-    /// those payloads green.
+    /// available. Older daemons without reference resolution joins
+    /// always report `"tier2-fact"`; the default here keeps
+    /// deserialization of those payloads green.
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
     /// Repo-relative path of the workspace file the target lives in
-    /// (v10+, Phase 2). `Some("src/foo.rs")` when a Tier-2.5+ resolver
+    /// (v10+). `Some("src/foo.rs")` when a Tier-2.5+ resolver
     /// pinned the reference to a workspace-internal target; `None` for
     /// unresolved sites and for targets that resolved outside the
     /// indexed workspace. Independent of `target_qualified`: cross-
     /// parser-id resolution may carry `target_path = Some` even when
     /// the qualified name could not be uniquely identified across
     /// sibling parsers. Additive field — older daemons that predate
-    /// the Phase 2 target_path surface omit it and the default `None`
+    /// the `target_path` field omit it and the default `None`
     /// keeps deserialization of those payloads green.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_path: Option<String>,
@@ -1371,14 +1369,14 @@ pub struct CallHit {
     #[serde(default = "default_kind_source")]
     pub kind_source: String,
     /// Repo-relative path of the workspace file the resolved callee
-    /// lives in (v10+, Phase 2). `Some("src/foo.rs")` when a
+    /// lives in (v10+). `Some("src/foo.rs")` when a
     /// Tier-2.5+ resolver pinned the call to a workspace-internal
     /// definition; `None` for unresolved calls and callees that live
     /// outside the indexed workspace. Independent of
     /// `target_qualified`: cross-parser-id resolution may carry
     /// `target_path = Some` even when the qualified name was not
     /// uniquely matched across sibling parsers. Additive field —
-    /// older daemons that predate the Phase 2 target_path surface
+    /// older daemons that predate the `target_path` field
     /// omit it and the default `None` keeps deserialization of those
     /// payloads green.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2004,7 +2002,7 @@ mod tests {
         assert_query_envelope::<GetSymbolSourceResult>(source);
     }
 
-    // ──── Phase 4 MF-3: wire serde round-trip for `target_path` ────
+    // Wire serde round-trips for the additive `target_path` fields.
 
     #[test]
     fn import_hit_target_path_serde_round_trip() {
