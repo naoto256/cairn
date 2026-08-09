@@ -2,7 +2,7 @@ use super::{refs_dedup_fixture, registered};
 use crate::anchor::AnchorName;
 use crate::cas::store;
 use crate::query::find_references::KIND_SOURCE_FACT;
-use crate::query::{FindReferencesArgs, find_references};
+use crate::query::{FindReferencesArgs, find_references, find_references_with_status};
 use crate::register::register_repo;
 use crate::testutil::init_repo;
 use cairn_proto::common::RefKind;
@@ -214,6 +214,50 @@ fn references_tier3_suppresses_tier2_same_call_site() {
 }
 
 #[test]
+fn qualified_miss_reports_only_an_actual_bare_fallback() {
+    let (_db, conn) = refs_dedup_fixture(true, None);
+
+    let bare = find_references_with_status(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "render".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!bare.hits.is_empty());
+    assert!(!bare.qualified_fallback);
+
+    let fallback = find_references_with_status(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "unrelated::render".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!fallback.hits.is_empty());
+    assert!(fallback.qualified_fallback);
+
+    let empty = find_references_with_status(
+        &conn,
+        &AnchorName::head(),
+        &FindReferencesArgs {
+            symbol: "unrelated::absent".into(),
+            direction: ReferenceDirection::Incoming,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(empty.hits.is_empty());
+    assert!(!empty.qualified_fallback);
+}
+
+#[test]
 fn references_tier3_suppresses_zero_range_semantic_same_line() {
     let (_db, conn) = refs_dedup_fixture(true, None);
     conn.execute(
@@ -227,7 +271,7 @@ fn references_tier3_suppresses_zero_range_semantic_same_line() {
     )
     .unwrap();
 
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -237,6 +281,8 @@ fn references_tier3_suppresses_zero_range_semantic_same_line() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
+    assert!(!outcome.qualified_fallback);
 
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(
@@ -808,8 +854,19 @@ fn find_references_incoming_dotted_fqn_matches_via_coalesce() {
         rusqlite::params![java_id],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO refs
+               (blob_sha, parser_id, enclosing_id, target_name, target_qualified, kind,
+                byte_start, byte_end, line, source)
+             VALUES
+               ('sha-kt', 'tree-sitter-kotlin-ng', 1, 'fromJson',
+                'other.Adapter.fromJson', 'call', 70, 78, 8,
+                'tree-sitter-kotlin-ng')",
+        [],
+    )
+    .unwrap();
 
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -820,6 +877,8 @@ fn find_references_incoming_dotted_fqn_matches_via_coalesce() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
+    assert!(!outcome.qualified_fallback);
     assert_eq!(
         hits.len(),
         1,
@@ -859,7 +918,7 @@ fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
     // `Bar` for the fallback to pick up, so the outcome is
     // `hits.is_empty()`. A future-tightening "strict miss means
     // strict empty, no bare fallback" is a separate design knob.
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -870,6 +929,8 @@ fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
+    assert!(!outcome.qualified_fallback);
     assert!(
         hits.is_empty(),
         "PHP-style FQN must not coincidentally match an unrelated cross-parser hit"
@@ -912,7 +973,7 @@ fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
         [],
     )
     .unwrap();
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -923,6 +984,8 @@ fn find_references_incoming_php_backslash_fqn_recognised_as_qualified() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
+    assert!(!outcome.qualified_fallback);
     assert_eq!(
         hits.len(),
         1,

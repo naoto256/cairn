@@ -1,4 +1,5 @@
-use cairn_core::query::{FindSymbolsArgs, find_symbols};
+use cairn_core::query::{FindReferencesArgs, FindSymbolsArgs, find_references, find_symbols};
+use cairn_proto::methods::ReferenceDirection;
 
 #[test]
 fn prechange_find_symbols_args_remain_source_compatible() {
@@ -13,4 +14,18 @@ fn prechange_find_symbols_args_remain_source_compatible() {
 
     let _public_query = find_symbols;
     assert_eq!(args.query.as_deref(), Some("Widget"));
+}
+
+#[test]
+fn prechange_find_references_api_remains_source_compatible() {
+    let args = FindReferencesArgs {
+        symbol: "Widget::render".to_string(),
+        direction: ReferenceDirection::Incoming,
+        kind: None,
+        include_noise: false,
+        limit: Some(10),
+    };
+
+    let _public_query = find_references;
+    assert_eq!(args.symbol, "Widget::render");
 }

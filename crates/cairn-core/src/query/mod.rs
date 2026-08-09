@@ -31,6 +31,7 @@ pub use find_impls::{
     FindSubtypesArgs, FindSupertypesArgs, ImplHit, KIND_SOURCE_FACT, find_subtypes, find_supertypes,
 };
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
+pub(crate) use find_references::find_references_with_status;
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};
 pub(crate) use find_symbols::find_symbols_with_status;
 pub use find_symbols::{FindSymbolsArgs, SymbolHit, find_symbols};
