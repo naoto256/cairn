@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use cairn_proto::Completeness;
+use cairn_proto::common::PartialReason;
 use cairn_proto::methods::{
     FindReferenceHit, FindReferencesArgs, FindReferencesResult, ReferenceDirection,
 };
@@ -64,30 +66,44 @@ impl DataMethod for FindReferences {
             move |entry, conn, snapshot| {
                 let anchor_label = snapshot.anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
-                let hits = query::find_references(conn, &snapshot.anchor, &q)?;
+                let outcome = query::find_references_with_status(conn, &snapshot.anchor, &q)?;
+                let qualified_fallback = outcome.qualified_fallback;
                 let mut snippets = SnippetCache::new(entry.alias.clone(), worktree_root);
-                Ok(hits
+                Ok(outcome
+                    .hits
                     .into_iter()
                     .map(|h| {
                         let parser_id = h.parser_id.clone();
                         (
                             into_wire_hit(&entry.alias, &anchor_label, h, &mut snippets),
                             parser_id,
+                            qualified_fallback,
                         )
                     })
                     .collect())
             },
-            |hits| parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone())),
-            |_out: &mut Vec<(FindReferenceHit, String)>| {},
+            |hits| parser_id_filter(hits.iter().map(|(_, parser_id, _)| parser_id.clone())),
+            |_out: &mut Vec<(FindReferenceHit, String, bool)>| {},
         )
         .await?;
-        let items: Vec<_> = execution.items.into_iter().map(|(item, _)| item).collect();
+        let qualified_fallback = execution
+            .items
+            .iter()
+            .any(|(_, _, qualified_fallback)| *qualified_fallback);
+        let items: Vec<_> = execution
+            .items
+            .into_iter()
+            .map(|(item, _, _)| item)
+            .collect();
         let tier3_status = execution.tier3_status;
         let freshness_issues = execution.freshness_issues;
-        let completeness = completeness_for_snapshot_scan(
-            execution.capped,
-            execution.skipped_unavailable,
-            &freshness_issues,
+        let completeness = qualified_reference_completeness(
+            completeness_for_snapshot_scan(
+                execution.capped,
+                execution.skipped_unavailable,
+                &freshness_issues,
+            ),
+            qualified_fallback,
         );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindReferences,
@@ -122,6 +138,33 @@ impl DataMethod for FindReferences {
             timing: cairn_proto::Timing::default(),
         })
         .unwrap())
+    }
+}
+
+pub(super) fn qualified_reference_completeness(
+    completeness: Completeness,
+    qualified_fallback: bool,
+) -> Completeness {
+    if !qualified_fallback {
+        return completeness;
+    }
+
+    // Snapshot freshness and unavailable-repository evidence remain stronger
+    // than query-local uncertainty. A cap is weaker: the returned rows came
+    // from a bare-name fallback, so callers must not mistake them for exact
+    // qualified matches. The independent cap hint still reports truncation.
+    if matches!(completeness, Completeness::Complete)
+        || matches!(
+            completeness,
+            Completeness::Partial {
+                reason: Some(PartialReason::Cap),
+                ..
+            }
+        )
+    {
+        Completeness::partial_semantic("qualified_fallback")
+    } else {
+        completeness
     }
 }
 
@@ -229,14 +272,43 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use cairn_proto::Completeness;
+    use cairn_proto::common::PartialReason;
     use serde_json::json;
 
     use super::*;
     use crate::cas::{registry as cas_registry, store as cas_store};
     use crate::data_rpc::helpers::test_support::assert_limit_probe;
+    use crate::data_rpc::methods::find_callers::FindCallers;
     use crate::paths::{CasDataDir, path_hash};
     use crate::register::register_repo;
     use crate::testutil::init_repo;
+
+    #[test]
+    fn qualified_fallback_only_replaces_complete_or_cap_reason() {
+        assert_eq!(
+            qualified_reference_completeness(Completeness::Complete, true),
+            Completeness::partial_semantic("qualified_fallback")
+        );
+        assert_eq!(
+            qualified_reference_completeness(
+                Completeness::partial_truncated(PartialReason::Cap),
+                true,
+            ),
+            Completeness::partial_semantic("qualified_fallback")
+        );
+
+        let freshness = Completeness::partial_truncated("file_not_indexed_or_snapshot_stale");
+        assert_eq!(
+            qualified_reference_completeness(freshness.clone(), true),
+            freshness
+        );
+        let tier = Completeness::partial_semantic(PartialReason::Tier2Warming);
+        assert_eq!(qualified_reference_completeness(tier.clone(), true), tier);
+        assert_eq!(
+            qualified_reference_completeness(Completeness::Complete, false),
+            Completeness::Complete
+        );
+    }
 
     #[tokio::test]
     async fn exact_limit_is_complete_and_over_limit_is_partial() {
@@ -288,6 +360,71 @@ mod tests {
             serde_json::from_value::<Completeness>(capped["completeness"].clone()).unwrap(),
             Completeness::partial_truncated("cap")
         );
+    }
+
+    #[tokio::test]
+    async fn capped_qualified_fallback_keeps_one_cap_hint() {
+        let fixture = cross_repo_fixture();
+        let capped = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "symbol": "Unrelated::target",
+                    "kind": "call",
+                    "include_noise": true,
+                    "limit": 2,
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(capped["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            serde_json::from_value::<Completeness>(capped["completeness"].clone()).unwrap(),
+            Completeness::partial_semantic("qualified_fallback")
+        );
+        assert_eq!(
+            capped["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hint| hint["code"] == "capped_increase_limit")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn final_trim_drops_fallback_status_with_the_fallback_row() {
+        let fixture = qualified_final_trim_fixture();
+
+        let references = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "symbol": "Exact.target",
+                    "kind": "call",
+                    "limit": 1,
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_exact_survivor_with_cap(&references);
+
+        let callers = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "name": "Exact.target",
+                    "limit": 1,
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_exact_survivor_with_cap(&callers);
     }
 
     #[test]
@@ -355,6 +492,74 @@ mod tests {
                 lifecycle: None,
             },
         }
+    }
+
+    fn qualified_final_trim_fixture() -> CrossRepoFixture {
+        let alpha = init_repo(&[(
+            "src/alpha.rs",
+            "pub fn target() {}\npub fn alpha_caller() { target(); }\n",
+        )])
+        .0;
+        let beta = init_repo(&[(
+            "src/beta.rs",
+            "pub fn target() {}\npub fn beta_caller() { target(); }\n",
+        )])
+        .0;
+        let data = tempfile::tempdir().unwrap();
+        let cas = CasDataDir::with_root(data.path().to_path_buf());
+        cas.ensure().unwrap();
+        register_alias(&cas, "alpha", alpha.path());
+        register_alias(&cas, "beta", beta.path());
+        set_target_qualified(&cas, alpha.path(), Some("Exact.target"));
+        set_target_qualified(&cas, beta.path(), None);
+
+        CrossRepoFixture {
+            _repos: vec![alpha, beta],
+            _data: data,
+            ctx: DataCtx {
+                cas_data_dir: Arc::new(cas),
+                lifecycle: None,
+            },
+        }
+    }
+
+    fn set_target_qualified(cas: &CasDataDir, repo_path: &std::path::Path, value: Option<&str>) {
+        let canonical = std::fs::canonicalize(repo_path).unwrap();
+        let repo_hash = path_hash(&canonical);
+        let conn = cas_store::open(&cas.store_db_path(&repo_hash)).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE refs SET target_qualified = ?1
+                  WHERE target_name = 'target' AND kind = 'call'",
+                rusqlite::params![value],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "fixture must contain exactly one target call");
+    }
+
+    fn assert_exact_survivor_with_cap(value: &Value) {
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{value:#}");
+        assert!(
+            items[0]["location"]
+                .as_str()
+                .unwrap()
+                .starts_with("alpha:HEAD:"),
+            "global final trim must retain the deterministic alpha exact row: {value:#}"
+        );
+        assert_eq!(items[0]["target_qualified"], "Exact.target");
+        assert_eq!(
+            serde_json::from_value::<Completeness>(value["completeness"].clone()).unwrap(),
+            Completeness::partial_truncated(PartialReason::Cap)
+        );
+        let cap_hints = value["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|hint| hint["code"] == "capped_increase_limit")
+            .collect::<Vec<_>>();
+        assert_eq!(cap_hints.len(), 1, "{value:#}");
+        assert_eq!(cap_hints[0]["action"], "increase_limit");
     }
 
     fn register_alias(cas: &CasDataDir, alias: &str, repo_path: &std::path::Path) {

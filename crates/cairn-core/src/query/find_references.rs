@@ -62,10 +62,23 @@ pub struct FindReferencesArgs {
     pub limit: Option<u32>,
 }
 
+/// Internal query outcome used by the data-RPC layer to distinguish an exact
+/// qualified-name result from usable rows returned by the legacy bare-name
+/// fallback. The public query API intentionally continues to return only hits.
+#[derive(Debug)]
+pub(crate) struct FindReferencesOutcome {
+    pub(crate) hits: Vec<ReferenceHit>,
+    pub(crate) qualified_fallback: bool,
+}
+
 /// Find references either way:
 /// - `Incoming` — refs whose target matches `symbol` (callers / use
-///   sites). When `symbol` contains `::`, the qualified-name index is
-///   tried first; bare names match `target_name` directly.
+///   sites). When `symbol` contains `::`, `.`, or `\`, the
+///   qualified-name index is tried first; bare names match
+///   `target_name` directly. The public query API preserves its
+///   historical best-effort behavior by returning usable bare-name
+///   rows after a strict miss; data-RPC consumers additionally report
+///   that fallback as partial rather than claiming an exact match.
 /// - `Outgoing` — refs inside the body of the symbol named `symbol`
 ///   (= callees / uses from the symbol). Matches `symbols.qualified`
 ///   on the enclosing FK.
@@ -78,6 +91,14 @@ pub fn find_references(
     anchor: &AnchorName,
     args: &FindReferencesArgs,
 ) -> Result<Vec<ReferenceHit>> {
+    Ok(find_references_with_status(conn, anchor, args)?.hits)
+}
+
+pub(crate) fn find_references_with_status(
+    conn: &Connection,
+    anchor: &AnchorName,
+    args: &FindReferencesArgs,
+) -> Result<FindReferencesOutcome> {
     if args.symbol.trim().is_empty() {
         return Err(crate::Error::InvalidArgument(
             "find_references: `symbol` must be non-empty".into(),
@@ -94,7 +115,7 @@ fn run_find_references(
     conn: &Connection,
     manifest_id: ManifestId,
     args: &FindReferencesArgs,
-) -> Result<Vec<ReferenceHit>> {
+) -> Result<FindReferencesOutcome> {
     // `None` picks the default page of 100. `.max(1)` guards against
     // `Some(0)` emitting `LIMIT 0` (SQLite: no rows).
     let limit = args.limit.unwrap_or(100).max(1);
@@ -295,7 +316,10 @@ fn run_find_references(
     };
 
     match args.direction {
-        ReferenceDirection::Outgoing => run("enc.qualified", &args.symbol, true),
+        ReferenceDirection::Outgoing => Ok(FindReferencesOutcome {
+            hits: run("enc.qualified", &args.symbol, true)?,
+            qualified_fallback: false,
+        }),
         ReferenceDirection::Incoming => {
             // Prefer qualified-name matching when the symbol carries a
             // language-specific separator (`::` for Rust, `.` for
@@ -321,12 +345,22 @@ fn run_find_references(
                     limit,
                 )?;
                 if !strict.is_empty() {
-                    return Ok(strict);
+                    return Ok(FindReferencesOutcome {
+                        hits: strict,
+                        qualified_fallback: false,
+                    });
                 }
                 let bare = bare_name_from_qualified(&args.symbol);
-                run("r.target_name", bare, false)
+                let hits = run("r.target_name", bare, false)?;
+                Ok(FindReferencesOutcome {
+                    qualified_fallback: !hits.is_empty(),
+                    hits,
+                })
             } else {
-                run("r.target_name", &args.symbol, false)
+                Ok(FindReferencesOutcome {
+                    hits: run("r.target_name", &args.symbol, false)?,
+                    qualified_fallback: false,
+                })
             }
         }
     }

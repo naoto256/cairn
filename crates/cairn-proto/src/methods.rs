@@ -1142,8 +1142,11 @@ pub struct FindReferencesArgs {
     /// Name or qualified path of the **anchor** symbol. In the default
     /// `direction = Incoming` this is the *target* (who calls X);
     /// with `Outgoing` it is the *enclosing* container (what does X
-    /// call). A token containing `::` matches the qualified form
-    /// first; a bare name falls back to the looser name index.
+    /// call). A token containing `::`, `.`, or `\` matches the
+    /// qualified form first; a bare name goes directly to the looser
+    /// name index. When a qualified lookup has no strict matches but
+    /// returns usable bare-name candidates, completeness is partial
+    /// with reason `qualified_fallback`.
     pub symbol: String,
     /// Restrict to a specific reference kind. For outgoing queries,
     /// the default still returns only resolved call refs unless
@@ -1179,7 +1182,12 @@ pub struct FindReferencesResult {
     /// missing tiers (Tier-2 not yet run on every file) **and**
     /// resolution precision (method-call receivers can't be
     /// resolved without rust-analyzer-class Tier-3). The `reason`
-    /// tag distinguishes the two for consumers that want to know.
+    /// tag distinguishes the two for consumers that want to know. A
+    /// `qualified_fallback` reason means returned rows are bare-name
+    /// candidates after a strict miss, not proven exact matches.
+    /// Freshness and tier reasons remain stronger; this semantic
+    /// reason outranks `cap`, while `capped_increase_limit` still
+    /// reports truncation exactly once.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
@@ -1264,9 +1272,11 @@ pub struct FindCallersArgs {
     /// Repository + snapshot scope.
     #[serde(flatten)]
     pub scope: SnapshotScope,
-    /// Callee symbol. Matches `refs.target_qualified` first when the
-    /// name carries `::`, falling back to the bare last segment;
-    /// bare names go straight to the name index.
+    /// Callee symbol. Matches the qualified target first when the name
+    /// carries `::`, `.`, or `\`, falling back to the bare last
+    /// segment; bare names go straight to the name index. Returned
+    /// bare fallback candidates are marked partial with reason
+    /// `qualified_fallback`.
     pub name: String,
     /// Optional result cap.
     #[serde(flatten)]
@@ -1298,8 +1308,11 @@ pub struct FindCalleesArgs {
 pub struct FindCallersResult {
     /// Matching call edges where the queried symbol is the callee.
     pub items: Vec<CallHit>,
-    /// `Partial` when the Tier-2 refs table was not ready or the result was
-    /// capped. Items already returned are still valid.
+    /// `Partial` when the Tier-2 refs table was not ready, the result was
+    /// capped, or a strict qualified miss returned only usable bare-name
+    /// candidates. Items remain usable, but `qualified_fallback` does not
+    /// claim they are exact matches. Freshness and tier reasons take
+    /// priority; a concurrent cap remains an independent hint.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.
