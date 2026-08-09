@@ -9,7 +9,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
-use super::find_references::SnippetCache;
+use super::find_references::{SnippetCache, qualified_reference_completeness};
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
     build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
@@ -21,7 +21,11 @@ use crate::{Error, Result};
 pub struct FindCallers;
 
 /// Per-snapshot scan output. `Hit` is a real call site (with its
-/// parser id captured for tier-3 status filtering). `TsxDefinition`
+/// parser id captured for tier-3 status filtering and a flag recording
+/// whether the surviving row came from qualified-to-bare fallback).
+/// Keeping that provenance on each row prevents a fallback trimmed by
+/// the cross-repo limit from downgrading an otherwise exact response.
+/// `TsxDefinition`
 /// is a sentinel emitted once per snapshot when the queried name has
 /// no callers *and* is defined in a `.tsx` / `.jsx` file — JSX
 /// component usage (`<Foo />`) records as an `instantiate` ref, not
@@ -29,7 +33,7 @@ pub struct FindCallers;
 /// otherwise mislead. The sentinel survives the finalize dedup and
 /// the tail turns it into the `TsxCallersUseInstantiate` hint.
 enum CallerScanItem {
-    Hit(Box<CallHit>, String),
+    Hit(Box<CallHit>, String, bool),
     TsxDefinition,
 }
 
@@ -74,15 +78,18 @@ impl DataMethod for FindCallers {
             move |entry, conn, snapshot| {
                 let anchor_label = snapshot.anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
-                let hits = query::find_references(conn, &snapshot.anchor, &q)?;
+                let outcome = query::find_references_with_status(conn, &snapshot.anchor, &q)?;
+                let qualified_fallback = outcome.qualified_fallback;
                 let mut snippets = SnippetCache::new(entry.alias.clone(), worktree_root);
-                let mut items = hits
+                let mut items = outcome
+                    .hits
                     .into_iter()
                     .map(|h| {
                         let parser_id = h.parser_id.clone();
                         CallerScanItem::Hit(
                             Box::new(into_call_hit(&entry.alias, &anchor_label, h, &mut snippets)),
                             parser_id,
+                            qualified_fallback,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -96,7 +103,7 @@ impl DataMethod for FindCallers {
             },
             |items| {
                 parser_id_filter(items.iter().filter_map(|item| match item {
-                    CallerScanItem::Hit(_, parser_id) => Some(parser_id.clone()),
+                    CallerScanItem::Hit(_, parser_id, _) => Some(parser_id.clone()),
                     CallerScanItem::TsxDefinition => None,
                 }))
             },
@@ -112,7 +119,7 @@ impl DataMethod for FindCallers {
                         saw_marker = true;
                         true
                     }
-                    CallerScanItem::Hit(_, _) => true,
+                    CallerScanItem::Hit(_, _, _) => true,
                 });
             },
         )
@@ -121,20 +128,26 @@ impl DataMethod for FindCallers {
             .items
             .iter()
             .any(|item| matches!(item, CallerScanItem::TsxDefinition));
+        let qualified_fallback = execution.items.iter().any(|item| {
+            matches!(item, CallerScanItem::Hit(_, _, qualified_fallback) if *qualified_fallback)
+        });
         let items: Vec<_> = execution
             .items
             .into_iter()
             .filter_map(|item| match item {
-                CallerScanItem::Hit(hit, _) => Some(*hit),
+                CallerScanItem::Hit(hit, _, _) => Some(*hit),
                 CallerScanItem::TsxDefinition => None,
             })
             .collect();
         let tier3_status = execution.tier3_status;
         let freshness_issues = execution.freshness_issues;
-        let completeness = completeness_for_snapshot_scan(
-            execution.capped,
-            execution.skipped_unavailable,
-            &freshness_issues,
+        let completeness = qualified_reference_completeness(
+            completeness_for_snapshot_scan(
+                execution.capped,
+                execution.skipped_unavailable,
+                &freshness_issues,
+            ),
+            qualified_fallback,
         );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindCallers,
@@ -267,10 +280,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use cairn_proto::Completeness;
     use serde_json::json;
 
     use super::*;
     use crate::cas::{registry as cas_registry, store as cas_store};
+    use crate::data_rpc::methods::find_references::FindReferences;
+    use crate::data_rpc::methods::find_symbols::FindSymbols;
     use crate::paths::{CasDataDir, path_hash};
     use crate::register::register_repo;
     use crate::testutil::init_repo;
@@ -306,6 +322,127 @@ mod tests {
             .await
             .unwrap();
         assert!(result["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn qualified_find_symbols_handoff_marks_bare_fallback_partial() {
+        let fixture = fixture_from_files(&[
+            (
+                "src/hello.ts",
+                "export class Hello { greet(): void {} }\nexport class Other { greet(): void {} use(): void { this.greet(); } }\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn greet() {}\npub fn rust_user() { greet(); }\npub fn rust_user_again() { greet(); }\n",
+            ),
+        ]);
+
+        let symbols = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "greet",
+                    "container": "Hello",
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        let qualified = symbols["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|item| item["qualified"].as_str())
+            .unwrap();
+        assert_eq!(qualified, "Hello.greet");
+
+        let callers = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": qualified, "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !callers["items"].as_array().unwrap().is_empty(),
+            "the baseline must prove that unrelated bare-name rows were used"
+        );
+        let fallback_locations = callers["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["location"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            fallback_locations
+                .iter()
+                .any(|location| location.contains("src/hello.ts")),
+            "same-language Other.greet distractor must survive fallback: {callers:#}"
+        );
+        assert!(
+            fallback_locations
+                .iter()
+                .any(|location| location.contains("src/lib.rs")),
+            "cross-language Rust greet distractor must survive fallback: {callers:#}"
+        );
+        assert_eq!(
+            serde_json::from_value::<Completeness>(callers["completeness"].clone()).unwrap(),
+            Completeness::partial_semantic("qualified_fallback")
+        );
+
+        let bare = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "greet", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare["items"], callers["items"]);
+        assert_eq!(
+            serde_json::from_value::<Completeness>(bare["completeness"].clone()).unwrap(),
+            Completeness::Complete
+        );
+
+        let empty_qualified = FindCallers
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "name": "Missing.absent",
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(empty_qualified["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            serde_json::from_value::<Completeness>(empty_qualified["completeness"].clone())
+                .unwrap(),
+            Completeness::Complete
+        );
+
+        let references = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "symbol": qualified,
+                    "direction": "incoming",
+                    "kind": "call",
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !references["items"].as_array().unwrap().is_empty(),
+            "find_references must exercise the same qualified-to-bare seam"
+        );
+        assert_eq!(
+            serde_json::from_value::<Completeness>(references["completeness"].clone()).unwrap(),
+            Completeness::partial_semantic("qualified_fallback")
+        );
     }
 
     #[tokio::test]
