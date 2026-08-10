@@ -1186,6 +1186,10 @@ pub struct FindReferencesResult {
     /// tag distinguishes the two for consumers that want to know. A
     /// `qualified_fallback` reason means returned rows are bare-name
     /// candidates after a strict miss, not proven exact matches.
+    /// For default outgoing queries, `call_graph_unresolved` means at
+    /// least one surviving call site had no qualified target and was
+    /// omitted from the usable call rows; `include_noise=true` returns
+    /// those diagnostic rows instead of applying this call-graph status.
     /// Freshness and tier reasons remain stronger; this semantic
     /// reason outranks `cap`, while `capped_increase_limit` still
     /// reports truncation exactly once.
@@ -1335,8 +1339,11 @@ pub struct FindCallersResult {
 pub struct FindCalleesResult {
     /// Matching call edges where the queried symbol is the caller.
     pub items: Vec<CallHit>,
-    /// `Partial` when the Tier-2 refs table was not ready or the result was
-    /// capped. Items already returned are still valid.
+    /// `Partial` when snapshot evidence was unavailable, the result was
+    /// capped, or a surviving call site had no qualified target and was
+    /// omitted (`call_graph_unresolved`). Returned items remain usable.
+    /// Freshness/unavailable reasons outrank unresolved-call evidence, which
+    /// outranks `cap`; a concurrent cap remains an exactly-once hint.
     #[serde(default = "Completeness::complete")]
     pub completeness: Completeness,
     /// Tier-3 analyzer readiness for snapshots touched by this query.

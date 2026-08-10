@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cairn_proto::Completeness;
 use cairn_proto::common::PartialReason;
@@ -51,6 +53,8 @@ impl DataMethod for FindReferences {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
+        let any_omitted_unresolved_calls = Arc::new(AtomicBool::new(false));
+        let query_omitted_unresolved_calls = Arc::clone(&any_omitted_unresolved_calls);
 
         let execution = query_one_or_all_snapshots(
             ctx,
@@ -68,6 +72,9 @@ impl DataMethod for FindReferences {
                 let worktree_root = PathBuf::from(&entry.root_path);
                 let outcome = query::find_references_with_status(conn, &snapshot.anchor, &q)?;
                 let qualified_fallback = outcome.qualified_fallback;
+                let omitted_unresolved_calls = outcome.omitted_unresolved_calls;
+                query_omitted_unresolved_calls
+                    .fetch_or(omitted_unresolved_calls, Ordering::Relaxed);
                 let mut snippets = SnippetCache::new(entry.alias.clone(), worktree_root);
                 Ok(outcome
                     .hits
@@ -78,32 +85,41 @@ impl DataMethod for FindReferences {
                             into_wire_hit(&entry.alias, &anchor_label, h, &mut snippets),
                             parser_id,
                             qualified_fallback,
+                            omitted_unresolved_calls,
                         )
                     })
                     .collect())
             },
-            |hits| parser_id_filter(hits.iter().map(|(_, parser_id, _)| parser_id.clone())),
-            |_out: &mut Vec<(FindReferenceHit, String, bool)>| {},
+            |hits| parser_id_filter(hits.iter().map(|(_, parser_id, _, _)| parser_id.clone())),
+            |_out: &mut Vec<(FindReferenceHit, String, bool, bool)>| {},
         )
         .await?;
         let qualified_fallback = execution
             .items
             .iter()
-            .any(|(_, _, qualified_fallback)| *qualified_fallback);
+            .any(|(_, _, qualified_fallback, _)| *qualified_fallback);
+        // Evidence follows surviving rows across cross-repo final trimming.
+        // An unresolved-only result has no row to carry provenance, so retain
+        // the aggregate bit only when the final result itself is empty.
+        let omitted_unresolved_calls = execution.items.iter().any(|(_, _, _, omitted)| *omitted)
+            || (execution.items.is_empty() && any_omitted_unresolved_calls.load(Ordering::Relaxed));
         let items: Vec<_> = execution
             .items
             .into_iter()
-            .map(|(item, _, _)| item)
+            .map(|(item, _, _, _)| item)
             .collect();
         let tier3_status = execution.tier3_status;
         let freshness_issues = execution.freshness_issues;
-        let completeness = qualified_reference_completeness(
-            completeness_for_snapshot_scan(
-                execution.capped,
-                execution.skipped_unavailable,
-                &freshness_issues,
+        let completeness = call_graph_completeness(
+            qualified_reference_completeness(
+                completeness_for_snapshot_scan(
+                    execution.capped,
+                    execution.skipped_unavailable,
+                    &freshness_issues,
+                ),
+                qualified_fallback,
             ),
-            qualified_fallback,
+            omitted_unresolved_calls,
         );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindReferences,
@@ -163,6 +179,32 @@ pub(super) fn qualified_reference_completeness(
         )
     {
         Completeness::partial_semantic("qualified_fallback")
+    } else {
+        completeness
+    }
+}
+
+pub(super) fn call_graph_completeness(
+    completeness: Completeness,
+    omitted_unresolved_calls: bool,
+) -> Completeness {
+    if !omitted_unresolved_calls {
+        return completeness;
+    }
+
+    // Snapshot freshness and unavailable-repository evidence outrank local
+    // semantic uncertainty. An actual omitted call outranks a cap; the cap
+    // remains independently visible through its exactly-once hint.
+    if matches!(completeness, Completeness::Complete)
+        || matches!(
+            completeness,
+            Completeness::Partial {
+                reason: Some(PartialReason::Cap),
+                ..
+            }
+        )
+    {
+        Completeness::partial_semantic("call_graph_unresolved")
     } else {
         completeness
     }
@@ -278,6 +320,7 @@ mod tests {
     use super::*;
     use crate::cas::{registry as cas_registry, store as cas_store};
     use crate::data_rpc::helpers::test_support::assert_limit_probe;
+    use crate::data_rpc::methods::find_callees::FindCallees;
     use crate::data_rpc::methods::find_callers::FindCallers;
     use crate::paths::{CasDataDir, path_hash};
     use crate::register::register_repo;
@@ -306,6 +349,27 @@ mod tests {
         assert_eq!(qualified_reference_completeness(tier.clone(), true), tier);
         assert_eq!(
             qualified_reference_completeness(Completeness::Complete, false),
+            Completeness::Complete
+        );
+    }
+
+    #[test]
+    fn unresolved_call_only_replaces_complete_or_cap_reason() {
+        assert_eq!(
+            call_graph_completeness(Completeness::Complete, true),
+            Completeness::partial_semantic("call_graph_unresolved")
+        );
+        assert_eq!(
+            call_graph_completeness(Completeness::partial_truncated(PartialReason::Cap), true),
+            Completeness::partial_semantic("call_graph_unresolved")
+        );
+
+        let freshness = Completeness::partial_truncated("file_not_indexed_or_snapshot_stale");
+        assert_eq!(call_graph_completeness(freshness.clone(), true), freshness);
+        let tier = Completeness::partial_semantic(PartialReason::Tier2Warming);
+        assert_eq!(call_graph_completeness(tier.clone(), true), tier);
+        assert_eq!(
+            call_graph_completeness(Completeness::Complete, false),
             Completeness::Complete
         );
     }
@@ -427,6 +491,35 @@ mod tests {
         assert_exact_survivor_with_cap(&callers);
     }
 
+    #[tokio::test]
+    async fn final_trim_drops_unresolved_status_with_the_unresolved_repo() {
+        let fixture = call_graph_final_trim_fixture();
+
+        let references = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "symbol": "caller",
+                    "direction": "outgoing",
+                    "kind": "call",
+                    "limit": 1,
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_resolved_survivor_with_cap(&references);
+
+        let callees = FindCallees
+            .dispatch(
+                &fixture.ctx,
+                json!({"name": "caller", "limit": 1, "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        assert_resolved_survivor_with_cap(&callees);
+    }
+
     #[test]
     fn extract_line_returns_target_line_text() {
         let src = b"alpha\nbeta\ngamma\n";
@@ -523,6 +616,37 @@ mod tests {
         }
     }
 
+    fn call_graph_final_trim_fixture() -> CrossRepoFixture {
+        let alpha = init_repo(&[(
+            "src/alpha.rs",
+            "pub fn first() {}\n\
+             pub fn second() {}\n\
+             pub fn caller() { first(); second(); }\n",
+        )])
+        .0;
+        let beta = init_repo(&[(
+            "src/beta.rs",
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n\
+             pub fn caller(arg: Widget) { arg.render(); }\n",
+        )])
+        .0;
+        let data = tempfile::tempdir().unwrap();
+        let cas = CasDataDir::with_root(data.path().to_path_buf());
+        cas.ensure().unwrap();
+        register_alias(&cas, "alpha", alpha.path());
+        register_alias(&cas, "beta", beta.path());
+
+        CrossRepoFixture {
+            _repos: vec![alpha, beta],
+            _data: data,
+            ctx: DataCtx {
+                cas_data_dir: Arc::new(cas),
+                lifecycle: None,
+            },
+        }
+    }
+
     fn set_target_qualified(cas: &CasDataDir, repo_path: &std::path::Path, value: Option<&str>) {
         let canonical = std::fs::canonicalize(repo_path).unwrap();
         let repo_hash = path_hash(&canonical);
@@ -560,6 +684,32 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(cap_hints.len(), 1, "{value:#}");
         assert_eq!(cap_hints[0]["action"], "increase_limit");
+    }
+
+    fn assert_resolved_survivor_with_cap(value: &Value) {
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{value:#}");
+        assert!(
+            items[0]["location"]
+                .as_str()
+                .unwrap()
+                .starts_with("alpha:HEAD:"),
+            "global final trim must retain a deterministic resolved row: {value:#}"
+        );
+        assert_eq!(
+            serde_json::from_value::<Completeness>(value["completeness"].clone()).unwrap(),
+            Completeness::partial_truncated(PartialReason::Cap)
+        );
+        assert_eq!(
+            value["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hint| hint["code"] == "capped_increase_limit")
+                .count(),
+            1,
+            "{value:#}"
+        );
     }
 
     fn register_alias(cas: &CasDataDir, alias: &str, repo_path: &std::path::Path) {

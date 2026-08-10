@@ -62,13 +62,16 @@ pub struct FindReferencesArgs {
     pub limit: Option<u32>,
 }
 
-/// Internal query outcome used by the data-RPC layer to distinguish an exact
-/// qualified-name result from usable rows returned by the legacy bare-name
-/// fallback. The public query API intentionally continues to return only hits.
+/// Internal query outcome used by the data-RPC layer to carry query-local
+/// precision evidence alongside usable rows. The public query API intentionally
+/// continues to return only hits.
 #[derive(Debug)]
 pub(crate) struct FindReferencesOutcome {
     pub(crate) hits: Vec<ReferenceHit>,
     pub(crate) qualified_fallback: bool,
+    /// `true` when an outgoing default query observed at least one logical
+    /// call site that survived tier de-duplication but had no qualified target.
+    pub(crate) omitted_unresolved_calls: bool,
 }
 
 /// Find references either way:
@@ -81,7 +84,9 @@ pub(crate) struct FindReferencesOutcome {
 ///   that fallback as partial rather than claiming an exact match.
 /// - `Outgoing` — refs inside the body of the symbol named `symbol`
 ///   (= callees / uses from the symbol). Matches `symbols.qualified`
-///   on the enclosing FK.
+///   on the enclosing FK. Default outgoing results contain resolved calls;
+///   the private outcome records whether unresolved logical call sites were
+///   omitted so data-RPC consumers do not claim a complete call graph.
 ///
 /// # Errors
 /// `Error::InvalidArgument` when `symbol` is empty, `Error::AnchorNotFound` when the anchor
@@ -154,12 +159,13 @@ fn run_find_references(
     let source_rank_r = source_rank_case_sql("r.source");
     let resolution_source_rank = source_rank_case_sql("source");
     let workspace_tier_t = source_is_workspace_tier_sql("t.source");
+    let logical_site_columns = logical_site_columns_sql("r");
     // Closure so incoming/outgoing share this SQL body — they differ
     // only in `where_col` (`enc.qualified` vs `r.target_name` /
     // `r.target_qualified`), the pinned `value`, the enclosing-symbol
     // JOIN semantics (INNER for outgoing, LEFT for incoming), and the
     // outgoing-only "resolved callee" noise filter below.
-    let run = |where_col: &str, value: &str, outgoing: bool| -> Result<Vec<ReferenceHit>> {
+    let run = |where_col: &str, value: &str, outgoing: bool| -> Result<(Vec<ReferenceHit>, bool)> {
         let mut sql = String::from(
             "WITH best_resolution AS (
                  SELECT site_blob_sha, site_parser_id,
@@ -179,11 +185,8 @@ fn run_find_references(
                    FROM resolutions
                   WHERE kind IN ('type', 'call', 'import')
                     AND (manifest_id = ?1 OR manifest_id IS NULL)
-             )
-             SELECT target_name, target_qualified, kind, enclosing,
-                    path, line, blob_sha, parser_id, kind_source,
-                    target_path
-               FROM (
+             ),
+             ref_candidates AS (
                  SELECT r.target_name,
                         COALESCE(sym.qualified, r.target_qualified)
                             AS target_qualified,
@@ -191,6 +194,7 @@ fn run_find_references(
                         enc.qualified AS enclosing,
                         me.path, r.line, r.blob_sha, r.parser_id,
                         r.byte_start, r.byte_end, r.id AS ref_id,
+                        r.enclosing_id, r.source,
                         res.target_path AS target_path,
                         CASE WHEN res.source IS NOT NULL THEN res.source
                              ELSE '",
@@ -210,17 +214,7 @@ fn run_find_references(
                              AND t.target_name = r.target_name
                              AND t.enclosing_id IS r.enclosing_id
                         ) AS has_workspace_tier_same_line_target_name,
-                        ROW_NUMBER() OVER (
-                          PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
-                          ORDER BY
-                            {source_rank_r},
-                            CASE
-                              WHEN r.target_qualified IS NOT NULL
-                               AND r.target_qualified <> '' THEN 0
-                              ELSE 1
-                            END,
-                            r.source
-                        ) AS dedup_rank
+                        {logical_site_columns}
                    FROM refs r
                    JOIN manifest_entries me
                      ON me.manifest_id = ?1
@@ -247,79 +241,149 @@ fn run_find_references(
         if kind_str.is_some() {
             sql.push_str(" AND r.kind = ?3");
         }
-        if outgoing && !args.include_noise {
-            // A row qualifies as a resolved callee when *either* the
-            // Tier-2 ref already carries a qualified target *or* a
-            // resolution-layer row pinned one (via sym.qualified).
-            sql.push_str(" AND r.kind = 'call'");
-            sql.push_str(
-                " AND ((r.target_qualified IS NOT NULL AND r.target_qualified <> '')
-                       OR sym.qualified IS NOT NULL)",
-            );
-        }
-        sql.push(')');
-        if !args.include_noise {
-            // Two-part noise cut. `dedup_rank = 1` keeps one row per
-            // (physical byte range, ref kind) — `kind` is part of the
-            // dedup `PARTITION BY` above so two refs that share a byte
-            // range but differ in kind (e.g. a `call` and a `type` on
-            // the same token) stay separate rather than collapsing
-            // into one (highest tier wins, with a qualified-target
-            // tiebreak). The AND NOT clause drops
-            // stale lower-tier duplicates that emit a zero byte range
-            // (marker for "no token range recorded"), but only when a
-            // workspace-tier row on the same `(line, kind,
-            // target_name, enclosing_id)` tuple already exists to
-            // supersede them — hence
-            // `has_workspace_tier_same_line_target_name`.
-            sql.push_str(" WHERE dedup_rank = 1");
-            sql.push_str(
-                " AND NOT (
+        // Two-part noise cut, staged as CTEs so the ranked set stays
+        // reusable. `dedup_rank = 1` keeps one row per site; `kind` sits in
+        // the partition so a `call` and a `type` on the same token stay
+        // separate, and the logical-site columns give range-less rows their
+        // own identity instead of collapsing distinct sites into one. The
+        // `AND NOT` clause then drops a range-less lower-tier row only when a
+        // workspace-tier row on the same `(line, kind, target_name,
+        // enclosing_id)` tuple already supersedes it.
+        sql.push_str(
+            "),
+             ranked_refs AS (
+               SELECT *,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY blob_sha, byte_start, byte_end, kind,
+                                     logical_site_line, logical_site_target,
+                                     logical_site_enclosing
+                        ORDER BY source_rank,
+                                 CASE WHEN target_qualified IS NOT NULL
+                                           AND target_qualified <> ''
+                                      THEN 0 ELSE 1 END,
+                                 source
+                      ) AS dedup_rank
+                 FROM ref_candidates
+             ),
+             surviving_refs AS (
+               SELECT *
+                 FROM ranked_refs
+                WHERE dedup_rank = 1
+                  AND NOT (
                     source_rank > 0
                     AND byte_start = 0
                     AND byte_end = 0
                     AND has_workspace_tier_same_line_target_name
-                )",
+                  )
+             ),
+             presentation_refs AS (
+               SELECT * FROM ",
+        );
+        sql.push_str(if args.include_noise {
+            "ref_candidates"
+        } else {
+            "surviving_refs"
+        });
+        if outgoing && !args.include_noise {
+            // The projected value is the sole resolved-target authority.
+            // Resolution-row presence by itself never makes a call usable.
+            sql.push_str(
+                " WHERE kind = 'call'
+                    AND target_qualified IS NOT NULL
+                    AND target_qualified <> ''",
             );
         }
-        // Deterministic per-page ordering: file, then line, then
-        // in-line byte offset, then tier rank. The persistent ref id
-        // is the final total-order tiebreaker when otherwise-identical
-        // rows survive in include-noise mode.
-        sql.push_str(" ORDER BY path, line, byte_start, source_rank, ref_id");
-        sql.push_str(&format!(" LIMIT {limit}"));
+        sql.push_str(
+            "),
+             limited_hits AS (
+               SELECT * FROM presentation_refs
+                ORDER BY path, line, byte_start, source_rank, ref_id
+                LIMIT ",
+        );
+        sql.push_str(&limit.to_string());
+        // Evidence reads the pre-limit surviving set: a call the page cut off
+        // is still an omitted call the caller has to know about.
+        sql.push_str(
+            "),
+             evidence AS (
+               SELECT ",
+        );
+        sql.push_str(if outgoing && !args.include_noise {
+            "EXISTS(
+                   SELECT 1 FROM surviving_refs
+                    WHERE kind = 'call'
+                      AND (target_qualified IS NULL OR target_qualified = '')
+                 )"
+        } else {
+            "0"
+        });
+        // The metadata-only row carries that evidence when the page is empty:
+        // an unresolved-only body leaves no surviving hit to attach it to, and
+        // dropping it would report a complete call graph.
+        sql.push_str(
+            " AS omitted_unresolved_calls
+             )
+             SELECT target_name, target_qualified, kind, enclosing,
+                    path, line, blob_sha, parser_id, kind_source,
+                    target_path, ref_id, byte_start, source_rank,
+                    0 AS is_metadata, omitted_unresolved_calls
+               FROM limited_hits CROSS JOIN evidence
+             UNION ALL
+             SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, 1, omitted_unresolved_calls
+               FROM evidence
+              WHERE NOT EXISTS (SELECT 1 FROM limited_hits)
+             ORDER BY is_metadata, path, line, byte_start, source_rank, ref_id",
+        );
 
         let mut stmt = conn.prepare(&sql)?;
-        let row_to_hit = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ReferenceHit> {
-            Ok(ReferenceHit {
-                target_name: row.get(0)?,
-                target_qualified: row.get(1)?,
-                kind: ref_kind_from_str(&row.get::<_, String>(2)?),
-                enclosing_qualified: row.get(3)?,
-                path: row.get(4)?,
-                line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                blob_sha: row.get(6)?,
-                parser_id: row.get(7)?,
-                kind_source: row.get(8)?,
-                target_path: row.get(9)?,
-            })
+        let row_to_result = |row: &rusqlite::Row<'_>| -> rusqlite::Result<_> {
+            let is_metadata = row.get::<_, bool>(13)?;
+            let omitted_unresolved_calls = row.get::<_, bool>(14)?;
+            if is_metadata {
+                return Ok((None, omitted_unresolved_calls));
+            }
+            Ok((
+                Some(ReferenceHit {
+                    target_name: row.get(0)?,
+                    target_qualified: row.get(1)?,
+                    kind: ref_kind_from_str(&row.get::<_, String>(2)?),
+                    enclosing_qualified: row.get(3)?,
+                    path: row.get(4)?,
+                    line: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                    blob_sha: row.get(6)?,
+                    parser_id: row.get(7)?,
+                    kind_source: row.get(8)?,
+                    target_path: row.get(9)?,
+                }),
+                omitted_unresolved_calls,
+            ))
         };
-        let rows: rusqlite::Result<Vec<ReferenceHit>> = match &kind_str {
+        let rows: rusqlite::Result<Vec<(Option<ReferenceHit>, bool)>> = match &kind_str {
             Some(k) => stmt
-                .query_map(rusqlite::params![manifest_id.0, value, k], row_to_hit)?
+                .query_map(rusqlite::params![manifest_id.0, value, k], row_to_result)?
                 .collect(),
             None => stmt
-                .query_map(rusqlite::params![manifest_id.0, value], row_to_hit)?
+                .query_map(rusqlite::params![manifest_id.0, value], row_to_result)?
                 .collect(),
         };
-        Ok(rows?)
+        let rows = rows?;
+        let omitted_unresolved_calls = rows
+            .iter()
+            .any(|(_, omitted_unresolved_calls)| *omitted_unresolved_calls);
+        let hits = rows.into_iter().filter_map(|(hit, _)| hit).collect();
+        Ok((hits, omitted_unresolved_calls))
     };
 
     match args.direction {
-        ReferenceDirection::Outgoing => Ok(FindReferencesOutcome {
-            hits: run("enc.qualified", &args.symbol, true)?,
-            qualified_fallback: false,
-        }),
+        ReferenceDirection::Outgoing => {
+            let (hits, omitted_unresolved_calls) = run("enc.qualified", &args.symbol, true)?;
+            Ok(FindReferencesOutcome {
+                hits,
+                qualified_fallback: false,
+                omitted_unresolved_calls,
+            })
+        }
         ReferenceDirection::Incoming => {
             // Prefer qualified-name matching when the symbol carries a
             // language-specific separator (`::` for Rust, `.` for
@@ -348,18 +412,22 @@ fn run_find_references(
                     return Ok(FindReferencesOutcome {
                         hits: strict,
                         qualified_fallback: false,
+                        omitted_unresolved_calls: false,
                     });
                 }
                 let bare = bare_name_from_qualified(&args.symbol);
-                let hits = run("r.target_name", bare, false)?;
+                let (hits, _) = run("r.target_name", bare, false)?;
                 Ok(FindReferencesOutcome {
                     qualified_fallback: !hits.is_empty(),
                     hits,
+                    omitted_unresolved_calls: false,
                 })
             } else {
+                let (hits, _) = run("r.target_name", &args.symbol, false)?;
                 Ok(FindReferencesOutcome {
-                    hits: run("r.target_name", &args.symbol, false)?,
+                    hits,
                     qualified_fallback: false,
+                    omitted_unresolved_calls: false,
                 })
             }
         }
@@ -414,6 +482,7 @@ fn run_strict_incoming(
     let source_rank_r = source_rank_case_sql("r.source");
     let resolution_source_rank = source_rank_case_sql("source");
     let workspace_tier_t = source_is_workspace_tier_sql("t.source");
+    let logical_site_columns = logical_site_columns_sql("r");
 
     let mut sql = String::from(
         "WITH best_resolution AS (
@@ -458,11 +527,8 @@ fn run_strict_incoming(
                JOIN symbols sym ON sym.id = res.target_symbol_id
               WHERE sym.qualified = ?2
                 AND (r.target_qualified IS NULL OR r.target_qualified <> ?2)
-         )
-         SELECT target_name, target_qualified, kind, enclosing,
-                path, line, blob_sha, parser_id, kind_source,
-                target_path
-           FROM (
+         ),
+         ref_candidates AS (
              SELECT r.target_name,
                     COALESCE(sym.qualified, r.target_qualified)
                         AS target_qualified,
@@ -470,6 +536,7 @@ fn run_strict_incoming(
                     enc.qualified AS enclosing,
                     me.path, r.line, r.blob_sha, r.parser_id,
                     r.byte_start, r.byte_end, r.id AS ref_id,
+                    r.enclosing_id, r.source,
                     res.target_path AS target_path,
                     CASE WHEN res.source IS NOT NULL THEN res.source
                          ELSE '",
@@ -489,17 +556,7 @@ fn run_strict_incoming(
                          AND t.target_name = r.target_name
                          AND t.enclosing_id IS r.enclosing_id
                     ) AS has_workspace_tier_same_line_target_name,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY r.blob_sha, r.byte_start, r.byte_end, r.kind
-                      ORDER BY
-                        {source_rank_r},
-                        CASE
-                          WHEN r.target_qualified IS NOT NULL
-                           AND r.target_qualified <> '' THEN 0
-                          ELSE 1
-                        END,
-                        r.source
-                    ) AS dedup_rank
+                    {logical_site_columns}
                FROM strict_refs r
                JOIN manifest_entries me
                  ON me.manifest_id = ?1
@@ -518,23 +575,44 @@ fn run_strict_incoming(
     if kind_str.is_some() {
         sql.push_str(" AND r.kind = ?3");
     }
-    sql.push(')');
-    if !include_noise {
-        sql.push_str(" WHERE dedup_rank = 1");
-        sql.push_str(
-            " AND NOT (
+    sql.push_str(
+        "),
+         ranked_refs AS (
+           SELECT *,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY blob_sha, byte_start, byte_end, kind,
+                                 logical_site_line, logical_site_target,
+                                 logical_site_enclosing
+                    ORDER BY source_rank,
+                             CASE WHEN target_qualified IS NOT NULL
+                                       AND target_qualified <> ''
+                                  THEN 0 ELSE 1 END,
+                             source
+                  ) AS dedup_rank
+             FROM ref_candidates
+         ),
+         surviving_refs AS (
+           SELECT *
+             FROM ranked_refs
+            WHERE dedup_rank = 1
+              AND NOT (
                 source_rank > 0
                 AND byte_start = 0
                 AND byte_end = 0
                 AND has_workspace_tier_same_line_target_name
-            )",
-        );
-    }
+              )
+         )
+         SELECT target_name, target_qualified, kind, enclosing,
+                path, line, blob_sha, parser_id, kind_source,
+                target_path
+           FROM ",
+    );
     sql.push_str(if include_noise {
-        " WHERE target_qualified = ?2"
+        "ref_candidates"
     } else {
-        " AND target_qualified = ?2"
+        "surviving_refs"
     });
+    sql.push_str(" WHERE target_qualified = ?2");
     sql.push_str(" ORDER BY path, line, byte_start, source_rank, ref_id");
     sql.push_str(&format!(" LIMIT {limit}"));
 
@@ -562,6 +640,22 @@ fn run_strict_incoming(
             .collect(),
     };
     Ok(rows?)
+}
+
+/// SQL projection for the fallback identity of refs without byte ranges.
+///
+/// A non-zero range remains the physical-site authority. For a 0..0 range,
+/// line + target + enclosing is the strongest fact the parser recorded; two
+/// identical references on the same line are therefore indistinguishable.
+fn logical_site_columns_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {alias}.byte_start = 0 AND {alias}.byte_end = 0
+              THEN {alias}.line END AS logical_site_line,
+         CASE WHEN {alias}.byte_start = 0 AND {alias}.byte_end = 0
+              THEN {alias}.target_name END AS logical_site_target,
+         CASE WHEN {alias}.byte_start = 0 AND {alias}.byte_end = 0
+              THEN {alias}.enclosing_id END AS logical_site_enclosing"
+    )
 }
 
 /// `true` when `symbol` looks like a fully-qualified name in any

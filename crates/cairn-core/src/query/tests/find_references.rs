@@ -67,7 +67,7 @@ fn references_outgoing_defaults_to_resolved_calls() {
     let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
     register_repo(&mut conn, _repo.path(), 0).unwrap();
 
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -77,6 +77,7 @@ fn references_outgoing_defaults_to_resolved_calls() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
 
     assert_eq!(
         hits.iter()
@@ -87,6 +88,7 @@ fn references_outgoing_defaults_to_resolved_calls() {
     );
     assert!(hits.iter().all(|h| h.kind == RefKind::Call));
     assert!(hits.iter().all(|h| h.target_qualified.is_some()));
+    assert!(outcome.omitted_unresolved_calls);
 }
 
 #[test]
@@ -106,7 +108,7 @@ fn references_outgoing_include_noise_returns_legacy_refs() {
     let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
     register_repo(&mut conn, _repo.path(), 0).unwrap();
 
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -117,6 +119,7 @@ fn references_outgoing_include_noise_returns_legacy_refs() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
 
     assert!(
         hits.iter().any(|h| h.target_name == "resolved"
@@ -135,6 +138,7 @@ fn references_outgoing_include_noise_returns_legacy_refs() {
             .any(|h| h.target_name == "Widget" && h.kind == RefKind::Type),
         "type refs missing from include_noise refs: {hits:?}"
     );
+    assert!(!outcome.omitted_unresolved_calls);
 }
 
 #[test]
@@ -283,6 +287,7 @@ fn references_tier3_suppresses_zero_range_semantic_same_line() {
     .unwrap();
     let hits = outcome.hits;
     assert!(!outcome.qualified_fallback);
+    assert!(!outcome.omitted_unresolved_calls);
 
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(
@@ -318,7 +323,7 @@ fn references_tier3_suppresses_zero_range_semantic_with_qualified_mismatch() {
     )
     .unwrap();
 
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -328,12 +333,14 @@ fn references_tier3_suppresses_zero_range_semantic_with_qualified_mismatch() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
 
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(
         hits[0].target_qualified.as_deref(),
         Some("crate::Widget::render")
     );
+    assert!(!outcome.omitted_unresolved_calls);
 
     let noisy = find_references(
         &conn,
@@ -379,7 +386,7 @@ fn references_tier3_failed_run_falls_back_to_tier2_refs() {
 fn references_outgoing_prefers_tier3_for_same_call_site() {
     let (_db, conn) = refs_dedup_fixture(true, None);
 
-    let hits = find_references(
+    let outcome = find_references_with_status(
         &conn,
         &AnchorName::head(),
         &FindReferencesArgs {
@@ -389,12 +396,14 @@ fn references_outgoing_prefers_tier3_for_same_call_site() {
         },
     )
     .unwrap();
+    let hits = outcome.hits;
 
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(
         hits[0].target_qualified.as_deref(),
         Some("crate::Widget::render")
     );
+    assert!(!outcome.omitted_unresolved_calls);
 }
 
 #[test]
