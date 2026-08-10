@@ -218,9 +218,10 @@ impl std::error::Error for ScanFailure {}
 pub(crate) const ALWAYS_PRUNED_DIR_NAMES: &[&str] =
     &[".git", "target", "node_modules", ".claude", ".ruby-lsp"];
 
-/// Walk `repo_root`, honoring `.gitignore` and `.git/info/exclude`,
-/// and collect every regular file found. Directories listed in
-/// [`ALWAYS_PRUNED_DIR_NAMES`] are skipped regardless of gitignore.
+/// Walk `repo_root`, honoring the effective `core.excludesFile`,
+/// `.git/info/exclude`, and working-tree `.gitignore` files, and collect every
+/// regular file found. Directories listed in `ALWAYS_PRUNED_DIR_NAMES` are
+/// skipped regardless of gitignore.
 pub fn walk_repo(repo_root: &Path) -> ScanReport {
     let errors = Arc::new(Mutex::new(ScanErrors::default()));
     let info_exclude = match resolve_git_metadata(repo_root) {

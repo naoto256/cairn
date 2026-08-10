@@ -7,13 +7,13 @@
 //!   keeps `.git/` next to the working tree, but a linked worktree
 //!   splits it into a per-worktree `gitdir` plus a shared `commondir`.
 //!   [`resolve_git_metadata`] follows the `.git` file / `commondir`
-//!   trail so `info/exclude` and the watched git roots point at the
-//!   right on-disk locations.
+//!   trail so local config controls, `info/exclude`, and the watched git
+//!   roots point at the right on-disk locations.
 //! - Is a path ignored, or does it fall in a subtree that never
-//!   belongs to the parent repository? [`RepoIgnoreMatcher`] layers
-//!   `.git/info/exclude` and every discovered `.gitignore` inside
-//!   the working tree, and treats nested repository boundaries
-//!   (a `.git` file or directory below the root) as always-pruned.
+//!   belongs to the parent repository? [`RepoIgnoreMatcher`] layers the
+//!   effective `core.excludesFile`, `.git/info/exclude`, and every discovered
+//!   `.gitignore` inside the working tree, and treats nested repository
+//!   boundaries (a `.git` file or directory below the root) as always-pruned.
 //!
 //! Sharing one matcher between the scanner and the event classifier
 //! keeps the startup snapshot and the live event stream from drifting
@@ -21,13 +21,14 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::scan::ALWAYS_PRUNED_DIR_NAMES;
 
-/// The three git-metadata locations the watcher needs to know about.
+/// Git-metadata locations the watcher needs to know about.
 ///
 /// - `worktree_git_dir`: the per-worktree git dir. For a plain
 ///   checkout this is `<repo>/.git/`; for a linked worktree it is
@@ -38,11 +39,15 @@ use crate::scan::ALWAYS_PRUNED_DIR_NAMES;
 /// - `info_exclude`: the resolved absolute path of
 ///   `<common_git_dir>/info/exclude`. Kept precomputed because the
 ///   classifier compares against it on every event.
+/// - `ignore_controls`: repository-local Git configuration files that
+///   can change the effective ignore source. They are already below the
+///   existing git-dir watch roots; no additional external path is watched.
 #[derive(Debug, Clone)]
 pub(crate) struct GitMetadataPaths {
     pub(crate) worktree_git_dir: PathBuf,
     pub(crate) common_git_dir: PathBuf,
     pub(crate) info_exclude: PathBuf,
+    pub(crate) ignore_controls: Vec<PathBuf>,
 }
 
 impl GitMetadataPaths {
@@ -53,10 +58,12 @@ impl GitMetadataPaths {
     /// silently going dark.
     pub(crate) fn fail_open(repo_root: &Path) -> Self {
         let dot_git = repo_root.join(".git");
+        let ignore_controls = git_config_controls(&dot_git, &dot_git);
         Self {
             info_exclude: dot_git.join("info").join("exclude"),
             worktree_git_dir: dot_git.clone(),
             common_git_dir: dot_git,
+            ignore_controls,
         }
     }
 
@@ -125,11 +132,23 @@ pub(crate) fn resolve_git_metadata(repo_root: &Path) -> io::Result<GitMetadataPa
         Err(err) => return Err(err),
     };
 
+    let ignore_controls = git_config_controls(&worktree_git_dir, &common_git_dir);
     Ok(GitMetadataPaths {
         info_exclude: common_git_dir.join("info").join("exclude"),
         worktree_git_dir,
         common_git_dir,
+        ignore_controls,
     })
+}
+
+fn git_config_controls(worktree_git_dir: &Path, common_git_dir: &Path) -> Vec<PathBuf> {
+    let mut controls = vec![
+        common_git_dir.join("config"),
+        worktree_git_dir.join("config.worktree"),
+    ];
+    controls.sort();
+    controls.dedup();
+    controls
 }
 
 /// Resolve `candidate` against `base` and canonicalize the result
@@ -159,10 +178,11 @@ struct IgnoreLayer {
 /// Hierarchical gitignore matcher shared by the startup scanner and
 /// the runtime event classifier.
 ///
-/// Layers are evaluated shallow-to-deep after `info_exclude`, so a
-/// deeper `.gitignore` can override a shallower rule (matching git
-/// semantics). Directory-scoped patterns anchor to the layer's own
-/// directory rather than the repo root.
+/// Layers are evaluated from the effective `core.excludesFile` through
+/// `info_exclude`, then shallow-to-deep working-tree `.gitignore` files.
+/// Each later layer can override an earlier one, matching Git precedence.
+/// Directory-scoped patterns anchor to the layer's own directory rather
+/// than the repo root.
 ///
 /// The set of layers is discovered eagerly by [`Self::build`] and
 /// fixed for the lifetime of the matcher; the classifier hot-swaps
@@ -171,13 +191,15 @@ struct IgnoreLayer {
 #[derive(Debug)]
 pub(crate) struct RepoIgnoreMatcher {
     repo_root: PathBuf,
+    core_excludes: Gitignore,
     info_exclude: Gitignore,
     layers: Vec<IgnoreLayer>,
 }
 
 impl RepoIgnoreMatcher {
-    /// Build a matcher for `repo_root`, loading `info_exclude` plus
-    /// every discovered `.gitignore` in the working tree.
+    /// Build a matcher for `repo_root`, sampling the current effective
+    /// `core.excludesFile`, then loading `info_exclude` and every discovered
+    /// `.gitignore` in the working tree.
     ///
     /// Discovery walks directories eagerly and stops descending into
     /// nested repository boundaries and always-pruned subtrees, so a
@@ -188,9 +210,11 @@ impl RepoIgnoreMatcher {
     /// [`Self::fail_open`].
     pub(crate) fn build(repo_root: &Path, info_exclude: &Path) -> io::Result<Self> {
         let repo_root = repo_root.to_path_buf();
+        let core_excludes = load_core_excludes_matcher(&repo_root)?;
         let info_exclude = load_matcher(&repo_root, info_exclude)?;
         let mut matcher = Self {
             repo_root: repo_root.clone(),
+            core_excludes,
             info_exclude,
             layers: Vec::new(),
         };
@@ -210,6 +234,7 @@ impl RepoIgnoreMatcher {
     pub(crate) fn fail_open(repo_root: &Path) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
+            core_excludes: Gitignore::empty(),
             info_exclude: Gitignore::empty(),
             layers: Vec::new(),
         }
@@ -300,12 +325,15 @@ impl RepoIgnoreMatcher {
         self.direct_match(path, is_dir) == MatchDecision::Ignore
     }
 
-    /// Combine `info/exclude` and every `.gitignore` layer whose
-    /// directory covers `path`. Later (deeper) layers override
-    /// earlier ones only when they produce a non-`None` decision,
-    /// matching git's precedence rules.
+    /// Combine `core.excludesFile`, `info/exclude`, and every `.gitignore`
+    /// layer whose directory covers `path`. Later layers override earlier
+    /// ones only when they produce a non-`None` decision.
     fn direct_match(&self, path: &Path, is_dir: bool) -> MatchDecision {
-        let mut result = decision(self.info_exclude.matched(path, is_dir));
+        let mut result = decision(self.core_excludes.matched(path, is_dir));
+        let info = decision(self.info_exclude.matched(path, is_dir));
+        if info != MatchDecision::None {
+            result = info;
+        }
         for layer in &self.layers {
             if !path.starts_with(&layer.directory) {
                 continue;
@@ -367,6 +395,110 @@ fn decision(matched: Match<&ignore::gitignore::Glob>) -> MatchDecision {
         Match::Ignore(_) => MatchDecision::Ignore,
         Match::Whitelist(_) => MatchDecision::Whitelist,
     }
+}
+
+/// Effective `core.excludesFile` state. Git treats the three cases
+/// differently, so they stay distinct: an unset key falls back to the XDG
+/// default, while an explicitly empty value disables the global ignore file.
+#[derive(Debug, PartialEq, Eq)]
+enum CoreExcludesPath {
+    Unset,
+    Empty,
+    Path(PathBuf),
+}
+
+/// Load the matcher for the effective `core.excludesFile`.
+///
+/// `Unset` defers to the same XDG default Git itself would read, so a
+/// repository that configures nothing still honors the user's global ignore
+/// file.
+fn load_core_excludes_matcher(repo_root: &Path) -> io::Result<Gitignore> {
+    match query_core_excludes_path(repo_root)? {
+        CoreExcludesPath::Unset => {
+            let (matcher, error) = GitignoreBuilder::new(repo_root).build_global();
+            if error.is_some() {
+                return Err(core_excludes_error(io::ErrorKind::InvalidData));
+            }
+            Ok(matcher)
+        }
+        CoreExcludesPath::Empty => Ok(Gitignore::empty()),
+        CoreExcludesPath::Path(path) => load_matcher(repo_root, &path)
+            .map_err(|_| core_excludes_error(io::ErrorKind::InvalidData)),
+    }
+}
+
+fn query_core_excludes_path(repo_root: &Path) -> io::Result<CoreExcludesPath> {
+    let output = query_core_excludes_output(repo_root)?;
+    parse_core_excludes_output(
+        repo_root,
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+fn query_core_excludes_output(repo_root: &Path) -> io::Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "--null", "--path", "--get", "core.excludesFile"])
+        .output()
+        .map_err(|_| core_excludes_error(io::ErrorKind::Other))
+}
+
+/// Interpret one `git config --null --path --get` result.
+///
+/// Only "key absent" is inferred, and only from the exact shape Git uses for
+/// it: exit 1 with both streams empty. Any other non-zero exit, any stderr, a
+/// value that is not NUL-terminated, or an embedded NUL — which would mean
+/// more than one value and no unambiguous choice — is an error rather than a
+/// guess, so a misread never silently widens or narrows what the watcher
+/// ignores.
+fn parse_core_excludes_output(
+    repo_root: &Path,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> io::Result<CoreExcludesPath> {
+    if exit_code == Some(1) && stdout.is_empty() && stderr.is_empty() {
+        return Ok(CoreExcludesPath::Unset);
+    }
+    if exit_code != Some(0) || !stderr.is_empty() {
+        return Err(core_excludes_error(io::ErrorKind::InvalidData));
+    }
+    let Some((&0, value)) = stdout.split_last() else {
+        return Err(core_excludes_error(io::ErrorKind::InvalidData));
+    };
+    if value.contains(&0) {
+        return Err(core_excludes_error(io::ErrorKind::InvalidData));
+    }
+    if value.is_empty() {
+        return Ok(CoreExcludesPath::Empty);
+    }
+
+    #[cfg(unix)]
+    let path = {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(value.to_vec()))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(
+        std::str::from_utf8(value).map_err(|_| core_excludes_error(io::ErrorKind::InvalidData))?,
+    );
+
+    Ok(if path.is_absolute() {
+        CoreExcludesPath::Path(path)
+    } else {
+        CoreExcludesPath::Path(repo_root.join(path))
+    })
+}
+
+/// One opaque error for every failure to determine the effective ignore
+/// configuration. Callers only need "unavailable" to fail open, and a fixed
+/// message keeps configured paths and values out of watcher diagnostics.
+fn core_excludes_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "effective Git ignore configuration is unavailable")
 }
 
 /// Build a `Gitignore` matcher anchored at `root` from the patterns
@@ -447,6 +579,451 @@ pub(crate) fn is_nested_git_marker_path(repo_root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::process::{Command, Output};
+
+    fn git_command(root: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.join(".cairn-test-global"));
+        command
+    }
+
+    fn run_git(root: &Path, args: &[&str]) -> Output {
+        git_command(root)
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn configure_core_excludes(root: &Path, value: &std::ffi::OsStr) {
+        let status = git_command(root)
+            .arg("-C")
+            .arg(root)
+            .arg("config")
+            .arg("core.excludesFile")
+            .arg(value)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn core_excludes_query_contract_is_nul_exact_and_cwd_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+
+        configure_core_excludes(&root, std::ffi::OsStr::new("rules/with space\nline"));
+        let output = query_core_excludes_output(&root).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"rules/with space\nline\0");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            parse_core_excludes_output(
+                &root,
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            )
+            .unwrap(),
+            CoreExcludesPath::Path(root.join("rules/with space\nline"))
+        );
+
+        let absolute = tmp.path().join("absolute rules");
+        configure_core_excludes(&root, absolute.as_os_str());
+        let output = query_core_excludes_output(&root).unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            parse_core_excludes_output(
+                &root,
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            )
+            .unwrap(),
+            CoreExcludesPath::Path(absolute)
+        );
+
+        configure_core_excludes(&root, std::ffi::OsStr::new("~/rules"));
+        let output = query_core_excludes_output(&root).unwrap();
+        assert_eq!(
+            parse_core_excludes_output(
+                &root,
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            )
+            .unwrap(),
+            CoreExcludesPath::Path(
+                PathBuf::from(std::env::var_os("HOME").unwrap()).join("rules")
+            )
+        );
+
+        configure_core_excludes(&root, std::ffi::OsStr::new(""));
+        let output = query_core_excludes_output(&root).unwrap();
+        assert_eq!(output.stdout, b"\0");
+        assert_eq!(
+            parse_core_excludes_output(
+                &root,
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            )
+            .unwrap(),
+            CoreExcludesPath::Empty
+        );
+
+        assert!(
+            run_git(&root, &["config", "--unset", "core.excludesFile"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            parse_core_excludes_output(&root, Some(1), b"", b"").unwrap(),
+            CoreExcludesPath::Unset
+        );
+    }
+
+    #[test]
+    fn core_excludes_query_contract_rejects_ambiguous_process_results() {
+        let root = Path::new("/repo");
+        for (code, stdout, stderr) in [
+            (Some(0), b"not-terminated".as_slice(), b"".as_slice()),
+            (Some(0), b"one\0two\0".as_slice(), b"".as_slice()),
+            (Some(0), b"rules\0".as_slice(), b"warning".as_slice()),
+            (Some(1), b"rules\0".as_slice(), b"".as_slice()),
+            (Some(1), b"".as_slice(), b"error".as_slice()),
+            (Some(2), b"".as_slice(), b"".as_slice()),
+            (None, b"".as_slice(), b"".as_slice()),
+        ] {
+            assert!(
+                parse_core_excludes_output(root, code, stdout, stderr).is_err(),
+                "unexpectedly accepted code={code:?}, stdout={stdout:?}, stderr={stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_ignore_authority_orders_core_then_info_then_nested_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("core-ignore"), "*.rs\n*.tmp\n").unwrap();
+        fs::write(root.join(".git/info/exclude"), "!same.rs\n!info.tmp\n").unwrap();
+        fs::write(root.join(".gitignore"), "same.rs\n").unwrap();
+        fs::write(root.join("sub/.gitignore"), "!same.rs\n").unwrap();
+        configure_core_excludes(&root, std::ffi::OsStr::new("core-ignore"));
+        for path in ["same.rs", "sub/same.rs", "only-core.rs", "info.tmp"] {
+            fs::write(root.join(path), "").unwrap();
+        }
+
+        assert!(
+            run_git(&root, &["check-ignore", "-q", "same.rs"])
+                .status
+                .success()
+        );
+        assert!(
+            !run_git(&root, &["check-ignore", "-q", "sub/same.rs"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&root, &["check-ignore", "-q", "only-core.rs"])
+                .status
+                .success()
+        );
+        assert!(
+            !run_git(&root, &["check-ignore", "-q", "info.tmp"])
+                .status
+                .success()
+        );
+
+        let metadata = resolve_git_metadata(&root).unwrap();
+        let matcher = RepoIgnoreMatcher::build(&root, &metadata.info_exclude).unwrap();
+        assert!(matcher.is_ignored(&root.join("same.rs"), false));
+        assert!(!matcher.is_ignored(&root.join("sub/same.rs"), false));
+        assert!(matcher.is_ignored(&root.join("only-core.rs"), false));
+        assert!(!matcher.is_ignored(&root.join("info.tmp"), false));
+    }
+
+    /// Only the root config and `config.worktree` are live ignore controls.
+    /// Included config and selected excludes files are sampled at build time,
+    /// wherever they live; changing either file alone leaves the current
+    /// matcher unchanged until reload, reindex, restart, or another rebuild.
+    #[test]
+    fn git_config_authority_resolves_conditional_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+        let included = tmp.path().join("included.conf");
+        fs::write(&included, "[core]\n\texcludesFile = rules-a\n").unwrap();
+        fs::write(root.join("rules-a"), "/a.rs\n").unwrap();
+        fs::write(root.join("rules-b"), "/b.rs\n").unwrap();
+        let git_dir = run_git(&root, &["rev-parse", "--absolute-git-dir"]);
+        assert!(git_dir.status.success());
+        assert!(git_dir.stderr.is_empty());
+        let git_dir = std::str::from_utf8(&git_dir.stdout)
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        let common_dir = run_git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        assert!(common_dir.status.success());
+        assert_eq!(common_dir.stdout, format!("{git_dir}\n").as_bytes());
+        let condition = format!("gitdir:{git_dir}");
+        let include_status = git_command(&root)
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "--add"])
+            .arg(format!("includeIf.{condition}.path"))
+            .arg(&included)
+            .status()
+            .unwrap();
+        assert!(include_status.success());
+        let output = query_core_excludes_output(&root).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"rules-a\0");
+        assert!(output.stderr.is_empty());
+
+        let metadata = resolve_git_metadata(&root).unwrap();
+        let matcher = RepoIgnoreMatcher::build(&root, &metadata.info_exclude).unwrap();
+        assert!(matcher.is_ignored(&root.join("a.rs"), false));
+        assert!(!matcher.is_ignored(&root.join("b.rs"), false));
+
+        fs::write(&included, "[core]\n\texcludesFile = rules-b\n").unwrap();
+        assert!(matcher.is_ignored(&root.join("a.rs"), false));
+        assert!(!matcher.is_ignored(&root.join("b.rs"), false));
+
+        let rebuilt = RepoIgnoreMatcher::build(&root, &metadata.info_exclude).unwrap();
+        assert!(!rebuilt.is_ignored(&root.join("a.rs"), false));
+        assert!(rebuilt.is_ignored(&root.join("b.rs"), false));
+    }
+
+    #[test]
+    fn git_config_authority_resolves_linked_worktree_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("main");
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&root).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+        fs::write(root.join("tracked"), "").unwrap();
+        assert!(run_git(&root, &["add", "tracked"]).status.success());
+        assert!(
+            run_git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Cairn Test",
+                    "-c",
+                    "user.email=cairn@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            )
+            .status
+            .success()
+        );
+        assert!(
+            run_git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "fixture-worktree",
+                    worktree.to_str().unwrap(),
+                ],
+            )
+            .status
+            .success()
+        );
+        assert!(
+            run_git(&root, &["config", "extensions.worktreeConfig", "true"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(
+                &worktree,
+                &[
+                    "config",
+                    "--worktree",
+                    "core.excludesFile",
+                    "worktree.rules",
+                ],
+            )
+            .status
+            .success()
+        );
+        let output = query_core_excludes_output(&worktree).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"worktree.rules\0");
+        let git_dir = run_git(&worktree, &["rev-parse", "--absolute-git-dir"]);
+        let common_dir = run_git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        assert!(git_dir.status.success());
+        assert!(common_dir.status.success());
+        assert_ne!(git_dir.stdout, common_dir.stdout);
+        let git_dir = std::str::from_utf8(&git_dir.stdout)
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        assert!(Path::new(git_dir).join("config.worktree").is_file());
+    }
+
+    #[test]
+    fn unset_core_excludes_adopts_xdg_default_in_repo_matcher() {
+        const CHILD: &str = "CAIRN_XDG_MATCHER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os("CAIRN_XDG_MATCHER_ROOT").unwrap());
+            let metadata = resolve_git_metadata(&root).unwrap();
+            let result = RepoIgnoreMatcher::build(&root, &metadata.info_exclude);
+            if std::env::var_os("CAIRN_XDG_MATCHER_EXPECT_ERROR").is_some() {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_ignored(&root.join("xdg.rs"), false));
+            }
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&home).unwrap();
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+        fs::write(xdg.join("git/ignore"), "/xdg.rs\n").unwrap();
+        fs::write(root.join("xdg.rs"), "").unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "matcher::tests::unset_core_excludes_adopts_xdg_default_in_repo_matcher",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("CAIRN_XDG_MATCHER_ROOT", &root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                tmp.path().join("missing-global-config"),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        fs::write(xdg.join("git/ignore"), "[z-a]\n").unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "matcher::tests::unset_core_excludes_adopts_xdg_default_in_repo_matcher",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("CAIRN_XDG_MATCHER_EXPECT_ERROR", "1")
+            .env("CAIRN_XDG_MATCHER_ROOT", &root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                tmp.path().join("missing-global-config"),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn missing_ignore_file_builds_an_empty_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let matcher = load_matcher(root, &root.join("missing-ignore")).unwrap();
+
+        assert_eq!(
+            decision(matcher.matched(root.join("source.rs"), false)),
+            MatchDecision::None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn core_excludes_query_preserves_non_utf8_without_shell_interpretation() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+        let raw = b"rules/\xff;$(touch SHOULD_NOT_EXIST)*.ignore".to_vec();
+        configure_core_excludes(&root, &OsString::from_vec(raw.clone()));
+
+        let output = query_core_excludes_output(&root).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, [raw.as_slice(), b"\0"].concat());
+        let parsed =
+            parse_core_excludes_output(&root, output.status.code(), &output.stdout, &output.stderr)
+                .unwrap();
+        let CoreExcludesPath::Path(parsed) = parsed else {
+            panic!("configured non-UTF-8 path was not retained");
+        };
+        assert_eq!(
+            parsed.as_os_str().as_bytes(),
+            root.join(OsString::from_vec(raw)).as_os_str().as_bytes()
+        );
+        assert!(!root.join("SHOULD_NOT_EXIST").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn core_excludes_query_keeps_a_symlink_path_lexical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        assert!(run_git(&root, &["init", "-q"]).status.success());
+        fs::write(root.join("actual-ignore"), "/generated.rs\n").unwrap();
+        std::os::unix::fs::symlink("actual-ignore", root.join("ignore-link")).unwrap();
+        configure_core_excludes(&root, std::ffi::OsStr::new("ignore-link"));
+
+        let output = query_core_excludes_output(&root).unwrap();
+        assert_eq!(output.stdout, b"ignore-link\0");
+        assert_eq!(
+            parse_core_excludes_output(
+                &root,
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            )
+            .unwrap(),
+            CoreExcludesPath::Path(root.join("ignore-link"))
+        );
+        assert!(
+            fs::symlink_metadata(root.join("ignore-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn nested_anchored_pattern_stays_scoped_to_its_directory() {
@@ -578,7 +1155,10 @@ mod tests {
         );
 
         fs::write(&paths.info_exclude, "generated.rs\n").unwrap();
-        let matcher = RepoIgnoreMatcher::build(&root, &paths.info_exclude).unwrap();
-        assert!(matcher.is_ignored(&root.join("generated.rs"), false));
+        let matcher = load_matcher(&root, &paths.info_exclude).unwrap();
+        assert_eq!(
+            decision(matcher.matched(root.join("generated.rs"), false)),
+            MatchDecision::Ignore
+        );
     }
 }
