@@ -1174,6 +1174,48 @@ mod tests {
         }
     }
 
+    struct SelfWritingConfigAnalyzer;
+
+    impl WorkspaceAnalyzer for SelfWritingConfigAnalyzer {
+        fn id(&self) -> &'static str {
+            "self-writing-config"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-test"
+        }
+
+        fn config_paths(&self) -> &'static [&'static str] {
+            &[".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"]
+        }
+
+        fn analyze_workspace(
+            &self,
+            repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            let generated_dir = repo_root.join(".ruby-lsp");
+            fs::create_dir_all(&generated_dir).unwrap();
+            fs::write(
+                generated_dir.join("Gemfile"),
+                "source 'https://example.invalid'\n",
+            )
+            .unwrap();
+            fs::write(generated_dir.join("Gemfile.lock"), "GEM\n").unwrap();
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
     #[test]
     fn config_hash_changes_when_globbed_config_file_is_added() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1194,6 +1236,58 @@ mod tests {
         let paths = expanded_config_paths(tmp.path(), &["*.csproj"]);
 
         assert_eq!(paths, vec!["A.csproj", "B.csproj"]);
+    }
+
+    /// The runner stamps the inputs it was asked to analyze, not files written
+    /// during that run. Exact watcher edges for those self-written inputs hand
+    /// the post-run hash to reconcile, which owns the bounded successor pass.
+    #[test]
+    fn self_written_config_uses_pre_run_stamp_for_watcher_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::write(repo.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let (mut conn, entry) = seed_fixture(&db.path().join("store.db"), "src/lib.rs");
+        let config_paths = [".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"];
+        let pre_run_hash = config_hash(repo.path(), &config_paths);
+
+        let execution = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer: Box::new(SelfWritingConfigAnalyzer),
+                repo_root: repo.path(),
+                manifest_id: ManifestId(1),
+                entries: &[entry],
+                now_ns: 1,
+                analyzer_stall_timeout: Duration::from_secs(1),
+                job_id: None,
+                progress: None,
+            },
+        )
+        .unwrap();
+        let (status, stored_hash): (String, String) = conn
+            .query_row(
+                "SELECT status, config_hash FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'self-writing-config'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let post_run_hash = config_hash(repo.path(), &config_paths);
+        let run_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'self-writing-config'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(execution.status, RunStatus::Succeeded);
+        assert_eq!(status, "succeeded");
+        assert_eq!(stored_hash, pre_run_hash);
+        assert_ne!(stored_hash, post_run_hash);
+        assert_eq!(run_rows, 1, "the runner does not own the successor");
     }
 
     #[test]

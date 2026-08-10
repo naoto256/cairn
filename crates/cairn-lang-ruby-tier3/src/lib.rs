@@ -81,13 +81,21 @@ impl WorkspaceAnalyzer for RubyLspWorkspaceAnalyzer {
 static REGISTER_RUBY_LSP_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(RubyLspWorkspaceAnalyzer);
 
+/// Inputs whose bytes contribute to the Ruby analyzer's scheduler snapshot.
+///
+/// Ruby LSP generates other runtime state under `.ruby-lsp`, but only its
+/// composed-bundle inputs affect analyzer currency. The scheduler samples
+/// these exact paths for its config hash, while the watcher forwards only
+/// their exact edges to reconcile; the generated directory remains excluded
+/// from scans and manifests.
 fn ruby_config_paths() -> &'static [&'static str] {
     &[
         "Gemfile",
         "Gemfile.lock",
         ".rubocop.yml",
         ".ruby-version",
-        ".ruby-lsp/",
+        ".ruby-lsp/Gemfile",
+        ".ruby-lsp/Gemfile.lock",
     ]
 }
 
@@ -255,6 +263,7 @@ fn site_from_node(node: Node<'_>) -> DefinitionSite {
 mod tests {
     use super::*;
     use cairn_core::lsp::Url;
+    use cairn_core::workspace_analyzer::compute_analyzer_run_inputs;
     use std::fs;
 
     #[test]
@@ -300,6 +309,66 @@ end
         assert!(names.contains(&"Mixin"));
         assert!(!names.contains(&"App"));
         assert!(!names.contains(&"Main"));
+    }
+
+    fn ruby_config_hash(repo_root: &Path) -> String {
+        compute_analyzer_run_inputs(&RubyLspWorkspaceAnalyzer, repo_root).1
+    }
+
+    #[test]
+    fn composed_bundle_inputs_drive_ruby_analyzer_currency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let generated_dir = tmp.path().join(".ruby-lsp");
+        fs::create_dir(&generated_dir).unwrap();
+        let without_bundle = ruby_config_hash(tmp.path());
+        let mut observations = Vec::new();
+
+        for name in ["Gemfile", "Gemfile.lock"] {
+            let path = generated_dir.join(name);
+            fs::write(&path, b"a").unwrap();
+            let after_add = ruby_config_hash(tmp.path());
+            fs::write(&path, b"b").unwrap();
+            let after_one_byte_edit = ruby_config_hash(tmp.path());
+            fs::remove_file(&path).unwrap();
+            let after_delete = ruby_config_hash(tmp.path());
+            observations.push((name, after_add, after_one_byte_edit, after_delete));
+        }
+
+        assert!(
+            observations.iter().all(|(_, added, edited, deleted)| {
+                added != &without_bundle && edited != added && deleted == &without_bundle
+            }),
+            "composed bundle add/edit/delete must update and then restore the persisted currency input: {observations:?}"
+        );
+    }
+
+    #[test]
+    fn generated_ruby_lsp_runtime_state_does_not_drive_currency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let generated_dir = tmp.path().join(".ruby-lsp");
+        fs::create_dir(&generated_dir).unwrap();
+        let before = ruby_config_hash(tmp.path());
+
+        for relative in [
+            "freshness_hash",
+            "last_updated",
+            "install_error",
+            "bundle_env",
+            "needs_update",
+            "bundle_is_composed",
+            "coverage_result.json",
+            "server.log",
+            "compose.lock",
+            "cache/index",
+        ] {
+            let path = generated_dir.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, b"generated").unwrap();
+        }
+
+        assert_eq!(before, ruby_config_hash(tmp.path()));
     }
 
     #[test]
