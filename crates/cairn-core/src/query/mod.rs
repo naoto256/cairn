@@ -33,8 +33,8 @@ pub use find_impls::{
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
 pub(crate) use find_references::find_references_with_status;
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};
-pub(crate) use find_symbols::find_symbols_with_status;
 pub use find_symbols::{FindSymbolsArgs, SymbolHit, find_symbols};
+pub(crate) use find_symbols::{RankedSymbolHit, find_symbols_with_status};
 pub use get_outline::{OutlineFilter, OutlineItem, get_outline, get_outline_under_path};
 pub use get_symbol_source::{SymbolSourceRow, get_symbol_source_row, get_symbol_source_rows};
 
