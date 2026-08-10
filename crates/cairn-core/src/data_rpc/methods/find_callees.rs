@@ -2,6 +2,8 @@
 //! `find_references` with `direction = Outgoing` and `kind = Call`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cairn_proto::common::RefKind;
 use cairn_proto::methods::{CallHit, FindCalleesArgs, FindCalleesResult, ReferenceDirection};
@@ -10,7 +12,7 @@ use serde_json::Value;
 
 use super::super::{DATA_METHODS, DataCtx, DataMethod, parse_params};
 use super::find_callers::into_call_hit;
-use super::find_references::SnippetCache;
+use super::find_references::{SnippetCache, call_graph_completeness};
 use crate::data_rpc::helpers::{
     EmissionContext, QueryArgsView, QueryToolKind, SnapshotQueryRequest,
     build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
@@ -49,6 +51,8 @@ impl DataMethod for FindCallees {
         let anchor_arg = args.scope.anchor.clone();
         let branch_arg = args.scope.branch.clone();
         let requested_repo = args.scope.repo.clone();
+        let any_omitted_unresolved_calls = Arc::new(AtomicBool::new(false));
+        let query_omitted_unresolved_calls = Arc::clone(&any_omitted_unresolved_calls);
 
         let execution = query_one_or_all_snapshots(
             ctx,
@@ -64,30 +68,47 @@ impl DataMethod for FindCallees {
             move |entry, conn, snapshot| {
                 let anchor_label = snapshot.anchor.as_str().to_string();
                 let worktree_root = PathBuf::from(&entry.root_path);
-                let hits = query::find_references(conn, &snapshot.anchor, &q)?;
+                let outcome = query::find_references_with_status(conn, &snapshot.anchor, &q)?;
+                let omitted_unresolved_calls = outcome.omitted_unresolved_calls;
+                query_omitted_unresolved_calls
+                    .fetch_or(omitted_unresolved_calls, Ordering::Relaxed);
                 let mut snippets = SnippetCache::new(entry.alias.clone(), worktree_root);
-                Ok(hits
+                Ok(outcome
+                    .hits
                     .into_iter()
                     .map(|h| {
                         let parser_id = h.parser_id.clone();
                         (
                             into_call_hit(&entry.alias, &anchor_label, h, &mut snippets),
                             parser_id,
+                            omitted_unresolved_calls,
                         )
                     })
                     .collect())
             },
-            |hits| parser_id_filter(hits.iter().map(|(_, parser_id)| parser_id.clone())),
-            |_out: &mut Vec<(CallHit, String)>| {},
+            |hits| parser_id_filter(hits.iter().map(|(_, parser_id, _)| parser_id.clone())),
+            |_out: &mut Vec<(CallHit, String, bool)>| {},
         )
         .await?;
-        let items: Vec<_> = execution.items.into_iter().map(|(item, _)| item).collect();
+        // Evidence follows surviving rows across cross-repo final trimming.
+        // An unresolved-only result has no row to carry provenance, so retain
+        // the aggregate bit only when the final result itself is empty.
+        let omitted_unresolved_calls = execution.items.iter().any(|(_, _, omitted)| *omitted)
+            || (execution.items.is_empty() && any_omitted_unresolved_calls.load(Ordering::Relaxed));
+        let items: Vec<_> = execution
+            .items
+            .into_iter()
+            .map(|(item, _, _)| item)
+            .collect();
         let tier3_status = execution.tier3_status;
         let freshness_issues = execution.freshness_issues;
-        let completeness = completeness_for_snapshot_scan(
-            execution.capped,
-            execution.skipped_unavailable,
-            &freshness_issues,
+        let completeness = call_graph_completeness(
+            completeness_for_snapshot_scan(
+                execution.capped,
+                execution.skipped_unavailable,
+                &freshness_issues,
+            ),
+            omitted_unresolved_calls,
         );
         let emission_ctx = EmissionContext {
             tool: QueryToolKind::FindCallees,
@@ -136,6 +157,7 @@ mod tests {
 
     use super::*;
     use crate::cas::{registry as cas_registry, store as cas_store};
+    use crate::data_rpc::methods::find_references::FindReferences;
     use crate::paths::{CasDataDir, path_hash};
     use crate::register::register_repo;
     use crate::testutil::init_repo;
@@ -155,6 +177,56 @@ mod tests {
         assert_eq!(items[0]["target_name"], "resolved");
         assert_eq!(items[0]["target_qualified"], "resolved");
         assert_eq!(items[0]["enclosing_qualified"], "caller");
+    }
+
+    #[tokio::test]
+    async fn returns_distinct_zero_range_resolved_callees() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub fn first() {}\n\
+             pub fn second() {}\n\
+             pub fn third() {}\n\
+             pub fn caller() { first(); second(); third(); }\n",
+        )]);
+        let fixture = fixture_from_repo(_repo);
+
+        let result = FindCallees
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "caller", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        let names: Vec<_> = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["target_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["first", "second", "third"]);
+        assert_eq!(result["completeness"]["status"], "complete");
+
+        let references = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "symbol": "caller",
+                    "direction": "outgoing",
+                    "kind": "call",
+                    "anchor": "HEAD"
+                }),
+            )
+            .await
+            .unwrap();
+        let reference_names: Vec<_> = references["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["target_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(reference_names, ["first", "second", "third"]);
+        assert_eq!(references["completeness"]["status"], "complete");
     }
 
     #[tokio::test]
@@ -181,6 +253,209 @@ mod tests {
         let items = result["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["target_name"], "resolved");
+    }
+
+    #[tokio::test]
+    async fn omitted_unresolved_calls_make_the_public_call_graph_partial() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n\
+             pub fn resolved() {}\n\
+             pub fn caller(arg: Widget) {\n\
+                 resolved();\n\
+                 arg.render();\n\
+             }\n",
+        )]);
+        let fixture = fixture_from_repo(_repo);
+
+        let callees = FindCallees
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "caller", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callees["items"].as_array().unwrap().len(), 1);
+        assert_eq!(callees["items"][0]["target_name"], "resolved");
+        assert_eq!(callees["completeness"]["status"], "partial");
+        assert_eq!(callees["completeness"]["reason"], "call_graph_unresolved");
+
+        let outgoing_default = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "symbol": "caller",
+                    "anchor": "HEAD",
+                    "direction": "outgoing"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outgoing_default["items"].as_array().unwrap().len(), 1);
+        assert_eq!(outgoing_default["completeness"]["status"], "partial");
+        assert_eq!(
+            outgoing_default["completeness"]["reason"],
+            "call_graph_unresolved"
+        );
+
+        let outgoing = FindReferences
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "symbol": "caller",
+                    "anchor": "HEAD",
+                    "direction": "outgoing",
+                    "include_noise": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outgoing["completeness"]["status"], "complete");
+        assert!(
+            outgoing["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["kind"] == "call" && item["target_name"] == "render" })
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_only_call_graph_is_empty_and_partial() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n\
+             pub fn caller(arg: Widget) { arg.render(); }\n",
+        )]);
+        let fixture = fixture_from_repo(_repo);
+
+        for result in [
+            FindCallees
+                .dispatch(
+                    &fixture.ctx,
+                    json!({"repo": "demo", "name": "caller", "anchor": "HEAD"}),
+                )
+                .await
+                .unwrap(),
+            FindReferences
+                .dispatch(
+                    &fixture.ctx,
+                    json!({
+                        "repo": "demo",
+                        "symbol": "caller",
+                        "anchor": "HEAD",
+                        "direction": "outgoing"
+                    }),
+                )
+                .await
+                .unwrap(),
+        ] {
+            assert!(result["items"].as_array().unwrap().is_empty());
+            assert_eq!(result["completeness"]["status"], "partial");
+            assert_eq!(result["completeness"]["reason"], "call_graph_unresolved");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_call_noise_does_not_make_the_call_graph_partial() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub struct Widget;\n\
+             pub fn caller(_arg: Widget) {}\n",
+        )]);
+        let fixture = fixture_from_repo(_repo);
+
+        let result = FindCallees
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "caller", "anchor": "HEAD"}),
+            )
+            .await
+            .unwrap();
+        assert!(result["items"].as_array().unwrap().is_empty());
+        assert_eq!(result["completeness"]["status"], "complete");
+    }
+
+    #[tokio::test]
+    async fn unresolved_call_outranks_cap_but_keeps_one_cap_hint() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub struct Widget;\n\
+             impl Widget { pub fn render(&self) {} }\n\
+             pub fn first() {}\n\
+             pub fn second() {}\n\
+             pub fn caller(arg: Widget) { first(); second(); arg.render(); }\n",
+        )]);
+        let fixture = fixture_from_repo(_repo);
+
+        for result in [
+            FindCallees
+                .dispatch(
+                    &fixture.ctx,
+                    json!({"repo": "demo", "name": "caller", "anchor": "HEAD", "limit": 1}),
+                )
+                .await
+                .unwrap(),
+            FindReferences
+                .dispatch(
+                    &fixture.ctx,
+                    json!({
+                        "repo": "demo",
+                        "symbol": "caller",
+                        "direction": "outgoing",
+                        "kind": "call",
+                        "anchor": "HEAD",
+                        "limit": 1
+                    }),
+                )
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(result["items"].as_array().unwrap().len(), 1);
+            assert_eq!(result["completeness"]["reason"], "call_graph_unresolved");
+            assert_eq!(
+                result["hints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|hint| hint["code"] == "capped_increase_limit")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_only_limit_remains_cap_partial() {
+        let (_repo, _sha) = init_repo(&[(
+            "src/lib.rs",
+            "pub fn first() {}\n\
+             pub fn second() {}\n\
+             pub fn caller() { first(); second(); }\n",
+        )]);
+        let fixture = fixture_from_repo(_repo);
+
+        let result = FindCallees
+            .dispatch(
+                &fixture.ctx,
+                json!({"repo": "demo", "name": "caller", "anchor": "HEAD", "limit": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["completeness"]["reason"], "cap");
+        assert_eq!(
+            result["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hint| hint["code"] == "capped_increase_limit")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
