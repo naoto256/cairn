@@ -127,9 +127,11 @@ pub enum WatchBackend {
 /// `debounce` and pushed on `tx`. The returned handle must be kept
 /// alive; dropping it stops the watcher.
 ///
-/// Gitignore filtering uses the same hierarchical matcher as the
-/// startup scanner: repository-local `.gitignore` files plus the
-/// repository's `.git/info/exclude`.
+/// Gitignore filtering uses the same hierarchical matcher as the startup
+/// scanner: the effective `core.excludesFile`, `.git/info/exclude`, and
+/// repository-local `.gitignore` files. Included config and selected excludes
+/// files are sampled when the matcher is built, wherever they live; only the
+/// root config and `config.worktree` are live ignore controls.
 ///
 /// # Errors
 /// Setup-time errors from `notify` or the filesystem.
@@ -282,8 +284,9 @@ impl EventClassifier {
     ///
     /// 1. The backend requested a rescan (`need_rescan()` flag) —
     ///    [`RescanReason::BackendRequested`].
-    /// 2. Any path is an ignore-control file (info/exclude or a
-    ///    working-tree `.gitignore`) — [`RescanReason::IgnoreRulesChanged`].
+    /// 2. Any path is an ignore-control file (info/exclude, local Git
+    ///    config, worktree config, or a working-tree `.gitignore`) —
+    ///    [`RescanReason::IgnoreRulesChanged`].
     /// 3. A create/remove/rename touches a nested `.git` marker in
     ///    the working tree — [`RescanReason::DirectoryTopologyChanged`].
     /// 4. Any working-tree directory create/remove/rename — same
@@ -384,8 +387,12 @@ impl EventClassifier {
         }
     }
 
-    /// Rebuild the ignore matcher from the on-disk `.gitignore` set
-    /// and swap it into place. On failure the classifier installs a
+    /// Rebuild the ignore matcher from the effective Git ignore snapshot and
+    /// swap it into place. Included config and selected excludes files are
+    /// sampled here but are not live watcher roots, wherever they live; a root
+    /// config or `config.worktree` event, reload, reindex, or restart observes
+    /// their latest contents. On
+    /// failure the classifier installs a
     /// permissive [`RepoIgnoreMatcher::fail_open`] so events keep
     /// flowing, and hands off to [`Self::start_matcher_retry`] so a
     /// later rebuild can restore normal filtering — the fail-open
@@ -472,14 +479,20 @@ impl EventClassifier {
         });
     }
 
-    /// True when `path` is a file that changes the ignore rules
-    /// themselves: the resolved `.git/info/exclude`, or any
-    /// `.gitignore` file inside the working tree. A `.gitignore`
+    /// True when `path` is a file that changes the ignore rules themselves:
+    /// the resolved `.git/info/exclude`, the repository's common config, the
+    /// per-worktree config, or any `.gitignore` file inside the working tree.
+    /// A `.gitignore`
     /// found *inside* a git dir (e.g. `.git/.gitignore`) is
     /// deliberately not treated as an ignore-control file because
     /// [`Self::is_working_tree_path`] excludes the git dirs.
     fn is_ignore_control(&self, path: &Path) -> bool {
         path == self.git_metadata.info_exclude
+            || self
+                .git_metadata
+                .ignore_controls
+                .iter()
+                .any(|item| item == path)
             || (self.is_working_tree_path(path)
                 && path.file_name().is_some_and(|name| name == ".gitignore"))
     }
@@ -736,6 +749,23 @@ mod tests {
         EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx)
     }
 
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.join(".cairn-test-global"))
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    fn init_git_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        run_git(root, &["init", "-q"]);
+    }
+
     fn debounced(event: notify::Event) -> notify_debouncer_full::DebouncedEvent {
         notify_debouncer_full::DebouncedEvent::new(event, std::time::Instant::now())
     }
@@ -905,6 +935,174 @@ mod tests {
                 .classify(&ignored, EventKind::Modify(ModifyKind::Any))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn common_and_worktree_configs_are_ignore_controls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("worktree");
+        let common = tmp.path().join("main.git");
+        let worktree_git_dir = common.join("worktrees/w1");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+        let metadata = resolve_git_metadata(&root).unwrap();
+        let classifier = classifier_for(&root);
+
+        assert!(classifier.is_ignore_control(&metadata.common_git_dir.join("config")));
+        assert!(classifier.is_ignore_control(&metadata.worktree_git_dir.join("config.worktree")));
+    }
+
+    #[tokio::test]
+    async fn local_core_excludes_config_change_reloads_classification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_git_repo(root);
+        std::fs::write(root.join("rules-a"), "/a.rs\n").unwrap();
+        std::fs::write(root.join("rules-b"), "/b.rs\n").unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            "[core]\n\texcludesFile = rules-a\n",
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        assert!(
+            classifier
+                .classify(&a, EventKind::Modify(ModifyKind::Any))
+                .is_none()
+        );
+        assert!(
+            classifier
+                .classify(&b, EventKind::Modify(ModifyKind::Any))
+                .is_some()
+        );
+
+        std::fs::write(
+            root.join(".git/config"),
+            "[core]\n\texcludesFile = rules-b\n",
+        )
+        .unwrap();
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(root.join(".git/config"));
+        classifier.handle_batch(&[debounced(event)]);
+
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::IgnoreRulesChanged
+            })
+        );
+        assert!(
+            classifier
+                .classify(&a, EventKind::Modify(ModifyKind::Any))
+                .is_some()
+        );
+        assert!(
+            classifier
+                .classify(&b, EventKind::Modify(ModifyKind::Any))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_config_change_reloads_classification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let root = tmp.path().join("worktree");
+        init_git_repo(&main);
+        std::fs::write(main.join("tracked"), "").unwrap();
+        run_git(&main, &["add", "tracked"]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=Cairn Test",
+                "-c",
+                "user.email=cairn@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fixture-worktree",
+                root.to_str().unwrap(),
+            ],
+        );
+        run_git(&main, &["config", "extensions.worktreeConfig", "true"]);
+        run_git(
+            &root,
+            &["config", "--worktree", "core.excludesFile", "rules-a"],
+        );
+        std::fs::write(root.join("rules-a"), "/a.rs\n").unwrap();
+        std::fs::write(root.join("rules-b"), "/b.rs\n").unwrap();
+        let metadata = resolve_git_metadata(&root).unwrap();
+        let worktree_config = metadata.worktree_git_dir.join("config.worktree");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root.as_path(), metadata, tx);
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        assert!(classifier.is_gitignored(&a, EventKind::Modify(ModifyKind::Any)));
+        assert!(!classifier.is_gitignored(&b, EventKind::Modify(ModifyKind::Any)));
+
+        std::fs::write(&worktree_config, "[core]\n\texcludesFile = rules-b\n").unwrap();
+        let event =
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(worktree_config);
+        classifier.handle_batch(&[debounced(event)]);
+
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::IgnoreRulesChanged
+            })
+        );
+        assert!(!classifier.is_gitignored(&a, EventKind::Modify(ModifyKind::Any)));
+        assert!(classifier.is_gitignored(&b, EventKind::Modify(ModifyKind::Any)));
+    }
+
+    /// Included config and selected excludes files are not watcher roots,
+    /// wherever they live. Their current contents are sampled at matcher
+    /// construction and become visible after a root config or
+    /// `config.worktree` event, reload, reindex, or restart.
+    #[test]
+    fn external_core_excludes_changes_only_on_explicit_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let external = tmp.path().join("external-ignore");
+        init_git_repo(&root);
+        std::fs::write(&external, "/a.rs\n").unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            format!("[core]\n\texcludesFile = {}\n", external.display()),
+        )
+        .unwrap();
+        let classifier = classifier_for(&root);
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        assert!(classifier.is_gitignored(&a, EventKind::Modify(ModifyKind::Any)));
+        assert!(!classifier.is_gitignored(&b, EventKind::Modify(ModifyKind::Any)));
+
+        std::fs::write(&external, "/b.rs\n").unwrap();
+        assert!(classifier.is_gitignored(&a, EventKind::Modify(ModifyKind::Any)));
+        assert!(!classifier.is_gitignored(&b, EventKind::Modify(ModifyKind::Any)));
+
+        classifier.reload_matcher();
+        assert!(!classifier.is_gitignored(&a, EventKind::Modify(ModifyKind::Any)));
+        assert!(classifier.is_gitignored(&b, EventKind::Modify(ModifyKind::Any)));
     }
 
     #[tokio::test]
