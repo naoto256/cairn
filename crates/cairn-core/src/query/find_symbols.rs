@@ -60,18 +60,58 @@ pub struct FindSymbolsArgs {
     pub limit: Option<u32>,
 }
 
+/// Fuzzy-result priority class. The variants are declared in priority order
+/// and compared by that order, so reordering them silently changes which hits
+/// lead a fuzzy page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FuzzyRank {
+    ExactName,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RankedSymbolHit {
+    pub(crate) hit: SymbolHit,
+    rank: FuzzyRank,
+}
+
+impl RankedSymbolHit {
+    pub(crate) fn rank_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank.cmp(&other.rank)
+    }
+}
+
 /// Query rows plus semantic-partiality discovered while expanding an
 /// inherited-member request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FindSymbolsOutcome {
-    pub(crate) hits: Vec<SymbolHit>,
+    pub(crate) ranked_hits: Vec<RankedSymbolHit>,
     pub(crate) inheritance_unresolved: bool,
     pub(crate) tier2_warming: bool,
+}
+
+// FTS membership and exact-name priority intentionally share this one
+// bytewise authority. Query syntax is passed to SQLite unchanged; only a raw
+// `name` equality receives the leading class. The ordinary query reserves
+// `?1` for its manifest; the inherited bulk lookup remaps this same expression
+// to its first bind rather than maintaining a second rank definition.
+const FUZZY_RANK_SQL: &str = "CASE WHEN s.name = ?2 COLLATE BINARY THEN 0 ELSE 1 END";
+
+fn fuzzy_rank_from_sql(value: i64) -> FuzzyRank {
+    if value == 0 {
+        FuzzyRank::ExactName
+    } else {
+        FuzzyRank::Other
+    }
 }
 
 /// Query the symbols visible from `anchor`. `anchor` resolves to one
 /// manifest; the join scopes hits to blobs that appear in that
 /// manifest.
+///
+/// A fuzzy query returns hits whose `name` equals the query ahead of the
+/// remaining full-text matches. Every other query shape keeps the structural
+/// language → path → line order unchanged.
 ///
 /// # Errors
 /// Returns [`crate::Error::InvalidArgument`] when no filter is set or
@@ -81,7 +121,11 @@ pub fn find_symbols(
     anchor: &AnchorName,
     args: &FindSymbolsArgs,
 ) -> Result<Vec<SymbolHit>> {
-    Ok(find_symbols_with_status(conn, anchor, args, false)?.hits)
+    Ok(find_symbols_with_status(conn, anchor, args, false)?
+        .ranked_hits
+        .into_iter()
+        .map(|ranked| ranked.hit)
+        .collect())
 }
 
 /// [`find_symbols`] with the semantic state needed by the public data
@@ -117,7 +161,7 @@ pub(crate) fn find_symbols_with_status(
     }
 
     Ok(FindSymbolsOutcome {
-        hits: run_find_symbols(conn, manifest_id, args)?,
+        ranked_hits: run_find_symbols(conn, manifest_id, args)?,
         inheritance_unresolved: false,
         tier2_warming: false,
     })
@@ -127,7 +171,7 @@ fn run_find_symbols(
     conn: &Connection,
     manifest_id: ManifestId,
     args: &FindSymbolsArgs,
-) -> Result<Vec<SymbolHit>> {
+) -> Result<Vec<RankedSymbolHit>> {
     // Default page of 50 (workspace-lookup pages are typically smaller
     // than reference / import listings). `.max(1)` guards against a
     // caller-supplied `Some(0)` becoming `LIMIT 0` (SQLite: no rows).
@@ -148,6 +192,7 @@ fn run_find_symbols(
     // The `s.scope = 'top_level'` filter is the workspace-vs-file
     // view split: nested (function-local) declarations are indexed
     // for outline / navigation but must not surface here.
+    let fuzzy_query = args.fuzzy && args.query.as_deref().is_some_and(|query| !query.is_empty());
     let mut sql = String::from(
         "SELECT s.id, s.name, s.qualified, s.kind, s.signature, s.visibility,
                  me.path, s.line_start, s.blob_sha, s.parser_id,
@@ -162,7 +207,15 @@ fn run_find_symbols(
                    WHEN b.parser_id LIKE 'tree-sitter-%' THEN substr(b.parser_id, 13)
                    ELSE b.parser_id
                  END AS language,
-                 b.analyzer_id IS NOT NULL
+                 b.analyzer_id IS NOT NULL",
+    );
+    if fuzzy_query {
+        sql.push_str(", ");
+        sql.push_str(FUZZY_RANK_SQL);
+        sql.push_str(" AS fuzzy_rank");
+    }
+    sql.push_str(
+        "
            FROM symbols s
            JOIN manifest_entries me
              ON me.manifest_id = ?1
@@ -173,6 +226,9 @@ fn run_find_symbols(
             AND s.scope = 'top_level'",
     );
     let mut bound: Vec<Box<dyn ToSql>> = vec![Box::new(manifest_id.0)];
+    if fuzzy_query {
+        bound.push(Box::new(args.query.clone().unwrap_or_default()));
+    }
 
     if let Some(q) = args.query.as_deref()
         && !q.is_empty()
@@ -188,7 +244,7 @@ fn run_find_symbols(
             sql.push_str(
                 " AND s.id IN (
                       SELECT rowid FROM symbols_fts
-                       WHERE symbols_fts MATCH ?
+                       WHERE symbols_fts MATCH ?3
                   )",
             );
             bound.push(Box::new(q.to_string()));
@@ -234,13 +290,29 @@ fn run_find_symbols(
     // `language IS NULL` first so blobs without an analyzer stamp (in
     // practice: no language attribution) sort to the end rather than
     // ahead of alphabetically-earlier known languages.
-    sql.push_str(" ORDER BY language IS NULL, language, me.path, s.line_start LIMIT ?");
+    if fuzzy_query {
+        sql.push_str(
+            " ORDER BY fuzzy_rank, language IS NULL, language, me.path, s.line_start LIMIT ?",
+        );
+    } else {
+        sql.push_str(" ORDER BY language IS NULL, language, me.path, s.line_start LIMIT ?");
+    }
     bound.push(Box::new(i64::from(limit)));
 
     let param_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: rusqlite::Result<Vec<SymbolHit>> =
-        stmt.query_map(param_refs.as_slice(), row_to_hit)?.collect();
+    let rows: rusqlite::Result<Vec<RankedSymbolHit>> = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(RankedSymbolHit {
+                hit: row_to_hit(row)?,
+                rank: if fuzzy_query {
+                    fuzzy_rank_from_sql(row.get(12)?)
+                } else {
+                    FuzzyRank::Other
+                },
+            })
+        })?
+        .collect();
     Ok(rows?)
 }
 
@@ -336,11 +408,11 @@ fn run_find_symbols_inherited(
 ) -> Result<FindSymbolsOutcome> {
     let symbols = load_manifest_symbols(conn, manifest_id)?;
     let edges = load_manifest_inheritance_edges(conn, manifest_id)?;
-    let fuzzy_ids = if args.fuzzy
+    let fuzzy_ranks = if args.fuzzy
         && let Some(query) = args.query.as_deref()
         && !query.is_empty()
     {
-        Some(load_fuzzy_symbol_ids(conn, query)?)
+        Some(load_fuzzy_symbol_ranks(conn, query)?)
     } else {
         None
     };
@@ -410,7 +482,7 @@ fn run_find_symbols_inherited(
     // the ordinary container lookup instead of inventing graph scope.
     if seeds.is_empty() {
         return Ok(FindSymbolsOutcome {
-            hits: run_find_symbols(conn, manifest_id, args)?,
+            ranked_hits: run_find_symbols(conn, manifest_id, args)?,
             inheritance_unresolved: false,
             tier2_warming: false,
         });
@@ -482,7 +554,7 @@ fn run_find_symbols_inherited(
             ))
     });
 
-    let mut hits = symbols
+    let mut ranked_hits = symbols
         .into_iter()
         .filter(|symbol| {
             selected_owners.iter().any(|owner| {
@@ -490,20 +562,28 @@ fn run_find_symbols_inherited(
                     && belongs_to_container(&symbol.hit.qualified, &owner.qualified)
             })
         })
-        .filter(|symbol| matches_result_filters(symbol, args, fuzzy_ids.as_ref()))
-        .map(|symbol| symbol.hit)
+        .filter(|symbol| matches_result_filters(symbol, args, fuzzy_ranks.as_ref()))
+        .map(|symbol| RankedSymbolHit {
+            rank: fuzzy_ranks
+                .as_ref()
+                .and_then(|ranks| ranks.get(&symbol.hit.id))
+                .copied()
+                .unwrap_or(FuzzyRank::Other),
+            hit: symbol.hit,
+        })
         .collect::<Vec<_>>();
 
-    // One blob can appear at multiple paths in a manifest. The public
-    // contract deduplicates the physical symbol id before sorting and
-    // applying the caller's limit.
-    hits.sort_by(symbol_hit_cmp);
+    // One blob can appear at multiple paths in a manifest. Preserve the
+    // existing tie order to choose one mount for each physical symbol, then
+    // apply fuzzy rank and the caller's limit to the deduplicated union.
+    ranked_hits.sort_by(|a, b| symbol_hit_cmp(&a.hit, &b.hit));
     let mut seen = HashSet::<i64>::new();
-    hits.retain(|hit| seen.insert(hit.id));
-    hits.truncate(args.limit.unwrap_or(50).max(1) as usize);
+    ranked_hits.retain(|ranked| seen.insert(ranked.hit.id));
+    ranked_hits.sort_by(ranked_symbol_hit_cmp);
+    ranked_hits.truncate(args.limit.unwrap_or(50).max(1) as usize);
 
     Ok(FindSymbolsOutcome {
-        hits,
+        ranked_hits,
         inheritance_unresolved,
         tier2_warming,
     })
@@ -590,11 +670,25 @@ fn load_manifest_inheritance_edges(
     Ok(rows)
 }
 
-fn load_fuzzy_symbol_ids(conn: &Connection, query: &str) -> Result<HashSet<i64>> {
-    let mut stmt = conn.prepare("SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?1")?;
+fn load_fuzzy_symbol_ranks(conn: &Connection, query: &str) -> Result<HashMap<i64, FuzzyRank>> {
+    let sql = fuzzy_rank_lookup_sql();
+    let mut stmt = conn.prepare(&sql)?;
     Ok(stmt
-        .query_map([query], |row| row.get(0))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?)
+        .query_map([query, query], |row| {
+            Ok((row.get(0)?, fuzzy_rank_from_sql(row.get(1)?)))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+fn fuzzy_rank_lookup_sql() -> String {
+    let rank_sql = FUZZY_RANK_SQL.replace("?2", "?1");
+    format!(
+        "SELECT s.id, {rank_sql}
+           FROM symbols s
+          WHERE s.id IN (
+                SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?2
+          )"
+    )
 }
 
 fn unique_owner<'a>(
@@ -643,13 +737,13 @@ fn belongs_to_container(qualified: &str, container: &str) -> bool {
 fn matches_result_filters(
     symbol: &IndexedSymbol,
     args: &FindSymbolsArgs,
-    fuzzy_ids: Option<&HashSet<i64>>,
+    fuzzy_ranks: Option<&HashMap<i64, FuzzyRank>>,
 ) -> bool {
     if let Some(query) = args.query.as_deref()
         && !query.is_empty()
     {
         if args.fuzzy {
-            if !fuzzy_ids.is_some_and(|ids| ids.contains(&symbol.hit.id)) {
+            if !fuzzy_ranks.is_some_and(|ranks| ranks.contains_key(&symbol.hit.id)) {
                 return false;
             }
         } else if symbol.hit.name != query && symbol.hit.qualified != query {
@@ -678,6 +772,10 @@ fn symbol_hit_cmp(a: &SymbolHit, b: &SymbolHit) -> std::cmp::Ordering {
         .then_with(|| a.line.cmp(&b.line))
         .then_with(|| a.qualified.cmp(&b.qualified))
         .then_with(|| a.id.cmp(&b.id))
+}
+
+fn ranked_symbol_hit_cmp(a: &RankedSymbolHit, b: &RankedSymbolHit) -> std::cmp::Ordering {
+    a.rank_cmp(b).then_with(|| symbol_hit_cmp(&a.hit, &b.hit))
 }
 
 fn language_sort_key(language: Option<&str>) -> (bool, &str) {
@@ -797,6 +895,32 @@ mod scope_filter_tests {
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "outer");
+    }
+
+    /// Ranking the inherited lookup must not add a symbols-table scan: FTS
+    /// membership still drives the query and symbols is reached by rowid.
+    #[test]
+    fn fuzzy_rank_lookup_uses_fts_membership_and_rowid_lookup() {
+        let (_tmp, conn) = fixture_with_top_level_and_nested();
+        let sql = format!("EXPLAIN QUERY PLAN {}", fuzzy_rank_lookup_sql());
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let plan = stmt
+            .query_map(["outer", "outer"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SCAN symbols_fts VIRTUAL TABLE")),
+            "{plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH s USING INTEGER PRIMARY KEY")),
+            "{plan:#?}"
+        );
+        assert!(!plan.iter().any(|line| line == "SCAN s"), "{plan:#?}");
     }
 }
 
