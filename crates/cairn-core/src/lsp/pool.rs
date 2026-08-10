@@ -25,15 +25,13 @@
 //!   lease release. Expired Ready entries with no active leases use
 //!   the same `Evicting` reservation and fail-closed termination
 //!   handling as capacity LRU.
-//! - Graceful drain: entries are published in a registry-owned
-//!   draining batch before they leave the live map. This keeps their
-//!   independent process-control handles discoverable while cleanup
-//!   waits on a data-plane or graceful-shutdown mutex.
+//! - Published drain: entries enter a registry-owned draining batch before
+//!   leaving the live map. This keeps independent process-control handles
+//!   discoverable across graceful, force, and final cleanup paths.
 //! - Force-shutdown: transitions `Running → Draining`, rejects new
-//!   acquisitions, and gives the published entries a per-entry
-//!   graceful timeout. It returns to `Running` on complete success;
-//!   if termination cannot be proven, the pool becomes `Poisoned`
-//!   until daemon restart.
+//!   acquisitions, and gives each published entry one bounded
+//!   process-control cleanup. It returns to `Running` only when termination is
+//!   proven; otherwise the pool becomes `Poisoned` until daemon restart.
 //! - Final bounded shutdown transitions to `Stopped`, takes both live
 //!   and published draining entries, and drives process control
 //!   without waiting on graceful cleanup. Concurrent kill/reap is
@@ -205,10 +203,9 @@ pub struct LspClientPool {
 struct PoolRegistry {
     mode: PoolMode,
     entries: HashMap<PoolKey, PoolRecord>,
-    /// Entries removed from the live map by an in-flight graceful
-    /// drain. Final bounded shutdown takes these published batches
-    /// so process control remains reachable while graceful cleanup
-    /// waits on an entry mutex.
+    /// Entries removed from the live map by an in-flight drain. Final bounded
+    /// shutdown takes these published batches so process control remains
+    /// reachable regardless of which cleanup path owns the batch.
     draining_entries: HashMap<u64, Vec<Arc<PoolEntry>>>,
     next_drain_id: u64,
     /// Monotonic counter; every acquire bumps it and stamps the
@@ -240,8 +237,8 @@ impl PoolRegistry {
         PublishedDrain { id, entries }
     }
 
-    /// Remove a graceful drain only when it is still owned by that
-    /// path. A final bounded drain may already have taken it.
+    /// Remove a published drain only when it is still owned by that path. A
+    /// final bounded drain may already have taken it.
     fn finish_published_drain(&mut self, id: u64) -> bool {
         self.draining_entries.remove(&id).is_some()
     }
@@ -524,31 +521,23 @@ struct ForceShutdownOutcome {
     /// separately so its identity survives even when a regular
     /// error came first.
     first_unproven_err: Option<Error>,
-    /// Set when the outer per-entry `timeout(..)` actually fired
-    /// (as opposed to `entry.shutdown()` returning an unproven
-    /// error under its own steam). Drives whether the finalize
-    /// generates the synthetic "outer timeout" ChildTerminationFailed.
-    timed_out: bool,
 }
 
 impl ForceShutdownOutcome {
     fn termination_unproven(&self) -> bool {
-        self.first_unproven_err.is_some() || self.timed_out
+        self.first_unproven_err.is_some()
     }
 }
 
-/// Fold per-entry force-shutdown results into the outcome slots. An
-/// `Err(Elapsed)` marks the outer timeout as fired; the error slots
-/// keep only the first error of each class.
-fn classify_force_shutdown_results(
-    results: Vec<std::result::Result<Result<()>, tokio::time::error::Elapsed>>,
-    entry_timeout: Duration,
-) -> ForceShutdownOutcome {
+/// Fold bounded per-entry force-shutdown results into the outcome slots. The
+/// bounded entry seam is the sole timeout authority, so every result already
+/// carries the correct termination-proof classification.
+fn classify_force_shutdown_results(results: Vec<Result<()>>) -> ForceShutdownOutcome {
     let mut out = ForceShutdownOutcome::default();
     for outcome in results {
         match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            Ok(()) => {}
+            Err(e) => {
                 if e.is_termination_unproven() {
                     if out.first_unproven_err.is_none() {
                         out.first_unproven_err = Some(e);
@@ -556,13 +545,6 @@ fn classify_force_shutdown_results(
                 } else if out.first_regular_err.is_none() {
                     out.first_regular_err = Some(e);
                 }
-            }
-            Err(_) => {
-                out.timed_out = true;
-                warn!(
-                    timeout_ms = entry_timeout.as_millis(),
-                    "timed out shutting down stalled LSP pool entry"
-                );
             }
         }
     }
@@ -1041,19 +1023,18 @@ impl LspClientPool {
         })
     }
 
-    /// Evict all live clients and give each entry a bounded grace
-    /// period to shut down. Used after analyzer stall detection so
-    /// the next analyzer run does not inherit a wedged pool key.
+    /// Evict all live clients and give each entry a bounded period to terminate
+    /// through its process-control handle. Used after analyzer stall detection
+    /// so the next analyzer run does not inherit a wedged pool key.
     ///
     /// New acquisitions are rejected with [`Error::PoolDraining`]
     /// while this call is in flight. Mode transitions on finalize:
     ///
     /// - Every entry clean (no timeout, no termination-unproven)
     ///   → pool returns to `Running`.
-    /// - Any termination-unproven signal (either an outer timeout
-    ///   or an entry that returned `ChildTerminationFailed`) →
-    ///   pool becomes `Poisoned` and rejects all future
-    ///   acquisitions until the daemon restarts.
+    /// - Any termination-unproven signal from bounded entry cleanup → pool
+    ///   becomes `Poisoned` and rejects all future acquisitions until the
+    ///   daemon restarts.
     /// - A concurrent `shutdown_all` transitioned the pool to
     ///   `Stopped` while we were mid-drain → we preserve
     ///   `Stopped`; the pool is stopped, not poisoned.
@@ -1091,26 +1072,23 @@ impl LspClientPool {
         // than `capacity × entry_timeout`. Each entry owns its own
         // child process; there is no cross-entry contention on
         // shutdown.
-        // Classify each entry's outcome into three orthogonal
-        // signals so we don't conflate "the actual shutdown
-        // returned a termination-unproven error" with "the outer
-        // per-entry timeout fired" — those are DIFFERENT causes
-        // of `termination_unproven` and only the second one
-        // warrants a synthetic "timeout" error message.
-        let outcome =
-            self.runtime.block_on(async move {
-                let results: Vec<_> =
-                    futures::future::join_all(drain.entries.into_iter().map(|entry| async move {
-                        timeout(entry_timeout, entry.shutdown()).await
-                    }))
-                    .await;
-                classify_force_shutdown_results(results, entry_timeout)
-            });
+        // `shutdown_bounded` owns the one per-entry timeout. Wrapping it in a
+        // second timeout would create two competing authorities for whether
+        // child termination was actually proven.
+        let outcome = self.runtime.block_on(async move {
+            let results = futures::future::join_all(
+                drain
+                    .entries
+                    .into_iter()
+                    .map(|entry| async move { entry.shutdown_bounded(entry_timeout).await }),
+            )
+            .await;
+            classify_force_shutdown_results(results)
+        });
         let termination_unproven = outcome.termination_unproven();
         let ForceShutdownOutcome {
             first_regular_err,
             first_unproven_err,
-            timed_out,
         } = outcome;
         // Finalize mode under lock. Preserve BOTH `Stopped` and
         // `Poisoned`: a concurrent `shutdown_all` may have raced
@@ -1131,11 +1109,9 @@ impl LspClientPool {
                 PoolMode::Stopped => PoolMode::Stopped,
                 PoolMode::Poisoned => PoolMode::Poisoned,
                 PoolMode::Draining => {
-                    // Only the `termination_unproven` signal (from
-                    // either an actual unproven error or an outer
-                    // timeout) drives the mode transition. A
-                    // clean `first_err` (e.g. protocol failure on
-                    // an entry whose child was cleanly reaped) is
+                    // Only a termination-unproven bounded cleanup drives the
+                    // mode transition. A clean `first_err` (e.g. protocol
+                    // failure on an entry whose child was cleanly reaped) is
                     // NOT a safety hazard for future spawns.
                     reg.mode = if termination_unproven {
                         PoolMode::Poisoned
@@ -1152,35 +1128,10 @@ impl LspClientPool {
                 }
             }
         };
-        // Build the caller-visible error in two layers so that
-        // the safety-critical termination-unproven cause is never
-        // dropped by ordering.
-        //
-        // 1. `safety_cause` combines the first unproven error
-        //    (from `entry.shutdown()`) with the synthetic outer
-        //    timeout error (only fabricated when the outer
-        //    `timeout(..)` actually fired).
-        // 2. `combined` composes the first regular error (protocol
-        //    etc.) with the safety cause. The safety cause is
-        //    placed in the `cleanup` slot of
-        //    `OperationWithCleanupFailure` so `is_termination_unproven`
-        //    recursion still fires on the top-level err.
-        let timeout_err = if timed_out {
-            Some(Error::ChildTerminationFailed(
-                "force-shutdown outer timeout — child termination could not be proven".into(),
-            ))
-        } else {
-            None
-        };
-        let safety_cause = match (first_unproven_err, timeout_err) {
-            (None, None) => None,
-            (Some(e), None) | (None, Some(e)) => Some(e),
-            (Some(unproven), Some(timeout)) => Some(Error::OperationWithCleanupFailure {
-                original: Box::new(unproven),
-                cleanup: Box::new(timeout),
-            }),
-        };
-        let combined = match (first_regular_err, safety_cause) {
+        // Keep the safety-critical error in the cleanup slot when a regular
+        // error was also observed so recursive termination-proof checks retain
+        // its identity independent of completion order.
+        let combined = match (first_regular_err, first_unproven_err) {
             (None, None) => None,
             (Some(e), None) | (None, Some(e)) => Some(e),
             (Some(orig), Some(safety)) => Some(Error::OperationWithCleanupFailure {
@@ -1450,13 +1401,11 @@ impl PoolEntry {
         result
     }
 
-    /// Graceful entry shutdown, used by capacity LRU eviction,
-    /// `shutdown_all`, and (wrapped in an outer timeout)
-    /// `force_shutdown_all`. Waits without its own bound on the
-    /// shutdown gate and the data-plane mutex, so an in-flight pass
-    /// completes first. `Ok(())` means either no client was installed
-    /// or `LspClient::shutdown` reaped the child — callers treat it
-    /// as termination-proven.
+    /// Graceful entry shutdown, used by capacity LRU eviction and
+    /// `shutdown_all`. Waits without its own bound on the shutdown gate and the
+    /// data-plane mutex, so an in-flight pass completes first. `Ok(())` means
+    /// either no client was installed or `LspClient::shutdown` reaped the child
+    /// — callers treat it as termination-proven.
     async fn shutdown(&self) -> Result<()> {
         let _shutdown_guard = self.shutdown_gate.lock().await;
         let mut state = self.state.lock().await;
@@ -1470,20 +1419,28 @@ impl PoolEntry {
     }
 
     /// Bounded entry shutdown that never waits for the data-plane state mutex.
-    /// Used both by `shutdown_all_bounded` (daemon-final shutdown) and by the
-    /// idle sweeper's per-victim eviction, so it is not final-shutdown-only.
+    /// Used by `shutdown_all_bounded` (daemon-final shutdown), by
+    /// `force_shutdown_all`, and by the idle sweeper's per-victim eviction, so
+    /// it is not final-shutdown-only.
     /// It also bypasses the graceful `shutdown_gate`: the independent
     /// process-control handle serializes kill/reap through the child mutex, so
     /// a concurrent graceful cleanup becomes an idempotent no-op after the
     /// bounded path reaps first. Dropping the pool record later discards any
     /// document state still held by a pass that is unwinding.
+    ///
+    /// This method owns the sole per-entry timeout classification for process
+    /// termination; callers must not wrap it in a second timeout.
     async fn shutdown_bounded(&self, entry_timeout: Duration) -> Result<()> {
         let shutdown = async {
             let control = {
-                let mut slot = self
-                    .process_control
-                    .lock()
-                    .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+                // A poisoned slot leaves kill/reap state unknown, so callers
+                // must treat it as termination-unproven; a reusable pool must
+                // not return to Running or install a replacement.
+                let mut slot = self.process_control.lock().map_err(|_| {
+                    Error::ChildTerminationFailed(
+                        "LSP process-control state unavailable during bounded shutdown".into(),
+                    )
+                })?;
                 slot.stopping = true;
                 slot.control.clone()
             };
