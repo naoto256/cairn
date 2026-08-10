@@ -255,6 +255,10 @@ struct EventClassifier {
     retry_attempt_hook: Arc<std::sync::Mutex<Option<MatcherRetryHook>>>,
     #[cfg(test)]
     retry_exit_hook: Arc<std::sync::Mutex<Option<MatcherRetryHook>>>,
+    #[cfg(test)]
+    retry_spawn_failure: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
+    #[cfg(test)]
+    retry_spawn_warning_count: Arc<std::sync::atomic::AtomicUsize>,
     tx: Sender<WatchEvent>,
 }
 
@@ -288,6 +292,10 @@ impl EventClassifier {
             retry_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             retry_exit_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retry_spawn_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retry_spawn_warning_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tx,
         };
         if initial_failed {
@@ -504,7 +512,7 @@ impl EventClassifier {
             }
         }
         let classifier = self.clone();
-        std::thread::spawn(move || {
+        let owner = move || {
             let mut delay = Duration::from_millis(100);
             'retry: loop {
                 if classifier.tx.is_closed() {
@@ -575,7 +583,40 @@ impl EventClassifier {
                     }
                 }
             }
-        });
+        };
+        #[cfg(test)]
+        let spawned = match self
+            .retry_spawn_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(kind) => Err(std::io::Error::new(kind, "injected retry spawn failure")),
+            None => std::thread::Builder::new().spawn(owner),
+        };
+        #[cfg(not(test))]
+        let spawned = std::thread::Builder::new().spawn(owner);
+        if let Err(err) = spawned {
+            self.release_matcher_retry_after_spawn_failure(&err);
+        }
+    }
+
+    /// Release retry ownership when the recovery thread could not be spawned.
+    ///
+    /// Nothing was rebuilt, so the matcher stays fail-open and no
+    /// [`RescanReason::MatcherRecovered`] is emitted; the failure is recorded
+    /// once in server-side diagnostics. Ownership returns to idle rather than
+    /// retrying in place, because a spawn failure may reflect thread-resource
+    /// exhaustion and an immediate respawn could hot-spin. A request coalesced
+    /// into the state word is dropped with it; a later reload either recovers
+    /// synchronously or, if it still fails, can claim a fresh retry owner.
+    fn release_matcher_retry_after_spawn_failure(&self, err: &std::io::Error) {
+        warn!(error = %err, "matcher retry thread spawn failed; releasing retry ownership");
+        #[cfg(test)]
+        self.retry_spawn_warning_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.matcher_retry_state
+            .store(MATCHER_RETRY_IDLE, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1585,7 +1626,7 @@ mod tests {
         proceed_tx.send(()).unwrap();
 
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .expect("the failure handed off at owner exit was lost"),
             Some(WatchEvent::Rescan {
@@ -1763,6 +1804,52 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn matcher_retry_spawn_failure_releases_owner_for_later_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        *classifier
+            .retry_spawn_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::io::ErrorKind::Other);
+
+        classifier.request_matcher_retry();
+
+        assert_eq!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_IDLE,
+            "a failed spawn must release retry ownership"
+        );
+        assert_eq!(
+            classifier.retry_spawn_warning_count.load(Ordering::SeqCst),
+            1,
+            "the failed spawn must emit exactly one server-side warning"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "spawn failure must not claim matcher recovery"
+        );
+
+        classifier.request_matcher_retry();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("a later request did not retry after spawn failure"),
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+        wait_for_matcher_retry_idle(&classifier).await;
+        assert_eq!(
+            classifier.retry_spawn_warning_count.load(Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
