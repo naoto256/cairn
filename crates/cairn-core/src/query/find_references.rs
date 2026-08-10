@@ -249,33 +249,9 @@ fn run_find_references(
         // `AND NOT` clause then drops a range-less lower-tier row only when a
         // workspace-tier row on the same `(line, kind, target_name,
         // enclosing_id)` tuple already supersedes it.
+        append_ranked_and_surviving_ctes(&mut sql);
         sql.push_str(
-            "),
-             ranked_refs AS (
-               SELECT *,
-                      ROW_NUMBER() OVER (
-                        PARTITION BY blob_sha, byte_start, byte_end, kind,
-                                     logical_site_line, logical_site_target,
-                                     logical_site_enclosing
-                        ORDER BY source_rank,
-                                 CASE WHEN target_qualified IS NOT NULL
-                                           AND target_qualified <> ''
-                                      THEN 0 ELSE 1 END,
-                                 source
-                      ) AS dedup_rank
-                 FROM ref_candidates
-             ),
-             surviving_refs AS (
-               SELECT *
-                 FROM ranked_refs
-                WHERE dedup_rank = 1
-                  AND NOT (
-                    source_rank > 0
-                    AND byte_start = 0
-                    AND byte_end = 0
-                    AND has_workspace_tier_same_line_target_name
-                  )
-             ),
+            ",
              presentation_refs AS (
                SELECT * FROM ",
         );
@@ -575,33 +551,9 @@ fn run_strict_incoming(
     if kind_str.is_some() {
         sql.push_str(" AND r.kind = ?3");
     }
+    append_ranked_and_surviving_ctes(&mut sql);
     sql.push_str(
-        "),
-         ranked_refs AS (
-           SELECT *,
-                  ROW_NUMBER() OVER (
-                    PARTITION BY blob_sha, byte_start, byte_end, kind,
-                                 logical_site_line, logical_site_target,
-                                 logical_site_enclosing
-                    ORDER BY source_rank,
-                             CASE WHEN target_qualified IS NOT NULL
-                                       AND target_qualified <> ''
-                                  THEN 0 ELSE 1 END,
-                             source
-                  ) AS dedup_rank
-             FROM ref_candidates
-         ),
-         surviving_refs AS (
-           SELECT *
-             FROM ranked_refs
-            WHERE dedup_rank = 1
-              AND NOT (
-                source_rank > 0
-                AND byte_start = 0
-                AND byte_end = 0
-                AND has_workspace_tier_same_line_target_name
-              )
-         )
+        "
          SELECT target_name, target_qualified, kind, enclosing,
                 path, line, blob_sha, parser_id, kind_source,
                 target_path
@@ -656,6 +608,49 @@ fn logical_site_columns_sql(alias: &str) -> String {
          CASE WHEN {alias}.byte_start = 0 AND {alias}.byte_end = 0
               THEN {alias}.enclosing_id END AS logical_site_enclosing"
     )
+}
+
+/// Append the ranking and supersession CTEs shared by both reference queries.
+///
+/// The general and strict-incoming paths both project `blob_sha`, byte range,
+/// `kind`, the three `logical_site_*` columns, `source_rank`,
+/// `target_qualified`, `source`, and
+/// `has_workspace_tier_same_line_target_name`. Keeping these CTEs shared makes
+/// both paths rank and suppress that common candidate contract identically.
+///
+/// The fragment closes the caller's open `ref_candidates` body and stops at
+/// `surviving_refs` with no trailing comma, so each caller states what comes
+/// next: a further CTE introduces its own leading comma, while the strict path
+/// continues straight into the final `SELECT`.
+fn append_ranked_and_surviving_ctes(sql: &mut String) {
+    sql.push_str(
+        "),
+         ranked_refs AS (
+           SELECT *,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY blob_sha, byte_start, byte_end, kind,
+                                 logical_site_line, logical_site_target,
+                                 logical_site_enclosing
+                    ORDER BY source_rank,
+                             CASE WHEN target_qualified IS NOT NULL
+                                       AND target_qualified <> ''
+                                  THEN 0 ELSE 1 END,
+                             source
+                  ) AS dedup_rank
+             FROM ref_candidates
+         ),
+         surviving_refs AS (
+           SELECT *
+             FROM ranked_refs
+            WHERE dedup_rank = 1
+              AND NOT (
+                source_rank > 0
+                AND byte_start = 0
+                AND byte_end = 0
+                AND has_workspace_tier_same_line_target_name
+              )
+         )",
+    );
 }
 
 /// `true` when `symbol` looks like a fully-qualified name in any
