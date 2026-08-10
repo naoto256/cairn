@@ -289,10 +289,13 @@ fn run_find_symbols(
     }
     // `language IS NULL` first so blobs without an analyzer stamp (in
     // practice: no language attribution) sort to the end rather than
-    // ahead of alphabetically-earlier known languages.
+    // ahead of alphabetically-earlier known languages. The fuzzy page also
+    // breaks ties on `qualified, id`, because symbols declared at one path and
+    // line are otherwise indistinguishable here: the local page has to select
+    // the same rows every run for the cross-repo merge to trim a stable set.
     if fuzzy_query {
         sql.push_str(
-            " ORDER BY fuzzy_rank, language IS NULL, language, me.path, s.line_start LIMIT ?",
+            " ORDER BY fuzzy_rank, language IS NULL, language, me.path, s.line_start, s.qualified, s.id LIMIT ?",
         );
     } else {
         sql.push_str(" ORDER BY language IS NULL, language, me.path, s.line_start LIMIT ?");

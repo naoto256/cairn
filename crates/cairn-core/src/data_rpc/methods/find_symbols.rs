@@ -433,6 +433,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fuzzy_same_site_ties_are_deterministic_before_local_limit() {
+        let fixture = registered_fixture_with_files(&[(
+            "src/same-site.rs",
+            "pub fn z_repo_status() {} pub fn a_repo_status() {}\n",
+        )]);
+
+        for (limit, expected) in [
+            (1, vec!["a_repo_status"]),
+            (2, vec!["a_repo_status", "z_repo_status"]),
+        ] {
+            let value = FindSymbols
+                .dispatch(
+                    &fixture.ctx,
+                    json!({
+                        "repo": "demo",
+                        "query": "repo_status",
+                        "fuzzy": true,
+                        "limit": limit,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                item_names(&value),
+                expected,
+                "limit={limit} value={value:#}"
+            );
+        }
+
+        let nonfuzzy = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "kind": "function",
+                    "limit": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            item_names(&nonfuzzy),
+            vec!["a_repo_status", "z_repo_status"]
+        );
+    }
+
+    #[tokio::test]
     async fn fuzzy_exact_name_survives_cross_repo_final_limit() {
         let fixture = multi_repo_fixture(&[
             (
