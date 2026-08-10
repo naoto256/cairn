@@ -1142,11 +1142,12 @@ pub struct FindReferencesArgs {
     /// Name or qualified path of the **anchor** symbol. In the default
     /// `direction = Incoming` this is the *target* (who calls X);
     /// with `Outgoing` it is the *enclosing* container (what does X
-    /// call). A token containing `::`, `.`, or `\` matches the
-    /// qualified form first; a bare name goes directly to the looser
-    /// name index. When a qualified lookup has no strict matches but
-    /// returns usable bare-name candidates, completeness is partial
-    /// with reason `qualified_fallback`.
+    /// call). Under `Incoming`, a token containing `::`, `.`, or `\`
+    /// matches the qualified form first and a bare name goes directly
+    /// to the looser name index; a qualified lookup with no strict
+    /// matches but usable bare-name candidates makes completeness
+    /// partial with reason `qualified_fallback`. `Outgoing` matches
+    /// the enclosing qualified name exactly and never falls back.
     pub symbol: String,
     /// Restrict to a specific reference kind. For outgoing queries,
     /// the default still returns only resolved call refs unless
