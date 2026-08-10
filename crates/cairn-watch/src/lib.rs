@@ -308,7 +308,9 @@ impl EventClassifier {
     ///
     /// Events whose paths are wholly inside a shared-pruned
     /// working-tree subtree are removed before topology and
-    /// ignore-control checks. Every remaining event is tested in
+    /// ignore-control checks, except the two exact Ruby composed-bundle
+    /// inputs that must dirty reconcile without entering the manifest.
+    /// Every remaining event is tested in
     /// order; the batch stops at the first event that produces a
     /// rescan reason, using this per-event precedence:
     ///
@@ -329,15 +331,16 @@ impl EventClassifier {
     /// skipped, since the consumer will re-read the whole snapshot
     /// anyway.
     fn handle_batch(&self, events: &[notify_debouncer_full::DebouncedEvent]) {
+        let is_observable = |event: &notify_debouncer_full::DebouncedEvent| {
+            event.paths.is_empty()
+                || !event.paths.iter().all(|path| {
+                    !self.is_ruby_lsp_config_control_path(path)
+                        && self.is_always_pruned_working_tree_path(path)
+                })
+        };
         let reason = events
             .iter()
-            .filter(|event| {
-                event.paths.is_empty()
-                    || !event
-                        .paths
-                        .iter()
-                        .all(|path| self.is_always_pruned_working_tree_path(path))
-            })
+            .filter(|event| is_observable(event))
             .find_map(|event| {
                 if event.need_rescan() {
                     return Some(RescanReason::BackendRequested);
@@ -357,10 +360,11 @@ impl EventClassifier {
                     return Some(RescanReason::DirectoryTopologyChanged);
                 }
                 (is_directory_topology_change(event.kind)
-                    && event
-                        .paths
-                        .iter()
-                        .any(|path| self.is_working_tree_path(path)))
+                    && event.paths.iter().any(|path| {
+                        self.is_working_tree_path(path)
+                            && !self.is_ruby_lsp_config_control_path(path)
+                            && !self.is_always_pruned_working_tree_path(path)
+                    }))
                 .then_some(RescanReason::DirectoryTopologyChanged)
             });
         if let Some(reason) = reason {
@@ -369,7 +373,7 @@ impl EventClassifier {
             return;
         }
 
-        for ev in events {
+        for ev in events.iter().filter(|event| is_observable(event)) {
             for path in &ev.paths {
                 if let Some(out) = self.classify(path, ev.kind) {
                     if !self.emit(out) {
@@ -687,6 +691,21 @@ impl EventClassifier {
         !topology_owned_marker && matcher.is_always_pruned_path(path)
     }
 
+    /// True only for Ruby LSP's two composed-bundle inputs at the repo root.
+    ///
+    /// Those files are still excluded from scans and manifests with the rest
+    /// of `.ruby-lsp`, but their edges must reach reconcile so a successful
+    /// first run that creates them can refresh its scheduler config snapshot.
+    /// The Ruby analyzer independently declares the same two config inputs.
+    /// This lower-level crate cannot import that declaration without creating
+    /// a dependency cycle, so changes must keep both private lists aligned.
+    fn is_ruby_lsp_config_control_path(&self, path: &Path) -> bool {
+        path.strip_prefix(&*self.repo_root).is_ok_and(|relative| {
+            relative == Path::new(".ruby-lsp/Gemfile")
+                || relative == Path::new(".ruby-lsp/Gemfile.lock")
+        })
+    }
+
     /// Reduce one raw notify event into a single [`WatchEvent`], or
     /// `None` when it should be silently dropped.
     ///
@@ -695,8 +714,9 @@ impl EventClassifier {
     /// 1. Path inside any git dir → [`classify_git`] (either a git
     ///    event, or `None` for internal-only paths like `objects/`).
     /// 2. Path inside an always-pruned subtree or a nested
-    ///    repository boundary → dropped.
-    /// 3. Path is gitignored → dropped.
+    ///    repository boundary → dropped, except the exact Ruby
+    ///    composed-bundle inputs.
+    /// 3. Path is gitignored → dropped, with the same exact exception.
     /// 4. Otherwise, map the raw `EventKind` to a [`WatchEvent::File`]:
     ///    Create and Modify collapse to `FileChange::Touched` (a
     ///    Tier-1 reparse is identical either way), Remove becomes
@@ -707,16 +727,18 @@ impl EventClassifier {
                 return classify_git(path, kind, &git_root);
             }
         }
-        if self
-            .ignore
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_pruned_path(path)
+        let ruby_lsp_config_control = self.is_ruby_lsp_config_control_path(path);
+        if !ruby_lsp_config_control
+            && self
+                .ignore
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_pruned_path(path)
         {
             debug!(?path, "skip (pruned subtree)");
             return None;
         }
-        if self.is_gitignored(path, kind) {
+        if !ruby_lsp_config_control && self.is_gitignored(path, kind) {
             debug!(?path, "skip (gitignored)");
             return None;
         }
@@ -1005,6 +1027,87 @@ mod tests {
         }
     }
 
+    async fn write_until_file_edge(
+        rx: &mut tokio::sync::mpsc::Receiver<WatchEvent>,
+        path: &Path,
+        contents: &str,
+    ) -> FileChange {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            std::fs::write(path, contents).unwrap();
+            let retry_at = tokio::time::Instant::now() + Duration::from_millis(250);
+            loop {
+                tokio::select! {
+                    event = rx.recv() => match event {
+                        Some(WatchEvent::File { path: event_path, change })
+                            if event_path == path => return change,
+                        Some(_) => {}
+                        None => panic!("watch channel closed before Ruby config edge"),
+                    },
+                    () = tokio::time::sleep_until(retry_at) => break,
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Ruby config edge timed out for {}",
+                path.display()
+            );
+        }
+    }
+
+    async fn assert_ruby_lsp_config_edges_for_backend(backend: WatchBackend) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".ruby-lsp/cache")).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let handle =
+            watch_repo_with_backend(&root, Duration::from_millis(50), tx, backend).unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        while rx.try_recv().is_ok() {}
+
+        for relative in [".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"] {
+            let config_path = root.join(relative);
+            for (contents, expected_change) in [
+                (Some("first config snapshot\n"), FileChange::Touched),
+                (Some("second config snapshot\n"), FileChange::Touched),
+                (None, FileChange::Deleted),
+            ] {
+                while rx.try_recv().is_ok() {}
+                if let Some(contents) = contents {
+                    assert_eq!(
+                        write_until_file_edge(&mut rx, &config_path, contents).await,
+                        expected_change
+                    );
+                } else {
+                    std::fs::remove_file(&config_path).unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            match rx.recv().await {
+                                Some(WatchEvent::File { path, .. }) if path == config_path => break,
+                                Some(_) => {}
+                                None => panic!("watch channel closed before Ruby config edge"),
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("Ruby config delete edge timed out for {relative}"));
+                }
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+        }
+
+        while rx.try_recv().is_ok() {}
+        std::fs::write(root.join(".ruby-lsp/cache/index"), "generated\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "generated Ruby LSP artifacts must remain silent"
+        );
+        drop(handle);
+    }
+
     #[test]
     fn classifier_skips_always_pruned_subtrees() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1019,6 +1122,103 @@ mod tests {
         let path = root.join("src").join("lib.rs");
         let ev = classifier.classify(&path, EventKind::Modify(notify::event::ModifyKind::Any));
         assert!(matches!(ev, Some(WatchEvent::File { .. })));
+    }
+
+    #[test]
+    fn ruby_lsp_composed_bundle_inputs_trigger_reconcile_without_exposing_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".ruby-lsp")).unwrap();
+        std::fs::write(root.join(".ruby-lsp/.gitignore"), "*\n").unwrap();
+        let classifier = classifier_for(root);
+
+        for relative in [".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"] {
+            let path = root.join(relative);
+            for kind in [
+                EventKind::Create(CreateKind::File),
+                EventKind::Modify(ModifyKind::Any),
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                EventKind::Remove(RemoveKind::File),
+            ] {
+                assert!(
+                    matches!(
+                        classifier.classify(&path, kind),
+                        Some(WatchEvent::File { path: event_path, .. }) if event_path == path
+                    ),
+                    "composed-bundle input {relative} must request reconcile"
+                );
+            }
+        }
+
+        for relative in [
+            ".ruby-lsp/freshness_hash",
+            ".ruby-lsp/needs_update",
+            ".ruby-lsp/bundle_is_composed",
+            ".ruby-lsp/cache/index",
+            ".ruby-lsp/server.log",
+            ".ruby-lsp/nested/Gemfile",
+            ".ruby-lsp/Gemfile.bak",
+            ".ruby-lsp/Gemfile.lock.tmp",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                classifier.classify(&path, EventKind::Modify(ModifyKind::Any)),
+                None,
+                "generated Ruby LSP state must stay pruned: {relative}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ruby_lsp_config_batch_bypasses_prune_without_rescanning_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".ruby-lsp/cache")).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let gemfile = root.join(".ruby-lsp/Gemfile");
+        let artifact = root.join(".ruby-lsp/cache/index");
+
+        classifier.handle_batch(&[
+            debounced(
+                notify::Event::new(EventKind::Create(CreateKind::File)).add_path(gemfile.clone()),
+            ),
+            debounced(
+                notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(artifact.clone()),
+            ),
+        ]);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("exact Ruby config batch edge timed out"),
+            Some(WatchEvent::File {
+                path: gemfile.clone(),
+                change: FileChange::Touched,
+            })
+        );
+        assert!(rx.try_recv().is_err(), "one exact input must emit one edge");
+
+        classifier.handle_batch(&[debounced(
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(artifact),
+        )]);
+        assert!(
+            rx.try_recv().is_err(),
+            "artifact-only batches must remain silent"
+        );
+
+        classifier.handle_batch(&[debounced(
+            notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+                .add_path(gemfile.clone()),
+        )]);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("Ruby config rename edge timed out"),
+            Some(WatchEvent::File {
+                path: gemfile,
+                change: FileChange::Touched,
+            })
+        );
     }
 
     #[test]
@@ -1931,5 +2131,16 @@ mod tests {
             "ordinary working-tree files must remain observable"
         );
         drop(handle);
+    }
+
+    #[tokio::test]
+    async fn polling_watcher_observes_exact_ruby_lsp_config_controls() {
+        assert_ruby_lsp_config_edges_for_backend(WatchBackend::Poll).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_watcher_observes_exact_ruby_lsp_config_controls() {
+        assert_ruby_lsp_config_edges_for_backend(WatchBackend::Recommended).await;
     }
 }

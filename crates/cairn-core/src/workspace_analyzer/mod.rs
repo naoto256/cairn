@@ -576,7 +576,7 @@ mod tests {
         }
 
         fn config_paths(&self) -> &'static [&'static str] {
-            &["Cargo.toml"]
+            &["Cargo.toml", ".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"]
         }
 
         fn analyze_workspace(

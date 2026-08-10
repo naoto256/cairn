@@ -1526,6 +1526,107 @@ mod tests {
     }
 
     #[test]
+    fn self_written_ruby_config_reuses_manifest_and_converges_after_one_successor() {
+        let repo = init_rust_repo(&[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            ("Cargo.toml", "[package]\nname = 'currency-fixture'\n"),
+        ]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let mut calls = Vec::new();
+
+        let first = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            1,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "succeeded",
+        );
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "succeeded",
+        );
+        let entries_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manifest_entries WHERE manifest_id = ?1",
+                [first.tentative_manifest.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        fs::create_dir_all(repo.path().join(".ruby-lsp")).unwrap();
+        fs::write(
+            repo.path().join(".ruby-lsp/Gemfile"),
+            "source 'https://example.invalid'\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join(".ruby-lsp/Gemfile.lock"), "GEM\n").unwrap();
+
+        let second = register_repo_inner(
+            &mut conn,
+            repo.path(),
+            2,
+            true,
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second.tentative_manifest, first.tentative_manifest);
+        assert_eq!(second.blobs_parsed, 0);
+        assert_eq!(calls[1], ["fake-workspace"]);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM manifest_entries WHERE manifest_id = ?1",
+                [second.tentative_manifest.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            entries_before,
+            "generated Ruby LSP inputs stay outside the physical manifest set"
+        );
+
+        let current_hash = config_hash(
+            repo.path(),
+            &["Cargo.toml", ".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"],
+        );
+        conn.execute(
+            "UPDATE workspace_analysis_runs
+             SET config_hash = ?1, status = 'succeeded'
+             WHERE manifest_id = ?2 AND analyzer_id = 'fake-workspace'",
+            params![current_hash, second.tentative_manifest.0],
+        )
+        .unwrap();
+
+        let stable = register_repo_inner(&mut conn, repo.path(), 3, true, |_, _, _, _, _, _| {
+            panic!("current config must not enqueue a trailing analyzer pass")
+        })
+        .unwrap();
+        assert_eq!(stable.tentative_manifest, first.tentative_manifest);
+        assert!(stable.skip_analyzers_for_unchanged_manifest);
+        assert_eq!(calls.len(), 2, "initial pass plus one successor only");
+    }
+
+    #[test]
     fn changed_manifest_runs_all_analyzers() {
         let repo = init_rust_repo(&[("src/lib.rs", "pub fn before() {}\n")]);
         let db_tmp = tempfile::tempdir().unwrap();
