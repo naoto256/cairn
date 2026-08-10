@@ -21,7 +21,7 @@ use crate::data_rpc::helpers::{
     build_snapshot_aware_feedback, completeness_for_snapshot_scan, limit_with_probe,
     parser_id_filter, query_one_or_all_snapshots,
 };
-use crate::query::{self, FindSymbolsArgs, SymbolHit};
+use crate::query::{self, FindSymbolsArgs, RankedSymbolHit, SymbolHit};
 use crate::{Error, Result};
 
 pub struct FindSymbols;
@@ -74,25 +74,32 @@ impl DataMethod for FindSymbols {
                     .fetch_or(outcome.inheritance_unresolved, Ordering::Relaxed);
                 query_tier2_warming.fetch_or(outcome.tier2_warming, Ordering::Relaxed);
                 Ok(outcome
-                    .hits
+                    .ranked_hits
                     .into_iter()
-                    .map(|hit| (entry.alias.clone(), anchor_label.clone(), hit))
+                    .map(|ranked| (entry.alias.clone(), anchor_label.clone(), ranked))
                     .collect())
             },
-            |hits| parser_id_filter(hits.iter().map(|(_, _, hit)| hit.parser_id.clone())),
-            |out: &mut Vec<(String, String, SymbolHit)>| {
-                // Deterministic cross-repo ordering: named languages
-                // first (unknown sinks to the end), then path → line
-                // → repo → qualified. Sorting by path before repo
-                // keeps hits from the same file adjacent even when
-                // several repos contribute overlapping paths.
+            |hits| {
+                parser_id_filter(
+                    hits.iter()
+                        .map(|(_, _, ranked)| ranked.hit.parser_id.clone()),
+                )
+            },
+            |out: &mut Vec<(String, String, RankedSymbolHit)>| {
+                // Exact fuzzy names lead the global result before the
+                // existing deterministic language → path → line → repo →
+                // qualified ties. Sorting by path before repo keeps hits from
+                // the same file adjacent when their rank class is equal.
                 out.sort_by(|(repo_a, _, a), (repo_b, _, b)| {
-                    language_sort_key(a.language.as_deref())
-                        .cmp(&language_sort_key(b.language.as_deref()))
-                        .then_with(|| a.path.cmp(&b.path))
-                        .then_with(|| a.line.cmp(&b.line))
+                    a.rank_cmp(b)
+                        .then_with(|| {
+                            language_sort_key(a.hit.language.as_deref())
+                                .cmp(&language_sort_key(b.hit.language.as_deref()))
+                        })
+                        .then_with(|| a.hit.path.cmp(&b.hit.path))
+                        .then_with(|| a.hit.line.cmp(&b.hit.line))
                         .then_with(|| repo_a.cmp(repo_b))
-                        .then_with(|| a.qualified.cmp(&b.qualified))
+                        .then_with(|| a.hit.qualified.cmp(&b.hit.qualified))
                 });
             },
         )
@@ -100,7 +107,9 @@ impl DataMethod for FindSymbols {
         let items: Vec<_> = execution
             .items
             .into_iter()
-            .map(|(repo, anchor_label, h)| into_wire_hit(&repo, &anchor_label, h, signature_only))
+            .map(|(repo, anchor_label, ranked)| {
+                into_wire_hit(&repo, &anchor_label, ranked.hit, signature_only)
+            })
             .collect();
         let tier3_status = execution.tier3_status;
         let freshness_issues = execution.freshness_issues;
@@ -371,6 +380,277 @@ mod tests {
         assert!(!value["items"].as_array().unwrap().is_empty());
         assert!(value.get("diagnostics").is_none());
         assert!(value.get("hints").is_none());
+    }
+
+    #[tokio::test]
+    async fn fuzzy_exact_name_ranks_before_derived_and_documentation_matches() {
+        let fixture = fuzzy_ranking_fixture();
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "repo_status",
+                    "fuzzy": true,
+                    "limit": 10,
+                }),
+            )
+            .await
+            .unwrap();
+        let names = item_names(&value);
+
+        assert_eq!(names.first().map(String::as_str), Some("repo_status"));
+        assert!(
+            names.contains(&"collect_repo_status".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"documented_helper".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_exact_name_survives_local_limit_after_decoys() {
+        let fixture = fuzzy_ranking_fixture();
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "repo_status",
+                    "fuzzy": true,
+                    "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(item_names(&value), vec!["repo_status"]);
+        assert_eq!(value["completeness"]["reason"], "cap");
+    }
+
+    #[tokio::test]
+    async fn fuzzy_exact_name_survives_cross_repo_final_limit() {
+        let fixture = multi_repo_fixture(&[
+            (
+                "alpha",
+                &[("src/a-derived.rs", "pub fn collect_repo_status() {}\n")],
+            ),
+            ("beta", &[("src/z-exact.rs", "pub mod repo_status {}\n")]),
+        ]);
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "query": "repo_status",
+                    "fuzzy": true,
+                    "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(item_names(&value), vec!["repo_status"]);
+        assert_eq!(value["items"][0]["repo"], "beta");
+        assert_eq!(value["completeness"]["reason"], "cap");
+    }
+
+    #[tokio::test]
+    async fn inherited_fuzzy_ranking_applies_after_filters_and_physical_dedupe() {
+        let source = "class Parent { collect_repo_status() {} repo_status() {} }\n\
+                      class Child {}\n";
+        let fixture =
+            registered_fixture_with_files(&[("src/a-copy.ts", source), ("src/z-copy.ts", source)]);
+        let conn = demo_store(&fixture);
+        insert_relation(&conn, "Child", "Parent", "inherit");
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "repo_status",
+                    "fuzzy": true,
+                    "kind": "method",
+                    "container": "Child",
+                    "include_inherited": true,
+                    "limit": 10,
+                }),
+            )
+            .await
+            .unwrap();
+        let names = item_names(&value);
+
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "repo_status")
+                .count(),
+            1,
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"collect_repo_status".to_string()),
+            "{names:?}"
+        );
+        assert_eq!(names.first().map(String::as_str), Some("repo_status"));
+    }
+
+    #[tokio::test]
+    async fn inherited_fuzzy_filters_wrong_path_exact_decoys_before_limit() {
+        let fixture = registered_fixture_with_files(&[
+            ("src/a-wrong.ts", "class Parent { repo_status() {} }\n"),
+            ("src/b-wrong.ts", "class Child { repo_status() {} }\n"),
+            (
+                "src/z-allowed.ts",
+                "class Grand { collect_repo_status() {} }\n",
+            ),
+        ]);
+        let conn = demo_store(&fixture);
+        insert_relation(&conn, "Child", "Parent", "inherit");
+        insert_relation(&conn, "Parent", "Grand", "inherit");
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "query": "repo_status",
+                    "fuzzy": true,
+                    "path": "src/z-allowed.ts",
+                    "container": "Child",
+                    "include_inherited": true,
+                    "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(item_names(&value), vec!["collect_repo_status"]);
+    }
+
+    #[tokio::test]
+    async fn fuzzy_syntax_and_case_variants_do_not_receive_literal_exact_bonus() {
+        let fixture = fuzzy_ranking_fixture();
+
+        for (query, expected_first) in [
+            ("\"repo_status\"", "collect_repo_status"),
+            ("repo*", "RepoStatusSummary"),
+            ("Repo_Status", "collect_repo_status"),
+        ] {
+            let value = FindSymbols
+                .dispatch(
+                    &fixture.ctx,
+                    json!({
+                        "repo": "demo",
+                        "query": query,
+                        "fuzzy": true,
+                        "limit": 10,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                item_names(&value).first().map(String::as_str),
+                Some(expected_first),
+                "query={query} value={value:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzzy_invalid_or_empty_queries_keep_existing_errors() {
+        let fixture = fuzzy_ranking_fixture();
+
+        for query in ["", "\""] {
+            assert!(
+                FindSymbols
+                    .dispatch(
+                        &fixture.ctx,
+                        json!({
+                            "repo": "demo",
+                            "query": query,
+                            "fuzzy": true,
+                            "limit": 10,
+                        }),
+                    )
+                    .await
+                    .is_err(),
+                "query={query:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzzy_qualified_query_syntax_has_no_exact_name_bonus() {
+        let fixture = fuzzy_ranking_fixture();
+
+        for raw in [
+            "Parent::repo_status",
+            "Parent.repo_status",
+            "Parent\\repo_status",
+        ] {
+            let unquoted = FindSymbols
+                .dispatch(
+                    &fixture.ctx,
+                    json!({
+                        "repo": "demo",
+                        "query": raw,
+                        "fuzzy": true,
+                        "limit": 10,
+                    }),
+                )
+                .await;
+            if let Ok(value) = unquoted {
+                assert!(
+                    !item_names(&value).contains(&"repo_status".to_string()),
+                    "raw={raw:?} value={value:#}"
+                );
+            }
+
+            let quoted = FindSymbols
+                .dispatch(
+                    &fixture.ctx,
+                    json!({
+                        "repo": "demo",
+                        "query": format!("\"{raw}\""),
+                        "fuzzy": true,
+                        "limit": 10,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !item_names(&quoted).contains(&"repo_status".to_string()),
+                "raw={raw:?} value={quoted:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nonfuzzy_structural_order_is_unchanged() {
+        let fixture = fuzzy_ranking_fixture();
+
+        let value = FindSymbols
+            .dispatch(
+                &fixture.ctx,
+                json!({
+                    "repo": "demo",
+                    "kind": "function",
+                    "limit": 10,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            item_names(&value),
+            vec!["collect_repo_status", "documented_helper"]
+        );
     }
 
     #[tokio::test]
@@ -1007,6 +1287,19 @@ mod tests {
         let canonical = std::fs::canonicalize(fixture._repo.path()).unwrap();
         let cas = CasDataDir::with_root(fixture._data.path().to_path_buf());
         store::open(&cas.store_db_path(&path_hash(&canonical))).unwrap()
+    }
+
+    fn fuzzy_ranking_fixture() -> DataRpcFixture {
+        registered_fixture_with_files(&[
+            (
+                "src/a-derived.rs",
+                "pub struct RepoStatusSummary;\n\
+                 pub fn collect_repo_status() {}\n\
+                 /// Reports repo status without using it in the declaration name.\n\
+                 pub fn documented_helper() {}\n",
+            ),
+            ("src/z-exact.rs", "pub mod repo_status {}\n"),
+        ])
     }
 
     fn insert_relation(conn: &Connection, child: &str, parent: &str, kind: &str) {
