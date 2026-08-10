@@ -20,7 +20,7 @@ mod matcher;
 pub mod scan;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -69,7 +69,9 @@ pub enum RescanReason {
     BackendRequested,
     /// The watcher backend returned a runtime error.
     WatchError,
-    /// A previously broken ignore matcher rebuilt successfully.
+    /// A previously broken ignore matcher rebuilt successfully. The watcher
+    /// was fail-open until then, so paths it let through may be ones the
+    /// restored rules ignore.
     MatcherRecovered,
 }
 
@@ -237,18 +239,34 @@ impl WatcherDebouncer {
 /// reacquires the lock rather than holding one snapshot across the
 /// whole classify.
 ///
-/// `retrying_matcher` is a simple flag that serializes matcher
-/// rebuild attempts after a fail-open — see
-/// [`Self::start_matcher_retry`]. `tx` is the outbound event
-/// channel; its `Closed` state is the only shutdown signal this
-/// classifier reacts to.
+/// `matcher_retry_state` serializes matcher rebuild attempts after a
+/// fail-open while retaining one coalesced request that arrives during
+/// the active owner's final successful attempt — see
+/// [`Self::request_matcher_retry`]. `tx` is the outbound event channel;
+/// its `Closed` state is the only shutdown signal this classifier reacts
+/// to.
 #[derive(Clone)]
 struct EventClassifier {
     repo_root: Arc<PathBuf>,
     git_metadata: Arc<GitMetadataPaths>,
     ignore: Arc<RwLock<Arc<RepoIgnoreMatcher>>>,
-    retrying_matcher: Arc<AtomicBool>,
+    matcher_retry_state: Arc<AtomicU8>,
+    #[cfg(test)]
+    retry_attempt_hook: Arc<std::sync::Mutex<Option<MatcherRetryHook>>>,
+    #[cfg(test)]
+    retry_exit_hook: Arc<std::sync::Mutex<Option<MatcherRetryHook>>>,
     tx: Sender<WatchEvent>,
+}
+
+const MATCHER_RETRY_IDLE: u8 = 0;
+const MATCHER_RETRY_RUNNING: u8 = 1;
+const MATCHER_RETRY_RUNNING_REQUESTED: u8 = 2;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MatcherRetryHook {
+    reached: std::sync::mpsc::SyncSender<()>,
+    proceed: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl EventClassifier {
@@ -265,11 +283,15 @@ impl EventClassifier {
             repo_root: Arc::new(repo_root.to_path_buf()),
             git_metadata: Arc::new(git_metadata),
             ignore: Arc::new(RwLock::new(Arc::new(initial))),
-            retrying_matcher: Arc::new(AtomicBool::new(false)),
+            matcher_retry_state: Arc::new(AtomicU8::new(MATCHER_RETRY_IDLE)),
+            #[cfg(test)]
+            retry_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retry_exit_hook: Arc::new(std::sync::Mutex::new(None)),
             tx,
         };
         if initial_failed {
-            classifier.start_matcher_retry();
+            classifier.request_matcher_retry();
         }
         classifier
     }
@@ -394,7 +416,7 @@ impl EventClassifier {
     /// their latest contents. On
     /// failure the classifier installs a
     /// permissive [`RepoIgnoreMatcher::fail_open`] so events keep
-    /// flowing, and hands off to [`Self::start_matcher_retry`] so a
+    /// flowing, and hands off to [`Self::request_matcher_retry`] so a
     /// later rebuild can restore normal filtering — the fail-open
     /// path is not the terminal state.
     fn reload_matcher(&self) {
@@ -403,7 +425,7 @@ impl EventClassifier {
             Err(err) => {
                 warn!(error = %err, "ignore matcher reload failed; watcher is fail-open");
                 self.install_fail_open();
-                self.start_matcher_retry();
+                self.request_matcher_retry();
             }
         }
     }
@@ -429,35 +451,77 @@ impl EventClassifier {
         *current = Arc::new(matcher);
     }
 
-    /// Start a background thread that keeps trying to rebuild a
-    /// real matcher after a fail-open.
+    /// Request recovery of a failed-open matcher.
     ///
-    /// At most one retry thread runs at a time — `retrying_matcher`
-    /// gates the spawn via `compare_exchange` and is cleared once
-    /// the thread exits. The retry uses exponential backoff
-    /// starting at 100ms and capped at 2s, and terminates when
-    /// either (a) the outgoing channel closed (the consumer went
-    /// away), or (b) a rebuild succeeded, in which case a
-    /// [`RescanReason::MatcherRecovered`] edge is emitted so the
-    /// consumer knows to re-check anything it observed while the
-    /// classifier was over-broad. Uses `std::thread` so no tokio
-    /// runtime handle needs to reach into the classifier's setup.
-    fn start_matcher_retry(&self) {
-        if self
-            .retrying_matcher
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+    /// One owner performs rebuild attempts. Requests arriving while it
+    /// runs coalesce in `MATCHER_RETRY_RUNNING_REQUESTED`; the owner
+    /// consumes requests present before an attempt and atomically hands a
+    /// request that arrived during its successful attempt to the next
+    /// attempt. This keeps ownership and pending work in one state word,
+    /// without a clear-then-check window. The retry uses exponential
+    /// backoff starting at 100ms and capped at 2s. A successful rebuild
+    /// emits [`RescanReason::MatcherRecovered`]. A closed channel ends
+    /// recovery: no new owner starts, and the active owner restores the idle
+    /// state itself, so a request left pending at shutdown cannot strand
+    /// ownership. Uses `std::thread` so no tokio runtime handle needs to
+    /// reach into classifier setup.
+    fn request_matcher_retry(&self) {
+        if self.tx.is_closed() {
             return;
+        }
+        loop {
+            match self.matcher_retry_state.load(Ordering::SeqCst) {
+                MATCHER_RETRY_IDLE => {
+                    if self
+                        .matcher_retry_state
+                        .compare_exchange(
+                            MATCHER_RETRY_IDLE,
+                            MATCHER_RETRY_RUNNING,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                MATCHER_RETRY_RUNNING => {
+                    if self
+                        .matcher_retry_state
+                        .compare_exchange(
+                            MATCHER_RETRY_RUNNING,
+                            MATCHER_RETRY_RUNNING_REQUESTED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                MATCHER_RETRY_RUNNING_REQUESTED => return,
+                state => unreachable!("invalid matcher retry state: {state}"),
+            }
         }
         let classifier = self.clone();
         std::thread::spawn(move || {
             let mut delay = Duration::from_millis(100);
-            loop {
+            'retry: loop {
                 if classifier.tx.is_closed() {
-                    break;
+                    classifier
+                        .matcher_retry_state
+                        .store(MATCHER_RETRY_IDLE, Ordering::SeqCst);
+                    return;
                 }
                 std::thread::sleep(delay);
+                #[cfg(test)]
+                Self::wait_on_matcher_retry_hook(&classifier.retry_attempt_hook);
+                let _ = classifier.matcher_retry_state.compare_exchange(
+                    MATCHER_RETRY_RUNNING_REQUESTED,
+                    MATCHER_RETRY_RUNNING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
                 match RepoIgnoreMatcher::build(
                     &classifier.repo_root,
                     &classifier.git_metadata.info_exclude,
@@ -467,7 +531,43 @@ impl EventClassifier {
                         classifier.emit(WatchEvent::Rescan {
                             reason: RescanReason::MatcherRecovered,
                         });
-                        break;
+                        #[cfg(test)]
+                        Self::wait_on_matcher_retry_hook(&classifier.retry_exit_hook);
+                        loop {
+                            if classifier.tx.is_closed() {
+                                classifier
+                                    .matcher_retry_state
+                                    .store(MATCHER_RETRY_IDLE, Ordering::SeqCst);
+                                return;
+                            }
+                            match classifier.matcher_retry_state.compare_exchange(
+                                MATCHER_RETRY_RUNNING,
+                                MATCHER_RETRY_IDLE,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
+                                Ok(_) => return,
+                                Err(MATCHER_RETRY_RUNNING_REQUESTED) => {
+                                    if classifier
+                                        .matcher_retry_state
+                                        .compare_exchange(
+                                            MATCHER_RETRY_RUNNING_REQUESTED,
+                                            MATCHER_RETRY_RUNNING,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                    {
+                                        delay = Duration::from_millis(100);
+                                        continue 'retry;
+                                    }
+                                }
+                                Err(MATCHER_RETRY_IDLE) => return,
+                                Err(state) => {
+                                    unreachable!("invalid matcher retry state: {state}")
+                                }
+                            }
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "ignore matcher retry failed");
@@ -475,8 +575,23 @@ impl EventClassifier {
                     }
                 }
             }
-            classifier.retrying_matcher.store(false, Ordering::SeqCst);
         });
+    }
+
+    #[cfg(test)]
+    fn wait_on_matcher_retry_hook(hook_slot: &std::sync::Mutex<Option<MatcherRetryHook>>) {
+        if let Some(hook) = hook_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            && hook.reached.send(()).is_ok()
+        {
+            let _ = hook
+                .proceed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+        }
     }
 
     /// True when `path` is a file that changes the ignore rules themselves:
@@ -747,6 +862,36 @@ mod tests {
     fn classifier_for(root: &Path) -> EventClassifier {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx)
+    }
+
+    fn install_matcher_retry_hook(
+        hook_slot: &std::sync::Mutex<Option<MatcherRetryHook>>,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        *hook_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(MatcherRetryHook {
+            reached: reached_tx,
+            proceed: Arc::new(std::sync::Mutex::new(proceed_rx)),
+        });
+        (reached_rx, proceed_tx)
+    }
+
+    async fn wait_for_matcher_retry_idle(classifier: &EventClassifier) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if classifier.matcher_retry_state.load(Ordering::SeqCst) == MATCHER_RETRY_IDLE {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("matcher retry owner did not return to idle");
     }
 
     fn run_git(root: &Path, args: &[&str]) {
@@ -1404,6 +1549,220 @@ mod tests {
                 reason: RescanReason::MatcherRecovered
             })
         );
+    }
+
+    #[tokio::test]
+    async fn matcher_retry_hands_off_failure_arriving_before_owner_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, "initial.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let (reached_rx, proceed_tx) = install_matcher_retry_hook(&classifier.retry_exit_hook);
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        assert_ne!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_IDLE
+        );
+
+        std::fs::write(&ignore_file, "first-recovery.rs\n").unwrap();
+        reached_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first retry owner did not reach its exit handoff");
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        std::fs::write(&ignore_file, "second-recovery.rs\n").unwrap();
+        proceed_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .expect("the failure handed off at owner exit was lost"),
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+        wait_for_matcher_retry_idle(&classifier).await;
+    }
+
+    #[tokio::test]
+    async fn matcher_retry_burst_coalesces_into_one_successor_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, "initial.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let (reached_rx, proceed_tx) = install_matcher_retry_hook(&classifier.retry_exit_hook);
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        std::fs::write(&ignore_file, "first-recovery.rs\n").unwrap();
+        reached_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first retry owner did not reach its exit handoff");
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        for _ in 0..8 {
+            classifier.reload_matcher();
+        }
+        assert_eq!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_RUNNING_REQUESTED
+        );
+        std::fs::write(&ignore_file, "second-recovery.rs\n").unwrap();
+        proceed_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("coalesced successor did not recover"),
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+        wait_for_matcher_retry_idle(&classifier).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn matcher_retry_records_request_during_failed_attempt_backoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, "initial.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let (reached_rx, proceed_tx) = install_matcher_retry_hook(&classifier.retry_attempt_hook);
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        reached_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("retry owner did not reach the controlled attempt");
+        classifier.reload_matcher();
+        assert_eq!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_RUNNING_REQUESTED
+        );
+        std::fs::write(&ignore_file, "recovered.rs\n").unwrap();
+        proceed_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("retry owner did not recover"),
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+        wait_for_matcher_retry_idle(&classifier).await;
+    }
+
+    #[tokio::test]
+    async fn matcher_retry_drops_pending_request_when_consumer_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, "initial.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let (reached_rx, proceed_tx) = install_matcher_retry_hook(&classifier.retry_exit_hook);
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        std::fs::write(&ignore_file, "first-recovery.rs\n").unwrap();
+        reached_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("retry owner did not reach its exit handoff");
+        assert_eq!(
+            rx.recv().await,
+            Some(WatchEvent::Rescan {
+                reason: RescanReason::MatcherRecovered
+            })
+        );
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        assert_eq!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_RUNNING_REQUESTED
+        );
+        drop(rx);
+        proceed_tx.send(()).unwrap();
+        wait_for_matcher_retry_idle(&classifier).await;
+    }
+
+    #[tokio::test]
+    async fn closed_foreground_request_does_not_clear_active_retry_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_file = root.join(".gitignore");
+        std::fs::write(&ignore_file, "initial.rs\n").unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+        let (reached_rx, proceed_tx) = install_matcher_retry_hook(&classifier.retry_attempt_hook);
+
+        std::fs::write(&ignore_file, [0xff]).unwrap();
+        classifier.reload_matcher();
+        reached_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("retry owner did not reach the controlled attempt");
+        assert_eq!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_RUNNING
+        );
+
+        drop(rx);
+        classifier.reload_matcher();
+        assert_ne!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_IDLE,
+            "a non-owner request must not clear active ownership"
+        );
+
+        proceed_tx.send(()).unwrap();
+        wait_for_matcher_retry_idle(&classifier).await;
+    }
+
+    #[tokio::test]
+    async fn successful_foreground_reload_does_not_arm_matcher_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let classifier = EventClassifier::new(root, resolve_git_metadata(root).unwrap(), tx);
+
+        classifier.reload_matcher();
+
+        assert_eq!(
+            classifier.matcher_retry_state.load(Ordering::SeqCst),
+            MATCHER_RETRY_IDLE
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
