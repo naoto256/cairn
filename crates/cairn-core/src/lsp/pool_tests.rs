@@ -505,39 +505,22 @@ fn idle_ttl_env_warnings_do_not_log_raw_values() {
 
 // ─── Force-shutdown outcome classifier ─────────────────────
 
-fn elapsed_outcome() -> std::result::Result<Result<()>, tokio::time::error::Elapsed> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(1),
-            std::future::pending::<Result<()>>(),
-        )
-        .await
-    })
-}
-
 #[test]
 fn classify_force_shutdown_all_ok_yields_neither_flag() {
-    let results = vec![Ok(Ok::<(), Error>(())), Ok(Ok(()))];
-    let out = classify_force_shutdown_results(results, Duration::from_millis(50));
+    let results = vec![Ok(()), Ok(())];
+    let out = classify_force_shutdown_results(results);
     assert!(!out.termination_unproven());
-    assert!(!out.timed_out);
     assert!(out.first_regular_err.is_none());
     assert!(out.first_unproven_err.is_none());
 }
 
 #[test]
 fn classify_force_shutdown_actual_unproven_lands_in_unproven_slot() {
-    // A real `ChildTerminationFailed` from `entry.shutdown()`
-    // lands in the unproven slot and leaves `timed_out=false`
-    // so the finalize does not fabricate an outer-timeout error.
-    let results = vec![Ok(Err(Error::ChildTerminationFailed("real".into())))];
-    let out = classify_force_shutdown_results(results, Duration::from_millis(50));
+    // A real `ChildTerminationFailed` from bounded entry cleanup lands in the
+    // unproven slot without a second timeout authority fabricating a cause.
+    let results = vec![Err(Error::ChildTerminationFailed("real".into()))];
+    let out = classify_force_shutdown_results(results);
     assert!(out.termination_unproven());
-    assert!(!out.timed_out);
     assert!(out.first_regular_err.is_none());
     match out.first_unproven_err {
         Some(Error::ChildTerminationFailed(msg)) => assert_eq!(msg, "real"),
@@ -546,27 +529,13 @@ fn classify_force_shutdown_actual_unproven_lands_in_unproven_slot() {
 }
 
 #[test]
-fn classify_force_shutdown_outer_timeout_flags_timed_out_only() {
-    // The outer `timeout(..)` firing sets `timed_out=true`; the
-    // finalize will fabricate a synthetic ChildTerminationFailed.
-    // No entry returned its own unproven Err.
-    let results = vec![elapsed_outcome()];
-    let out = classify_force_shutdown_results(results, Duration::from_millis(50));
-    assert!(out.termination_unproven());
-    assert!(out.timed_out);
-    assert!(out.first_regular_err.is_none());
-    assert!(out.first_unproven_err.is_none());
-}
-
-#[test]
 fn classify_force_shutdown_non_unproven_err_only_flags_regular_slot() {
     // A protocol failure whose child was still reaped is NOT a
     // termination-unproven signal — mode stays Running / does
     // not poison; downstream sees the protocol err only.
-    let results = vec![Ok(Err(Error::Protocol("proto".into())))];
-    let out = classify_force_shutdown_results(results, Duration::from_millis(50));
+    let results = vec![Err(Error::Protocol("proto".into()))];
+    let out = classify_force_shutdown_results(results);
     assert!(!out.termination_unproven());
-    assert!(!out.timed_out);
     assert!(matches!(out.first_regular_err, Some(Error::Protocol(_))));
     assert!(out.first_unproven_err.is_none());
 }
@@ -577,12 +546,11 @@ fn classify_force_shutdown_mixed_regular_then_unproven_preserves_both() {
     // preserved in their respective slots — a naive single-slot
     // `first_err` would silently drop the unproven cause.
     let results = vec![
-        Ok(Err(Error::Protocol("a".into()))),
-        Ok(Err(Error::ChildTerminationFailed("b".into()))),
+        Err(Error::Protocol("a".into())),
+        Err(Error::ChildTerminationFailed("b".into())),
     ];
-    let out = classify_force_shutdown_results(results, Duration::from_millis(50));
+    let out = classify_force_shutdown_results(results);
     assert!(out.termination_unproven());
-    assert!(!out.timed_out);
     assert!(matches!(out.first_regular_err, Some(Error::Protocol(_))));
     assert!(matches!(
         out.first_unproven_err,
@@ -595,12 +563,11 @@ fn classify_force_shutdown_mixed_unproven_then_regular_preserves_both() {
     // Order 2: unproven first, then regular. Symmetric — the
     // classifier must not depend on order-of-arrival.
     let results = vec![
-        Ok(Err(Error::ChildTerminationFailed("b".into()))),
-        Ok(Err(Error::Protocol("a".into()))),
+        Err(Error::ChildTerminationFailed("b".into())),
+        Err(Error::Protocol("a".into())),
     ];
-    let out = classify_force_shutdown_results(results, Duration::from_millis(50));
+    let out = classify_force_shutdown_results(results);
     assert!(out.termination_unproven());
-    assert!(!out.timed_out);
     assert!(matches!(out.first_regular_err, Some(Error::Protocol(_))));
     assert!(matches!(
         out.first_unproven_err,
@@ -1129,10 +1096,9 @@ impl FakeLspBinary {
         )]
     }
 
-    /// Env that also silences shutdown responses so
-    /// `LspClient::shutdown` sits in the request timeout + the
-    /// graceful `wait` timeout — used to force `force_shutdown_all`'s
-    /// outer timeout to fire.
+    /// Env that also silences shutdown responses so graceful shutdown would
+    /// stall. Force shutdown must bypass that protocol path and terminate the
+    /// installed child through process control.
     fn env_stall_shutdown(&self) -> Vec<(String, String)> {
         let mut env = self.env();
         env.push(("CAIRN_TEST_RESPOND_SHUTDOWN".into(), "0".into()));
@@ -1285,8 +1251,108 @@ fn bounded_final_shutdown_reaps_child_while_pass_holds_state_mutex() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
+fn force_shutdown_all_reaps_stalled_owner_without_poisoning_pool() {
+    let fake = FakeLspBinary::new();
+    let methods_log = fake
+        .pid_file
+        .with_file_name("force-stalled-owner-methods.log");
+    let pool = Arc::new(pool(1));
+    let key = fake_pool_key(&fake, 1);
+    let spec = LspSpawnSpec {
+        env: fake.env_with_methods_log(&methods_log),
+        ..spawn_spec(&fake, Duration::from_secs(10))
+    };
+    let worker_pool = Arc::clone(&pool);
+    let worker_key = key.clone();
+    let uri = Url::from("file:///tmp/pool-test/force-stalled-owner.py");
+    let (work_unblocked_tx, work_unblocked_rx) = std::sync::mpsc::channel();
+    let (release_work_tx, release_work_rx) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        worker_pool.with_lsp(worker_key, spec, move |pooled| {
+            Box::pin(async move {
+                pooled.sync_document(&uri, "print('waiting')").await?;
+                let definition = pooled
+                    .definition(
+                        &uri,
+                        Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    )
+                    .await;
+                work_unblocked_tx
+                    .send(())
+                    .expect("test owner must publish that child cleanup unblocked it");
+                release_work_rx
+                    .await
+                    .expect("test must release the old owner");
+                definition?;
+                Ok::<(), Error>(())
+            })
+        })
+    });
+
+    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
+    assert!(methods.values().any(|methods| {
+        methods
+            .iter()
+            .any(|method| method == "textDocument/definition")
+    }));
+    let pid = read_pid(
+        &fake.pid_file,
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .expect("fake LSP must publish its PID");
+    let old_entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+
+    let force_result = pool.force_shutdown_all(Duration::from_millis(100));
+    if force_result.is_err() {
+        // Keep the baseline failure leak-free: the current graceful path times
+        // out while the owner holds `state`, so use the already-proven control
+        // plane solely to let the failing carrier unwind.
+        pool.runtime
+            .block_on(old_entry.shutdown_bounded(Duration::from_secs(2)))
+            .expect("baseline cleanup must reap the stalled child");
+    }
+    work_unblocked_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("child cleanup must unblock the stalled owner");
+    assert!(
+        wait_until_dead(pid, Duration::from_secs(2)),
+        "force cleanup must kill and reap child pid {pid}"
+    );
+
+    let replacement = force_result
+        .as_ref()
+        .ok()
+        .map(|_| acquire(&pool, key.clone()).expect("proven cleanup must keep the pool reusable"));
+    release_work_tx
+        .send(())
+        .expect("old owner must still be waiting for release");
+    let worker_result = worker.join().expect("stalled owner thread must unwind");
+    assert!(
+        matches!(
+            worker_result,
+            Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
+        ),
+        "stalled owner must observe the reaped child, got {worker_result:?}"
+    );
+
+    force_result.expect("proven bounded cleanup must not poison the global pool");
+    assert_eq!(pool.mode(), PoolMode::Running);
+    let replacement = replacement.expect("successful force cleanup must install a replacement");
+    assert_eq!(
+        pool.active_leases(&key),
+        Some(1),
+        "late release from the old owner must not clobber its replacement"
+    );
+    assert!(!Arc::ptr_eq(&old_entry, &replacement.entry));
+}
+
+#[test]
+fn bounded_shutdown_reaps_entry_published_by_concurrent_force_drain() {
     let fake = FakeLspBinary::new();
     let methods_log = fake
         .pid_file
@@ -1298,7 +1364,106 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
         ..spawn_spec(&fake, Duration::from_secs(10))
     };
     let worker_pool = Arc::clone(&pool);
+    let worker_key = key.clone();
     let uri = Url::from("file:///tmp/pool-test/overlapping-shutdown.py");
+    let worker = std::thread::spawn(move || {
+        worker_pool.with_lsp(worker_key, spec, move |pooled| {
+            Box::pin(async move {
+                pooled.sync_document(&uri, "print('waiting')").await?;
+                pooled
+                    .definition(
+                        &uri,
+                        Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    )
+                    .await?;
+                Ok::<(), Error>(())
+            })
+        })
+    });
+
+    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
+    assert!(methods.values().any(|methods| {
+        methods
+            .iter()
+            .any(|method| method == "textDocument/definition")
+    }));
+    let pid = read_pid(
+        &fake.pid_file,
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .expect("fake LSP must publish its PID");
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let process_gate = entry.process_control.lock().unwrap();
+
+    let force_pool = Arc::clone(&pool);
+    let force = std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(5)));
+    assert!(
+        wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
+        "force shutdown must publish Draining before final shutdown"
+    );
+    {
+        let registry = pool.registry.lock().unwrap();
+        assert!(registry.entries.is_empty());
+        assert_eq!(
+            registry
+                .draining_entries
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            1,
+            "force drain must publish the entry before removing it from the live map"
+        );
+    }
+
+    let final_pool = Arc::clone(&pool);
+    let final_shutdown =
+        std::thread::spawn(move || final_pool.shutdown_all_bounded(Duration::from_secs(2)));
+    assert!(
+        wait_for_mode(&pool, PoolMode::Stopped, Duration::from_secs(2)),
+        "final bounded shutdown must publish Stopped before entry cleanup"
+    );
+    drop(process_gate);
+    final_shutdown
+        .join()
+        .expect("final bounded shutdown thread panicked")
+        .expect("bounded path must reap the published draining entry");
+    assert!(wait_until_dead(pid, Duration::from_secs(2)));
+    assert!(pool.registry.lock().unwrap().draining_entries.is_empty());
+
+    let worker_result = worker.join().expect("pass thread must unwind");
+    assert!(matches!(
+        worker_result,
+        Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
+    ));
+    force
+        .join()
+        .expect("force-shutdown thread panicked")
+        .expect("overlapping bounded cleanup after reap must be idempotent");
+    assert_eq!(
+        pool.mode(),
+        PoolMode::Stopped,
+        "force finalize must not overwrite final bounded shutdown state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
+    let fake = FakeLspBinary::new();
+    let methods_log = fake
+        .pid_file
+        .with_file_name("graceful-takeover-methods.log");
+    let pool = Arc::new(pool(1));
+    let key = fake_pool_key(&fake, 1);
+    let spec = LspSpawnSpec {
+        env: fake.env_with_methods_log(&methods_log),
+        ..spawn_spec(&fake, Duration::from_secs(10))
+    };
+    let worker_pool = Arc::clone(&pool);
+    let uri = Url::from("file:///tmp/pool-test/graceful-takeover.py");
     let worker = std::thread::spawn(move || {
         worker_pool.with_lsp(key, spec, move |pooled| {
             Box::pin(async move {
@@ -1329,11 +1494,11 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
     )
     .expect("fake LSP must publish its PID");
 
-    let force_pool = Arc::clone(&pool);
-    let force = std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(5)));
+    let graceful_pool = Arc::clone(&pool);
+    let graceful = std::thread::spawn(move || graceful_pool.shutdown_all());
     assert!(
-        wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
-        "force shutdown must publish Draining before final shutdown"
+        wait_for_mode(&pool, PoolMode::Stopped, Duration::from_secs(2)),
+        "graceful shutdown must publish Stopped before waiting on the owner"
     );
     {
         let registry = pool.registry.lock().unwrap();
@@ -1345,13 +1510,16 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
                 .map(Vec::len)
                 .sum::<usize>(),
             1,
-            "graceful drain must publish the entry before removing it from the live map"
+            "graceful shutdown must publish its batch while the owner holds state"
         );
     }
 
     pool.shutdown_all_bounded(Duration::from_secs(2))
-        .expect("bounded path must reap the published draining entry");
-    assert!(wait_until_dead(pid, Duration::from_secs(2)));
+        .expect("bounded shutdown must take over and prove child termination");
+    assert!(
+        wait_until_dead(pid, Duration::from_secs(2)),
+        "bounded takeover must kill and reap child pid {pid}"
+    );
     assert!(pool.registry.lock().unwrap().draining_entries.is_empty());
 
     let worker_result = worker.join().expect("pass thread must unwind");
@@ -1359,15 +1527,12 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
         worker_result,
         Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
     ));
-    force
+    graceful
         .join()
-        .expect("force-shutdown thread panicked")
-        .expect("graceful cleanup after bounded reap must be idempotent");
-    assert_eq!(
-        pool.mode(),
-        PoolMode::Stopped,
-        "graceful finalize must not overwrite final bounded shutdown state"
-    );
+        .expect("graceful-shutdown thread panicked")
+        .expect("graceful finalize after bounded takeover must be idempotent");
+    assert_eq!(pool.mode(), PoolMode::Stopped);
+    assert!(pool.registry.lock().unwrap().draining_entries.is_empty());
 }
 
 #[test]
@@ -1393,6 +1558,113 @@ fn bounded_final_shutdown_rejects_late_process_control_install() {
 }
 
 #[test]
+fn force_shutdown_without_control_rejects_late_process_control_install() {
+    let pool = pool(1);
+    let key = test_key(41);
+    drop(acquire(&pool, key.clone()).unwrap());
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+
+    pool.force_shutdown_all(Duration::from_millis(20))
+        .expect("an entry without installed control is already termination-proven");
+    assert_eq!(pool.mode(), PoolMode::Running);
+
+    let client = LspClient::configured(
+        Path::new("unused-lsp"),
+        Vec::new(),
+        Vec::new(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(1),
+    );
+    let install = entry.install_process_control(client.process_control());
+    assert!(
+        matches!(install, Err(Error::PoolStopped)),
+        "late process-control install must be rejected, got {install:?}"
+    );
+}
+
+#[test]
+fn force_shutdown_process_control_failure_poisons_and_rejects_replacement() {
+    let pool = pool(1);
+    let key = test_key(42);
+    drop(acquire(&pool, key.clone()).unwrap());
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let poison_entry = Arc::clone(&entry);
+    assert!(
+        std::thread::spawn(move || {
+            let _slot = poison_entry.process_control.lock().unwrap();
+            panic!("poison process-control slot for the failure-policy carrier");
+        })
+        .join()
+        .is_err()
+    );
+
+    let err = pool
+        .force_shutdown_all(Duration::from_millis(20))
+        .expect_err("unreadable process control leaves termination unproven");
+    assert!(
+        matches!(err, Error::PoolPoisoned),
+        "unproven process-control failure must poison, got {err:?}"
+    );
+    assert_eq!(pool.mode(), PoolMode::Poisoned);
+    assert!(matches!(acquire(&pool, key), Err(Error::PoolPoisoned)));
+}
+
+#[test]
+fn stopped_force_shutdown_surfaces_unproven_cleanup_error() {
+    let pool = Arc::new(pool(2));
+    let gated_key = test_key(43);
+    let poisoned_key = test_key(44);
+    drop(acquire(&pool, gated_key.clone()).unwrap());
+    drop(acquire(&pool, poisoned_key.clone()).unwrap());
+    let (gated_entry, poisoned_entry) = {
+        let registry = pool.registry.lock().unwrap();
+        (
+            registry.entries[&gated_key].entry.clone(),
+            registry.entries[&poisoned_key].entry.clone(),
+        )
+    };
+    let process_gate = gated_entry.process_control.lock().unwrap();
+    let poison_entry = Arc::clone(&poisoned_entry);
+    assert!(
+        std::thread::spawn(move || {
+            let _slot = poison_entry.process_control.lock().unwrap();
+            panic!("poison one process-control slot for Stopped precedence");
+        })
+        .join()
+        .is_err()
+    );
+
+    let force_pool = Arc::clone(&pool);
+    let force = std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(2)));
+    assert!(
+        wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
+        "force shutdown must publish Draining before final shutdown"
+    );
+    // Either poll order leaves the held slot blocking finalize, while the
+    // poisoned slot's termination-unproven result is aggregated by or after
+    // gate release.
+    pool.shutdown_all()
+        .expect("the already-published force batch leaves no graceful work");
+    assert_eq!(pool.mode(), PoolMode::Stopped);
+    drop(process_gate);
+
+    let err = force
+        .join()
+        .expect("force-shutdown thread panicked")
+        .expect_err("Stopped precedence must not discard cleanup evidence");
+    assert!(
+        err.is_termination_unproven(),
+        "force result must retain termination-unproven evidence, got {err:?}"
+    );
+    assert_eq!(pool.mode(), PoolMode::Stopped);
+    assert!(matches!(
+        acquire(&pool, test_key(45)),
+        Err(Error::PoolStopped)
+    ));
+}
+
+#[test]
 fn bounded_entry_shutdown_timeout_message_is_context_neutral() {
     let err = bounded_shutdown_timeout_error(Duration::from_millis(1));
     assert_eq!(
@@ -1403,7 +1675,7 @@ fn bounded_entry_shutdown_timeout_message_is_context_neutral() {
 
 #[cfg(unix)]
 #[test]
-fn force_shutdown_all_with_stalled_shutdown_transitions_to_poisoned() {
+fn force_shutdown_all_bypasses_stalled_graceful_shutdown() {
     let fake = FakeLspBinary::new();
     let pool = pool(2);
     pool.with_lsp(
@@ -1412,16 +1684,17 @@ fn force_shutdown_all_with_stalled_shutdown_transitions_to_poisoned() {
         |_lsp| Box::pin(async { Ok::<(), Error>(()) }),
     )
     .unwrap();
-    // Very small entry_timeout so the outer bound fires before
-    // the stalled `shutdown` request / graceful wait completes.
-    let err = pool
-        .force_shutdown_all(Duration::from_millis(50))
-        .unwrap_err();
-    assert!(matches!(err, Error::PoolPoisoned));
-    assert_eq!(pool.mode(), PoolMode::Poisoned);
-    // Follow-up acquires must reject.
-    let err = acquire(&pool, fake_pool_key(&fake, 2)).unwrap_err();
-    assert!(matches!(err, Error::PoolPoisoned));
+    let pid = read_pid(
+        &fake.pid_file,
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .expect("fake LSP must publish its PID");
+
+    pool.force_shutdown_all(Duration::from_secs(2)).unwrap();
+    assert_eq!(pool.mode(), PoolMode::Running);
+    assert_eq!(pool.len(), 0);
+    assert!(wait_until_dead(pid, Duration::from_secs(2)));
+    drop(acquire(&pool, fake_pool_key(&fake, 2)).unwrap());
 }
 
 // Concurrency around `Draining` publication is exercised by
@@ -1678,33 +1951,34 @@ fn wait_for_mode(pool: &Arc<LspClientPool>, target: PoolMode, timeout: Duration)
 #[cfg(unix)]
 #[test]
 fn acquire_during_drain_returns_pool_draining_deterministic() {
-    // Deterministic replacement for the earlier sleep-based
-    // test. We spawn a `force_shutdown_all` on a stalled
-    // entry (which spends its whole time in the Draining
-    // phase) and poll for Draining publication with a
-    // bounded deadline — no conditional-pass; if we can't
-    // observe Draining, the test fails.
+    // Hold the process-control slot so bounded cleanup cannot complete before
+    // the test observes the already-published Draining mode.
     use std::sync::Arc as StdArc;
     let fake = FakeLspBinary::new();
     let pool = StdArc::new(pool(2));
+    let key = fake_pool_key(&fake, 1);
     pool.with_lsp(
-        fake_pool_key(&fake, 1),
+        key.clone(),
         spawn_spec_stall(&fake, Duration::from_secs(10)),
         |_lsp| Box::pin(async { Ok::<(), Error>(()) }),
     )
     .unwrap();
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let process_gate = entry.process_control.lock().unwrap();
     let force_pool = StdArc::clone(&pool);
-    let force_handle = std::thread::spawn(move || {
-        // Longer timeout so Draining is observable throughout.
-        let _ = force_pool.force_shutdown_all(Duration::from_secs(5));
-    });
+    let force_handle =
+        std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(5)));
     assert!(
         wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
         "force_shutdown_all failed to publish Draining within 2s"
     );
     let err = acquire(&pool, fake_pool_key(&fake, 2)).unwrap_err();
     assert!(matches!(err, Error::PoolDraining));
-    force_handle.join().unwrap();
+    drop(process_gate);
+    force_handle
+        .join()
+        .unwrap()
+        .expect("bounded force cleanup must complete");
 }
 
 #[cfg(unix)]
@@ -1716,15 +1990,18 @@ fn stopped_race_after_force_reaches_draining_stays_stopped() {
     use std::sync::Arc as StdArc;
     let fake = FakeLspBinary::new();
     let pool = StdArc::new(pool(2));
+    let key = fake_pool_key(&fake, 1);
     pool.with_lsp(
-        fake_pool_key(&fake, 1),
+        key.clone(),
         spawn_spec_stall(&fake, Duration::from_secs(10)),
         |_lsp| Box::pin(async { Ok::<(), Error>(()) }),
     )
     .unwrap();
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let process_gate = entry.process_control.lock().unwrap();
     let force_pool = StdArc::clone(&pool);
     let force_handle =
-        std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_millis(50)));
+        std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(5)));
     assert!(
         wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
         "force_shutdown_all failed to publish Draining"
@@ -1732,22 +2009,14 @@ fn stopped_race_after_force_reaches_draining_stays_stopped() {
     // Now race shutdown_all in. Its Stopped write must not be
     // overwritten by force's finalize.
     pool.shutdown_all().ok();
+    drop(process_gate);
     let force_result = force_handle.join().unwrap();
     assert_eq!(
         pool.mode(),
         PoolMode::Stopped,
         "final mode must be Stopped despite concurrent force finalize"
     );
-    // Even under Stopped, the force call must surface the
-    // termination-unproven signal it observed (50 ms outer
-    // timeout on a slow-shutdown entry). Dropping it would be an
-    // observability lie — safe from a spawn-invariant standpoint
-    // but misleading for callers.
-    let err = force_result.expect_err("force must surface unproven signal");
-    assert!(
-        err.is_termination_unproven(),
-        "force result must be termination-unproven, got {err:?}"
-    );
+    force_result.expect("bounded cleanup proved termination before force finalize");
 }
 
 // ─── Additional lifecycle invariants ───────────────────────
@@ -2170,10 +2439,9 @@ fn force_finalize_preserves_concurrent_poisoned_mode() {
     // just because its own local cleanup was clean.
     //
     // Reproduce by:
-    // 1. Populate one entry with a fake that ignores `exit`
-    //    (~2s graceful wait before `force_terminate` reaps).
-    // 2. Kick `force_shutdown_all` on a thread; poll for
-    //    `Draining` publication.
+    // 1. Populate one entry and hold its process-control slot so bounded
+    //    cleanup pauses after publishing the drain.
+    // 2. Kick `force_shutdown_all` on a thread and observe `Draining`.
     // 3. Directly call `poison_from_unproven_cleanup` on the
     //    pool (simulating a concurrent central-poison event
     //    from a different normal-path caller). This transitions
@@ -2190,10 +2458,12 @@ fn force_finalize_preserves_concurrent_poisoned_mode() {
         env: fake.env_shutdown_ok_but_no_exit(),
         ..spawn_spec(&fake, Duration::from_secs(3))
     };
-    pool.with_lsp(key, spec_slow_exit, |_lsp| {
+    pool.with_lsp(key.clone(), spec_slow_exit, |_lsp| {
         Box::pin(async { Ok::<(), Error>(()) })
     })
     .unwrap();
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let process_gate = entry.process_control.lock().unwrap();
     let force_pool = StdArc::clone(&pool);
     let force_handle =
         std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(5)));
@@ -2204,6 +2474,7 @@ fn force_finalize_preserves_concurrent_poisoned_mode() {
     );
     // Race in a normal-path poison.
     pool.poison_from_unproven_cleanup("synthetic normal-path unproven");
+    drop(process_gate);
     // Force completes; finalize must NOT overwrite Poisoned.
     let force_result = force_handle.join().unwrap();
     assert_eq!(
