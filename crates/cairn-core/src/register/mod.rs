@@ -1804,6 +1804,63 @@ mod tests {
     }
 
     #[test]
+    fn registration_honors_all_git_ignore_sources_for_tentative_manifest() {
+        let repo = init_rust_repo(&[
+            (".gitignore", "/repo_ignored.rs\n"),
+            ("src/lib.rs", "pub fn committed() {}\n"),
+        ]);
+        fs::write(repo.path().join(".git/info/exclude"), "/info_ignored.rs\n").unwrap();
+        let excludes_file = repo.path().join(".git/global-ignore");
+        fs::write(&excludes_file, "/global_ignored.rs\n").unwrap();
+        run_git(
+            repo.path(),
+            &["config", "core.excludesFile", ".git/global-ignore"],
+        );
+        assert_ne!(std::env::current_dir().unwrap(), repo.path());
+
+        for path in [
+            "repo_ignored.rs",
+            "info_ignored.rs",
+            "global_ignored.rs",
+            "kept.rs",
+        ] {
+            fs::write(
+                repo.path().join(path),
+                format!("pub fn {}() {{}}\n", path.replace('.', "_")),
+            )
+            .unwrap();
+        }
+
+        let repo_rule =
+            run_git_capture(repo.path(), &["check-ignore", "-v", "repo_ignored.rs"]).unwrap();
+        let info_rule =
+            run_git_capture(repo.path(), &["check-ignore", "-v", "info_ignored.rs"]).unwrap();
+        let global_rule =
+            run_git_capture(repo.path(), &["check-ignore", "-v", "global_ignored.rs"]).unwrap();
+        assert!(repo_rule.contains(".gitignore"));
+        assert!(info_rule.contains("info/exclude"));
+        assert!(global_rule.contains("global-ignore"));
+        assert!(run_git_capture(repo.path(), &["check-ignore", "-v", "kept.rs"]).is_err());
+
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let outcome = register_repo(&mut conn, repo.path(), 0).unwrap();
+        let committed = manifest::get_entries(&conn, outcome.committed_manifest).unwrap();
+        let tentative = manifest::get_entries(&conn, outcome.tentative_manifest).unwrap();
+        let committed_paths: Vec<&str> =
+            committed.iter().map(|entry| entry.path.as_str()).collect();
+        let paths: Vec<&str> = tentative.iter().map(|entry| entry.path.as_str()).collect();
+
+        assert!(committed_paths.contains(&"src/lib.rs"));
+        assert!(!committed_paths.contains(&"kept.rs"));
+        assert!(paths.contains(&"src/lib.rs"));
+        assert!(paths.contains(&"kept.rs"));
+        assert!(!paths.contains(&"repo_ignored.rs"));
+        assert!(!paths.contains(&"info_ignored.rs"));
+        assert!(!paths.contains(&"global_ignored.rs"));
+    }
+
+    #[test]
     fn dot_h_with_cpp_signals_routes_to_cpp_parser() {
         let repo = init_rust_repo(&[(
             "include/widget.h",
