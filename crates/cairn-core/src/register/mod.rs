@@ -137,6 +137,9 @@ impl RegistrationPublication {
         }
     }
 
+    /// Direct publications retry unchanged failures. Forced reconciles already
+    /// bypass unchanged-manifest deduplication and select the full analyzer set
+    /// before this admission flag is consulted.
     fn retry_unchanged_failed_analyzers(self) -> bool {
         !matches!(self, Self::Reconcile { forced: false, .. })
     }
@@ -1468,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_reconcile_retries_unchanged_failed_analyzers() {
+    fn forced_reconcile_bypasses_unchanged_dedupe_and_selects_all_analyzers() {
         let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
         let db_tmp = tempfile::tempdir().unwrap();
         let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();

@@ -851,7 +851,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 1, "fixture must select exactly one target analyzer");
-        assert_eq!(failed, 1, "fixture must establish one failed TS LSP run");
+        assert_eq!(
+            failed, 1,
+            "fixture must establish one failed churn-precondition analyzer run"
+        );
     }
 
     fn second_reconcile(fixture: &ChurnFixture) -> Arc<RepoReconcileManager> {
@@ -1246,6 +1249,7 @@ mod tests {
         let (reconcile, jobs) = running_reconcile(&fixture);
         let (recorder, _recorder_guard) =
             churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
+        recorder.wait_for_terminal_after_publication();
         let probe_path = fixture.repo.path().join("src/watch_probe.ts");
         assert!(!probe_path.exists(), "watch probe must be initially absent");
         let watcher = poll_watcher(&fixture, reconcile.clone());
@@ -1262,6 +1266,10 @@ mod tests {
         wait_for_applied(&fixture.cas, &fixture.repo_hash, 2).await;
         wait_for_recorded_precondition_retry(&recorder, 2).await;
         assert_generation_stable(&fixture, 2).await;
+
+        watcher.unwatch_repository(&fixture.repo_hash);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        jobs.shutdown(Duration::from_secs(1)).await;
 
         let snapshot = recorder.snapshot();
         assert_eq!(
@@ -1300,10 +1308,11 @@ mod tests {
                 && check.analyzer_id == PRECONDITION_ANALYZER_ID
                 && check.job_id == retry_job_id
         }));
-
-        watcher.unwatch_repository(&fixture.repo_hash);
-        reconcile.shutdown(Duration::from_secs(1)).await;
-        jobs.shutdown(Duration::from_secs(1)).await;
+        assert!(
+            snapshot.observation_failures.is_empty(),
+            "production admission and terminal observations must remain complete: {:?}",
+            snapshot.observation_failures
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

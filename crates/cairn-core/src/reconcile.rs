@@ -1619,63 +1619,92 @@ fn run_register(
     job_manager: &Option<Arc<JobManager>>,
 ) -> Result<ReconcilePublicationReceipt> {
     #[cfg(test)]
-    crate::churn_recorder::begin_reconcile(request.repo_hash, request.generation);
-    #[cfg(test)]
     let prior_manifest = {
         use rusqlite::OptionalExtension;
-        let worktree_id = conn
-            .query_row(
-                "SELECT worktree_id FROM worktrees WHERE path = ?1",
-                [request.worktree_path.to_string_lossy().as_ref()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        worktree_id
-            .map(|id| crate::anchor::resolve(conn, &crate::anchor::AnchorName::tentative(id)))
-            .transpose()?
-            .flatten()
+        let observed =
+            if crate::churn_recorder::take_prior_manifest_observation_failure(request.repo_hash) {
+                Err(())
+            } else {
+                (|| -> Result<Option<crate::manifest::ManifestId>> {
+                    let worktree_id = conn
+                        .query_row(
+                            "SELECT worktree_id FROM worktrees WHERE path = ?1",
+                            [request.worktree_path.to_string_lossy().as_ref()],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?;
+                    worktree_id
+                        .map(|id| {
+                            crate::anchor::resolve(conn, &crate::anchor::AnchorName::tentative(id))
+                        })
+                        .transpose()
+                        .map(Option::flatten)
+                })()
+                .map_err(|_| ())
+            };
+        match observed {
+            Ok(manifest) => manifest,
+            Err(()) => {
+                crate::churn_recorder::record_observation_failure(
+                    request.repo_hash,
+                    crate::churn_recorder::ObservationFailureKind::PriorManifestUnavailable,
+                    Some(request.generation),
+                    None,
+                    None,
+                );
+                None
+            }
+        }
     };
-    #[cfg(not(test))]
-    let outcome = match job_manager.as_deref() {
-        Some(jm) => register_repo_reconcile_enqueue_analyzers(conn, request, jm)?,
+    #[cfg(test)]
+    crate::churn_recorder::begin_reconcile(request.repo_hash, request.generation);
+
+    let outcome_result = match job_manager.as_deref() {
+        Some(jm) => register_repo_reconcile_enqueue_analyzers(conn, request, jm),
         None => register_repo_reconcile(
             conn,
             request.worktree_path,
             request.now_ns,
             request.generation,
             request.forced,
-        )?,
+        ),
     };
-    #[cfg(test)]
-    let outcome = {
-        let outcome_result = match job_manager.as_deref() {
-            Some(jm) => register_repo_reconcile_enqueue_analyzers(conn, request, jm),
-            None => register_repo_reconcile(
-                conn,
-                request.worktree_path,
-                request.now_ns,
-                request.generation,
-                request.forced,
-            ),
-        };
-        match outcome_result {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                crate::churn_recorder::abort_reconcile(request.repo_hash);
-                return Err(err);
-            }
+    let outcome = match outcome_result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            #[cfg(test)]
+            crate::churn_recorder::abort_reconcile(request.repo_hash);
+            return Err(err);
         }
     };
     #[cfg(test)]
     {
-        let entries = crate::manifest::get_entries(conn, outcome.tentative_manifest)?;
-        crate::churn_recorder::finish_reconcile(
+        let entries = if crate::churn_recorder::take_manifest_entries_observation_failure(
             request.repo_hash,
-            request.generation,
-            outcome.tentative_manifest,
-            prior_manifest == Some(outcome.tentative_manifest),
-            &entries,
-        );
+        ) {
+            Err(())
+        } else {
+            crate::manifest::get_entries(conn, outcome.tentative_manifest).map_err(|_| ())
+        };
+        match entries {
+            Ok(entries) => crate::churn_recorder::finish_reconcile(
+                request.repo_hash,
+                request.generation,
+                outcome.tentative_manifest,
+                prior_manifest == Some(outcome.tentative_manifest),
+                &entries,
+            ),
+            Err(()) => {
+                crate::churn_recorder::record_observation_failure(
+                    request.repo_hash,
+                    crate::churn_recorder::ObservationFailureKind::ManifestEntriesUnavailable,
+                    Some(request.generation),
+                    None,
+                    None,
+                );
+                crate::churn_recorder::abort_reconcile(request.repo_hash);
+            }
+        }
     }
     outcome.publication.ok_or_else(|| {
         Error::Internal("reconcile register completed without a publication receipt".into())
