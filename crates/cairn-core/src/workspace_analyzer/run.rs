@@ -26,7 +26,8 @@ use crate::{Error, Result};
 
 use super::persist::{persist_resolutions_in_transaction, persist_resolved_refs_in_transaction};
 use super::{
-    AnalyzerProgress, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, all_workspace_analyzers,
+    AnalyzerProgress, StallWatchdogEvent, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
+    all_workspace_analyzers,
 };
 
 // Timeout is a hang detector, not a total work cap. T3 measured nlohmann's
@@ -597,6 +598,46 @@ enum AnalyzerRun {
     TimedOut { timeout: Duration },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StallWatchdogState {
+    Armed { last_progress: u64 },
+    Deferred,
+}
+
+enum StallWatchdogWait {
+    Event(StallWatchdogEvent),
+    WindowElapsed(Option<mpsc::Sender<()>>),
+    Disconnected,
+}
+
+struct WorkerCompletion {
+    result: Option<mpsc::Sender<Result<super::WorkspaceFacts>>>,
+    events: Option<mpsc::Sender<StallWatchdogEvent>>,
+}
+
+impl WorkerCompletion {
+    fn complete(mut self, result: Result<super::WorkspaceFacts>) {
+        if let Some(result_tx) = self.result.take() {
+            let _ = result_tx.send(result);
+        }
+        if let Some(events) = self.events.take() {
+            let _ = events.send(StallWatchdogEvent::WorkerFinished);
+        }
+    }
+}
+
+impl Drop for WorkerCompletion {
+    fn drop(&mut self) {
+        // Dropping the dedicated result authority before waking the driver
+        // makes a panic distinguishable even if analyzer-held phase handles
+        // outlive the worker invocation.
+        self.result.take();
+        if let Some(events) = self.events.take() {
+            let _ = events.send(StallWatchdogEvent::WorkerFinished);
+        }
+    }
+}
+
 /// Run the analyzer on a dedicated thread under a stall watchdog.
 ///
 /// `timeout` is a stall window, not a total-runtime cap: each time
@@ -616,24 +657,114 @@ fn analyze_workspace_with_timeout(
     timeout: Duration,
     progress: AnalyzerProgress,
 ) -> AnalyzerRun {
+    let initial_state = if analyzer.defer_stall_watchdog_until_active_work() {
+        StallWatchdogState::Deferred
+    } else {
+        StallWatchdogState::Armed {
+            last_progress: progress.snapshot(),
+        }
+    };
     let repo_root = repo_root.to_path_buf();
     let files = files.to_vec();
-    let (tx, rx) = mpsc::channel();
-    let worker_progress = progress.clone();
+    let (event_tx, event_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let (worker_progress, _cancel_guard) = progress.with_watchdog_events(event_tx.clone());
+    let completion = WorkerCompletion {
+        result: Some(result_tx),
+        events: Some(event_tx),
+    };
     let worker = std::thread::spawn(move || {
         let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files, &worker_progress);
-        let _ = tx.send(result);
+        completion.complete(result);
     });
 
-    let mut last_progress = progress.snapshot();
+    #[cfg(not(test))]
+    let wait = |events: &mpsc::Receiver<StallWatchdogEvent>, timeout| match timeout {
+        Some(timeout) => match events.recv_timeout(timeout) {
+            Ok(event) => StallWatchdogWait::Event(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => StallWatchdogWait::WindowElapsed(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => StallWatchdogWait::Disconnected,
+        },
+        None => match events.recv() {
+            Ok(event) => StallWatchdogWait::Event(event),
+            Err(_) => StallWatchdogWait::Disconnected,
+        },
+    };
+    #[cfg(test)]
+    let wait = test_watchdog_wait;
+
+    drive_analyzer_watchdog(
+        worker,
+        &event_rx,
+        &result_rx,
+        timeout,
+        progress,
+        initial_state,
+        wait,
+    )
+}
+
+/// Drive the progress-silence watchdog using `wait` as its sole clock/result
+/// source. Production passes `Receiver::recv_timeout`; tests inject logical
+/// windows without cloning the state machine below.
+fn drive_analyzer_watchdog<F>(
+    worker: std::thread::JoinHandle<()>,
+    events: &mpsc::Receiver<StallWatchdogEvent>,
+    results: &mpsc::Receiver<Result<super::WorkspaceFacts>>,
+    timeout: Duration,
+    progress: AnalyzerProgress,
+    mut state: StallWatchdogState,
+    mut wait: F,
+) -> AnalyzerRun
+where
+    F: FnMut(&mpsc::Receiver<StallWatchdogEvent>, Option<Duration>) -> StallWatchdogWait,
+{
     loop {
-        match rx.recv_timeout(timeout) {
+        match results.try_recv() {
             Ok(result) => return AnalyzerRun::Completed(result),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return analyzer_worker_disconnected();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let deadline = matches!(state, StallWatchdogState::Armed { .. }).then_some(timeout);
+        match wait(events, deadline) {
+            StallWatchdogWait::Event(StallWatchdogEvent::Arm(acknowledgement)) => {
+                if state == StallWatchdogState::Deferred {
+                    state = StallWatchdogState::Armed {
+                        last_progress: progress.snapshot(),
+                    };
+                }
+                let _ = acknowledgement.send(());
+            }
+            StallWatchdogWait::Event(StallWatchdogEvent::Cancel) => {
+                match results.try_recv() {
+                    Ok(result) => return AnalyzerRun::Completed(result),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return analyzer_worker_disconnected();
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                let _ = cleanup_stalled_analyzer_worker(worker, results);
+                return AnalyzerRun::Completed(Err(Error::InvalidArgument(
+                    "workspace analyzer cancelled".to_string(),
+                )));
+            }
+            StallWatchdogWait::Event(StallWatchdogEvent::WorkerFinished) => {
+                return match results.recv() {
+                    Ok(result) => AnalyzerRun::Completed(result),
+                    Err(_) => analyzer_worker_disconnected(),
+                };
+            }
             // A full window elapsed with no result. Ticks are only
             // inspected at window boundaries, so a genuine stall is
             // detected between one and two windows after the last
             // observed tick.
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            StallWatchdogWait::WindowElapsed(acknowledgement) => {
+                let StallWatchdogState::Armed { last_progress } = state else {
+                    acknowledge_watchdog_window(acknowledgement);
+                    continue;
+                };
                 let current_progress = progress.snapshot();
                 if current_progress != last_progress {
                     debug!(
@@ -642,27 +773,100 @@ fn analyze_workspace_with_timeout(
                         stall_window_secs = timeout.as_secs(),
                         "workspace analyzer still making progress"
                     );
-                    last_progress = current_progress;
+                    state = StallWatchdogState::Armed {
+                        last_progress: current_progress,
+                    };
+                    acknowledge_watchdog_window(acknowledgement);
                     continue;
                 }
                 // Beacon did not advance for a full window: ask the
                 // worker to stop, give it a short grace period, then
                 // reclaim the shared LSP pool.
                 progress.cancel();
-                let _ = cleanup_stalled_analyzer_worker(worker, &rx);
+                acknowledge_watchdog_window(acknowledgement);
+                let _ = cleanup_stalled_analyzer_worker(worker, results);
                 cleanup_stalled_analyzer_resources();
                 return AnalyzerRun::TimedOut { timeout };
             }
             // Sender dropped without a message: the worker thread
             // panicked inside `analyze_workspace`. Surface it as a
             // completed-with-error run rather than unwinding.
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return AnalyzerRun::Completed(Err(Error::InvalidArgument(
-                    "workspace analyzer worker disconnected".to_string(),
-                )));
+            StallWatchdogWait::Disconnected => {
+                return match results.try_recv() {
+                    Ok(result) => AnalyzerRun::Completed(result),
+                    Err(_) => analyzer_worker_disconnected(),
+                };
             }
         }
     }
+}
+
+fn acknowledge_watchdog_window(acknowledgement: Option<mpsc::Sender<()>>) {
+    if let Some(acknowledgement) = acknowledgement {
+        let _ = acknowledgement.send(());
+    }
+}
+
+fn analyzer_worker_disconnected() -> AnalyzerRun {
+    AnalyzerRun::Completed(Err(Error::InvalidArgument(
+        "workspace analyzer worker disconnected".to_string(),
+    )))
+}
+
+#[cfg(test)]
+fn test_watchdog_wait(
+    rx: &mpsc::Receiver<StallWatchdogEvent>,
+    timeout: Option<Duration>,
+) -> StallWatchdogWait {
+    TEST_WATCHDOG_ADVANCES.with(|advances| {
+        let mut advances = advances.borrow_mut();
+        let Some(advances) = advances.as_mut() else {
+            return match timeout {
+                Some(timeout) => match rx.recv_timeout(timeout) {
+                    Ok(event) => StallWatchdogWait::Event(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => StallWatchdogWait::WindowElapsed(None),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => StallWatchdogWait::Disconnected,
+                },
+                None => match rx.recv() {
+                    Ok(event) => StallWatchdogWait::Event(event),
+                    Err(_) => StallWatchdogWait::Disconnected,
+                },
+            };
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(event) => return StallWatchdogWait::Event(event),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return StallWatchdogWait::Disconnected;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match advances.try_recv() {
+                Ok(acknowledgement) => {
+                    return match rx.try_recv() {
+                        Ok(event) => StallWatchdogWait::Event(event),
+                        Err(mpsc::TryRecvError::Disconnected) => StallWatchdogWait::Disconnected,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            StallWatchdogWait::WindowElapsed(Some(acknowledgement))
+                        }
+                    };
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return StallWatchdogWait::Disconnected;
+                }
+                Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Manual timeout windows for deterministic watchdog tests. Each sender is
+    /// acknowledged after the worker-result channel has been sampled.
+    static TEST_WATCHDOG_ADVANCES:
+        std::cell::RefCell<Option<mpsc::Receiver<mpsc::Sender<()>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Give a cancelled worker a bounded grace period to finish.
@@ -673,9 +877,9 @@ fn analyze_workspace_with_timeout(
 /// block the runner.
 fn cleanup_stalled_analyzer_worker(
     worker: std::thread::JoinHandle<()>,
-    rx: &mpsc::Receiver<Result<super::WorkspaceFacts>>,
+    results: &mpsc::Receiver<Result<super::WorkspaceFacts>>,
 ) -> std::thread::Result<()> {
-    match rx.recv_timeout(ANALYZER_STALL_JOIN_TIMEOUT) {
+    match results.recv_timeout(ANALYZER_STALL_JOIN_TIMEOUT) {
         Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => worker.join(),
         Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
     }
@@ -686,6 +890,10 @@ fn cleanup_stalled_analyzer_worker(
 /// language server; failures are logged and the runner continues.
 fn cleanup_stalled_analyzer_resources() {
     test_observe_stalled_analyzer_cleanup();
+    #[cfg(test)]
+    if TEST_ISOLATE_STALLED_ANALYZER_CLEANUP.get() {
+        return;
+    }
     if let Err(err) =
         crate::lsp::pool::force_shutdown_global_if_initialized(ANALYZER_STALL_LSP_SHUTDOWN_TIMEOUT)
     {
@@ -695,21 +903,98 @@ fn cleanup_stalled_analyzer_resources() {
 
 #[cfg(test)]
 fn test_observe_stalled_analyzer_cleanup() {
-    if let Some(observer) = STALLED_ANALYZER_CLEANUP_OBSERVER
-        .lock()
-        .expect("stalled analyzer cleanup observer poisoned")
-        .as_ref()
-    {
-        observer();
-    }
+    STALLED_ANALYZER_CLEANUP_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow().as_ref() {
+            observer();
+        }
+    });
 }
 
 #[cfg(not(test))]
 fn test_observe_stalled_analyzer_cleanup() {}
 
 #[cfg(test)]
-static STALLED_ANALYZER_CLEANUP_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static STALLED_ANALYZER_CLEANUP_OBSERVER:
+        std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+
+    /// Logical watchdog tests must not tear down the process-global LSP pool
+    /// owned by unrelated parallel tests. Pool shutdown itself is covered by
+    /// the pool module's child/reap carriers; these tests own the timeout and
+    /// cleanup-call boundary only.
+    static TEST_ISOLATE_STALLED_ANALYZER_CLEANUP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn with_isolated_stalled_analyzer_cleanup<T>(run: impl FnOnce() -> T) -> T {
+    struct ResetCleanupIsolation;
+
+    impl Drop for ResetCleanupIsolation {
+        fn drop(&mut self) {
+            TEST_ISOLATE_STALLED_ANALYZER_CLEANUP.set(false);
+        }
+    }
+
+    TEST_ISOLATE_STALLED_ANALYZER_CLEANUP.with(|isolated| {
+        assert!(!isolated.replace(true), "cleanup isolation must not nest");
+        let _reset = ResetCleanupIsolation;
+        run()
+    })
+}
+
+#[cfg(test)]
+pub(super) fn test_run_isolated_active_stall() {
+    struct ActiveStall;
+
+    impl WorkspaceAnalyzer for ActiveStall {
+        fn id(&self) -> &'static str {
+            "test-active-stall"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "test"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "test-parser"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            progress.arm_stall_watchdog();
+            while !progress.is_cancelled() {
+                std::thread::yield_now();
+            }
+            Ok(WorkspaceFacts::default())
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+    }
+
+    let run = with_isolated_stalled_analyzer_cleanup(|| {
+        analyze_workspace_with_timeout(
+            Box::new(ActiveStall),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_millis(1),
+            AnalyzerProgress::default(),
+        )
+    });
+    assert!(matches!(run, AnalyzerRun::TimedOut { .. }));
+}
 
 /// LSP `ContentModified`: the server saw its input change while a
 /// request was in flight. The caller records `Skipped` for this.
@@ -1137,8 +1422,8 @@ mod tests {
         ResolutionKind, ResolvedRef, WorkspaceFacts, WorkspaceResolution,
     };
     use std::fs;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     struct CancelAwareAnalyzer;
@@ -1172,6 +1457,738 @@ mod tests {
             }
             Ok(WorkspaceFacts::default())
         }
+    }
+
+    struct QueuedLspAnalyzer {
+        state: Arc<Mutex<()>>,
+        readiness: Arc<AtomicBool>,
+        queued: mpsc::SyncSender<()>,
+        owns_state: mpsc::SyncSender<()>,
+        active: mpsc::SyncSender<()>,
+    }
+
+    struct BlockingQueuedLspAnalyzer {
+        state: Arc<Mutex<()>>,
+        queued: mpsc::SyncSender<()>,
+    }
+
+    struct DuplicateArmLspAnalyzer {
+        active: mpsc::SyncSender<()>,
+    }
+
+    struct PreArmTickLspAnalyzer {
+        active: mpsc::SyncSender<()>,
+    }
+
+    impl WorkspaceAnalyzer for PreArmTickLspAnalyzer {
+        fn id(&self) -> &'static str {
+            "pre-arm-tick-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            progress.tick();
+            progress.arm_stall_watchdog();
+            let _ = self.active.send(());
+            while !progress.is_cancelled() {
+                std::thread::yield_now();
+            }
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    impl WorkspaceAnalyzer for DuplicateArmLspAnalyzer {
+        fn id(&self) -> &'static str {
+            "duplicate-arm-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            progress.arm_stall_watchdog();
+            progress.tick();
+            progress.arm_stall_watchdog();
+            let _ = self.active.send(());
+            while !progress.is_cancelled() {
+                std::thread::yield_now();
+            }
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    struct ImmediateAnalyzer {
+        fails: bool,
+        defer: bool,
+        progress_tx: Option<mpsc::SyncSender<AnalyzerProgress>>,
+    }
+
+    impl WorkspaceAnalyzer for ImmediateAnalyzer {
+        fn id(&self) -> &'static str {
+            "immediate"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            self.defer
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            if let Some(progress_tx) = &self.progress_tx {
+                let _ = progress_tx.send(progress.clone());
+            }
+            if progress.is_cancelled() {
+                return Err(Error::InvalidArgument("cancelled before arm".into()));
+            }
+            if self.fails {
+                Err(Error::InvalidArgument("pre-arm".into()))
+            } else {
+                Ok(WorkspaceFacts::default())
+            }
+        }
+    }
+
+    struct PanickingDeferredAnalyzer;
+
+    struct RetainedClonePanickingAnalyzer {
+        progress_tx: mpsc::SyncSender<AnalyzerProgress>,
+    }
+
+    struct DuplicateArmAfterCancelAnalyzer {
+        cancelled: mpsc::SyncSender<()>,
+    }
+
+    impl WorkspaceAnalyzer for PanickingDeferredAnalyzer {
+        fn id(&self) -> &'static str {
+            "panicking-deferred"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            panic!("disconnect before arm")
+        }
+    }
+
+    impl WorkspaceAnalyzer for RetainedClonePanickingAnalyzer {
+        fn id(&self) -> &'static str {
+            "retained-clone-panicking"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            self.progress_tx.send(progress.clone()).unwrap();
+            panic!("disconnect with a retained phase sender")
+        }
+    }
+
+    impl WorkspaceAnalyzer for DuplicateArmAfterCancelAnalyzer {
+        fn id(&self) -> &'static str {
+            "duplicate-arm-after-cancel"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            while !progress.is_cancelled() {
+                std::thread::yield_now();
+            }
+            self.cancelled.send(()).unwrap();
+            progress.arm_stall_watchdog();
+            std::thread::park();
+            unreachable!("parked worker must be leaked by bounded cleanup")
+        }
+    }
+
+    struct PolicyCountingAnalyzer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WorkspaceAnalyzer for PolicyCountingAnalyzer {
+        fn id(&self) -> &'static str {
+            "policy-counting"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    impl WorkspaceAnalyzer for QueuedLspAnalyzer {
+        fn id(&self) -> &'static str {
+            "queued-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            let _ = self.queued.send(());
+            let state = loop {
+                match self.state.try_lock() {
+                    Ok(state) => break state,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if progress.is_cancelled() {
+                            return Ok(WorkspaceFacts::default());
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                }
+            };
+            let _ = self.owns_state.send(());
+            while !self.readiness.load(Ordering::SeqCst) {
+                if progress.is_cancelled() {
+                    return Ok(WorkspaceFacts::default());
+                }
+                std::thread::yield_now();
+            }
+            progress.arm_stall_watchdog();
+            let _ = self.active.send(());
+            while !progress.is_cancelled() {
+                std::thread::yield_now();
+            }
+            drop(state);
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    impl WorkspaceAnalyzer for BlockingQueuedLspAnalyzer {
+        fn id(&self) -> &'static str {
+            "blocking-queued-lsp"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            self.queued.send(()).unwrap();
+            let _state = self.state.lock().unwrap();
+            if progress.is_cancelled() {
+                return Ok(WorkspaceFacts::default());
+            }
+            progress.arm_stall_watchdog();
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    fn run_with_test_watchdog(
+        advances: mpsc::Receiver<mpsc::Sender<()>>,
+        analyzer: Box<dyn WorkspaceAnalyzer>,
+    ) -> AnalyzerRun {
+        run_with_test_watchdog_progress(advances, analyzer, AnalyzerProgress::default())
+    }
+
+    fn run_with_test_watchdog_progress(
+        advances: mpsc::Receiver<mpsc::Sender<()>>,
+        analyzer: Box<dyn WorkspaceAnalyzer>,
+        progress: AnalyzerProgress,
+    ) -> AnalyzerRun {
+        TEST_WATCHDOG_ADVANCES.with(|slot| {
+            assert!(slot.borrow_mut().replace(advances).is_none());
+        });
+        let run = with_isolated_stalled_analyzer_cleanup(|| {
+            analyze_workspace_with_timeout(
+                analyzer,
+                Path::new("/tmp/repo"),
+                ManifestId(1),
+                &[],
+                Duration::from_secs(300),
+                progress,
+            )
+        });
+        TEST_WATCHDOG_ADVANCES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        run
+    }
+
+    fn advance_test_watchdog(advances: &mpsc::Sender<mpsc::Sender<()>>) {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        advances.send(ack_tx).unwrap();
+        ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    /// An LSP invocation starts Deferred before the worker is spawned, so a
+    /// logical active-work window cannot expire while it waits for the same
+    /// pool key. The active closure arms exactly one fresh window.
+    #[test]
+    fn lsp_watchdog_does_not_spend_active_window_while_queued() {
+        let state = Arc::new(Mutex::new(()));
+        let owner = state.lock().unwrap();
+        let readiness = Arc::new(AtomicBool::new(false));
+        let (queued_tx, queued_rx) = mpsc::sync_channel(1);
+        let (owns_tx, owns_rx) = mpsc::sync_channel(1);
+        let (active_tx, active_rx) = mpsc::sync_channel(1);
+        let (advance_tx, advance_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+
+        let runner = std::thread::spawn({
+            let state = state.clone();
+            let readiness = readiness.clone();
+            move || {
+                let run = run_with_test_watchdog(
+                    advance_rx,
+                    Box::new(QueuedLspAnalyzer {
+                        state,
+                        readiness,
+                        queued: queued_tx,
+                        owns_state: owns_tx,
+                        active: active_tx,
+                    }),
+                );
+                let _ = run_tx.send(run);
+            }
+        });
+
+        queued_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        advance_test_watchdog(&advance_tx);
+        assert!(
+            run_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "queued ownership must not consume the active-work window"
+        );
+
+        drop(owner);
+        owns_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        readiness.store(true, Ordering::SeqCst);
+        active_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        advance_test_watchdog(&advance_tx);
+        assert!(matches!(
+            run_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AnalyzerRun::TimedOut { timeout } if timeout == Duration::from_secs(300)
+        ));
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn generic_watchdog_still_arms_at_worker_spawn() {
+        let (advance_tx, advance_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let run = run_with_test_watchdog(advance_rx, Box::new(CancelAwareAnalyzer));
+            let _ = run_tx.send(run);
+        });
+
+        advance_test_watchdog(&advance_tx);
+        assert!(matches!(
+            run_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AnalyzerRun::TimedOut { timeout } if timeout == Duration::from_secs(300)
+        ));
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn timeout_cleanup_ignores_duplicate_arm_from_a_parked_worker() {
+        let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+        let (advance_tx, advance_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let run = run_with_test_watchdog(
+                advance_rx,
+                Box::new(DuplicateArmAfterCancelAnalyzer {
+                    cancelled: cancelled_tx,
+                }),
+            );
+            let _ = run_tx.send(run);
+        });
+
+        advance_test_watchdog(&advance_tx);
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            run_rx.recv_timeout(ANALYZER_STALL_JOIN_TIMEOUT + Duration::from_secs(1)),
+            Ok(AnalyzerRun::TimedOut { timeout }) if timeout == Duration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn retained_phase_sender_does_not_hide_worker_panic() {
+        let (progress_tx, progress_rx) = mpsc::sync_channel(1);
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let run = analyze_workspace_with_timeout(
+                Box::new(RetainedClonePanickingAnalyzer { progress_tx }),
+                Path::new("/tmp/repo"),
+                ManifestId(1),
+                &[],
+                Duration::from_secs(300),
+                AnalyzerProgress::default(),
+            );
+            let _ = run_tx.send(run);
+        });
+
+        let retained_progress = progress_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            run_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AnalyzerRun::Completed(Err(Error::InvalidArgument(message))))
+                if message == "workspace analyzer worker disconnected"
+        ));
+        assert!(!retained_progress.is_cancelled());
+    }
+
+    #[test]
+    fn external_cancel_wakes_a_deferred_same_key_waiter() {
+        let state = Arc::new(Mutex::new(()));
+        let owner = state.lock().unwrap();
+        let (queued_tx, queued_rx) = mpsc::sync_channel(1);
+        let (_advance_tx, advance_rx) = mpsc::channel();
+        let progress = AnalyzerProgress::default();
+        let cancel_handle = progress.clone();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        let waiter_state = state.clone();
+        let runner = std::thread::spawn(move || {
+            let run = run_with_test_watchdog_progress(
+                advance_rx,
+                Box::new(BlockingQueuedLspAnalyzer {
+                    state: waiter_state,
+                    queued: queued_tx,
+                }),
+                progress,
+            );
+            let _ = run_tx.send(run);
+        });
+
+        queued_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancel_handle.cancel();
+        assert!(matches!(
+            run_rx.recv_timeout(ANALYZER_STALL_JOIN_TIMEOUT + Duration::from_secs(1)),
+            Ok(AnalyzerRun::Completed(_))
+        ));
+        assert!(cancel_handle.is_cancelled());
+        drop(owner);
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn duplicate_active_arm_does_not_reset_progress_window() {
+        let (active_tx, active_rx) = mpsc::sync_channel(1);
+        let (advance_tx, advance_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let run = run_with_test_watchdog(
+                advance_rx,
+                Box::new(DuplicateArmLspAnalyzer { active: active_tx }),
+            );
+            let _ = run_tx.send(run);
+        });
+
+        active_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        advance_test_watchdog(&advance_tx);
+        assert!(
+            run_rx.try_recv().is_err(),
+            "the tick after the first arm must refresh the first window"
+        );
+        advance_test_watchdog(&advance_tx);
+        assert!(matches!(
+            run_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AnalyzerRun::TimedOut { timeout } if timeout == Duration::from_secs(300)
+        ));
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn active_arm_resets_progress_snapshot_after_deferred_ticks() {
+        let (active_tx, active_rx) = mpsc::sync_channel(1);
+        let (advance_tx, advance_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let run = run_with_test_watchdog(
+                advance_rx,
+                Box::new(PreArmTickLspAnalyzer { active: active_tx }),
+            );
+            let _ = run_tx.send(run);
+        });
+
+        active_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        advance_test_watchdog(&advance_tx);
+        assert!(matches!(
+            run_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AnalyzerRun::TimedOut { timeout } if timeout == Duration::from_secs(300)
+        ));
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn deferred_watchdog_returns_pre_arm_success_and_error() {
+        let success = analyze_workspace_with_timeout(
+            Box::new(ImmediateAnalyzer {
+                fails: false,
+                defer: true,
+                progress_tx: None,
+            }),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_secs(300),
+            AnalyzerProgress::default(),
+        );
+        assert!(matches!(success, AnalyzerRun::Completed(Ok(_))));
+
+        let error = analyze_workspace_with_timeout(
+            Box::new(ImmediateAnalyzer {
+                fails: true,
+                defer: true,
+                progress_tx: None,
+            }),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_secs(300),
+            AnalyzerProgress::default(),
+        );
+        assert!(matches!(error, AnalyzerRun::Completed(Err(_))));
+
+        let cancelled_progress = AnalyzerProgress::default();
+        cancelled_progress.cancel();
+        let cancelled = analyze_workspace_with_timeout(
+            Box::new(ImmediateAnalyzer {
+                fails: false,
+                defer: true,
+                progress_tx: None,
+            }),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_secs(300),
+            cancelled_progress,
+        );
+        assert!(matches!(cancelled, AnalyzerRun::Completed(Err(_))));
+
+        let disconnected = analyze_workspace_with_timeout(
+            Box::new(PanickingDeferredAnalyzer),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_secs(300),
+            AnalyzerProgress::default(),
+        );
+        assert!(matches!(disconnected, AnalyzerRun::Completed(Err(_))));
+    }
+
+    #[test]
+    fn stale_invocation_arm_cannot_reach_the_next_run() {
+        let (progress_tx, progress_rx) = mpsc::sync_channel(1);
+        let first = analyze_workspace_with_timeout(
+            Box::new(ImmediateAnalyzer {
+                fails: false,
+                defer: true,
+                progress_tx: Some(progress_tx),
+            }),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_secs(300),
+            AnalyzerProgress::default(),
+        );
+        assert!(matches!(first, AnalyzerRun::Completed(Ok(_))));
+        let stale_progress = progress_rx.recv().unwrap();
+
+        let (advance_tx, advance_rx) = mpsc::channel();
+        let (run_tx, run_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let run = run_with_test_watchdog(advance_rx, Box::new(CancelAwareAnalyzer));
+            let _ = run_tx.send(run);
+        });
+        stale_progress.arm_stall_watchdog();
+        stale_progress.cancel();
+        advance_test_watchdog(&advance_tx);
+        assert!(matches!(
+            run_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AnalyzerRun::TimedOut { .. }
+        ));
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn watchdog_policy_is_read_once_before_worker_spawn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let run = analyze_workspace_with_timeout(
+            Box::new(PolicyCountingAnalyzer {
+                calls: calls.clone(),
+            }),
+            Path::new("/tmp/repo"),
+            ManifestId(1),
+            &[],
+            Duration::from_secs(300),
+            AnalyzerProgress::default(),
+        );
+
+        assert!(matches!(run, AnalyzerRun::Completed(Ok(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     struct SelfWritingConfigAnalyzer;
@@ -1295,31 +2312,33 @@ mod tests {
         let cleanup_called = Arc::new(AtomicBool::new(false));
         {
             let cleanup_called = cleanup_called.clone();
-            *STALLED_ANALYZER_CLEANUP_OBSERVER
-                .lock()
-                .expect("stalled cleanup observer poisoned") = Some(Box::new(move || {
-                cleanup_called.store(true, Ordering::SeqCst);
-            }));
+            STALLED_ANALYZER_CLEANUP_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(Box::new(move || {
+                    cleanup_called.store(true, Ordering::SeqCst);
+                }));
+            });
         }
 
         let started = Instant::now();
-        let run = analyze_workspace_with_timeout(
-            Box::new(CancelAwareAnalyzer),
-            Path::new("/tmp/repo"),
-            ManifestId(1),
-            &[WorkspaceFile {
-                path: "src/lib.rs".into(),
-                blob_sha: "sha".into(),
-                worktree_path: None,
-                source_bytes: None,
-            }],
-            Duration::from_millis(10),
-            AnalyzerProgress::default(),
-        );
+        let run = with_isolated_stalled_analyzer_cleanup(|| {
+            analyze_workspace_with_timeout(
+                Box::new(CancelAwareAnalyzer),
+                Path::new("/tmp/repo"),
+                ManifestId(1),
+                &[WorkspaceFile {
+                    path: "src/lib.rs".into(),
+                    blob_sha: "sha".into(),
+                    worktree_path: None,
+                    source_bytes: None,
+                }],
+                Duration::from_millis(10),
+                AnalyzerProgress::default(),
+            )
+        });
 
-        *STALLED_ANALYZER_CLEANUP_OBSERVER
-            .lock()
-            .expect("stalled cleanup observer poisoned") = None;
+        STALLED_ANALYZER_CLEANUP_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
 
         assert!(matches!(
             run,
