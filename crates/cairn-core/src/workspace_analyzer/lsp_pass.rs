@@ -845,16 +845,21 @@ mod tests {
     use std::time::Instant;
 
     #[cfg(unix)]
-    use crate::lsp::pool::{AvailabilityStrategy, ReadinessStrategy};
+    use crate::lsp::pool::{AvailabilityStrategy, LspClientPool, ReadinessStrategy};
     use crate::lsp::{CONTENT_MODIFIED_ERROR_CODE, Range};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     #[cfg(unix)]
     const WATCHDOG_FAKE_LSP: &str = r#"#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 
 methods = os.environ["CAIRN_TEST_METHODS_FILE"]
+initialize_marker = os.environ["CAIRN_TEST_INITIALIZE_MARKER"]
+initialize_release = os.environ["CAIRN_TEST_INITIALIZE_RELEASE"]
+sys.stderr = open(os.environ["CAIRN_TEST_STDERR_FILE"], "a", buffering=1)
 
 def read_message():
     headers = {}
@@ -881,7 +886,15 @@ while True:
     if method:
         with open(methods, "a") as log:
             log.write(method + "\n")
+            log.flush()
+            os.fsync(log.fileno())
     if method == "initialize":
+        with open(initialize_marker, "w") as marker:
+            marker.write("initialize\n")
+            marker.flush()
+            os.fsync(marker.fileno())
+        while not os.path.exists(initialize_release):
+            time.sleep(0.001)
         respond(message["id"], {"capabilities": {}})
     elif method == "textDocument/definition":
         respond(message["id"], [])
@@ -963,8 +976,20 @@ while True:
     }
 
     #[cfg(unix)]
+    fn wait_for_file_contents(path: &Path, expected: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if fs::read_to_string(path).is_ok_and(|contents| contents == expected) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    #[cfg(unix)]
     fn wait_for_logged_definition(path: &Path) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if fs::read_to_string(path).is_ok_and(|methods| {
                 methods
@@ -979,6 +1004,79 @@ while True:
     }
 
     #[cfg(unix)]
+    fn watchdog_fixture_evidence(
+        methods: &Path,
+        marker: &Path,
+        release: &Path,
+        stderr: &Path,
+    ) -> String {
+        format!(
+            "methods={:?}, marker={:?}, release_exists={}, stderr={:?}",
+            fs::read_to_string(methods),
+            fs::read_to_string(marker),
+            release.exists(),
+            fs::read_to_string(stderr),
+        )
+    }
+
+    #[cfg(unix)]
+    fn wait_for_active_leases(
+        pool: &LspClientPool,
+        key: &PoolKey,
+        expected: usize,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pool.active_leases(key) == Some(expected) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    struct PlacementThreadGuard {
+        initialize_release: PathBuf,
+        owner_work_release: Option<mpsc::SyncSender<()>>,
+        owner: Option<std::thread::JoinHandle<()>>,
+        runner: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    struct PlacementGuardUnwindSentinel;
+
+    #[cfg(unix)]
+    impl PlacementThreadGuard {
+        fn cleanup(&mut self) {
+            let _ = fs::write(&self.initialize_release, "release\n");
+            if let Some(release) = self.owner_work_release.take() {
+                let _ = release.send(());
+            }
+            if let Some(owner) = self.owner.take() {
+                let _ = owner.join();
+            }
+            if let Some(runner) = self.runner.take() {
+                let _ = runner.join();
+            }
+        }
+
+        fn release_owner_work(&mut self) {
+            if let Some(release) = self.owner_work_release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PlacementThreadGuard {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    #[cfg(unix)]
     fn assert_production_pass_arms_after_pool_readiness(
         multi: bool,
         overlap_isolated_cleanup: bool,
@@ -986,6 +1084,9 @@ while True:
         let fixture = tempfile::tempdir().unwrap();
         let binary = fixture.path().join("watchdog-fake-lsp.py");
         let methods = fixture.path().join("methods.log");
+        let initialize_marker = fixture.path().join("initialize.marker");
+        let initialize_release = fixture.path().join("initialize.release");
+        let stderr = fixture.path().join("stderr.log");
         let source = fixture.path().join("source.rb");
         fs::write(&binary, WATCHDOG_FAKE_LSP).unwrap();
         let mut permissions = fs::metadata(&binary).unwrap().permissions();
@@ -1002,15 +1103,29 @@ while True:
             binary: binary.clone(),
             workspace_root: fixture.path().to_path_buf(),
             config_hash: analyzer_id.to_string(),
-            request_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
             availability: AvailabilityStrategy::PathExistsExecutable,
             readiness: ReadinessStrategy::InitializeResponseOnly,
             language_id: "ruby",
             launch_args: Vec::new(),
-            env: vec![(
-                "CAIRN_TEST_METHODS_FILE".into(),
-                methods.display().to_string(),
-            )],
+            env: vec![
+                (
+                    "CAIRN_TEST_METHODS_FILE".into(),
+                    methods.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_INITIALIZE_MARKER".into(),
+                    initialize_marker.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_INITIALIZE_RELEASE".into(),
+                    initialize_release.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_STDERR_FILE".into(),
+                    stderr.display().to_string(),
+                ),
+            ],
             initialization_options: serde_json::json!({}),
         };
         let key = PoolKey::lsp(
@@ -1025,19 +1140,38 @@ while True:
         let (owner_ready_tx, owner_ready_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let owner_spec = spawn_spec.clone();
+        let owner_key = key.clone();
         let owner = std::thread::spawn(move || {
-            pool.with_lsp(key, owner_spec, move |_client| {
+            let _ = pool.with_lsp(owner_key, owner_spec, move |_client| {
                 Box::pin(async move {
-                    owner_ready_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
+                    let _ = owner_ready_tx.send(());
+                    let _ = release_rx.recv();
                     Ok(())
                 })
-            })
-            .unwrap();
+            });
         });
-        owner_ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        if overlap_isolated_cleanup {
-            super::super::run::test_run_isolated_active_stall();
+        let mut threads = PlacementThreadGuard {
+            initialize_release: initialize_release.clone(),
+            owner_work_release: Some(release_tx),
+            owner: Some(owner),
+            runner: None,
+        };
+        assert!(
+            wait_for_file_contents(&initialize_marker, "initialize\n", Duration::from_secs(10),),
+            "fake LSP did not publish and flush initialize receipt: {}",
+            watchdog_fixture_evidence(&methods, &initialize_marker, &initialize_release, &stderr,)
+        );
+        assert!(
+            wait_for_active_leases(pool, &key, 1, Duration::from_secs(10)),
+            "owner lease did not reach one: {}",
+            watchdog_fixture_evidence(&methods, &initialize_marker, &initialize_release, &stderr,)
+        );
+        match owner_ready_rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("owner readiness channel disconnected before initialize release")
+            }
+            Ok(()) => panic!("owner became ready before initialize release"),
         }
 
         let (events_tx, events_rx) = mpsc::channel();
@@ -1086,16 +1220,85 @@ while True:
                     &progress,
                 )
             };
-            result_tx.send(result).unwrap();
+            let _ = result_tx.send(result);
         });
+        threads.runner = Some(runner);
 
-        assert!(
-            events_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "queued pass must not arm before pooled ownership and readiness"
-        );
-        release_tx.send(()).unwrap();
-        let StallWatchdogEvent::Arm(acknowledgement) =
-            events_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        let lease_deadline = Instant::now() + Duration::from_secs(10);
+        while pool.active_leases(&key) != Some(2) {
+            match events_rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("placement watchdog channel disconnected before lease acquisition")
+                }
+                Ok(_) => panic!(
+                    "queued pass armed before acquiring its pool lease: {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                ),
+            }
+            assert!(
+                Instant::now() < lease_deadline,
+                "queued placement lease did not reach two: {}",
+                watchdog_fixture_evidence(
+                    &methods,
+                    &initialize_marker,
+                    &initialize_release,
+                    &stderr,
+                )
+            );
+            std::thread::yield_now();
+        }
+        match events_rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("placement watchdog channel disconnected while queued")
+            }
+            Ok(_) => panic!(
+                "queued pass armed before initialize release: {}",
+                watchdog_fixture_evidence(
+                    &methods,
+                    &initialize_marker,
+                    &initialize_release,
+                    &stderr,
+                )
+            ),
+        }
+        if overlap_isolated_cleanup {
+            super::super::run::test_run_isolated_active_stall();
+        }
+        fs::write(&initialize_release, "release\n").unwrap();
+        owner_ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "owner did not become ready after initialize release ({err:?}): {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                )
+            });
+        threads.release_owner_work();
+        let StallWatchdogEvent::Arm(acknowledgement) = events_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "placement pass did not arm after owner release ({err:?}): {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                )
+            })
         else {
             panic!("active-work boundary must emit Arm");
         };
@@ -1108,12 +1311,180 @@ while True:
         );
         acknowledgement.send(()).unwrap();
         result_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "placement pass did not finish ({err:?}): {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                )
+            })
             .unwrap();
-        assert!(wait_for_logged_definition(&methods));
-        runner.join().unwrap();
-        owner.join().unwrap();
+        assert!(
+            wait_for_logged_definition(&methods),
+            "definition request was not logged: {}",
+            watchdog_fixture_evidence(&methods, &initialize_marker, &initialize_release, &stderr,)
+        );
+        threads.cleanup();
+    }
+
+    #[cfg(unix)]
+    fn assert_placement_guard_actual_unwind() {
+        let fixture = tempfile::tempdir().unwrap();
+        let binary = fixture.path().join("watchdog-fake-lsp.py");
+        let methods = fixture.path().join("methods.log");
+        let initialize_marker = fixture.path().join("initialize.marker");
+        let initialize_release = fixture.path().join("initialize.release");
+        let stderr = fixture.path().join("stderr.log");
+        let source = fixture.path().join("source.rb");
+        fs::write(&binary, WATCHDOG_FAKE_LSP).unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        fs::write(&source, "target\n").unwrap();
+
+        let analyzer_id = "watchdog-unwind-test";
+        let spawn_spec = LspSpawnSpec {
+            binary: binary.clone(),
+            workspace_root: fixture.path().to_path_buf(),
+            config_hash: analyzer_id.to_string(),
+            request_timeout: Duration::from_secs(30),
+            availability: AvailabilityStrategy::PathExistsExecutable,
+            readiness: ReadinessStrategy::InitializeResponseOnly,
+            language_id: "ruby",
+            launch_args: Vec::new(),
+            env: vec![
+                (
+                    "CAIRN_TEST_METHODS_FILE".into(),
+                    methods.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_INITIALIZE_MARKER".into(),
+                    initialize_marker.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_INITIALIZE_RELEASE".into(),
+                    initialize_release.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_STDERR_FILE".into(),
+                    stderr.display().to_string(),
+                ),
+            ],
+            initialization_options: serde_json::json!({}),
+        };
+        let key = PoolKey::lsp(
+            "watchdog-test",
+            fixture.path(),
+            analyzer_id,
+            &binary,
+            analyzer_id,
+        )
+        .unwrap();
+        let pool = lsp_pool::global().unwrap();
+        let reacquire_spec = spawn_spec.clone();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (owner_ready_tx, owner_ready_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(0);
+            let owner_spec = spawn_spec.clone();
+            let owner_key = key.clone();
+            let owner = std::thread::spawn(move || {
+                let _ = pool.with_lsp(owner_key, owner_spec, move |_client| {
+                    Box::pin(async move {
+                        let _ = owner_ready_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok(())
+                    })
+                });
+            });
+            let mut threads = PlacementThreadGuard {
+                initialize_release: initialize_release.clone(),
+                owner_work_release: Some(release_tx),
+                owner: Some(owner),
+                runner: None,
+            };
+            assert!(wait_for_file_contents(
+                &initialize_marker,
+                "initialize\n",
+                Duration::from_secs(10),
+            ));
+            assert!(wait_for_active_leases(
+                pool,
+                &key,
+                1,
+                Duration::from_secs(10),
+            ));
+            assert!(matches!(
+                owner_ready_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+
+            let (events_tx, events_rx) = mpsc::channel();
+            let (progress, _cancel_guard) =
+                AnalyzerProgress::default().with_watchdog_events(events_tx);
+            let files = vec![WorkspaceFile {
+                path: "source.rb".into(),
+                blob_sha: "test".into(),
+                worktree_path: Some(source.clone()),
+                source_bytes: None,
+            }];
+            let root = fixture.path().to_path_buf();
+            let runner_spec = spawn_spec.clone();
+            let (result_tx, _result_rx) = mpsc::sync_channel(1);
+            let runner = std::thread::spawn(move || {
+                let result = run_lsp_definition_pass(
+                    LspDefinitionPass {
+                        analyzer_id,
+                        pool_analyzer_id: None,
+                        language: "watchdog-test",
+                        ref_kind: RefKind::Call,
+                        spawn_spec: runner_spec,
+                        retry: DefinitionRetryPolicy::default(),
+                        collect_definition_sites: one_definition_site,
+                        suppress_definition_targets_at_requested_sites: false,
+                    },
+                    &root,
+                    &files,
+                    &progress,
+                );
+                let _ = result_tx.send(result);
+            });
+            threads.runner = Some(runner);
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pool.active_leases(&key) != Some(2) {
+                assert!(matches!(
+                    events_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(matches!(
+                events_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            std::panic::panic_any(PlacementGuardUnwindSentinel);
+        }));
+
+        match unwind {
+            Err(payload) if payload.is::<PlacementGuardUnwindSentinel>() => {}
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("natural unwind carrier must panic"),
+        }
+        assert!(
+            wait_for_active_leases(pool, &key, 0, Duration::from_secs(10)),
+            "natural unwind left an active lease"
+        );
+        pool.with_lsp(key, reacquire_spec, |_client| {
+            Box::pin(async move { Ok(()) })
+        })
+        .expect("placement acquisition after natural unwind must succeed");
     }
 
     async fn run_retry(
@@ -1539,5 +1910,11 @@ while True:
     #[test]
     fn logical_watchdog_cleanup_does_not_stop_parallel_lsp_placement() {
         assert_production_pass_arms_after_pool_readiness(false, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placement_failure_guard_releases_threads_and_pool_lease() {
+        assert_placement_guard_actual_unwind();
     }
 }
