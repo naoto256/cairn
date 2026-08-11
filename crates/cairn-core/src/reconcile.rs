@@ -1618,6 +1618,24 @@ fn run_register(
     request: ReconcileRegistration<'_>,
     job_manager: &Option<Arc<JobManager>>,
 ) -> Result<ReconcilePublicationReceipt> {
+    #[cfg(test)]
+    crate::churn_recorder::begin_reconcile(request.repo_hash, request.generation);
+    #[cfg(test)]
+    let prior_manifest = {
+        use rusqlite::OptionalExtension;
+        let worktree_id = conn
+            .query_row(
+                "SELECT worktree_id FROM worktrees WHERE path = ?1",
+                [request.worktree_path.to_string_lossy().as_ref()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        worktree_id
+            .map(|id| crate::anchor::resolve(conn, &crate::anchor::AnchorName::tentative(id)))
+            .transpose()?
+            .flatten()
+    };
+    #[cfg(not(test))]
     let outcome = match job_manager.as_deref() {
         Some(jm) => register_repo_reconcile_enqueue_analyzers(conn, request, jm)?,
         None => register_repo_reconcile(
@@ -1628,6 +1646,37 @@ fn run_register(
             request.forced,
         )?,
     };
+    #[cfg(test)]
+    let outcome = {
+        let outcome_result = match job_manager.as_deref() {
+            Some(jm) => register_repo_reconcile_enqueue_analyzers(conn, request, jm),
+            None => register_repo_reconcile(
+                conn,
+                request.worktree_path,
+                request.now_ns,
+                request.generation,
+                request.forced,
+            ),
+        };
+        match outcome_result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                crate::churn_recorder::abort_reconcile(request.repo_hash);
+                return Err(err);
+            }
+        }
+    };
+    #[cfg(test)]
+    {
+        let entries = crate::manifest::get_entries(conn, outcome.tentative_manifest)?;
+        crate::churn_recorder::finish_reconcile(
+            request.repo_hash,
+            request.generation,
+            outcome.tentative_manifest,
+            prior_manifest == Some(outcome.tentative_manifest),
+            &entries,
+        );
+    }
     outcome.publication.ok_or_else(|| {
         Error::Internal("reconcile register completed without a publication receipt".into())
     })

@@ -1283,6 +1283,21 @@ mod tests {
     }
 
     #[test]
+    fn classifier_drops_gradle_generated_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), ".gradle\n").unwrap();
+        let classifier = classifier_for(tmp.path());
+        let generated = tmp
+            .path()
+            .join("gradle/plugins/.gradle/caches/junit/generated.bin");
+
+        assert_eq!(
+            classifier.classify(&generated, EventKind::Create(CreateKind::File)),
+            None
+        );
+    }
+
+    #[test]
     fn ignore_control_is_detected_before_parent_ignore_filter() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".gitignore"), ".gitignore\n").unwrap();

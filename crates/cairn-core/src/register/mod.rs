@@ -64,11 +64,12 @@ pub struct RegisterOutcome {
     /// tentative, no blobs were re-parsed by the pre-publication parse pass,
     /// and no expected analyzer needs a re-run. Current succeeded runs and
     /// current queued or running runs with an identified job satisfy the last
-    /// gate. Missing, terminal, unidentified in-flight, stale-revision, and
-    /// stale-config runs require another enqueue. All three gates must hold —
-    /// entries-unchanged alone is not enough to skip (it would let a
-    /// parser_revision bump leave the resolutions table stale under a reused
-    /// `manifest_id`).
+    /// gate. Missing, unidentified in-flight, stale-revision, and stale-config
+    /// runs require another enqueue. An unchanged failed run is skipped only
+    /// for a non-forced reconcile; direct and forced registrations retry it.
+    /// All three gates must hold — entries-unchanged alone is not enough to
+    /// skip (it would let a parser_revision bump leave the resolutions table
+    /// stale under a reused `manifest_id`).
     pub skip_analyzers_for_unchanged_manifest: bool,
     /// Analyzer jobs enqueued by the `*_enqueue_*` entry points;
     /// always empty for the inline-run variants.
@@ -134,6 +135,10 @@ impl RegistrationPublication {
             Self::Direct { .. } => None,
             Self::Reconcile { generation, .. } => Some(generation),
         }
+    }
+
+    fn retry_unchanged_failed_analyzers(self) -> bool {
+        !matches!(self, Self::Reconcile { forced: false, .. })
     }
 }
 
@@ -501,13 +506,17 @@ where
     // Gate #3 (per-analyzer currency): when the manifest and Tier-1
     // facts are unchanged, current succeeded runs and current queued
     // or running runs with an identified job need no replacement.
-    // Missing, terminal, unidentified in-flight, stale-revision, and
-    // stale-config runs are selected. A permanently failing analyzer
-    // must not amplify into re-running every healthy analyzer on each
-    // watcher tick. Changed inputs still run the full registered set
-    // so newly applicable analyzers are not missed.
+    // Missing, unidentified in-flight, stale-revision, and stale-config runs
+    // are selected. A current failed run is selected by direct/forced paths,
+    // but not by a non-forced no-op reconcile. Changed inputs still run the
+    // full registered set so newly applicable analyzers are not missed.
     let analyzers_to_run = if entries_unchanged && blobs_parsed == 0 {
-        workspace_analyzers_needing_rerun(conn, tentative, worktree_path)?
+        workspace_analyzers_needing_rerun(
+            conn,
+            tentative,
+            worktree_path,
+            publication.retry_unchanged_failed_analyzers(),
+        )?
     } else {
         all_workspace_analyzers()
     };
@@ -518,6 +527,25 @@ where
     // satisfies it.
     let skip_analyzers_for_unchanged_manifest =
         entries_unchanged && blobs_parsed == 0 && analyzers_to_run.is_empty();
+
+    #[cfg(test)]
+    {
+        let selected: HashSet<&str> = analyzers_to_run
+            .iter()
+            .map(|analyzer| analyzer.id())
+            .collect();
+        for analyzer in crate::workspace_analyzer::expected_analyzers_for_manifest(conn, tentative)?
+        {
+            if !selected.contains(analyzer.id()) {
+                crate::churn_recorder::record_existing_for_root(
+                    worktree_path,
+                    analyzer.id(),
+                    &config_hash(worktree_path, analyzer.config_paths()),
+                    analyzer.revision(),
+                );
+            }
+        }
+    }
 
     let analyzer_jobs = if analyzers_to_run.is_empty() {
         debug!(
@@ -1376,6 +1404,127 @@ mod tests {
         assert_eq!(calls[1], ["second-fake-workspace"]);
         assert!(!second.skip_analyzers_for_unchanged_manifest);
         assert_eq!(second.tentative_manifest, first.tentative_manifest);
+    }
+
+    #[test]
+    fn changed_manifest_retries_failed_analyzers_on_automatic_reconcile() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn before() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let expected_all = analyzer_ids(all_workspace_analyzers());
+        let mut calls = Vec::new();
+
+        let first = register_repo_inner_with_publication(
+            &mut conn,
+            repo.path(),
+            1,
+            RegistrationPublication::Reconcile {
+                generation: 1,
+                forced: false,
+            },
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "failed",
+        );
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "failed",
+        );
+
+        fs::write(repo.path().join("src/lib.rs"), "pub fn after() {}\n").unwrap();
+        let second = register_repo_inner_with_publication(
+            &mut conn,
+            repo.path(),
+            2,
+            RegistrationPublication::Reconcile {
+                generation: 2,
+                forced: false,
+            },
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, [expected_all.clone(), expected_all]);
+        assert_ne!(second.tentative_manifest, first.tentative_manifest);
+        assert!(!second.skip_analyzers_for_unchanged_manifest);
+    }
+
+    #[test]
+    fn forced_reconcile_retries_unchanged_failed_analyzers() {
+        let repo = init_rust_repo(&[("src/lib.rs", "pub fn f() {}\n")]);
+        let db_tmp = tempfile::tempdir().unwrap();
+        let mut conn = store::open(&db_tmp.path().join("store.db")).unwrap();
+        let expected_all = analyzer_ids(all_workspace_analyzers());
+        let mut calls = Vec::new();
+
+        let first = register_repo_inner_with_publication(
+            &mut conn,
+            repo.path(),
+            1,
+            RegistrationPublication::Reconcile {
+                generation: 1,
+                forced: false,
+            },
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        attach_test_analyzer_parsers(&conn, first.tentative_manifest);
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "fake-workspace",
+            7,
+            "failed",
+        );
+        insert_analyzer_run(
+            &conn,
+            repo.path(),
+            first.tentative_manifest,
+            "second-fake-workspace",
+            11,
+            "failed",
+        );
+
+        let second = register_repo_inner_with_publication(
+            &mut conn,
+            repo.path(),
+            2,
+            RegistrationPublication::Reconcile {
+                generation: 2,
+                forced: true,
+            },
+            |_, _, _, _, analyzers, _| {
+                calls.push(analyzer_ids(analyzers));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, [expected_all.clone(), expected_all]);
+        assert_ne!(second.tentative_manifest, first.tentative_manifest);
+        assert!(!second.skip_analyzers_for_unchanged_manifest);
     }
 
     #[test]

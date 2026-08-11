@@ -45,6 +45,13 @@ impl JobManager {
             .transpose()?;
         let runtime_metrics = self.runtime_metrics.clone();
         let job_id = dispatch.job.id;
+        #[cfg(test)]
+        let terminal_identity = (
+            dispatch.job.repo_hash.clone(),
+            dispatch.job.store_path.clone(),
+            dispatch.job.manifest_id,
+            dispatch.job.analyzer_id.clone(),
+        );
         let progress_metrics = runtime_metrics.clone();
         let progress =
             crate::workspace_analyzer::AnalyzerProgress::with_observer(Arc::new(move |ticks| {
@@ -65,7 +72,14 @@ impl JobManager {
         })
         .await;
         self.unregister_active_progress(job_id);
-        finalize_joined_run(&self.runtime_metrics, job_id, joined)
+        #[cfg(not(test))]
+        return finalize_joined_run(&self.runtime_metrics, job_id, joined);
+        #[cfg(test)]
+        {
+            let result = finalize_joined_run(&self.runtime_metrics, job_id, joined);
+            record_terminal_after_worker(&terminal_identity, job_id, result.as_ref().err());
+            result
+        }
     }
 
     /// Report a finished dispatch back to the scheduler so it frees
@@ -97,6 +111,45 @@ impl JobManager {
         if let Some(sender) = sender.as_ref() {
             let _ = sender.send(SchedulerMsg::Cancel(job_id));
         }
+    }
+}
+
+#[cfg(test)]
+fn record_terminal_after_worker(
+    identity: &(
+        String,
+        std::path::PathBuf,
+        crate::manifest::ManifestId,
+        String,
+    ),
+    job_id: JobId,
+    worker_error: Option<&Error>,
+) {
+    let (repo_hash, store_path, manifest_id, analyzer_id) = identity;
+    let durable = cas_store::open_existing(store_path).and_then(|conn| {
+        conn.query_row(
+            "SELECT status, error IS NOT NULL
+             FROM workspace_analysis_runs
+             WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3",
+            params![job_id, manifest_id.0, analyzer_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .map_err(Error::from)
+    });
+    match durable {
+        Ok((status, has_error)) => crate::churn_recorder::record_terminal(
+            repo_hash,
+            job_id,
+            &status,
+            has_error.then_some("analyzer_failed"),
+        ),
+        Err(_) if worker_error.is_some() => crate::churn_recorder::record_terminal(
+            repo_hash,
+            job_id,
+            "worker_error",
+            Some("worker_error"),
+        ),
+        Err(_) => {}
     }
 }
 

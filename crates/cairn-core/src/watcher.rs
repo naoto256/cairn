@@ -505,9 +505,13 @@ async fn dispatch_events(
     repo_hash: String,
     mut rx: mpsc::Receiver<WatchEvent>,
 ) {
+    #[cfg(test)]
+    let mut source_batch_ordinal = 0_u64;
     while let Some(first_event) = rx.recv().await {
         let mut event_count = 1_u64;
         let mut channel_closed = false;
+        #[cfg(test)]
+        let mut recorded_events = vec![first_event.clone()];
         debug!(repo_hash = %repo_hash, ?first_event, "repo watcher event edge");
         // Fixed deadline anchored to the *first* event: later events
         // are absorbed but never extend the window, so a continuous
@@ -519,6 +523,8 @@ async fn dispatch_events(
                 event = rx.recv() => match event {
                     Some(event) => {
                         event_count = event_count.saturating_add(1);
+                        #[cfg(test)]
+                        recorded_events.push(event.clone());
                         debug!(repo_hash = %repo_hash, ?event, "coalesced repo watcher event");
                     }
                     None => {
@@ -538,6 +544,16 @@ async fn dispatch_events(
             continue;
         };
 
+        #[cfg(test)]
+        {
+            source_batch_ordinal = source_batch_ordinal.saturating_add(1);
+            crate::churn_recorder::record_watch_batch(
+                &repo_hash,
+                source_batch_ordinal,
+                &recorded_events,
+            );
+        }
+
         // The coalesced edge must not be lost: retry with capped
         // exponential backoff until the dirty bump lands. This
         // covers the registration race where the repo row does not
@@ -549,6 +565,12 @@ async fn dispatch_events(
                 .await
             {
                 Ok(outcome) => {
+                    #[cfg(test)]
+                    crate::churn_recorder::correlate_watch_generation(
+                        &repo_hash,
+                        source_batch_ordinal,
+                        outcome.generation,
+                    );
                     debug!(
                         repo_hash = %repo_hash,
                         generation = outcome.generation,
@@ -586,7 +608,88 @@ async fn dispatch_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas::store as cas_store;
+    use crate::churn_recorder::{self, ChurnSnapshot, EnqueueDecision, WatchOutput};
+    use crate::jobs::JobManager;
     use crate::lifecycle::{RegistrationReconcilePolicy, RepoLifecycleManager};
+    use crate::manifest::ManifestId;
+    use crate::workspace_analyzer::{
+        AnalyzerProgress, WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
+    };
+    use std::process::Command;
+
+    const PRECONDITION_ANALYZER_ID: &str = "churn-precondition-failure";
+    const PRECONDITION_PARSER_ID: &str = "churn-precondition-parser";
+
+    struct ChurnPreconditionBackend;
+
+    impl cairn_lang_api::LanguageBackend for ChurnPreconditionBackend {
+        fn name(&self) -> &'static str {
+            "churn-precondition"
+        }
+
+        fn file_patterns(&self) -> &'static [&'static str] {
+            &["*.churn-precondition"]
+        }
+
+        fn parser_id(&self) -> &'static str {
+            PRECONDITION_PARSER_ID
+        }
+
+        fn parser_revision(&self) -> u32 {
+            1
+        }
+
+        fn extract_syntactic(
+            &self,
+            _source: &[u8],
+        ) -> std::result::Result<cairn_lang_api::SyntacticFacts, cairn_lang_api::ExtractError>
+        {
+            Ok(cairn_lang_api::SyntacticFacts::default())
+        }
+    }
+
+    #[allow(unsafe_code)]
+    #[linkme::distributed_slice(cairn_lang_api::LANGUAGE_BACKENDS)]
+    static CHURN_PRECONDITION_BACKEND: fn() -> Box<dyn cairn_lang_api::LanguageBackend> =
+        || Box::new(ChurnPreconditionBackend);
+
+    struct ChurnPreconditionAnalyzer;
+
+    impl WorkspaceAnalyzer for ChurnPreconditionAnalyzer {
+        fn id(&self) -> &'static str {
+            PRECONDITION_ANALYZER_ID
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "churn-precondition"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            PRECONDITION_PARSER_ID
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &std::path::Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            Err(Error::Internal(
+                "churn analyzer precondition failure".into(),
+            ))
+        }
+    }
+
+    #[allow(unsafe_code)]
+    #[linkme::distributed_slice(WORKSPACE_ANALYZERS)]
+    static CHURN_PRECONDITION_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
+        || Box::new(ChurnPreconditionAnalyzer);
 
     fn test_event() -> WatchEvent {
         WatchEvent::File {
@@ -620,6 +723,661 @@ mod tests {
         let tx = index.transaction().unwrap();
         cas_registry::upsert(&tx, "demo", &root.to_string_lossy(), repo_hash, 1).unwrap();
         tx.commit().unwrap();
+    }
+
+    struct ChurnFixture {
+        _data_root: tempfile::TempDir,
+        repo: tempfile::TempDir,
+        cas: Arc<CasDataDir>,
+        repo_hash: String,
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn write_fixture_file(root: &std::path::Path, path: &str, contents: &str) {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    async fn wait_for_applied(cas: &CasDataDir, repo_hash: &str, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let index = cas_registry::open(&cas.index_db_path()).unwrap();
+                let state = cas_registry::get_reconcile_state(&index, repo_hash)
+                    .unwrap()
+                    .unwrap();
+                if state.applied_generation >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("applied generation did not reach {expected}"));
+    }
+
+    async fn wait_for_precondition_failure(cas: &CasDataDir, repo_hash: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let conn = cas_store::open_existing(&cas.store_db_path(repo_hash)).unwrap();
+                let (total, failed): (i64, i64) = conn
+                    .query_row(
+                        "SELECT COUNT(*),
+                                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+                         FROM workspace_analysis_runs
+                         WHERE analyzer_id = ?1",
+                        [PRECONDITION_ANALYZER_ID],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                if total == 1 && failed == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("precondition analyzer did not reach one failed terminal row");
+    }
+
+    async fn churn_fixture(files: &[(&str, &str)]) -> ChurnFixture {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+        run_git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run_git(repo.path(), &["config", "user.name", "Cairn Test"]);
+        for (path, contents) in files {
+            write_fixture_file(repo.path(), path, contents);
+        }
+        run_git(repo.path(), &["add", "."]);
+        run_git(
+            repo.path(),
+            &["-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"],
+        );
+
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let repo_hash = format!(
+            "churn-{}",
+            repo.path().file_name().unwrap().to_string_lossy()
+        );
+        seed_repo(&cas, &repo_hash, repo.path());
+        cas_store::open(&cas.store_db_path(&repo_hash)).unwrap();
+
+        let first_jobs = JobManager::new(cas.clone());
+        first_jobs.start_workers();
+        let first = RepoReconcileManager::new(cas.clone(), Some(first_jobs.clone()));
+        first
+            .request_dirty_by_repo_hash(repo_hash.clone(), ReconcileTrigger::WatchEvent)
+            .await
+            .unwrap();
+        wait_for_applied(&cas, &repo_hash, 1).await;
+        wait_for_precondition_failure(&cas, &repo_hash).await;
+        first.shutdown(Duration::from_secs(1)).await;
+        first_jobs.shutdown(Duration::from_secs(1)).await;
+
+        ChurnFixture {
+            _data_root: data_root,
+            repo,
+            cas,
+            repo_hash,
+        }
+    }
+
+    fn assert_precondition_failed(fixture: &ChurnFixture) {
+        let conn =
+            cas_store::open_existing(&fixture.cas.store_db_path(&fixture.repo_hash)).unwrap();
+        let (total, failed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+                 FROM workspace_analysis_runs
+                 WHERE analyzer_id = ?1",
+                [PRECONDITION_ANALYZER_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(total, 1, "fixture must select exactly one target analyzer");
+        assert_eq!(failed, 1, "fixture must establish one failed TS LSP run");
+    }
+
+    fn second_reconcile(fixture: &ChurnFixture) -> Arc<RepoReconcileManager> {
+        RepoReconcileManager::new(
+            fixture.cas.clone(),
+            Some(JobManager::new(fixture.cas.clone())),
+        )
+    }
+
+    fn running_reconcile(fixture: &ChurnFixture) -> (Arc<RepoReconcileManager>, Arc<JobManager>) {
+        let jobs = JobManager::new(fixture.cas.clone());
+        jobs.start_workers();
+        let reconcile = RepoReconcileManager::new(fixture.cas.clone(), Some(jobs.clone()));
+        (reconcile, jobs)
+    }
+
+    fn poll_watcher(fixture: &ChurnFixture, reconcile: Arc<RepoReconcileManager>) -> WatchManager {
+        watcher_for_backend(fixture, reconcile, WatchBackend::Poll)
+    }
+
+    fn watcher_for_backend(
+        fixture: &ChurnFixture,
+        reconcile: Arc<RepoReconcileManager>,
+        backend: WatchBackend,
+    ) -> WatchManager {
+        let manager =
+            WatchManager::with_backend_and_reconcile(fixture.cas.clone(), backend, reconcile);
+        manager
+            .watch_repository(fixture.repo_hash.clone(), fixture.repo.path().to_path_buf())
+            .unwrap();
+        manager
+    }
+
+    fn precondition_run(fixture: &ChurnFixture) -> (u32, String, String, Option<String>) {
+        let conn =
+            cas_store::open_existing(&fixture.cas.store_db_path(&fixture.repo_hash)).unwrap();
+        conn.query_row(
+            "SELECT analyzer_revision, config_hash, status, error
+             FROM workspace_analysis_runs
+             WHERE analyzer_id = ?1",
+            [PRECONDITION_ANALYZER_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn precondition_job_id(fixture: &ChurnFixture) -> Option<i64> {
+        let conn =
+            cas_store::open_existing(&fixture.cas.store_db_path(&fixture.repo_hash)).unwrap();
+        conn.query_row(
+            "SELECT job_id FROM workspace_analysis_runs WHERE analyzer_id = ?1",
+            [PRECONDITION_ANALYZER_ID],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn tentative_manifest_snapshot(fixture: &ChurnFixture) -> (ManifestId, usize, u64) {
+        let conn =
+            cas_store::open_existing(&fixture.cas.store_db_path(&fixture.repo_hash)).unwrap();
+        let manifest_id = crate::anchor::resolve_tentative_manifest_id(&conn, fixture.repo.path())
+            .unwrap()
+            .unwrap();
+        let entries = crate::manifest::get_entries(&conn, manifest_id).unwrap();
+        (
+            manifest_id,
+            entries.len(),
+            churn_recorder::physical_fingerprint(&entries),
+        )
+    }
+
+    fn assert_git_worktree_clean(root: &std::path::Path) {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "directory metadata touch must not change tracked or untracked content: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    async fn assert_generation_stable(fixture: &ChurnFixture, expected: i64) {
+        tokio::time::sleep(WATCH_COALESCE_WINDOW * 2 + Duration::from_millis(300)).await;
+        assert_eq!(
+            desired_generation(&fixture.cas, &fixture.repo_hash),
+            Some(expected)
+        );
+    }
+
+    async fn wait_for_recorded_precondition_retry(
+        recorder: &churn_recorder::ChurnRecorder,
+        generation: i64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if recorder.snapshot().enqueue.iter().any(|record| {
+                    record.generation == generation
+                        && record.analyzer_id == PRECONDITION_ANALYZER_ID
+                        && record.terminal_status.as_deref() == Some("failed")
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("target analyzer retry did not reach failed terminal status");
+    }
+
+    struct IgnoredWriteOutcome {
+        snapshot: ChurnSnapshot,
+        generation: i64,
+        before_run: (u32, String, String, Option<String>),
+        after_run: (u32, String, String, Option<String>),
+    }
+
+    struct MetadataTouchOutcome {
+        snapshot: ChurnSnapshot,
+        before_manifest: (ManifestId, usize, u64),
+        after_manifest: (ManifestId, usize, u64),
+        before_run: (u32, String, String, Option<String>),
+        after_run: (u32, String, String, Option<String>),
+        before_job_id: Option<i64>,
+        after_job_id: Option<i64>,
+        state: cas_registry::RepoReconcileState,
+    }
+
+    async fn parent_metadata_touches(touch_count: i64) -> MetadataTouchOutcome {
+        let fixture = churn_fixture(&[
+            ("src/app.ts", "export const answer: number = 42;\n"),
+            (
+                "src/failure.churn-precondition",
+                "deterministic precondition fixture\n",
+            ),
+        ])
+        .await;
+        assert_precondition_failed(&fixture);
+        assert_git_worktree_clean(fixture.repo.path());
+        let before_manifest = tentative_manifest_snapshot(&fixture);
+        let before_run = precondition_run(&fixture);
+        let before_job_id = precondition_job_id(&fixture);
+
+        // The 10s bound below measures active convergence only. Acquiring the
+        // recorder guard and teardown live outside it, so waiting for parallel
+        // recorder ownership does not consume that budget. `catch_unwind` keeps
+        // watcher, reconcile, and job shutdown on the timeout/panic path before
+        // the outcome is propagated or a quiesced repository is observed.
+        let (recorder, _recorder_guard) =
+            churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
+        let (reconcile, jobs) = running_reconcile(&fixture);
+        let watcher = poll_watcher(&fixture, reconcile.clone());
+
+        use futures::FutureExt as _;
+        let active =
+            std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(10), async {
+                let source_dir = std::fs::File::open(fixture.repo.path().join("src")).unwrap();
+                let mut modified = source_dir.metadata().unwrap().modified().unwrap();
+
+                for offset in 1..=touch_count {
+                    modified += Duration::from_secs(2);
+                    source_dir.set_modified(modified).unwrap();
+                    let generation = 1 + offset;
+                    wait_for_applied(&fixture.cas, &fixture.repo_hash, generation).await;
+                    let decision = recorder.snapshot().enqueue.into_iter().find(|record| {
+                        record.generation == generation
+                            && record.analyzer_id == PRECONDITION_ANALYZER_ID
+                    });
+                    if decision
+                        .as_ref()
+                        .is_some_and(|record| matches!(record.decision, EnqueueDecision::New))
+                    {
+                        wait_for_recorded_precondition_retry(&recorder, generation).await;
+                    }
+                }
+                drop(source_dir);
+                assert_generation_stable(&fixture, 1 + touch_count).await;
+            }))
+            .catch_unwind()
+            .await;
+
+        watcher.unwatch_repository(&fixture.repo_hash);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        jobs.shutdown(Duration::from_secs(1)).await;
+
+        match active {
+            Ok(result) => {
+                result.expect("metadata-touch convergence exceeded the 10 second carrier bound")
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+
+        let snapshot = recorder.snapshot();
+        let after_manifest = tentative_manifest_snapshot(&fixture);
+        let after_run = precondition_run(&fixture);
+        let after_job_id = precondition_job_id(&fixture);
+        let index = cas_registry::open(&fixture.cas.index_db_path()).unwrap();
+        let state = cas_registry::get_reconcile_state(&index, &fixture.repo_hash)
+            .unwrap()
+            .unwrap();
+        assert_git_worktree_clean(fixture.repo.path());
+
+        MetadataTouchOutcome {
+            snapshot,
+            before_manifest,
+            after_manifest,
+            before_run,
+            after_run,
+            before_job_id,
+            after_job_id,
+            state,
+        }
+    }
+
+    fn assert_metadata_touch_neutral(outcome: &MetadataTouchOutcome, touch_count: i64) {
+        assert_eq!(outcome.snapshot.watch.len(), touch_count as usize);
+        assert_eq!(outcome.snapshot.reconcile.len(), touch_count as usize);
+        for (index, edge) in outcome.snapshot.watch.iter().enumerate() {
+            let generation = 2 + index as i64;
+            assert_eq!(edge.source_batch_ordinal, 1 + index as u64);
+            assert_eq!(edge.generation, Some(generation));
+            assert_eq!(
+                edge.output,
+                WatchOutput::File {
+                    path: b"src".to_vec(),
+                    change: "touched",
+                }
+            );
+            let reconcile = &outcome.snapshot.reconcile[index];
+            assert_eq!(reconcile.generation, generation);
+            assert!(reconcile.reused);
+            assert_eq!(reconcile.manifest_id, outcome.before_manifest.0);
+            assert_eq!(reconcile.entry_count, outcome.before_manifest.1);
+            assert_eq!(reconcile.physical_fingerprint, outcome.before_manifest.2);
+        }
+        assert_eq!(outcome.after_manifest, outcome.before_manifest);
+        assert_eq!(outcome.after_run, outcome.before_run);
+        assert_eq!(outcome.state.desired_generation, 1 + touch_count);
+        assert_eq!(outcome.state.applied_generation, 1 + touch_count);
+        assert!(outcome.state.attempt_generation.is_none());
+        assert!(outcome.state.next_retry_at_ns.is_none());
+    }
+
+    async fn ignored_generated_write_for_backend(backend: WatchBackend) -> IgnoredWriteOutcome {
+        let fixture = churn_fixture(&[
+            (".gitignore", ".gradle\n"),
+            ("gradle/plugins/keep.txt", "tracked parent\n"),
+            (
+                "src/failure.churn-precondition",
+                "deterministic precondition fixture\n",
+            ),
+        ])
+        .await;
+        assert_precondition_failed(&fixture);
+        let before_run = precondition_run(&fixture);
+        let generated_dir = fixture
+            .repo
+            .path()
+            .join("gradle/plugins/.gradle/caches/junit");
+        std::fs::create_dir_all(&generated_dir).unwrap();
+
+        let (reconcile, jobs) = running_reconcile(&fixture);
+        let (recorder, _recorder_guard) =
+            churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
+        let watcher = watcher_for_backend(&fixture, reconcile.clone(), backend);
+        tokio::time::sleep(WATCH_DEBOUNCE + Duration::from_millis(100)).await;
+
+        let generated = generated_dir.join("generated.bin");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&generated)
+            .unwrap();
+        use std::io::Write as _;
+        file.write_all(b"ignored generated bytes\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        tokio::time::sleep(WATCH_DEBOUNCE + WATCH_COALESCE_WINDOW + Duration::from_secs(1)).await;
+        let generation = desired_generation(&fixture.cas, &fixture.repo_hash).unwrap();
+        if generation > 1 {
+            wait_for_applied(&fixture.cas, &fixture.repo_hash, generation).await;
+            assert_generation_stable(&fixture, generation).await;
+        }
+        let snapshot = recorder.snapshot();
+        let after_run = precondition_run(&fixture);
+
+        watcher.unwatch_repository(&fixture.repo_hash);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        jobs.shutdown(Duration::from_secs(1)).await;
+
+        IgnoredWriteOutcome {
+            snapshot,
+            generation,
+            before_run,
+            after_run,
+        }
+    }
+
+    fn assert_ignored_write_contract(outcome: IgnoredWriteOutcome) {
+        assert!(
+            outcome.snapshot.watch.len() <= 1,
+            "backend may suppress the ignored child or emit one parent edge"
+        );
+        if let Some(edge) = outcome.snapshot.watch.first() {
+            assert_eq!(
+                edge.output,
+                WatchOutput::File {
+                    path: b"gradle/plugins".to_vec(),
+                    change: "touched",
+                }
+            );
+            assert_eq!(edge.generation, Some(2));
+            assert_eq!(outcome.generation, 2);
+            assert_eq!(outcome.snapshot.reconcile.len(), 1);
+            let reconcile = &outcome.snapshot.reconcile[0];
+            assert_eq!(reconcile.generation, 2);
+            assert!(reconcile.reused);
+        } else {
+            assert_eq!(outcome.generation, 1);
+            assert!(outcome.snapshot.reconcile.is_empty());
+        }
+        assert_eq!(
+            outcome.after_run, outcome.before_run,
+            "ignored-only writes must not change analyzer currency or terminal state"
+        );
+        assert!(
+            outcome.snapshot.enqueue.is_empty(),
+            "ignored-only writes must not enqueue a new analyzer job"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_analyzer_without_repo_writes_does_not_churn() {
+        let fixture = churn_fixture(&[
+            ("package.json", "{\"private\":true}\n"),
+            ("src/app.ts", "export const answer: number = 42;\n"),
+            ("src/legacy.js", "export const legacy = true;\n"),
+            ("src/Main.java", "final class Main {}\n"),
+            ("src/Main.kt", "class Main\n"),
+            (
+                "src/failure.churn-precondition",
+                "deterministic precondition fixture\n",
+            ),
+        ])
+        .await;
+        assert_precondition_failed(&fixture);
+
+        let reconcile = second_reconcile(&fixture);
+        let (recorder, _recorder_guard) =
+            churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
+        let watcher = poll_watcher(&fixture, reconcile.clone());
+
+        assert_generation_stable(&fixture, 1).await;
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot.watch.is_empty(),
+            "no repo write may produce a watcher edge"
+        );
+        assert!(
+            snapshot.reconcile.is_empty(),
+            "a terminal analyzer failure alone must not create a generation"
+        );
+        assert!(
+            snapshot.enqueue.is_empty(),
+            "a terminal analyzer failure alone must not be re-enqueued"
+        );
+
+        watcher.unwatch_repository(&fixture.repo_hash);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_source_edge_retries_failed_analyzer_once_without_trailing_churn() {
+        let fixture = churn_fixture(&[
+            ("package.json", "{\"private\":true}\n"),
+            ("src/app.ts", "export const answer: number = 42;\n"),
+            ("src/legacy.js", "export const legacy = true;\n"),
+            ("src/Main.java", "final class Main {}\n"),
+            ("src/Main.kt", "class Main\n"),
+            (
+                "src/failure.churn-precondition",
+                "deterministic precondition fixture\n",
+            ),
+        ])
+        .await;
+        assert_precondition_failed(&fixture);
+
+        let (reconcile, jobs) = running_reconcile(&fixture);
+        let (recorder, _recorder_guard) =
+            churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
+        let probe_path = fixture.repo.path().join("src/watch_probe.ts");
+        assert!(!probe_path.exists(), "watch probe must be initially absent");
+        let watcher = poll_watcher(&fixture, reconcile.clone());
+
+        use std::io::Write as _;
+        let mut probe = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .unwrap();
+        probe.write_all(b"export const watched = true;\n").unwrap();
+        probe.sync_all().unwrap();
+        drop(probe);
+        wait_for_applied(&fixture.cas, &fixture.repo_hash, 2).await;
+        wait_for_recorded_precondition_retry(&recorder, 2).await;
+        assert_generation_stable(&fixture, 2).await;
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot.watch.len(),
+            1,
+            "one source edge must be normalized once"
+        );
+        assert_eq!(snapshot.watch[0].source_batch_ordinal, 1);
+        assert_eq!(snapshot.watch[0].generation, Some(2));
+        assert!(
+            matches!(
+                &snapshot.watch[0].output,
+                WatchOutput::File { path, change: "touched" }
+                    if path == b"src/watch_probe.ts" || path == b"src"
+            ),
+            "Poll may report the created child or its immediate parent across the snapshot timing boundary: {:?}",
+            snapshot.watch[0].output
+        );
+        assert_eq!(snapshot.reconcile.len(), 1);
+        assert_eq!(snapshot.reconcile[0].generation, 2);
+
+        let retries: Vec<_> = snapshot
+            .enqueue
+            .iter()
+            .filter(|record| record.analyzer_id == PRECONDITION_ANALYZER_ID)
+            .collect();
+        assert_eq!(retries.len(), 1, "target analyzer must retry exactly once");
+        assert_eq!(retries[0].generation, 2);
+        assert_eq!(retries[0].decision, EnqueueDecision::New);
+        assert_eq!(retries[0].terminal_status.as_deref(), Some("failed"));
+        assert_eq!(retries[0].failure_class, Some("analyzer_failed"));
+        let retry_job_id = retries[0].job_id.expect("new admission must own a job id");
+        assert!(snapshot.publication_checks.iter().any(|check| {
+            check.repo_hash == fixture.repo_hash
+                && check.generation == 2
+                && check.analyzer_id == PRECONDITION_ANALYZER_ID
+                && check.job_id == retry_job_id
+        }));
+
+        watcher.unwatch_repository(&fixture.repo_hash);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        jobs.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn polling_ignored_generated_write_does_not_enqueue_analyzers() {
+        assert_ignored_write_contract(
+            ignored_generated_write_for_backend(WatchBackend::Poll).await,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_ignored_generated_write_does_not_enqueue_analyzers() {
+        assert_ignored_write_contract(
+            ignored_generated_write_for_backend(WatchBackend::Recommended).await,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parent_metadata_edge_records_current_failed_analyzer_decision() {
+        let outcome = parent_metadata_touches(1).await;
+        assert_metadata_touch_neutral(&outcome, 1);
+        let decisions: Vec<_> = outcome
+            .snapshot
+            .enqueue
+            .iter()
+            .filter(|record| record.analyzer_id == PRECONDITION_ANALYZER_ID)
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].generation, 2);
+        assert_eq!(decisions[0].config_hash, outcome.before_run.1);
+        assert_eq!(decisions[0].revision, outcome.before_run.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn noop_reused_manifest_does_not_readmit_unchanged_failed_analyzer() {
+        let outcome = parent_metadata_touches(1).await;
+        assert_metadata_touch_neutral(&outcome, 1);
+        let new_jobs: Vec<_> = outcome
+            .snapshot
+            .enqueue
+            .iter()
+            .filter(|record| {
+                record.analyzer_id == PRECONDITION_ANALYZER_ID
+                    && matches!(record.decision, EnqueueDecision::New)
+            })
+            .collect();
+        assert!(
+            new_jobs.is_empty(),
+            "no-op reconcile must admit zero new jobs"
+        );
+        assert_eq!(
+            outcome.after_job_id, outcome.before_job_id,
+            "durable run row must retain its prior job identity"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn junit_shaped_parent_metadata_churn_converges_without_analyzer_readmission() {
+        let outcome = parent_metadata_touches(5).await;
+        assert_metadata_touch_neutral(&outcome, 5);
+        let new_jobs: Vec<_> = outcome
+            .snapshot
+            .enqueue
+            .iter()
+            .filter(|record| {
+                record.analyzer_id == PRECONDITION_ANALYZER_ID
+                    && matches!(record.decision, EnqueueDecision::New)
+            })
+            .collect();
+        assert!(
+            new_jobs.is_empty(),
+            "five no-op generations must admit zero analyzer jobs; observed {}",
+            new_jobs.len()
+        );
+        assert_eq!(outcome.after_job_id, outcome.before_job_id);
     }
 
     #[tokio::test]
