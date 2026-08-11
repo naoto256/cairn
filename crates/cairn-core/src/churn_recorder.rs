@@ -78,16 +78,18 @@ pub(crate) struct ChurnSnapshot {
 pub(crate) struct ChurnRecorder {
     repo_hash: String,
     repo_root: PathBuf,
+    canonical_repo_root: Option<PathBuf>,
     snapshot: Mutex<ChurnSnapshot>,
     active_generation: Mutex<Option<i64>>,
     changed_paths: Mutex<HashMap<i64, Vec<Vec<u8>>>>,
 }
 
 impl ChurnRecorder {
-    fn new(repo_hash: String, repo_root: PathBuf) -> Self {
+    fn new(repo_hash: String, repo_root: PathBuf, canonical_repo_root: Option<PathBuf>) -> Self {
         Self {
             repo_hash,
             repo_root,
+            canonical_repo_root,
             snapshot: Mutex::new(ChurnSnapshot::default()),
             active_generation: Mutex::new(None),
             changed_paths: Mutex::new(HashMap::new()),
@@ -102,8 +104,23 @@ impl ChurnRecorder {
         self.repo_hash == repo_hash
     }
 
+    /// Relativize one observed path against the repository root.
+    ///
+    /// The raw root stays the registry/register identity; the canonical root
+    /// is only a fallback for backend-reported watch paths that spell the same
+    /// directory through an alias. The event leaf itself is never canonicalized,
+    /// so after an accepted root is stripped, the remaining relative bytes
+    /// preserve the watcher's spelling.
     fn relative_bytes(&self, path: &Path) -> Vec<u8> {
-        let relative = path.strip_prefix(&self.repo_root).unwrap_or(path);
+        if path.is_relative() {
+            return path_bytes(path);
+        }
+        let relative = path.strip_prefix(&self.repo_root).ok().or_else(|| {
+            self.canonical_repo_root
+                .as_deref()
+                .and_then(|root| path.strip_prefix(root).ok())
+        });
+        let relative = relative.unwrap_or(path);
         path_bytes(relative)
     }
 }
@@ -128,7 +145,13 @@ pub(crate) fn install(
     let exclusive = RECORDER_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let recorder = Arc::new(ChurnRecorder::new(repo_hash.into(), repo_root.into()));
+    let repo_root = repo_root.into();
+    let canonical_repo_root = repo_root.canonicalize().ok();
+    let recorder = Arc::new(ChurnRecorder::new(
+        repo_hash.into(),
+        repo_root,
+        canonical_repo_root,
+    ));
     *RECORDER.get_or_init(Default::default).lock().unwrap() = Some(recorder.clone());
     (
         recorder,
@@ -393,4 +416,82 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 #[cfg(not(unix))]
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_bytes_accepts_raw_canonical_and_relative_child_or_parent_paths() {
+        let raw_root = PathBuf::from("/tmp/churn-recorder-alias");
+        let canonical_root = PathBuf::from("/private/tmp/churn-recorder-real");
+        let recorder = ChurnRecorder::new(
+            "repo".to_string(),
+            raw_root.clone(),
+            Some(canonical_root.clone()),
+        );
+
+        for (path, expected) in [
+            (
+                raw_root.join("src/watch_probe.ts"),
+                b"src/watch_probe.ts".as_slice(),
+            ),
+            (raw_root.join("src"), b"src".as_slice()),
+            (
+                canonical_root.join("src/watch_probe.ts"),
+                b"src/watch_probe.ts".as_slice(),
+            ),
+            (canonical_root.join("src"), b"src".as_slice()),
+            (
+                PathBuf::from("src/watch_probe.ts"),
+                b"src/watch_probe.ts".as_slice(),
+            ),
+            (PathBuf::from("src"), b"src".as_slice()),
+        ] {
+            assert_eq!(recorder.relative_bytes(&path), expected);
+        }
+    }
+
+    #[test]
+    fn relative_bytes_does_not_accept_an_outside_path_by_suffix() {
+        let repo_root = PathBuf::from("/tmp/churn-recorder-repo");
+        let outside = PathBuf::from("/tmp/churn-recorder-other/src");
+        let recorder = ChurnRecorder::new("repo".to_string(), repo_root, None);
+
+        assert_eq!(recorder.relative_bytes(&outside), path_bytes(&outside));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_bytes_preserves_non_utf8_root_and_child_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = PathBuf::from(OsString::from_vec(b"/tmp/churn-recorder-\xff".to_vec()));
+        let child = root.join(OsString::from_vec(b"src/child-\xfe.rs".to_vec()));
+        let recorder = ChurnRecorder::new("repo".to_string(), root, None);
+
+        assert_eq!(recorder.relative_bytes(&child), b"src/child-\xfe.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_relativizes_events_from_a_symlink_alias_canonical_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("real");
+        let alias_root = temp.path().join("alias");
+        std::fs::create_dir(&real_root).unwrap();
+        symlink(&real_root, &alias_root).unwrap();
+
+        let (recorder, _guard) = install("repo", &alias_root);
+
+        assert_eq!(
+            recorder.relative_bytes(&real_root.join("src/watch_probe.ts")),
+            b"src/watch_probe.ts"
+        );
+        assert_eq!(recorder.relative_bytes(&real_root.join("src")), b"src");
+    }
 }
