@@ -823,11 +823,7 @@ impl JobManager {
                 crate::churn_recorder::EnqueueDecision::New,
                 Some(job_id),
             );
-            crate::churn_recorder::assert_enqueue_recorded_before_publication(
-                repo_hash,
-                analyzer_id,
-                job_id,
-            );
+            crate::churn_recorder::record_scheduler_publication(repo_hash, analyzer_id, job_id);
         }
         self.runtime_metrics
             .mark_enqueued(job_id, pool_group, now_ns);
@@ -848,6 +844,8 @@ impl JobManager {
             self.tracked_keys.release(&key);
         }
         drop(admission);
+        #[cfg(test)]
+        crate::churn_recorder::await_terminal_after_scheduler_publication(repo_hash, job_id);
         Ok(enqueued.then(|| QueuedAnalyzerJob {
             job_id,
             analyzer_id: analyzer_id.to_string(),

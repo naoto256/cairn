@@ -77,7 +77,7 @@ impl JobManager {
         #[cfg(test)]
         {
             let result = finalize_joined_run(&self.runtime_metrics, job_id, joined);
-            record_terminal_after_worker(&terminal_identity, job_id, result.as_ref().err());
+            record_terminal_after_worker(terminal_identity, job_id, result.as_ref().err()).await;
             result
         }
     }
@@ -115,8 +115,8 @@ impl JobManager {
 }
 
 #[cfg(test)]
-fn record_terminal_after_worker(
-    identity: &(
+async fn record_terminal_after_worker(
+    identity: (
         String,
         std::path::PathBuf,
         crate::manifest::ManifestId,
@@ -125,31 +125,64 @@ fn record_terminal_after_worker(
     job_id: JobId,
     worker_error: Option<&Error>,
 ) {
-    let (repo_hash, store_path, manifest_id, analyzer_id) = identity;
-    let durable = cas_store::open_existing(store_path).and_then(|conn| {
-        conn.query_row(
-            "SELECT status, error IS NOT NULL
+    record_terminal_after_worker_with_probe(identity, job_id, worker_error.is_some(), || {}).await;
+}
+
+#[cfg(test)]
+async fn record_terminal_after_worker_with_probe<F>(
+    identity: (
+        String,
+        std::path::PathBuf,
+        crate::manifest::ManifestId,
+        String,
+    ),
+    job_id: JobId,
+    worker_error: bool,
+    probe: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    let failure_identity = identity.clone();
+    let durable = tokio::task::spawn_blocking(move || {
+        probe();
+        let (_, store_path, manifest_id, analyzer_id) = identity;
+        cas_store::open_existing(&store_path).and_then(|conn| {
+            conn.query_row(
+                "SELECT status, error IS NOT NULL
              FROM workspace_analysis_runs
              WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3",
-            params![job_id, manifest_id.0, analyzer_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
-        )
-        .map_err(Error::from)
-    });
+                params![job_id, manifest_id.0, analyzer_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .map_err(Error::from)
+        })
+    })
+    .await;
+    let (repo_hash, _, _, analyzer_id) = failure_identity;
     match durable {
-        Ok((status, has_error)) => crate::churn_recorder::record_terminal(
-            repo_hash,
+        Ok(Ok((status, has_error))) => crate::churn_recorder::record_terminal(
+            &repo_hash,
+            &analyzer_id,
             job_id,
             &status,
             has_error.then_some("analyzer_failed"),
         ),
-        Err(_) if worker_error.is_some() => crate::churn_recorder::record_terminal(
-            repo_hash,
+        Ok(Err(_)) | Err(_) => crate::churn_recorder::record_observation_failure(
+            &repo_hash,
+            crate::churn_recorder::ObservationFailureKind::TerminalRowUnavailable,
+            None,
+            Some(&analyzer_id),
+            Some(job_id),
+        ),
+    }
+    if worker_error {
+        crate::churn_recorder::record_terminal(
+            &repo_hash,
+            &analyzer_id,
             job_id,
             "worker_error",
             Some("worker_error"),
-        ),
-        Err(_) => {}
+        );
     }
 }
 
@@ -313,6 +346,75 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(scheduler_state(&metrics, 2), RunStatus::Failed.as_str());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_observation_uses_blocking_pool_and_reports_missing_or_unreadable_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (recorder, _guard) = crate::churn_recorder::install("repo", tmp.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store_path = tmp.path().join("store.db");
+        cas_store::open(&store_path).unwrap();
+        let task = tokio::spawn(record_terminal_after_worker_with_probe(
+            (
+                "repo".into(),
+                store_path,
+                crate::manifest::ManifestId(7),
+                "test-analyzer".into(),
+            ),
+            41,
+            false,
+            move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+            },
+        ));
+
+        started_rx.await.unwrap();
+        // Reaching this point while the blocking probe is still held is the
+        // responsiveness evidence; the counter below is only a sentinel that
+        // the yield returned.
+        let mut heartbeat = 0;
+        tokio::task::yield_now().await;
+        heartbeat += 1;
+        assert_eq!(
+            heartbeat, 1,
+            "current-thread runtime must remain responsive"
+        );
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        record_terminal_after_worker(
+            (
+                "repo".into(),
+                tmp.path().join("unreadable.db"),
+                crate::manifest::ManifestId(8),
+                "test-analyzer".into(),
+            ),
+            42,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.snapshot().observation_failures,
+            [
+                crate::churn_recorder::ObservationFailure {
+                    kind: crate::churn_recorder::ObservationFailureKind::TerminalRowUnavailable,
+                    repo_hash: "repo".into(),
+                    generation: None,
+                    analyzer_id: Some("test-analyzer".into()),
+                    job_id: Some(41),
+                },
+                crate::churn_recorder::ObservationFailure {
+                    kind: crate::churn_recorder::ObservationFailureKind::TerminalRowUnavailable,
+                    repo_hash: "repo".into(),
+                    generation: None,
+                    analyzer_id: Some("test-analyzer".into()),
+                    job_id: Some(42),
+                },
+            ]
+        );
     }
 
     #[test]
