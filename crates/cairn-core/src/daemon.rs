@@ -1668,11 +1668,12 @@ mod tests {
             );
             if let Some(state) = &state {
                 if state.desired_generation >= minimum_desired_generation
-                    && state.applied_generation >= state.desired_generation
+                    && state.applied_generation == state.desired_generation
                     && state.attempt_generation.is_none()
                     && state.last_success_ns.is_some()
                     && state.last_error.is_none()
                     && state.consecutive_failures == 0
+                    && state.next_retry_at_ns.is_none()
                     && saw_required_symbol
                 {
                     return state.clone();

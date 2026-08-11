@@ -1191,6 +1191,55 @@ impl LspClientPool {
             .get(key)
             .map(|r| r.active_leases)
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_running_for_test(&self) -> bool {
+        self.registry.lock().unwrap().mode == PoolMode::Running
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity_for_test(&self) -> usize {
+        self.capacity.get()
+    }
+
+    /// Remove one idle entry so a test leaves the shared pool as it found it.
+    ///
+    /// Termination-unproven cleanup keeps the record and poisons the pool,
+    /// matching how production treats a child it could not prove dead:
+    /// dropping the record would discard the pool's registry-owned cleanup
+    /// path for a child that may still be running.
+    #[cfg(test)]
+    pub(crate) fn remove_idle_test_entry(&self, key: &PoolKey) -> Result<()> {
+        let entry = {
+            let mut reg = self.lock_registry()?;
+            let Some(record) = reg.entries.get_mut(key) else {
+                return Ok(());
+            };
+            if record.state != RecordState::Ready || record.active_leases != 0 {
+                return Err(Error::Protocol(
+                    "test cleanup requires an idle ready pool entry".into(),
+                ));
+            }
+            record.state = RecordState::Evicting;
+            Arc::clone(&record.entry)
+        };
+
+        let result = self.runtime.block_on(entry.shutdown());
+        match result {
+            Ok(()) => {
+                self.lock_registry()?.entries.remove(key);
+                Ok(())
+            }
+            Err(error) if error.is_termination_unproven() => {
+                self.poison_from_unproven_cleanup(&format!("test entry cleanup: {error}"));
+                Err(error)
+            }
+            Err(error) => {
+                self.lock_registry()?.entries.remove(key);
+                Err(error)
+            }
+        }
+    }
 }
 
 #[derive(Default)]

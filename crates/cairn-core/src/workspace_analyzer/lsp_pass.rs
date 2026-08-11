@@ -860,6 +860,12 @@ methods = os.environ["CAIRN_TEST_METHODS_FILE"]
 initialize_marker = os.environ["CAIRN_TEST_INITIALIZE_MARKER"]
 initialize_release = os.environ["CAIRN_TEST_INITIALIZE_RELEASE"]
 sys.stderr = open(os.environ["CAIRN_TEST_STDERR_FILE"], "a", buffering=1)
+pid_file = os.environ.get("CAIRN_TEST_PID_FILE")
+if pid_file:
+    with open(pid_file, "w") as pid_out:
+        pid_out.write(str(os.getpid()))
+        pid_out.flush()
+        os.fsync(pid_out.fileno())
 
 def read_message():
     headers = {}
@@ -903,6 +909,13 @@ while True:
     elif method == "exit":
         break
 "#;
+
+    /// Serializes the placement carriers. They use distinct keys in the finite
+    /// process-global LSP pool, so parallel carriers can turn an otherwise
+    /// valid acquisition into PoolAtCapacity. The lock covers the whole
+    /// carrier, including unwind/re-acquisition cleanup.
+    #[cfg(unix)]
+    static PLACEMENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_uri() -> Url {
         Url::from("file:///tmp/repo/src/lib.rs")
@@ -982,7 +995,7 @@ while True:
             if fs::read_to_string(path).is_ok_and(|contents| contents == expected) {
                 return true;
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         false
     }
@@ -998,7 +1011,7 @@ while True:
             }) {
                 return true;
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         false
     }
@@ -1031,7 +1044,7 @@ while True:
             if pool.active_leases(key) == Some(expected) {
                 return true;
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         false
     }
@@ -1048,6 +1061,43 @@ while True:
     struct PlacementGuardUnwindSentinel;
 
     #[cfg(unix)]
+    struct ForeignGuardUnwindSentinel;
+
+    #[cfg(unix)]
+    struct PlacementPoolCleanupGuard {
+        pool: &'static LspClientPool,
+        key: Option<PoolKey>,
+    }
+
+    #[cfg(unix)]
+    impl PlacementPoolCleanupGuard {
+        fn new(pool: &'static LspClientPool, key: PoolKey) -> Self {
+            Self {
+                pool,
+                key: Some(key),
+            }
+        }
+
+        fn cleanup(&mut self) -> crate::lsp::Result<()> {
+            let Some(key) = self.key.take() else {
+                return Ok(());
+            };
+            self.pool.remove_idle_test_entry(&key)
+        }
+
+        fn finish(mut self) -> crate::lsp::Result<()> {
+            self.cleanup()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PlacementPoolCleanupGuard {
+        fn drop(&mut self) {
+            let _ = self.cleanup();
+        }
+    }
+
+    #[cfg(unix)]
     impl PlacementThreadGuard {
         fn cleanup(&mut self) {
             let _ = fs::write(&self.initialize_release, "release\n");
@@ -1060,6 +1110,10 @@ while True:
             if let Some(runner) = self.runner.take() {
                 let _ = runner.join();
             }
+        }
+
+        fn finish(mut self) {
+            self.cleanup();
         }
 
         fn release_owner_work(&mut self) {
@@ -1077,16 +1131,30 @@ while True:
     }
 
     #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
     fn assert_production_pass_arms_after_pool_readiness(
         multi: bool,
         overlap_isolated_cleanup: bool,
     ) {
+        let _placement_lock = PLACEMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fixture = tempfile::tempdir().unwrap();
         let binary = fixture.path().join("watchdog-fake-lsp.py");
         let methods = fixture.path().join("methods.log");
         let initialize_marker = fixture.path().join("initialize.marker");
         let initialize_release = fixture.path().join("initialize.release");
         let stderr = fixture.path().join("stderr.log");
+        let pid_file = fixture.path().join("pid");
         let source = fixture.path().join("source.rb");
         fs::write(&binary, WATCHDOG_FAKE_LSP).unwrap();
         let mut permissions = fs::metadata(&binary).unwrap().permissions();
@@ -1125,6 +1193,7 @@ while True:
                     "CAIRN_TEST_STDERR_FILE".into(),
                     stderr.display().to_string(),
                 ),
+                ("CAIRN_TEST_PID_FILE".into(), pid_file.display().to_string()),
             ],
             initialization_options: serde_json::json!({}),
         };
@@ -1137,6 +1206,7 @@ while True:
         )
         .unwrap();
         let pool = lsp_pool::global().unwrap();
+        let pool_cleanup = PlacementPoolCleanupGuard::new(pool, key.clone());
         let (owner_ready_tx, owner_ready_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let owner_spec = spawn_spec.clone();
@@ -1241,6 +1311,36 @@ while True:
                     )
                 ),
             }
+            match result_rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => panic!(
+                    "placement runner disconnected before lease acquisition: {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                ),
+                Ok(Ok(_)) => panic!(
+                    "placement runner completed before lease acquisition: {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                ),
+                Ok(Err(err)) => panic!(
+                    "placement runner failed before lease acquisition ({err:?}): {}",
+                    watchdog_fixture_evidence(
+                        &methods,
+                        &initialize_marker,
+                        &initialize_release,
+                        &stderr,
+                    )
+                ),
+            }
             assert!(
                 Instant::now() < lease_deadline,
                 "queued placement lease did not reach two: {}",
@@ -1329,17 +1429,24 @@ while True:
             "definition request was not logged: {}",
             watchdog_fixture_evidence(&methods, &initialize_marker, &initialize_release, &stderr,)
         );
-        threads.cleanup();
+        threads.finish();
+        pool_cleanup
+            .finish()
+            .expect("placement test pool entry cleanup must succeed");
     }
 
     #[cfg(unix)]
     fn assert_placement_guard_actual_unwind() {
+        let _placement_lock = PLACEMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fixture = tempfile::tempdir().unwrap();
         let binary = fixture.path().join("watchdog-fake-lsp.py");
         let methods = fixture.path().join("methods.log");
         let initialize_marker = fixture.path().join("initialize.marker");
         let initialize_release = fixture.path().join("initialize.release");
         let stderr = fixture.path().join("stderr.log");
+        let pid_file = fixture.path().join("pid");
         let source = fixture.path().join("source.rb");
         fs::write(&binary, WATCHDOG_FAKE_LSP).unwrap();
         let mut permissions = fs::metadata(&binary).unwrap().permissions();
@@ -1374,6 +1481,7 @@ while True:
                     "CAIRN_TEST_STDERR_FILE".into(),
                     stderr.display().to_string(),
                 ),
+                ("CAIRN_TEST_PID_FILE".into(), pid_file.display().to_string()),
             ],
             initialization_options: serde_json::json!({}),
         };
@@ -1387,8 +1495,73 @@ while True:
         .unwrap();
         let pool = lsp_pool::global().unwrap();
         let reacquire_spec = spawn_spec.clone();
+        let foreign_key = PoolKey::lsp(
+            "watchdog-test",
+            fixture.path(),
+            "watchdog-foreign-sentinel",
+            &binary,
+            "watchdog-foreign-sentinel",
+        )
+        .unwrap();
+        // A second live entry proves exact target-only cleanup. Capacity one
+        // cannot retain the foreign control and target entry together, so the
+        // control is skipped.
+        let preserve_foreign = pool.capacity_for_test() > 1;
+        let foreign_cleanup = if preserve_foreign {
+            let foreign_pid = Cell::new(None);
+            let foreign_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fs::write(&initialize_release, "release\n").unwrap();
+                pool.with_lsp(foreign_key.clone(), spawn_spec.clone(), |_client| {
+                    Box::pin(async move { Ok(()) })
+                })
+                .expect("foreign unwind sentinel entry must start");
+                let _foreign_cleanup = PlacementPoolCleanupGuard::new(pool, foreign_key.clone());
+                foreign_pid.set(Some(
+                    fs::read_to_string(&pid_file)
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap(),
+                ));
+                std::panic::panic_any(ForeignGuardUnwindSentinel);
+            }));
+            match foreign_unwind {
+                Err(payload) if payload.is::<ForeignGuardUnwindSentinel>() => {}
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => panic!("foreign cleanup carrier must panic"),
+            }
+            assert_eq!(
+                pool.active_leases(&foreign_key),
+                None,
+                "foreign record survived unwind"
+            );
+            let foreign_pid = foreign_pid
+                .get()
+                .expect("foreign child PID must be captured");
+            assert!(
+                !process_is_alive(foreign_pid),
+                "foreign child {foreign_pid} survived unwind"
+            );
+            for path in [&initialize_release, &initialize_marker, &methods, &pid_file] {
+                let _ = fs::remove_file(path);
+            }
+
+            fs::write(&initialize_release, "release\n").unwrap();
+            pool.with_lsp(foreign_key.clone(), spawn_spec.clone(), |_client| {
+                Box::pin(async move { Ok(()) })
+            })
+            .expect("foreign sentinel entry must start");
+            let foreign_cleanup = PlacementPoolCleanupGuard::new(pool, foreign_key.clone());
+            for path in [&initialize_release, &initialize_marker, &methods, &pid_file] {
+                let _ = fs::remove_file(path);
+            }
+            Some(foreign_cleanup)
+        } else {
+            None
+        };
+        let old_pid = Cell::new(None);
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pool_cleanup = PlacementPoolCleanupGuard::new(pool, key.clone());
             let (owner_ready_tx, owner_ready_rx) = mpsc::sync_channel(1);
             let (release_tx, release_rx) = mpsc::sync_channel(0);
             let owner_spec = spawn_spec.clone();
@@ -1412,6 +1585,12 @@ while True:
                 &initialize_marker,
                 "initialize\n",
                 Duration::from_secs(10),
+            ));
+            old_pid.set(Some(
+                fs::read_to_string(&pid_file)
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap(),
             ));
             assert!(wait_for_active_leases(
                 pool,
@@ -1477,14 +1656,41 @@ while True:
             Err(payload) => std::panic::resume_unwind(payload),
             Ok(()) => panic!("natural unwind carrier must panic"),
         }
-        assert!(
-            wait_for_active_leases(pool, &key, 0, Duration::from_secs(10)),
-            "natural unwind left an active lease"
+        assert_eq!(
+            pool.active_leases(&key),
+            None,
+            "target record survived unwind"
         );
-        pool.with_lsp(key, reacquire_spec, |_client| {
+        let old_pid = old_pid.get().expect("target child PID must be captured");
+        assert!(
+            !process_is_alive(old_pid),
+            "target child {old_pid} survived unwind"
+        );
+        assert!(
+            pool.is_running_for_test(),
+            "unwind cleanup stopped the pool"
+        );
+        if preserve_foreign {
+            assert_eq!(
+                pool.active_leases(&foreign_key),
+                Some(0),
+                "target cleanup changed the foreign sentinel record"
+            );
+        }
+
+        let successor_cleanup = PlacementPoolCleanupGuard::new(pool, key.clone());
+        pool.with_lsp(key.clone(), reacquire_spec, |_client| {
             Box::pin(async move { Ok(()) })
         })
         .expect("placement acquisition after natural unwind must succeed");
+        successor_cleanup
+            .finish()
+            .expect("placement unwind pool entry cleanup must succeed");
+        if let Some(foreign_cleanup) = foreign_cleanup {
+            foreign_cleanup
+                .finish()
+                .expect("foreign sentinel cleanup must succeed");
+        }
     }
 
     async fn run_retry(
