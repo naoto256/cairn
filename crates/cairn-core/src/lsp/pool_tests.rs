@@ -1351,6 +1351,7 @@ fn force_shutdown_all_reaps_stalled_owner_without_poisoning_pool() {
     assert!(!Arc::ptr_eq(&old_entry, &replacement.entry));
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_shutdown_reaps_entry_published_by_concurrent_force_drain() {
     let fake = FakeLspBinary::new();
@@ -1622,6 +1623,12 @@ fn stopped_force_shutdown_surfaces_unproven_cleanup_error() {
             registry.entries[&poisoned_key].entry.clone(),
         )
     };
+    // Test-only deterministic barrier: holding this slot keeps one entry's
+    // bounded cleanup pending while Stopped precedence is established.
+    // Production holders finish their short synchronous slot operation and
+    // release it before any await, so this synchronous hold has no production
+    // counterpart. The gate drops as soon as Stopped is observed; this test
+    // asserts evidence retention, not entry-timeout behaviour.
     let process_gate = gated_entry.process_control.lock().unwrap();
     let poison_entry = Arc::clone(&poisoned_entry);
     assert!(
