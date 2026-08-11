@@ -3,13 +3,14 @@
 //! The recorder is test-only observation state. Production owners make their
 //! decisions first; these hooks copy the resulting facts afterwards so tests
 //! can separate event classification, manifest reuse, and enqueue policy
-//! without changing their ordering. One hook goes further: before a queue
-//! publication it asserts, test-only, that the durable admission record
-//! already exists, and fails the test when it does not.
+//! without changing their ordering. Publication and observation failures are
+//! captured for assertions after the production owner has released its locks.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use crate::manifest::{ManifestEntry, ManifestId};
 
@@ -66,12 +67,34 @@ pub(crate) struct PublicationCheck {
     pub job_id: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationFailureKind {
+    MissingAdmissionBeforePublication,
+    MissingActiveGeneration,
+    TerminalAdmissionUnavailable,
+    TerminalObservationTimedOut,
+    TerminalRowUnavailable,
+    PriorObservationAfterBegin,
+    PriorManifestUnavailable,
+    ManifestEntriesUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservationFailure {
+    pub kind: ObservationFailureKind,
+    pub repo_hash: String,
+    pub generation: Option<i64>,
+    pub analyzer_id: Option<String>,
+    pub job_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ChurnSnapshot {
     pub watch: Vec<WatchRecord>,
     pub reconcile: Vec<ReconcileRecord>,
     pub enqueue: Vec<EnqueueRecord>,
     pub publication_checks: Vec<PublicationCheck>,
+    pub observation_failures: Vec<ObservationFailure>,
 }
 
 #[derive(Debug)]
@@ -82,6 +105,10 @@ pub(crate) struct ChurnRecorder {
     snapshot: Mutex<ChurnSnapshot>,
     active_generation: Mutex<Option<i64>>,
     changed_paths: Mutex<HashMap<i64, Vec<Vec<u8>>>>,
+    fail_next_prior_manifest_observation: AtomicBool,
+    fail_next_manifest_entries_observation: AtomicBool,
+    wait_for_terminal_after_publication: AtomicBool,
+    terminal_observed: Condvar,
 }
 
 impl ChurnRecorder {
@@ -93,6 +120,10 @@ impl ChurnRecorder {
             snapshot: Mutex::new(ChurnSnapshot::default()),
             active_generation: Mutex::new(None),
             changed_paths: Mutex::new(HashMap::new()),
+            fail_next_prior_manifest_observation: AtomicBool::new(false),
+            fail_next_manifest_entries_observation: AtomicBool::new(false),
+            wait_for_terminal_after_publication: AtomicBool::new(false),
+            terminal_observed: Condvar::new(),
         }
     }
 
@@ -102,6 +133,29 @@ impl ChurnRecorder {
 
     fn matches(&self, repo_hash: &str) -> bool {
         self.repo_hash == repo_hash
+    }
+
+    pub(crate) fn active_generation(&self) -> Option<i64> {
+        *self.active_generation.lock().unwrap()
+    }
+
+    pub(crate) fn fail_next_prior_manifest_observation(&self) {
+        self.fail_next_prior_manifest_observation
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn fail_next_manifest_entries_observation(&self) {
+        self.fail_next_manifest_entries_observation
+            .store(true, Ordering::Release);
+    }
+
+    /// Opt into a test-only wait for each published job's terminal observation.
+    /// The publication path enters the wait only after releasing admission
+    /// ownership; it is bounded at five seconds and records an
+    /// `ObservationFailure` on timeout.
+    pub(crate) fn wait_for_terminal_after_publication(&self) {
+        self.wait_for_terminal_after_publication
+            .store(true, Ordering::Release);
     }
 
     /// Relativize one observed path against the repository root.
@@ -284,6 +338,63 @@ pub(crate) fn abort_reconcile(repo_hash: &str) {
     *recorder.active_generation.lock().unwrap() = None;
 }
 
+pub(crate) fn take_prior_manifest_observation_failure(repo_hash: &str) -> bool {
+    let Some(recorder) = active().filter(|recorder| recorder.matches(repo_hash)) else {
+        return false;
+    };
+    if !recorder
+        .fail_next_prior_manifest_observation
+        .swap(false, Ordering::AcqRel)
+    {
+        return false;
+    }
+    if let Some(generation) = recorder.active_generation() {
+        record_observation_failure(
+            repo_hash,
+            ObservationFailureKind::PriorObservationAfterBegin,
+            Some(generation),
+            None,
+            None,
+        );
+    }
+    true
+}
+
+pub(crate) fn take_manifest_entries_observation_failure(repo_hash: &str) -> bool {
+    active()
+        .filter(|recorder| recorder.matches(repo_hash))
+        .is_some_and(|recorder| {
+            recorder
+                .fail_next_manifest_entries_observation
+                .swap(false, Ordering::AcqRel)
+        })
+}
+
+pub(crate) fn record_observation_failure(
+    repo_hash: &str,
+    kind: ObservationFailureKind,
+    generation: Option<i64>,
+    analyzer_id: Option<&str>,
+    job_id: Option<i64>,
+) {
+    let Some(recorder) = active().filter(|recorder| recorder.matches(repo_hash)) else {
+        return;
+    };
+    recorder
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .observation_failures
+        .push(ObservationFailure {
+            kind,
+            repo_hash: repo_hash.to_string(),
+            generation,
+            analyzer_id: analyzer_id.map(str::to_string),
+            job_id,
+        });
+    recorder.terminal_observed.notify_all();
+}
+
 pub(crate) fn record_enqueue(
     repo_hash: &str,
     analyzer_id: &str,
@@ -335,40 +446,88 @@ pub(crate) fn record_existing_for_root(
     );
 }
 
-pub(crate) fn assert_enqueue_recorded_before_publication(
-    repo_hash: &str,
-    analyzer_id: &str,
-    job_id: i64,
-) {
+pub(crate) fn record_scheduler_publication(repo_hash: &str, analyzer_id: &str, job_id: i64) {
     let Some(recorder) = active().filter(|recorder| recorder.matches(repo_hash)) else {
         return;
     };
-    let generation = recorder
-        .active_generation
-        .lock()
-        .unwrap()
-        .expect("worker publication requires an active reconcile generation");
+    let Some(generation) = *recorder.active_generation.lock().unwrap() else {
+        record_observation_failure(
+            repo_hash,
+            ObservationFailureKind::MissingActiveGeneration,
+            None,
+            Some(analyzer_id),
+            Some(job_id),
+        );
+        return;
+    };
     let mut snapshot = recorder.snapshot.lock().unwrap();
-    assert!(
-        snapshot.enqueue.iter().any(|record| {
-            record.repo_hash == repo_hash
-                && record.generation == generation
-                && record.analyzer_id == analyzer_id
-                && record.decision == EnqueueDecision::New
-                && record.job_id == Some(job_id)
-        }),
-        "durable analyzer admission must be recorded before worker publication"
-    );
-    snapshot.publication_checks.push(PublicationCheck {
-        repo_hash: repo_hash.to_string(),
-        generation,
-        analyzer_id: analyzer_id.to_string(),
-        job_id,
+    let recorded = snapshot.enqueue.iter().any(|record| {
+        record.repo_hash == repo_hash
+            && record.generation == generation
+            && record.analyzer_id == analyzer_id
+            && record.decision == EnqueueDecision::New
+            && record.job_id == Some(job_id)
     });
+    if recorded {
+        snapshot.publication_checks.push(PublicationCheck {
+            repo_hash: repo_hash.to_string(),
+            generation,
+            analyzer_id: analyzer_id.to_string(),
+            job_id,
+        });
+    } else {
+        snapshot.observation_failures.push(ObservationFailure {
+            kind: ObservationFailureKind::MissingAdmissionBeforePublication,
+            repo_hash: repo_hash.to_string(),
+            generation: Some(generation),
+            analyzer_id: Some(analyzer_id.to_string()),
+            job_id: Some(job_id),
+        });
+    }
+}
+
+pub(crate) fn await_terminal_after_scheduler_publication(repo_hash: &str, job_id: i64) {
+    let Some(recorder) = active().filter(|recorder| recorder.matches(repo_hash)) else {
+        return;
+    };
+    if !recorder
+        .wait_for_terminal_after_publication
+        .load(Ordering::Acquire)
+    {
+        return;
+    }
+    let snapshot = recorder
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut snapshot, timeout) = recorder
+        .terminal_observed
+        .wait_timeout_while(snapshot, Duration::from_secs(5), |snapshot| {
+            let terminal = snapshot
+                .enqueue
+                .iter()
+                .any(|record| record.job_id == Some(job_id) && record.terminal_status.is_some());
+            let failed = snapshot
+                .observation_failures
+                .iter()
+                .any(|failure| failure.job_id == Some(job_id));
+            !terminal && !failed
+        })
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if timeout.timed_out() {
+        snapshot.observation_failures.push(ObservationFailure {
+            kind: ObservationFailureKind::TerminalObservationTimedOut,
+            repo_hash: repo_hash.to_string(),
+            generation: None,
+            analyzer_id: None,
+            job_id: Some(job_id),
+        });
+    }
 }
 
 pub(crate) fn record_terminal(
     repo_hash: &str,
+    analyzer_id: &str,
     job_id: i64,
     status: &str,
     failure_class: Option<&'static str>,
@@ -376,17 +535,28 @@ pub(crate) fn record_terminal(
     let Some(recorder) = active().filter(|recorder| recorder.matches(repo_hash)) else {
         return;
     };
-    if let Some(record) = recorder
+    let mut snapshot = recorder
         .snapshot
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(record) = snapshot
         .enqueue
         .iter_mut()
         .find(|record| record.job_id == Some(job_id))
     {
         record.terminal_status = Some(status.to_string());
         record.failure_class = failure_class;
+    } else {
+        snapshot.observation_failures.push(ObservationFailure {
+            kind: ObservationFailureKind::TerminalAdmissionUnavailable,
+            repo_hash: repo_hash.to_string(),
+            generation: None,
+            analyzer_id: Some(analyzer_id.to_string()),
+            job_id: Some(job_id),
+        });
     }
+    drop(snapshot);
+    recorder.terminal_observed.notify_all();
 }
 
 pub(crate) fn physical_fingerprint(entries: &[ManifestEntry]) -> u64 {
@@ -460,6 +630,34 @@ mod tests {
         let recorder = ChurnRecorder::new("repo".to_string(), repo_root, None);
 
         assert_eq!(recorder.relative_bytes(&outside), path_bytes(&outside));
+    }
+
+    #[test]
+    fn missing_admission_before_publication_is_recorded_without_poisoning_owner_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let (recorder, _guard) = install("repo", temp.path());
+        begin_reconcile("repo", 9);
+        let admission_lock = Mutex::new(());
+
+        {
+            let _owner = admission_lock.lock().unwrap();
+            record_scheduler_publication("repo", "test-analyzer", 73);
+        }
+        assert!(
+            admission_lock.lock().is_ok(),
+            "owner lock must not be poisoned"
+        );
+
+        assert_eq!(
+            recorder.snapshot().observation_failures,
+            [ObservationFailure {
+                kind: ObservationFailureKind::MissingAdmissionBeforePublication,
+                repo_hash: "repo".into(),
+                generation: Some(9),
+                analyzer_id: Some("test-analyzer".into()),
+                job_id: Some(73),
+            }]
+        );
     }
 
     #[cfg(unix)]

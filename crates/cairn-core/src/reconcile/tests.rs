@@ -1666,3 +1666,100 @@ fn durable_publication_receipt_must_match_manifest_and_generation() {
     tx.commit().unwrap();
     assert!(super::verify_publication_receipt(&conn, &matching).is_err());
 }
+
+#[test]
+fn prior_manifest_observation_failure_does_not_change_reconcile_result() {
+    let (repo, _commit) = init_repo(&[("src/lib.rs", "pub fn indexed() {}\n")]);
+    let store_tmp = tempfile::tempdir().unwrap();
+    let mut conn = cas_store::open(&store_tmp.path().join("store.db")).unwrap();
+    let (recorder, _guard) = crate::churn_recorder::install("repo", repo.path());
+    recorder.fail_next_prior_manifest_observation();
+
+    let receipt = super::run_register(
+        &mut conn,
+        crate::register::ReconcileRegistration {
+            alias: "demo",
+            repo_hash: "repo",
+            worktree_path: repo.path(),
+            now_ns: 1,
+            generation: 1,
+            forced: false,
+        },
+        &None,
+    )
+    .unwrap();
+    let next_receipt = super::run_register(
+        &mut conn,
+        crate::register::ReconcileRegistration {
+            alias: "demo",
+            repo_hash: "repo",
+            worktree_path: repo.path(),
+            now_ns: 2,
+            generation: 2,
+            forced: false,
+        },
+        &None,
+    )
+    .unwrap();
+
+    assert_eq!(receipt.generation, 1);
+    assert_eq!(next_receipt.generation, 2);
+    assert_eq!(recorder.active_generation(), None);
+    let snapshot = recorder.snapshot();
+    assert_eq!(
+        snapshot
+            .reconcile
+            .iter()
+            .map(|record| record.generation)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        snapshot.observation_failures,
+        [crate::churn_recorder::ObservationFailure {
+            kind: crate::churn_recorder::ObservationFailureKind::PriorManifestUnavailable,
+            repo_hash: "repo".into(),
+            generation: Some(1),
+            analyzer_id: None,
+            job_id: None,
+        }]
+    );
+}
+
+#[test]
+fn manifest_entries_observation_failure_aborts_only_test_observation() {
+    let (repo, _commit) = init_repo(&[("src/lib.rs", "pub fn indexed() {}\n")]);
+    let store_tmp = tempfile::tempdir().unwrap();
+    let mut conn = cas_store::open(&store_tmp.path().join("store.db")).unwrap();
+    let (recorder, _guard) = crate::churn_recorder::install("repo", repo.path());
+    recorder.fail_next_manifest_entries_observation();
+
+    let receipt = super::run_register(
+        &mut conn,
+        crate::register::ReconcileRegistration {
+            alias: "demo",
+            repo_hash: "repo",
+            worktree_path: repo.path(),
+            now_ns: 1,
+            generation: 1,
+            forced: false,
+        },
+        &None,
+    )
+    .unwrap();
+
+    assert_eq!(receipt.generation, 1);
+    assert_eq!(recorder.active_generation(), None);
+    let snapshot = recorder.snapshot();
+    assert!(snapshot.reconcile.is_empty());
+    assert_eq!(
+        snapshot.observation_failures,
+        [crate::churn_recorder::ObservationFailure {
+            kind: crate::churn_recorder::ObservationFailureKind::ManifestEntriesUnavailable,
+            repo_hash: "repo".into(),
+            generation: Some(1),
+            analyzer_id: None,
+            job_id: None,
+        }]
+    );
+}
