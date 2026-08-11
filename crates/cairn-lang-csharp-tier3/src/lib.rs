@@ -49,6 +49,10 @@ impl WorkspaceAnalyzer for CsharpLsWorkspaceAnalyzer {
         CsharpBackend.parser_id()
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         csharp_config_paths()
     }

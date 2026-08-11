@@ -106,6 +106,10 @@ impl WorkspaceAnalyzer for ClangdCWorkspaceAnalyzer {
         C_LANGUAGE.parser_id
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         clangd_config_paths()
     }
@@ -142,6 +146,10 @@ impl WorkspaceAnalyzer for ClangdCppWorkspaceAnalyzer {
         CPP_LANGUAGE.parser_id
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         clangd_config_paths()
     }
@@ -176,6 +184,10 @@ impl WorkspaceAnalyzer for ClangdObjcWorkspaceAnalyzer {
 
     fn parser_id(&self) -> &'static str {
         OBJC_LANGUAGE.parser_id
+    }
+
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
     }
 
     fn config_paths(&self) -> &'static [&'static str] {

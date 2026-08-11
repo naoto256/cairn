@@ -90,8 +90,8 @@
 //! `tier2-direct-*` rows.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 
 // Re-exported so language crates can declare their pass's ref kind
 // without depending on cairn-proto directly.
@@ -173,6 +173,13 @@ struct AnalyzerProgressState {
     // is relied on to publish other memory.
     ticks: AtomicU64,
     cancelled: AtomicBool,
+    watchdog_cancel: std::sync::Mutex<Option<WatchdogCancelRegistration>>,
+}
+
+#[derive(Debug)]
+struct WatchdogCancelRegistration {
+    token: Arc<()>,
+    events: mpsc::Sender<StallWatchdogEvent>,
 }
 
 /// Cloneable progress and cancellation handle shared between the runner and
@@ -182,6 +189,37 @@ struct AnalyzerProgressState {
 pub struct AnalyzerProgress {
     state: Arc<AnalyzerProgressState>,
     observer: Option<AnalyzerProgressObserver>,
+    watchdog_events: Option<mpsc::Sender<StallWatchdogEvent>>,
+}
+
+pub(crate) enum StallWatchdogEvent {
+    Arm(mpsc::SyncSender<()>),
+    Cancel,
+    WorkerFinished,
+}
+
+pub(crate) struct WatchdogCancelGuard {
+    state: Arc<AnalyzerProgressState>,
+    token: Arc<()>,
+}
+
+impl Drop for WatchdogCancelGuard {
+    fn drop(&mut self) {
+        // Clear only a registration this guard still owns. A later invocation
+        // may have replaced it on the same shared progress handle, and a stale
+        // guard must not disarm the live run's cancel path.
+        let mut registration = self
+            .state
+            .watchdog_cancel
+            .lock()
+            .expect("watchdog cancellation registration poisoned");
+        if registration
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.token, &self.token))
+        {
+            registration.take();
+        }
+    }
 }
 
 /// Callback invoked synchronously from [`AnalyzerProgress::tick`], on
@@ -198,6 +236,7 @@ impl std::fmt::Debug for AnalyzerProgress {
             .field("ticks", &self.snapshot())
             .field("cancelled", &self.is_cancelled())
             .field("has_observer", &self.observer.is_some())
+            .field("has_watchdog_events", &self.watchdog_events.is_some())
             .finish()
     }
 }
@@ -211,6 +250,50 @@ impl AnalyzerProgress {
         Self {
             state: Arc::default(),
             observer: Some(observer),
+            watchdog_events: None,
+        }
+    }
+
+    pub(crate) fn with_watchdog_events(
+        &self,
+        watchdog_events: mpsc::Sender<StallWatchdogEvent>,
+    ) -> (Self, WatchdogCancelGuard) {
+        let token = Arc::new(());
+        *self
+            .state
+            .watchdog_cancel
+            .lock()
+            .expect("watchdog cancellation registration poisoned") =
+            Some(WatchdogCancelRegistration {
+                token: token.clone(),
+                events: watchdog_events.clone(),
+            });
+        if self.is_cancelled() {
+            let _ = watchdog_events.send(StallWatchdogEvent::Cancel);
+        }
+        let progress = Self {
+            state: self.state.clone(),
+            observer: self.observer.clone(),
+            watchdog_events: Some(watchdog_events),
+        };
+        let guard = WatchdogCancelGuard {
+            state: self.state.clone(),
+            token,
+        };
+        (progress, guard)
+    }
+
+    /// Arm this invocation's deferred stall watchdog at the active-work
+    /// boundary. The acknowledgement makes the new deadline authoritative
+    /// before the caller begins work; repeated calls are harmless and do not
+    /// extend an already armed window.
+    pub(crate) fn arm_stall_watchdog(&self) {
+        let Some(events) = &self.watchdog_events else {
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        if events.send(StallWatchdogEvent::Arm(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
         }
     }
 
@@ -235,6 +318,16 @@ impl AnalyzerProgress {
     /// analyzer keeps going until it polls [`Self::is_cancelled`].
     pub(crate) fn cancel(&self) {
         self.state.cancelled.store(true, Ordering::Relaxed);
+        let events = self
+            .state
+            .watchdog_cancel
+            .lock()
+            .expect("watchdog cancellation registration poisoned")
+            .as_ref()
+            .map(|registration| registration.events.clone());
+        if let Some(events) = events {
+            let _ = events.send(StallWatchdogEvent::Cancel);
+        }
     }
 
     #[must_use]
@@ -368,6 +461,24 @@ pub trait WorkspaceAnalyzer: Send + Sync {
     /// while it waits.
     fn pool_group(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Whether this analyzer starts its stall watchdog only after entering
+    /// active work.
+    ///
+    /// The default (`false`) arms at worker spawn, preserving the historical
+    /// behavior for existing implementations. Returning `true` defers only
+    /// this run's watchdog until an analyzer-owned active-work boundary calls
+    /// the runner's private arm signal after ownership and readiness. This
+    /// method must be a pure, static capability declaration: implementations
+    /// must not perform I/O or consult mutable runtime state.
+    ///
+    /// Deferral removes the window until the arm signal is reached, so a run
+    /// that never reaches it has no stall detection. Return `true` only for
+    /// passes whose active work is entered through the runner's own LSP
+    /// helpers, which arm at that boundary.
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        false
     }
 
     /// Whether the runner must read every workspace file's bytes from
@@ -588,6 +699,49 @@ mod tests {
         ) -> Result<WorkspaceFacts> {
             Ok(WorkspaceFacts::default())
         }
+    }
+
+    struct DeferredFakeWorkspaceAnalyzer;
+
+    impl WorkspaceAnalyzer for DeferredFakeWorkspaceAnalyzer {
+        fn id(&self) -> &'static str {
+            "deferred-fake"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "fake-parser"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    #[test]
+    fn stall_watchdog_policy_defaults_armed_and_dispatches_dyn_override() {
+        let old_style: Box<dyn WorkspaceAnalyzer> = Box::new(FakeWorkspaceAnalyzer);
+        let deferred: Box<dyn WorkspaceAnalyzer> = Box::new(DeferredFakeWorkspaceAnalyzer);
+
+        assert!(!old_style.defer_stall_watchdog_until_active_work());
+        assert!(deferred.defer_stall_watchdog_until_active_work());
     }
 
     #[allow(unsafe_code)]
@@ -1446,15 +1600,17 @@ mod tests {
         )
         .unwrap();
 
-        let inserted = run_workspace_analyzers_with_timeout(
-            &mut conn,
-            &repo_root,
-            manifest_id,
-            &entries,
-            10,
-            vec![Box::new(SlowRustAnalyzer)],
-            std::time::Duration::from_millis(10),
-        )
+        let inserted = run::with_isolated_stalled_analyzer_cleanup(|| {
+            run_workspace_analyzers_with_timeout(
+                &mut conn,
+                &repo_root,
+                manifest_id,
+                &entries,
+                10,
+                vec![Box::new(SlowRustAnalyzer)],
+                std::time::Duration::from_millis(10),
+            )
+        })
         .unwrap();
 
         assert_eq!(inserted, 0);

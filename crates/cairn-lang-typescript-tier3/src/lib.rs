@@ -115,6 +115,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerTsAnalyzer {
         TS_LANGUAGE.parser_id
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         ts_config_paths()
     }
@@ -151,6 +155,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerJsAnalyzer {
         JS_LANGUAGE.parser_id
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         ts_config_paths()
     }
@@ -185,6 +193,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerTsxAnalyzer {
 
     fn parser_id(&self) -> &'static str {
         TSX_LANGUAGE.parser_id
+    }
+
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
     }
 
     fn config_paths(&self) -> &'static [&'static str] {

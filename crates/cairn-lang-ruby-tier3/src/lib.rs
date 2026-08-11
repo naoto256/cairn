@@ -62,6 +62,10 @@ impl WorkspaceAnalyzer for RubyLspWorkspaceAnalyzer {
         "tree-sitter-ruby"
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         ruby_config_paths()
     }
