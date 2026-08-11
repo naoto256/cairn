@@ -1417,6 +1417,13 @@ mod tests {
         // Wire the production lifecycle and reconcile path so registration
         // catch-up and later watcher events both execute real indexing work.
         let (repo, _) = init_repo(&[("src/lib.rs", "pub fn initial_symbol() {}\n")]);
+        let symbol_source = Path::new("src/daemon_watcher_probe.rs");
+        let symbol_path = repo.path().join(symbol_source);
+        assert!(
+            !symbol_path.exists(),
+            "watcher create-edge fixture must start absent: {}",
+            symbol_path.display()
+        );
         let runtime_tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
@@ -1479,53 +1486,45 @@ mod tests {
             response.contains("\"result\""),
             "register response: {response}"
         );
-        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let canonical = std::fs::canonicalize(repo.path()).unwrap();
         let repo_hash = path_hash(&canonical);
         let store_path = cas_data_dir.store_db_path(&repo_hash);
         let index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
-        let baseline_state = cas_registry::get_reconcile_state(&index, &repo_hash)
-            .unwrap()
-            .expect("reconcile state row must exist for watched repo");
+        let baseline_state = wait_for_reconcile_terminal_success(
+            &index,
+            &repo_hash,
+            1,
+            None,
+            Duration::from_secs(20),
+        )
+        .await;
         let baseline_desired = baseline_state.desired_generation;
-        assert!(
-            baseline_desired >= 1
-                && baseline_state.applied_generation >= baseline_desired
-                && baseline_state.attempt_generation.is_none(),
-            "registration catch-up must leave a clean applied generation: {baseline_state:?}"
-        );
 
         let symbol_name = "daemon_watcher_probe_symbol";
-        std::fs::write(
-            repo.path().join("src/lib.rs"),
-            format!("pub fn initial_symbol() {{}}\npub fn {symbol_name}() {{}}\n"),
+        let mut symbol_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&symbol_path)
+            .expect("watcher probe source creation must succeed");
+        std::io::Write::write_all(
+            &mut symbol_file,
+            format!("pub fn {symbol_name}() {{}}\n").as_bytes(),
         )
-        .unwrap();
+        .expect("watcher probe source write must succeed");
+        drop(symbol_file);
 
         // Poll: durable generation must advance (watcher event →
         // reconcile manager → desired++) AND the symbol must
         // land in the store (worker executed the reindex).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let mut saw_symbol = false;
-        let mut last_state = Some(baseline_state);
-        while tokio::time::Instant::now() < deadline {
-            saw_symbol = symbol_exists(&store_path, &canonical, symbol_name);
-            last_state = cas_registry::get_reconcile_state(&index, &repo_hash).unwrap();
-            let reconcile_applied = last_state.as_ref().is_some_and(|state| {
-                state.desired_generation > baseline_desired
-                    && state.applied_generation >= state.desired_generation
-            });
-            if saw_symbol && reconcile_applied {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let state = last_state.expect("reconcile state row must exist for watched repo");
-        assert!(
-            saw_symbol,
-            "watcher did not reindex symbol {symbol_name}; last reconcile state: {state:?}"
-        );
+        let state = wait_for_reconcile_terminal_success(
+            &index,
+            &repo_hash,
+            baseline_desired + 1,
+            Some((&store_path, &canonical, symbol_name, symbol_source)),
+            Duration::from_secs(20),
+        )
+        .await;
         assert!(
             state.desired_generation > baseline_desired,
             "watcher event must bump desired_generation above baseline {baseline_desired}, got {state:?}"
@@ -1652,7 +1651,47 @@ mod tests {
         response
     }
 
-    fn symbol_exists(store_path: &Path, repo_root: &Path, symbol_name: &str) -> bool {
+    async fn wait_for_reconcile_terminal_success(
+        index: &rusqlite::Connection,
+        repo_hash: &str,
+        minimum_desired_generation: i64,
+        required_symbol: Option<(&Path, &Path, &str, &Path)>,
+        timeout: Duration,
+    ) -> cas_registry::RepoReconcileState {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let state = cas_registry::get_reconcile_state(index, repo_hash).unwrap();
+            let saw_required_symbol = required_symbol.is_none_or(
+                |(store_path, repo_root, symbol_name, symbol_source)| {
+                    symbol_exists(store_path, repo_root, symbol_name, symbol_source)
+                },
+            );
+            if let Some(state) = &state {
+                if state.desired_generation >= minimum_desired_generation
+                    && state.applied_generation >= state.desired_generation
+                    && state.attempt_generation.is_none()
+                    && state.last_success_ns.is_some()
+                    && state.last_error.is_none()
+                    && state.consecutive_failures == 0
+                    && saw_required_symbol
+                {
+                    return state.clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reconcile did not reach terminal success for desired generation >= {minimum_desired_generation}; saw required symbol: {saw_required_symbol}; last state: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn symbol_exists(
+        store_path: &Path,
+        repo_root: &Path,
+        symbol_name: &str,
+        symbol_source: &Path,
+    ) -> bool {
         let Ok(conn) = cas_store::open_existing(store_path) else {
             return false;
         };
@@ -1671,6 +1710,9 @@ mod tests {
                 ..FindSymbolsArgs::default()
             },
         )
-        .is_ok_and(|hits| hits.iter().any(|hit| hit.name == symbol_name))
+        .is_ok_and(|hits| {
+            hits.iter()
+                .any(|hit| hit.name == symbol_name && Path::new(&hit.path) == symbol_source)
+        })
     }
 }
