@@ -1183,7 +1183,7 @@ impl LspClientPool {
     }
 
     #[cfg(test)]
-    fn active_leases(&self, key: &PoolKey) -> Option<usize> {
+    pub(crate) fn active_leases(&self, key: &PoolKey) -> Option<usize> {
         self.registry
             .lock()
             .unwrap()
