@@ -340,6 +340,11 @@ pub struct RepoReconcileManager {
     /// synchronise with tokio task scheduling in MF tests.
     #[cfg(test)]
     test_attempts_started: AtomicI64,
+    /// Lossless test-only sequence authority for failures rejected before
+    /// Phase A can persist an attempt. Each permit is published immediately
+    /// before the worker enters its local retry delay.
+    #[cfg(test)]
+    test_pre_start_rejections: Semaphore,
     /// Test-only register injector. When `Some`, the worker
     /// invokes it in place of the real `register_repo_*_enqueue`
     /// call — the injector receives
@@ -451,6 +456,8 @@ impl RepoReconcileManager {
             periodic_task: Mutex::new(None),
             #[cfg(test)]
             test_attempts_started: AtomicI64::new(0),
+            #[cfg(test)]
+            test_pre_start_rejections: Semaphore::new(0),
             #[cfg(test)]
             test_register_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1283,6 +1290,8 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                     "reconcile attempt failed"
                 );
                 if failure.before_start {
+                    #[cfg(test)]
+                    mgr.test_pre_start_rejections.add_permits(1);
                     // No durable retry deadline exists until Phase A succeeds.
                     // Pace lifecycle/registry failures locally so a persistently
                     // unavailable repository cannot hot-spin this worker.
@@ -1760,6 +1769,23 @@ impl RepoReconcileManager {
     /// the worker loop.
     pub fn test_attempts_started(&self) -> i64 {
         self.test_attempts_started.load(Ordering::SeqCst)
+    }
+
+    /// Consume the next pre-start rejection sequence permit.
+    async fn test_wait_for_pre_start_rejection(&self) {
+        self.test_pre_start_rejections
+            .acquire()
+            .await
+            .expect("test pre-start rejection semaphore remains open")
+            .forget();
+    }
+
+    fn test_try_take_pre_start_rejection(&self) -> bool {
+        let Ok(permit) = self.test_pre_start_rejections.try_acquire() else {
+            return false;
+        };
+        permit.forget();
+        true
     }
 }
 

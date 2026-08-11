@@ -1375,7 +1375,7 @@ async fn periodic_cycle_skips_registering_owner_until_publication() {
     mgr.shutdown(Duration::from_secs(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn lifecycle_rejection_before_attempt_start_is_locally_paced() {
     let root = tempfile::tempdir().unwrap();
     let (_t, cas) = fresh_cas();
@@ -1406,12 +1406,36 @@ async fn lifecycle_rejection_before_attempt_start_is_locally_paced() {
     );
     assert!(mgr.wake_or_spawn("h", Some("demo".to_string())));
 
-    tokio::time::sleep(Duration::from_millis(135)).await;
-    let attempts = mgr.test_attempts_started();
-    assert!(
-        (2..=4).contains(&attempts),
-        "pre-start rejection must be bounded by base delay, got {attempts} attempts"
+    timeout(
+        Duration::from_secs(1),
+        mgr.test_wait_for_pre_start_rejection(),
+    )
+    .await
+    .expect("first pre-start rejection must be observed");
+    assert_eq!(mgr.test_attempts_started(), 1);
+
+    tokio::time::advance(Duration::from_millis(39)).await;
+    for _ in 0..1_024 {
+        assert!(
+            !mgr.test_try_take_pre_start_rejection(),
+            "second pre-start rejection arrived before the base delay"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        mgr.test_attempts_started(),
+        1,
+        "pre-start rejection must remain paced before the base delay"
     );
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    timeout(
+        Duration::from_millis(1),
+        mgr.test_wait_for_pre_start_rejection(),
+    )
+    .await
+    .expect("second pre-start rejection must follow the base delay");
+    assert_eq!(mgr.test_attempts_started(), 2);
     let state = read_state(&cas, "h");
     assert_eq!(state.attempt_generation, None);
     assert_eq!(state.consecutive_failures, 0);
