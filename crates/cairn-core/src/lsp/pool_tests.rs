@@ -1213,11 +1213,12 @@ fn bounded_final_shutdown_reaps_child_while_pass_holds_state_mutex() {
         })
     });
 
-    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
     assert!(
-        methods.values().any(|methods| methods
-            .iter()
-            .any(|method| method == "textDocument/definition")),
+        wait_for_logged_method(
+            &methods_log,
+            "textDocument/definition",
+            Duration::from_secs(5),
+        ),
         "fake LSP must receive the pending definition request before shutdown"
     );
     let pid = read_pid(
@@ -1294,12 +1295,11 @@ fn force_shutdown_all_reaps_stalled_owner_without_poisoning_pool() {
         })
     });
 
-    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
-    assert!(methods.values().any(|methods| {
-        methods
-            .iter()
-            .any(|method| method == "textDocument/definition")
-    }));
+    assert!(wait_for_logged_method(
+        &methods_log,
+        "textDocument/definition",
+        Duration::from_secs(5),
+    ));
     let pid = read_pid(
         &fake.pid_file,
         std::time::Instant::now() + Duration::from_secs(2),
@@ -1384,12 +1384,11 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_force_drain() {
         })
     });
 
-    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
-    assert!(methods.values().any(|methods| {
-        methods
-            .iter()
-            .any(|method| method == "textDocument/definition")
-    }));
+    assert!(wait_for_logged_method(
+        &methods_log,
+        "textDocument/definition",
+        Duration::from_secs(5),
+    ));
     let pid = read_pid(
         &fake.pid_file,
         std::time::Instant::now() + Duration::from_secs(2),
@@ -1482,12 +1481,11 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
         })
     });
 
-    let methods = poll_methods_log(&methods_log, 1, Duration::from_secs(5));
-    assert!(methods.values().any(|methods| {
-        methods
-            .iter()
-            .any(|method| method == "textDocument/definition")
-    }));
+    assert!(wait_for_logged_method(
+        &methods_log,
+        "textDocument/definition",
+        Duration::from_secs(5),
+    ));
     let pid = read_pid(
         &fake.pid_file,
         std::time::Instant::now() + Duration::from_secs(2),
@@ -2487,6 +2485,55 @@ fn force_finalize_preserves_concurrent_poisoned_mode() {
     match force_result {
         Err(Error::PoolPoisoned) => {}
         other => panic!("expected Err(PoolPoisoned) from force, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wait_for_logged_method_requires_the_exact_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("methods.log");
+    std::fs::write(&path, "123:textDocument/didOpen\n").unwrap();
+
+    assert!(!wait_for_logged_method(
+        &path,
+        "textDocument/definition",
+        Duration::ZERO,
+    ));
+
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(log, "123:textDocument/definition").unwrap();
+    assert!(wait_for_logged_method(
+        &path,
+        "textDocument/definition",
+        Duration::ZERO,
+    ));
+}
+
+/// Wait until `required_method` itself is logged.
+///
+/// The previous PID-count wait released a carrier as soon as the child
+/// recorded `textDocument/didOpen`, which precedes the definition request the
+/// fixture actually needs in flight; Linux scheduling made that window
+/// observable. The snapshot is read before the deadline check, so a zero
+/// timeout still sees an already-logged method.
+#[cfg(unix)]
+fn wait_for_logged_method(path: &Path, required_method: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let found = read_methods_by_pid(path)
+            .values()
+            .any(|methods| methods.iter().any(|method| method == required_method));
+        if found {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
