@@ -158,6 +158,11 @@ pub fn run_lsp_definition_pass(
     let progress = progress.clone();
     pool.with_lsp(key, pass.spawn_spec, move |client| {
         Box::pin(async move {
+            // `with_lsp` has taken pool ownership and finished readiness before
+            // this closure runs, so arming here keeps queueing and server
+            // startup out of the stall window and starts it at the first
+            // request this pass issues.
+            progress.arm_stall_watchdog();
             let mut facts = WorkspaceFacts::default();
             collect_resolved_refs(
                 client,
@@ -214,6 +219,8 @@ pub fn run_lsp_multi_kind_definition_pass(
     let progress = progress.clone();
     pool.with_lsp(key, pass.spawn_spec, move |client| {
         Box::pin(async move {
+            // Same active-work boundary as `run_lsp_definition_pass`.
+            progress.arm_stall_watchdog();
             let mut facts = WorkspaceFacts::default();
             collect_multi_kind_resolved_refs(
                 client,
@@ -825,15 +832,64 @@ fn ref_kind_name(kind: RefKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_analyzer::StallWatchdogEvent;
     use std::cell::Cell;
+    #[cfg(unix)]
+    use std::fs;
     use std::future::ready;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     };
     use std::time::Instant;
 
+    #[cfg(unix)]
+    use crate::lsp::pool::{AvailabilityStrategy, ReadinessStrategy};
     use crate::lsp::{CONTENT_MODIFIED_ERROR_CODE, Range};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    const WATCHDOG_FAKE_LSP: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+
+methods = os.environ["CAIRN_TEST_METHODS_FILE"]
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line == b"\r\n":
+            break
+        key, _, value = line.decode().strip().partition(":")
+        headers[key] = value
+    return json.loads(sys.stdin.buffer.read(int(headers["Content-Length"])))
+
+def respond(identifier, result):
+    body = json.dumps({"jsonrpc": "2.0", "id": identifier, "result": result}).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method:
+        with open(methods, "a") as log:
+            log.write(method + "\n")
+    if method == "initialize":
+        respond(message["id"], {"capabilities": {}})
+    elif method == "textDocument/definition":
+        respond(message["id"], [])
+    elif method == "shutdown":
+        respond(message["id"], None)
+    elif method == "exit":
+        break
+"#;
 
     fn test_uri() -> Url {
         Url::from("file:///tmp/repo/src/lib.rs")
@@ -892,6 +948,172 @@ mod tests {
             code: -32603,
             message: "file not found".into(),
         }
+    }
+
+    #[cfg(unix)]
+    fn one_definition_site(_source: &[u8]) -> Result<Vec<DefinitionSite>> {
+        Ok(vec![DefinitionSite {
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+            byte_start: 0,
+            byte_end: 1,
+        }])
+    }
+
+    #[cfg(unix)]
+    fn wait_for_logged_definition(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if fs::read_to_string(path).is_ok_and(|methods| {
+                methods
+                    .lines()
+                    .any(|method| method == "textDocument/definition")
+            }) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn assert_production_pass_arms_after_pool_readiness(
+        multi: bool,
+        overlap_isolated_cleanup: bool,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let binary = fixture.path().join("watchdog-fake-lsp.py");
+        let methods = fixture.path().join("methods.log");
+        let source = fixture.path().join("source.rb");
+        fs::write(&binary, WATCHDOG_FAKE_LSP).unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        fs::write(&source, "target\n").unwrap();
+
+        let analyzer_id = if multi {
+            "watchdog-multi-test"
+        } else {
+            "watchdog-single-test"
+        };
+        let spawn_spec = LspSpawnSpec {
+            binary: binary.clone(),
+            workspace_root: fixture.path().to_path_buf(),
+            config_hash: analyzer_id.to_string(),
+            request_timeout: Duration::from_secs(5),
+            availability: AvailabilityStrategy::PathExistsExecutable,
+            readiness: ReadinessStrategy::InitializeResponseOnly,
+            language_id: "ruby",
+            launch_args: Vec::new(),
+            env: vec![(
+                "CAIRN_TEST_METHODS_FILE".into(),
+                methods.display().to_string(),
+            )],
+            initialization_options: serde_json::json!({}),
+        };
+        let key = PoolKey::lsp(
+            "watchdog-test",
+            fixture.path(),
+            analyzer_id,
+            &binary,
+            analyzer_id,
+        )
+        .unwrap();
+        let pool = lsp_pool::global().unwrap();
+        let (owner_ready_tx, owner_ready_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let owner_spec = spawn_spec.clone();
+        let owner = std::thread::spawn(move || {
+            pool.with_lsp(key, owner_spec, move |_client| {
+                Box::pin(async move {
+                    owner_ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            })
+            .unwrap();
+        });
+        owner_ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if overlap_isolated_cleanup {
+            super::super::run::test_run_isolated_active_stall();
+        }
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let (progress, _cancel_guard) = AnalyzerProgress::default().with_watchdog_events(events_tx);
+        let files = vec![WorkspaceFile {
+            path: "source.rb".into(),
+            blob_sha: "test".into(),
+            worktree_path: Some(source),
+            source_bytes: None,
+        }];
+        let root = fixture.path().to_path_buf();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let result = if multi {
+                run_lsp_multi_kind_definition_pass(
+                    LspMultiKindDefinitionPass {
+                        analyzer_id,
+                        pool_analyzer_id: None,
+                        language: "watchdog-test",
+                        spawn_spec,
+                        retry: DefinitionRetryPolicy::default(),
+                        collectors: vec![LspDefinitionCollector {
+                            ref_kind: RefKind::Call,
+                            collect_definition_sites: one_definition_site,
+                        }],
+                        suppress_definition_targets_at_requested_sites: false,
+                    },
+                    &root,
+                    &files,
+                    &progress,
+                )
+            } else {
+                run_lsp_definition_pass(
+                    LspDefinitionPass {
+                        analyzer_id,
+                        pool_analyzer_id: None,
+                        language: "watchdog-test",
+                        ref_kind: RefKind::Call,
+                        spawn_spec,
+                        retry: DefinitionRetryPolicy::default(),
+                        collect_definition_sites: one_definition_site,
+                        suppress_definition_targets_at_requested_sites: false,
+                    },
+                    &root,
+                    &files,
+                    &progress,
+                )
+            };
+            result_tx.send(result).unwrap();
+        });
+
+        assert!(
+            events_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "queued pass must not arm before pooled ownership and readiness"
+        );
+        release_tx.send(()).unwrap();
+        let StallWatchdogEvent::Arm(acknowledgement) =
+            events_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("active-work boundary must emit Arm");
+        };
+        assert!(
+            !fs::read_to_string(&methods)
+                .unwrap_or_default()
+                .lines()
+                .any(|method| method == "textDocument/definition"),
+            "Arm must be processed before the first active request"
+        );
+        acknowledgement.send(()).unwrap();
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(wait_for_logged_definition(&methods));
+        runner.join().unwrap();
+        owner.join().unwrap();
     }
 
     async fn run_retry(
@@ -1299,5 +1521,23 @@ mod tests {
         assert_eq!(resolved.resolved[0].ref_kind, RefKind::Import);
         assert_eq!(resolved.resolved[0].site.position.line, 2);
         assert_eq!(resolved.resolved[0].locations, vec![test_location_at(9)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_definition_pass_arms_after_pool_readiness_before_request() {
+        assert_production_pass_arms_after_pool_readiness(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_kind_definition_pass_arms_after_pool_readiness_before_request() {
+        assert_production_pass_arms_after_pool_readiness(true, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_watchdog_cleanup_does_not_stop_parallel_lsp_placement() {
+        assert_production_pass_arms_after_pool_readiness(false, true);
     }
 }

@@ -48,6 +48,10 @@ impl WorkspaceAnalyzer for PhpantomLspWorkspaceAnalyzer {
         PhpBackend.parser_id()
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         php_config_paths()
     }

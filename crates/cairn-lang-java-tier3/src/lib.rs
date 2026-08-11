@@ -50,6 +50,10 @@ impl WorkspaceAnalyzer for JdtlsWorkspaceAnalyzer {
         "tree-sitter-java"
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         java_config_paths()
     }

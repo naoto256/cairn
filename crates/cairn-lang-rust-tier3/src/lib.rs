@@ -65,6 +65,10 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
         "tree-sitter-rust"
     }
 
+    fn defer_stall_watchdog_until_active_work(&self) -> bool {
+        true
+    }
+
     fn config_paths(&self) -> &'static [&'static str] {
         &["Cargo.toml", "rust-toolchain.toml", "rust-toolchain"]
     }

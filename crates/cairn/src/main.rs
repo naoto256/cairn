@@ -186,7 +186,8 @@ mod tests {
 
     #[test]
     fn runtime_workspace_analyzer_registry_includes_cli_linked_analyzers() {
-        let mut analyzer_ids = cairn_core::workspace_analyzer::all_workspace_analyzers()
+        let analyzers = cairn_core::workspace_analyzer::all_workspace_analyzers();
+        let mut analyzer_ids = analyzers
             .iter()
             .map(|analyzer| analyzer.id())
             .collect::<Vec<_>>();
@@ -219,6 +220,34 @@ mod tests {
                 "typescript-language-server-tsx-lsp"
             ]
         );
+
+        let mut deferred = analyzers
+            .iter()
+            .filter(|analyzer| analyzer.defer_stall_watchdog_until_active_work())
+            .map(|analyzer| analyzer.id())
+            .collect::<Vec<_>>();
+        deferred.sort_unstable();
+        assert_eq!(
+            deferred,
+            [
+                "clangd-c-lsp",
+                "clangd-cpp-lsp",
+                "clangd-objc-lsp",
+                "csharp-ls",
+                "gopls-lsp",
+                "jdtls-lsp",
+                "kotlin-language-server",
+                "phpantom-lsp",
+                "pyright-lsp",
+                "ruby-lsp",
+                "rust-analyzer-lsp",
+                "sourcekit-lsp",
+                "typescript-language-server-js-lsp",
+                "typescript-language-server-ts-lsp",
+                "typescript-language-server-tsx-lsp",
+            ]
+        );
+        assert_eq!(analyzers.len() - deferred.len(), 7);
     }
 
     #[test]
