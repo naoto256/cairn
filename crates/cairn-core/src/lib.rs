@@ -24,6 +24,8 @@
 
 pub mod anchor;
 pub mod cas;
+#[cfg(test)]
+pub(crate) mod churn_recorder;
 pub mod ctl;
 pub mod daemon;
 pub mod data_rpc;

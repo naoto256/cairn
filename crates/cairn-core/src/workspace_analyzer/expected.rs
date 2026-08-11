@@ -58,8 +58,10 @@ pub fn expected_analyzers_for_manifest(
 /// missing, its revision differs from the linked-in `revision()`, its
 /// configuration hash differs from the current files under `repo_root`, or
 /// it has no current succeeded or identified in-flight run. Current queued
-/// and running jobs are left to finish; terminal failed, skipped, cancelled,
-/// and timed-out rows remain eligible for retry.
+/// and running jobs are left to finish. Terminal skipped, cancelled, and
+/// timed-out rows remain eligible for retry. A current failed row is eligible
+/// when `retry_unchanged_failed` is true; otherwise only a revision or config
+/// change makes that failed analyzer eligible.
 ///
 /// If `expected_analyzers_for_manifest` is empty (no language we analyze
 /// at workspace tier appears in the manifest), the returned vector is
@@ -68,6 +70,7 @@ pub(crate) fn workspace_analyzers_needing_rerun(
     conn: &rusqlite::Connection,
     manifest_id: ManifestId,
     repo_root: &Path,
+    retry_unchanged_failed: bool,
 ) -> Result<Vec<Box<dyn WorkspaceAnalyzer>>> {
     let expected = expected_analyzers_for_manifest(conn, manifest_id)?;
     if expected.is_empty() {
@@ -106,15 +109,20 @@ pub(crate) fn workspace_analyzers_needing_rerun(
             // Defensive clamp mirroring the staleness scanner: the
             // column is INTEGER but writers bound it to u32.
             let revision = u32::try_from(*revision).unwrap_or(u32::MAX);
+            let revision_current = revision == analyzer.revision();
+            let config_current = stored_hash == &config_hash(repo_root, analyzer.config_paths());
+            // An unchanged failed run is retried by explicit/forced paths, not
+            // by a non-forced no-op reconcile that reused the same manifest.
+            if status == "failed" && revision_current && config_current && !retry_unchanged_failed {
+                return false;
+            }
             // Conditions 2-4: no current completed or identified
             // in-flight run, revision-stale, or config-stale. The revision test is `!=` (not the
             // startup scanner's rollback-safe `<`): on this path a
             // revision rollback also forces a rerun.
             let current_or_in_flight = status == "succeeded"
                 || (matches!(status.as_str(), "queued" | "running") && job_id.is_some());
-            !current_or_in_flight
-                || revision != analyzer.revision()
-                || stored_hash != &config_hash(repo_root, analyzer.config_paths())
+            !current_or_in_flight || !revision_current || !config_current
         })
         .collect())
 }
@@ -343,11 +351,21 @@ mod tests {
         manifest_id: ManifestId,
         repo_root: &Path,
     ) -> Vec<String> {
-        let mut ids = workspace_analyzers_needing_rerun(conn, manifest_id, repo_root)
-            .unwrap()
-            .into_iter()
-            .map(|analyzer| analyzer.id().to_string())
-            .collect::<Vec<_>>();
+        rerun_ids_with_failed_policy(conn, manifest_id, repo_root, true)
+    }
+
+    fn rerun_ids_with_failed_policy(
+        conn: &rusqlite::Connection,
+        manifest_id: ManifestId,
+        repo_root: &Path,
+        retry_unchanged_failed: bool,
+    ) -> Vec<String> {
+        let mut ids =
+            workspace_analyzers_needing_rerun(conn, manifest_id, repo_root, retry_unchanged_failed)
+                .unwrap()
+                .into_iter()
+                .map(|analyzer| analyzer.id().to_string())
+                .collect::<Vec<_>>();
         ids.sort();
         ids
     }
@@ -512,6 +530,66 @@ mod tests {
                 rerun_ids(&conn, ManifestId(1), tmp.path()),
                 ["fake-workspace"],
                 "status {status:?} must require that analyzer to re-run"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_noop_suppresses_only_unchanged_failed_analyzer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
+        insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+        insert_manifest_parser(&conn, ManifestId(1), "second-sha", "second-fake-parser");
+        insert_run(
+            &conn,
+            tmp.path(),
+            ManifestId(1),
+            "fake-workspace",
+            7,
+            "failed",
+        );
+
+        assert_eq!(
+            rerun_ids_with_failed_policy(&conn, ManifestId(1), tmp.path(), false),
+            ["second-fake-workspace"],
+            "a missing run remains eligible while the unchanged failed run is suppressed"
+        );
+        assert_eq!(
+            rerun_ids_with_failed_policy(&conn, ManifestId(1), tmp.path(), true),
+            ["fake-workspace", "second-fake-workspace"],
+            "explicit retry policy retains the failed analyzer"
+        );
+    }
+
+    #[test]
+    fn automatic_noop_retries_failed_analyzer_after_revision_or_config_change() {
+        for (revision, stored_hash) in [(6, None), (7, Some("stale-config-hash"))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = cas_store::open(&tmp.path().join("store.db")).unwrap();
+            insert_manifest_parser(&conn, ManifestId(1), "fake-sha", "fake-parser");
+            match stored_hash {
+                Some(stored_hash) => insert_run_with_config_hash(
+                    &conn,
+                    ManifestId(1),
+                    "fake-workspace",
+                    revision,
+                    "failed",
+                    stored_hash,
+                ),
+                None => insert_run(
+                    &conn,
+                    tmp.path(),
+                    ManifestId(1),
+                    "fake-workspace",
+                    revision,
+                    "failed",
+                ),
+            }
+
+            assert_eq!(
+                rerun_ids_with_failed_policy(&conn, ManifestId(1), tmp.path(), false),
+                ["fake-workspace"],
+                "a failed analyzer with changed currency must remain eligible"
             );
         }
     }

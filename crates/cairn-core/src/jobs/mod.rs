@@ -795,6 +795,15 @@ impl JobManager {
             Ok(())
         })?;
         if !queued {
+            #[cfg(test)]
+            crate::churn_recorder::record_enqueue(
+                repo_hash,
+                analyzer_id,
+                config_hash,
+                analyzer_revision,
+                crate::churn_recorder::EnqueueDecision::Coalesced,
+                None,
+            );
             debug!(
                 analyzer_id,
                 job_id,
@@ -804,6 +813,22 @@ impl JobManager {
             return Ok(None);
         }
 
+        #[cfg(test)]
+        {
+            crate::churn_recorder::record_enqueue(
+                repo_hash,
+                analyzer_id,
+                config_hash,
+                analyzer_revision,
+                crate::churn_recorder::EnqueueDecision::New,
+                Some(job_id),
+            );
+            crate::churn_recorder::assert_enqueue_recorded_before_publication(
+                repo_hash,
+                analyzer_id,
+                job_id,
+            );
+        }
         self.runtime_metrics
             .mark_enqueued(job_id, pool_group, now_ns);
         let enqueued = self.enqueue_memory(Job {
