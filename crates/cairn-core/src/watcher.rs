@@ -986,6 +986,101 @@ mod tests {
         state: cas_registry::RepoReconcileState,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct MetadataTouchProgress {
+        issued_touch: i64,
+        applied_touch: i64,
+        last_expected_generation: i64,
+        stability_phase: &'static str,
+    }
+
+    struct ReconcileDiagnostic {
+        desired: i64,
+        applied: i64,
+        attempt: Option<i64>,
+        next_retry: Option<i64>,
+        consecutive_failures: i64,
+        last_error: Option<String>,
+    }
+
+    struct TargetDiagnostic {
+        analyzer_revision: u32,
+        config_hash: String,
+        status: String,
+        error: Option<String>,
+        job_id: Option<i64>,
+    }
+
+    fn set_metadata_touch_progress(
+        progress: &std::sync::Mutex<MetadataTouchProgress>,
+        update: impl FnOnce(&mut MetadataTouchProgress),
+    ) {
+        let mut progress = progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut progress);
+    }
+
+    fn metadata_touch_failure_diagnostic(
+        failure: &str,
+        progress: MetadataTouchProgress,
+        snapshot: &ChurnSnapshot,
+        reconcile_state: Option<ReconcileDiagnostic>,
+        target_row: Option<TargetDiagnostic>,
+    ) -> String {
+        let reconcile_state = reconcile_state.map(|value| {
+            (
+                value.desired,
+                value.applied,
+                value.attempt,
+                value.next_retry,
+                value.consecutive_failures,
+                value.last_error,
+            )
+        });
+        let target_row = target_row.map(|value| {
+            (
+                value.analyzer_revision,
+                value.config_hash,
+                value.status,
+                value.error,
+                value.job_id,
+            )
+        });
+        let last_watch = snapshot
+            .watch
+            .last()
+            .map(|record| (record.generation, record.source_batch_ordinal));
+        let last_reconcile = snapshot.reconcile.last().map(|record| record.generation);
+        let new_jobs = snapshot
+            .enqueue
+            .iter()
+            .filter(|record| {
+                record.analyzer_id == PRECONDITION_ANALYZER_ID
+                    && matches!(record.decision, EnqueueDecision::New)
+            })
+            .map(|record| {
+                (
+                    record.generation,
+                    record.job_id,
+                    record.terminal_status.as_deref(),
+                    record.failure_class,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "metadata-touch convergence failed after teardown: {failure}; \
+             progress={progress:?}; watch_count={}; reconcile_count={}; \
+             last_watch_generation_batch={last_watch:?}; \
+             last_reconcile_generation={last_reconcile:?}; \
+             reconcile_state(desired,applied,attempt,next_retry,failures,error)=\
+             {reconcile_state:?}; target_run={target_row:?}; \
+             target_new_jobs={new_jobs:?}",
+            snapshot.watch.len(),
+            snapshot.reconcile.len(),
+        )
+    }
+
     async fn parent_metadata_touches(touch_count: i64) -> MetadataTouchOutcome {
         let fixture = churn_fixture(&[
             ("src/app.ts", "export const answer: number = 42;\n"),
@@ -1001,19 +1096,24 @@ mod tests {
         let before_run = precondition_run(&fixture);
         let before_job_id = precondition_job_id(&fixture);
 
-        // The 10s bound below measures active convergence only. Acquiring the
-        // recorder guard and teardown live outside it, so waiting for parallel
-        // recorder ownership does not consume that budget. `catch_unwind` keeps
-        // watcher, reconcile, and job shutdown on the timeout/panic path before
-        // the outcome is propagated or a quiesced repository is observed.
+        // The 10s bound below measures the five touch-to-applied transitions.
+        // Acquiring the recorder guard, the fixed stability check, and teardown
+        // live outside it. `catch_unwind` still keeps watcher, reconcile, and job
+        // shutdown on every timeout/panic path before the outcome is propagated.
         let (recorder, _recorder_guard) =
             churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
         let (reconcile, jobs) = running_reconcile(&fixture);
         let watcher = poll_watcher(&fixture, reconcile.clone());
+        let progress = Arc::new(std::sync::Mutex::new(MetadataTouchProgress {
+            issued_touch: 0,
+            applied_touch: 0,
+            last_expected_generation: 1,
+            stability_phase: "waiting_for_first_touch",
+        }));
 
         use futures::FutureExt as _;
-        let active =
-            std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(10), async {
+        let active = std::panic::AssertUnwindSafe(async {
+            let touch_result = tokio::time::timeout(Duration::from_secs(10), async {
                 let source_dir = std::fs::File::open(fixture.repo.path().join("src")).unwrap();
                 let mut modified = source_dir.metadata().unwrap().modified().unwrap();
 
@@ -1021,7 +1121,16 @@ mod tests {
                     modified += Duration::from_secs(2);
                     source_dir.set_modified(modified).unwrap();
                     let generation = 1 + offset;
+                    set_metadata_touch_progress(&progress, |progress| {
+                        progress.issued_touch = offset;
+                        progress.last_expected_generation = generation;
+                        progress.stability_phase = "waiting_for_applied_generation";
+                    });
                     wait_for_applied(&fixture.cas, &fixture.repo_hash, generation).await;
+                    set_metadata_touch_progress(&progress, |progress| {
+                        progress.applied_touch = offset;
+                        progress.stability_phase = "waiting_for_terminal_observation";
+                    });
                     let decision = recorder.snapshot().enqueue.into_iter().find(|record| {
                         record.generation == generation
                             && record.analyzer_id == PRECONDITION_ANALYZER_ID
@@ -1032,32 +1141,101 @@ mod tests {
                     {
                         wait_for_recorded_precondition_retry(&recorder, generation).await;
                     }
+                    set_metadata_touch_progress(&progress, |progress| {
+                        progress.stability_phase = "touch_complete";
+                    });
                 }
                 drop(source_dir);
-                assert_generation_stable(&fixture, 1 + touch_count).await;
-            }))
-            .catch_unwind()
+            })
             .await;
+            touch_result?;
+            set_metadata_touch_progress(&progress, |progress| {
+                progress.stability_phase = "waiting_for_final_stability";
+            });
+            assert_generation_stable(&fixture, 1 + touch_count).await;
+            set_metadata_touch_progress(&progress, |progress| {
+                progress.stability_phase = "complete";
+            });
+            Ok::<(), tokio::time::error::Elapsed>(())
+        })
+        .catch_unwind()
+        .await;
 
         watcher.unwatch_repository(&fixture.repo_hash);
         reconcile.shutdown(Duration::from_secs(1)).await;
         jobs.shutdown(Duration::from_secs(1)).await;
 
-        match active {
-            Ok(result) => {
-                result.expect("metadata-touch convergence exceeded the 10 second carrier bound")
+        let snapshot = recorder.snapshot();
+        let progress = *progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = cas_registry::open(&fixture.cas.index_db_path()).ok();
+        let state = index.as_ref().and_then(|index| {
+            cas_registry::get_reconcile_state(index, &fixture.repo_hash)
+                .ok()
+                .flatten()
+        });
+        let target_row = cas_store::open_existing(&fixture.cas.store_db_path(&fixture.repo_hash))
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT analyzer_revision, config_hash, status, error, job_id
+                 FROM workspace_analysis_runs
+                 WHERE analyzer_id = ?1",
+                    [PRECONDITION_ANALYZER_ID],
+                    |row| {
+                        Ok(TargetDiagnostic {
+                            analyzer_revision: row.get(0)?,
+                            config_hash: row.get(1)?,
+                            status: row.get(2)?,
+                            error: row.get(3)?,
+                            job_id: row.get(4)?,
+                        })
+                    },
+                )
+                .ok()
+            });
+        let failure = match active {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some("active convergence timed out".to_string()),
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|value| (*value).to_string())
+                    })
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                Some(format!("active convergence panicked: {detail}"))
             }
-            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        if let Some(failure) = failure {
+            let reconcile_state = state.as_ref().map(|state| ReconcileDiagnostic {
+                desired: state.desired_generation,
+                applied: state.applied_generation,
+                attempt: state.attempt_generation,
+                next_retry: state.next_retry_at_ns,
+                consecutive_failures: state.consecutive_failures,
+                last_error: state.last_error.clone(),
+            });
+            panic!(
+                "{}",
+                metadata_touch_failure_diagnostic(
+                    &failure,
+                    progress,
+                    &snapshot,
+                    reconcile_state,
+                    target_row,
+                )
+            );
         }
 
-        let snapshot = recorder.snapshot();
         let after_manifest = tentative_manifest_snapshot(&fixture);
         let after_run = precondition_run(&fixture);
         let after_job_id = precondition_job_id(&fixture);
-        let index = cas_registry::open(&fixture.cas.index_db_path()).unwrap();
-        let state = cas_registry::get_reconcile_state(&index, &fixture.repo_hash)
-            .unwrap()
-            .unwrap();
+        let state = state.expect("successful convergence must retain reconcile state");
         assert_git_worktree_clean(fixture.repo.path());
 
         MetadataTouchOutcome {
@@ -1252,17 +1430,32 @@ mod tests {
         recorder.wait_for_terminal_after_publication();
         let probe_path = fixture.repo.path().join("src/watch_probe.ts");
         assert!(!probe_path.exists(), "watch probe must be initially absent");
-        let watcher = poll_watcher(&fixture, reconcile.clone());
-
+        let staging_path = fixture.repo.path().parent().unwrap().join(format!(
+            ".{}.watch-probe-stage",
+            fixture.repo.path().file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!staging_path.exists(), "staging path must be unique");
         use std::io::Write as _;
         let mut probe = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&probe_path)
+            .open(&staging_path)
             .unwrap();
         probe.write_all(b"export const watched = true;\n").unwrap();
         probe.sync_all().unwrap();
         drop(probe);
+        assert!(!staging_path.starts_with(fixture.repo.path()));
+        assert_eq!(
+            std::fs::read(&staging_path).unwrap(),
+            b"export const watched = true;\n"
+        );
+        let watcher = poll_watcher(&fixture, reconcile.clone());
+        std::fs::rename(&staging_path, &probe_path).unwrap();
+        assert!(!staging_path.exists());
+        assert_eq!(
+            std::fs::read(&probe_path).unwrap(),
+            b"export const watched = true;\n"
+        );
         wait_for_applied(&fixture.cas, &fixture.repo_hash, 2).await;
         wait_for_recorded_precondition_retry(&recorder, 2).await;
         assert_generation_stable(&fixture, 2).await;
@@ -1272,11 +1465,44 @@ mod tests {
         jobs.shutdown(Duration::from_secs(1)).await;
 
         let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot.watch.len(),
-            1,
-            "one source edge must be normalized once"
-        );
+        if snapshot.watch.len() != 1 {
+            let state = cas_registry::open(&fixture.cas.index_db_path())
+                .ok()
+                .and_then(|index| {
+                    cas_registry::get_reconcile_state(&index, &fixture.repo_hash)
+                        .ok()
+                        .flatten()
+                });
+            let durable = state.as_ref().map(|state| {
+                (
+                    state.desired_generation,
+                    state.applied_generation,
+                    state.attempt_generation,
+                    state.next_retry_at_ns,
+                    state.consecutive_failures,
+                    state.last_error.as_deref(),
+                )
+            });
+            let target_jobs = snapshot
+                .enqueue
+                .iter()
+                .filter(|record| record.analyzer_id == PRECONDITION_ANALYZER_ID)
+                .map(|record| {
+                    (
+                        record.generation,
+                        record.job_id,
+                        record.decision,
+                        record.terminal_status.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "one source edge must be normalized once; watch={:?}; \
+                 reconcile={:?}; durable(desired,applied,attempt,next_retry,failures,error)=\
+                 {durable:?}; target_jobs={target_jobs:?}",
+                snapshot.watch, snapshot.reconcile,
+            );
+        }
         assert_eq!(snapshot.watch[0].source_batch_ordinal, 1);
         assert_eq!(snapshot.watch[0].generation, Some(2));
         assert!(
@@ -1387,6 +1613,54 @@ mod tests {
             new_jobs.len()
         );
         assert_eq!(outcome.after_job_id, outcome.before_job_id);
+    }
+
+    #[test]
+    fn metadata_touch_failure_diagnostic_includes_progress_and_durable_authorities() {
+        let message = metadata_touch_failure_diagnostic(
+            "active convergence timed out",
+            MetadataTouchProgress {
+                issued_touch: 5,
+                applied_touch: 4,
+                last_expected_generation: 6,
+                stability_phase: "waiting_for_applied_generation",
+            },
+            &ChurnSnapshot::default(),
+            Some(ReconcileDiagnostic {
+                desired: 6,
+                applied: 5,
+                attempt: Some(6),
+                next_retry: None,
+                consecutive_failures: 0,
+                last_error: None,
+            }),
+            Some(TargetDiagnostic {
+                analyzer_revision: 1,
+                config_hash: "config".into(),
+                status: "failed".into(),
+                error: None,
+                job_id: Some(41),
+            }),
+        );
+        for authority in [
+            "after teardown",
+            "issued_touch",
+            "applied_touch",
+            "last_expected_generation",
+            "stability_phase",
+            "watch_count",
+            "reconcile_count",
+            "last_watch_generation_batch",
+            "last_reconcile_generation",
+            "reconcile_state(desired,applied,attempt,next_retry,failures,error)",
+            "target_run",
+            "target_new_jobs",
+        ] {
+            assert!(
+                message.contains(authority),
+                "timeout diagnostic omitted {authority}: {message}"
+            );
+        }
     }
 
     #[tokio::test]
