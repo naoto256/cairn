@@ -485,13 +485,19 @@ mod tests {
         let alias_root = temp.path().join("alias");
         std::fs::create_dir(&real_root).unwrap();
         symlink(&real_root, &alias_root).unwrap();
+        // The temporary directory itself may use an alias spelling, so canonicalize
+        // the real root too.
+        let canonical_real_root = real_root.canonicalize().unwrap();
 
         let (recorder, _guard) = install("repo", &alias_root);
 
         assert_eq!(
-            recorder.relative_bytes(&real_root.join("src/watch_probe.ts")),
+            recorder.relative_bytes(&canonical_real_root.join("src/watch_probe.ts")),
             b"src/watch_probe.ts"
         );
-        assert_eq!(recorder.relative_bytes(&real_root.join("src")), b"src");
+        assert_eq!(
+            recorder.relative_bytes(&canonical_real_root.join("src")),
+            b"src"
+        );
     }
 }
