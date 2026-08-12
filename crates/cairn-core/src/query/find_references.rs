@@ -2,9 +2,19 @@ use cairn_proto::common::RefKind;
 use cairn_proto::methods::ReferenceDirection;
 use rusqlite::Connection;
 
+#[cfg(test)]
+use std::time::Instant;
+
+#[cfg(test)]
+use crate::Error;
 use crate::Result;
 use crate::anchor::{self, AnchorName};
 use crate::cas::kind_conv::{ref_kind_from_str, ref_kind_to_str};
+#[cfg(test)]
+use crate::data_rpc::helpers::{
+    CapturedQueryKind, QueryPhase, TestQueryVariant, current_test_query_variant,
+    record_test_query_phase, record_test_query_sql, test_query_capture_only,
+};
 use crate::manifest::ManifestId;
 use crate::workspace_analyzer::{source_is_workspace_tier_sql, source_rank_case_sql};
 
@@ -160,33 +170,23 @@ fn run_find_references(
     let resolution_source_rank = source_rank_case_sql("source");
     let workspace_tier_t = source_is_workspace_tier_sql("t.source");
     let logical_site_columns = logical_site_columns_sql("r");
+    let supersession = SupersessionSql::new(&workspace_tier_t, SupersessionLayout::Fallback);
+    let resolution = ResolutionSql::new(
+        current_resolution_plan(),
+        &resolution_source_rank,
+        ResolutionLayout::Fallback,
+    );
     // Closure so incoming/outgoing share this SQL body — they differ
     // only in `where_col` (`enc.qualified` vs `r.target_name` /
     // `r.target_qualified`), the pinned `value`, the enclosing-symbol
     // JOIN semantics (INNER for outgoing, LEFT for incoming), and the
     // outgoing-only "resolved callee" noise filter below.
     let run = |where_col: &str, value: &str, outgoing: bool| -> Result<(Vec<ReferenceHit>, bool)> {
-        let mut sql = String::from(
-            "WITH best_resolution AS (
-                 SELECT site_blob_sha, site_parser_id,
-                        site_byte_start, site_byte_end, kind,
-                        target_symbol_id, source, target_path,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY site_blob_sha, site_parser_id,
-                                         site_byte_start, site_byte_end, kind
-                            ORDER BY
-                                CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
-                                ",
-        );
-        sql.push_str(&resolution_source_rank);
+        #[cfg(test)]
+        let phase_started = Instant::now();
+        let mut sql = resolution.ctes.clone();
         sql.push_str(
-            ", id
-                        ) AS rn
-                   FROM resolutions
-                  WHERE kind IN ('type', 'call', 'import')
-                    AND (manifest_id = ?1 OR manifest_id IS NULL)
-             ),
-             ref_candidates AS (
+            "             ref_candidates AS (
                  SELECT r.target_name,
                         COALESCE(sym.qualified, r.target_qualified)
                             AS target_qualified,
@@ -203,33 +203,34 @@ fn run_find_references(
         sql.push_str("' END AS kind_source,\n                        ");
         sql.push_str(&source_rank_r);
         sql.push_str(" AS source_rank,\n");
+        sql.push_str(&supersession.projection);
         sql.push_str(&format!(
-            "                        EXISTS (
-                          SELECT 1
-                            FROM refs t
-                           WHERE t.blob_sha = r.blob_sha
-                             AND ({workspace_tier_t})
-                             AND t.line = r.line
-                             AND t.kind = r.kind
-                             AND t.target_name = r.target_name
-                             AND t.enclosing_id IS r.enclosing_id
-                        ) AS has_workspace_tier_same_line_target_name,
-                        {logical_site_columns}
+            "                        {logical_site_columns}
                    FROM refs r
                    JOIN manifest_entries me
-                     ON me.manifest_id = ?1
-                    AND me.blob_sha = r.blob_sha
-                   LEFT JOIN best_resolution res
+"
+        ));
+        sql.push_str(&manifest_entry_membership_on_sql(
+            "                     ",
+            "                    ",
+            "me",
+            "r",
+        ));
+        sql.push_str(
+            "                   LEFT JOIN best_resolution res
                      ON res.site_blob_sha = r.blob_sha
                     AND res.site_parser_id = r.parser_id
                     AND res.site_byte_start = r.byte_start
                     AND res.site_byte_end = r.byte_end
                     AND res.kind = r.kind
-                    AND res.rn = 1
-                   LEFT JOIN symbols sym
+",
+        );
+        sql.push_str(resolution.consumer_rank_predicate);
+        sql.push_str(
+            "                   LEFT JOIN symbols sym
                      ON sym.id = res.target_symbol_id
-               "
-        ));
+               ",
+        );
         sql.push_str(if outgoing {
             "JOIN symbols enc ON enc.id = r.enclosing_id\n"
         } else {
@@ -312,6 +313,23 @@ fn run_find_references(
              ORDER BY is_metadata, path, line, byte_start, source_rank, ref_id",
         );
 
+        #[cfg(test)]
+        record_test_query_sql(
+            CapturedQueryKind::Fallback,
+            &sql,
+            match kind_str {
+                Some(kind) => vec![
+                    manifest_id.0.into(),
+                    value.to_string().into(),
+                    kind.to_string().into(),
+                ],
+                None => vec![manifest_id.0.into(), value.to_string().into()],
+            },
+        );
+        #[cfg(test)]
+        if test_query_capture_only() {
+            return Err(Error::Internal("test SQL capture only".into()));
+        }
         let mut stmt = conn.prepare(&sql)?;
         let row_to_result = |row: &rusqlite::Row<'_>| -> rusqlite::Result<_> {
             let is_metadata = row.get::<_, bool>(13)?;
@@ -347,7 +365,16 @@ fn run_find_references(
         let omitted_unresolved_calls = rows
             .iter()
             .any(|(_, omitted_unresolved_calls)| *omitted_unresolved_calls);
-        let hits = rows.into_iter().filter_map(|(hit, _)| hit).collect();
+        let hits: Vec<_> = rows.into_iter().filter_map(|(hit, _)| hit).collect();
+        #[cfg(test)]
+        record_test_query_phase(
+            QueryPhase::FallbackSql,
+            phase_started,
+            Some(hits.len()),
+            Some(hits.len()),
+            None,
+            true,
+        );
         Ok((hits, omitted_unresolved_calls))
     };
 
@@ -455,56 +482,24 @@ fn run_strict_incoming(
     include_noise: bool,
     limit: u32,
 ) -> Result<Vec<ReferenceHit>> {
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let source_rank_r = source_rank_case_sql("r.source");
     let resolution_source_rank = source_rank_case_sql("source");
     let workspace_tier_t = source_is_workspace_tier_sql("t.source");
     let logical_site_columns = logical_site_columns_sql("r");
-
-    let mut sql = String::from(
-        "WITH best_resolution AS (
-             SELECT site_blob_sha, site_parser_id,
-                    site_byte_start, site_byte_end, kind,
-                    target_symbol_id, source, target_path,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY site_blob_sha, site_parser_id,
-                                     site_byte_start, site_byte_end, kind
-                        ORDER BY
-                            CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
-                            ",
+    let supersession = SupersessionSql::new(&workspace_tier_t, SupersessionLayout::StrictIncoming);
+    let resolution = ResolutionSql::new(
+        current_resolution_plan(),
+        &resolution_source_rank,
+        ResolutionLayout::StrictIncoming,
     );
-    sql.push_str(&resolution_source_rank);
+    let strict_resolution = StrictResolutionSql::new(current_strict_resolution_shape());
+
+    let mut sql = resolution.ctes.clone();
+    strict_resolution.append_strict_refs(&mut sql, resolution.consumer_rank_predicate);
     sql.push_str(
-        ", id
-                    ) AS rn
-               FROM resolutions
-              WHERE kind IN ('type', 'call', 'import')
-                AND (manifest_id = ?1 OR manifest_id IS NULL)
-         ),
-         strict_refs AS (
-             -- Branch A: r.target_qualified hits idx_refs_target_qualified.
-             SELECT r.*
-               FROM refs r
-              WHERE r.target_qualified = ?2
-             UNION ALL
-             -- Branch B: cross-parser fallback. The Tier-2.5 persist
-             -- layer adopted a sibling-parser symbol id (so
-             -- `target_qualified` on the ref may be absent or merely
-             -- syntactic); the strict query reaches it via the resolution row + symbol
-             -- table. Probes idx_symbols_qualified first.
-             SELECT r.*
-               FROM refs r
-               JOIN best_resolution res
-                 ON res.site_blob_sha = r.blob_sha
-                AND res.site_parser_id = r.parser_id
-                AND res.site_byte_start = r.byte_start
-                AND res.site_byte_end = r.byte_end
-                AND res.kind = r.kind
-                AND res.rn = 1
-               JOIN symbols sym ON sym.id = res.target_symbol_id
-              WHERE sym.qualified = ?2
-                AND (r.target_qualified IS NULL OR r.target_qualified <> ?2)
-         ),
-         ref_candidates AS (
+        "         ref_candidates AS (
              SELECT r.target_name,
                     COALESCE(sym.qualified, r.target_qualified)
                         AS target_qualified,
@@ -513,41 +508,40 @@ fn run_strict_incoming(
                     me.path, r.line, r.blob_sha, r.parser_id,
                     r.byte_start, r.byte_end, r.id AS ref_id,
                     r.enclosing_id, r.source,
-                    res.target_path AS target_path,
-                    CASE WHEN res.source IS NOT NULL THEN res.source
-                         ELSE '",
+                    ",
     );
+    sql.push_str(strict_resolution.target_path_expr());
+    sql.push_str(
+        " AS target_path,
+                    CASE WHEN ",
+    );
+    sql.push_str(strict_resolution.resolution_source_expr());
+    sql.push_str(" IS NOT NULL THEN ");
+    sql.push_str(strict_resolution.resolution_source_expr());
+    sql.push_str("\n                         ELSE '");
     sql.push_str(KIND_SOURCE_FACT);
     sql.push_str("' END AS kind_source,\n                    ");
     sql.push_str(&source_rank_r);
     sql.push_str(" AS source_rank,\n");
+    sql.push_str(&supersession.projection);
     sql.push_str(&format!(
-        "                    EXISTS (
-                      SELECT 1
-                        FROM refs t
-                       WHERE t.blob_sha = r.blob_sha
-                         AND ({workspace_tier_t})
-                         AND t.line = r.line
-                         AND t.kind = r.kind
-                         AND t.target_name = r.target_name
-                         AND t.enclosing_id IS r.enclosing_id
-                    ) AS has_workspace_tier_same_line_target_name,
-                    {logical_site_columns}
+        "                    {logical_site_columns}
                FROM strict_refs r
                JOIN manifest_entries me
-                 ON me.manifest_id = ?1
-                AND me.blob_sha = r.blob_sha
-               LEFT JOIN best_resolution res
-                 ON res.site_blob_sha = r.blob_sha
-                AND res.site_parser_id = r.parser_id
-                AND res.site_byte_start = r.byte_start
-                AND res.site_byte_end = r.byte_end
-                AND res.kind = r.kind
-                AND res.rn = 1
-               LEFT JOIN symbols sym ON sym.id = res.target_symbol_id
-               LEFT JOIN symbols enc ON enc.id = r.enclosing_id
-              WHERE 1=1"
+"
     ));
+    sql.push_str(&manifest_entry_membership_on_sql(
+        "                 ",
+        "                ",
+        "me",
+        "r",
+    ));
+    strict_resolution
+        .append_ref_candidate_resolution_joins(&mut sql, resolution.consumer_rank_predicate);
+    sql.push_str(
+        "               LEFT JOIN symbols enc ON enc.id = r.enclosing_id
+              WHERE 1=1",
+    );
     if kind_str.is_some() {
         sql.push_str(" AND r.kind = ?3");
     }
@@ -568,6 +562,23 @@ fn run_strict_incoming(
     sql.push_str(" ORDER BY path, line, byte_start, source_rank, ref_id");
     sql.push_str(&format!(" LIMIT {limit}"));
 
+    #[cfg(test)]
+    record_test_query_sql(
+        CapturedQueryKind::Strict,
+        &sql,
+        match kind_str {
+            Some(kind) => vec![
+                manifest_id.0.into(),
+                symbol.to_string().into(),
+                kind.to_string().into(),
+            ],
+            None => vec![manifest_id.0.into(), symbol.to_string().into()],
+        },
+    );
+    #[cfg(test)]
+    if test_query_capture_only() {
+        return Err(Error::Internal("test SQL capture only".into()));
+    }
     let mut stmt = conn.prepare(&sql)?;
     let row_to_hit = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ReferenceHit> {
         Ok(ReferenceHit {
@@ -591,7 +602,17 @@ fn run_strict_incoming(
             .query_map(rusqlite::params![manifest_id.0, symbol], row_to_hit)?
             .collect(),
     };
-    Ok(rows?)
+    let rows = rows?;
+    #[cfg(test)]
+    record_test_query_phase(
+        QueryPhase::StrictSql,
+        phase_started,
+        Some(rows.len()),
+        Some(rows.len()),
+        None,
+        true,
+    );
+    Ok(rows)
 }
 
 /// SQL projection for the fallback identity of refs without byte ranges.
@@ -608,6 +629,335 @@ fn logical_site_columns_sql(alias: &str) -> String {
          CASE WHEN {alias}.byte_start = 0 AND {alias}.byte_end = 0
               THEN {alias}.enclosing_id END AS logical_site_enclosing"
     )
+}
+
+fn manifest_entry_membership_on_sql(
+    on_indent: &str,
+    and_indent: &str,
+    manifest_alias: &str,
+    ref_alias: &str,
+) -> String {
+    format!(
+        "{on_indent}ON {manifest_alias}.manifest_id = ?1\n\
+{and_indent}AND {manifest_alias}.blob_sha = {ref_alias}.blob_sha\n"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolutionPlan {
+    InlineRanked,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolutionLayout {
+    Fallback,
+    StrictIncoming,
+}
+
+struct ResolutionSql {
+    ctes: String,
+    consumer_rank_predicate: &'static str,
+}
+
+impl ResolutionSql {
+    fn new(plan: ResolutionPlan, source_rank: &str, layout: ResolutionLayout) -> Self {
+        match plan {
+            ResolutionPlan::InlineRanked => {
+                let (mut ctes, tail, consumer_rank_predicate) = match layout {
+                    ResolutionLayout::Fallback => (
+                        String::from(
+                            "WITH best_resolution AS (
+                 SELECT site_blob_sha, site_parser_id,
+                        site_byte_start, site_byte_end, kind,
+                        target_symbol_id, source, target_path,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY site_blob_sha, site_parser_id,
+                                         site_byte_start, site_byte_end, kind
+                            ORDER BY
+                                CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
+                                ",
+                        ),
+                        ", id
+                        ) AS rn
+                   FROM resolutions
+                  WHERE kind IN ('type', 'call', 'import')
+                    AND (manifest_id = ?1 OR manifest_id IS NULL)
+             ),
+",
+                        "                    AND res.rn = 1\n",
+                    ),
+                    ResolutionLayout::StrictIncoming => (
+                        String::from(
+                            "WITH best_resolution AS (
+             SELECT site_blob_sha, site_parser_id,
+                    site_byte_start, site_byte_end, kind,
+                    target_symbol_id, source, target_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY site_blob_sha, site_parser_id,
+                                     site_byte_start, site_byte_end, kind
+                        ORDER BY
+                            CASE WHEN manifest_id = ?1 THEN 0 ELSE 1 END,
+                            ",
+                        ),
+                        ", id
+                    ) AS rn
+               FROM resolutions
+              WHERE kind IN ('type', 'call', 'import')
+                AND (manifest_id = ?1 OR manifest_id IS NULL)
+         ),
+",
+                        "                AND res.rn = 1\n",
+                    ),
+                };
+                ctes.push_str(source_rank);
+                ctes.push_str(tail);
+                Self {
+                    ctes,
+                    consumer_rank_predicate,
+                }
+            }
+        }
+    }
+}
+
+fn current_resolution_plan() -> ResolutionPlan {
+    #[cfg(test)]
+    {
+        return resolution_plan_for_variant(current_test_query_variant());
+    }
+    #[allow(unreachable_code)]
+    ResolutionPlan::InlineRanked
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictResolutionShape {
+    #[cfg(test)]
+    Rejoin,
+    CarryPayload,
+}
+
+struct StrictResolutionSql {
+    shape: StrictResolutionShape,
+}
+
+impl StrictResolutionSql {
+    fn new(shape: StrictResolutionShape) -> Self {
+        Self { shape }
+    }
+
+    fn append_strict_refs(&self, sql: &mut String, rank_predicate: &str) {
+        match self.shape {
+            #[cfg(test)]
+            StrictResolutionShape::Rejoin => {
+                sql.push_str(
+                    "         strict_refs AS (
+             -- Branch A: r.target_qualified hits idx_refs_target_qualified.
+             SELECT r.*
+               FROM refs r
+              WHERE r.target_qualified = ?2
+             UNION ALL
+             -- Branch B: cross-parser fallback. The Tier-2.5 persist
+             -- layer adopted a sibling-parser symbol id (so
+             -- `target_qualified` on the ref may be absent or merely
+             -- syntactic); the strict query reaches it via the resolution row + symbol
+             -- table. Probes idx_symbols_qualified first.
+             SELECT r.*
+               FROM refs r
+               JOIN best_resolution res
+                 ON res.site_blob_sha = r.blob_sha
+                AND res.site_parser_id = r.parser_id
+                AND res.site_byte_start = r.byte_start
+                AND res.site_byte_end = r.byte_end
+                AND res.kind = r.kind
+",
+                );
+                sql.push_str(rank_predicate);
+                sql.push_str(
+                    "               JOIN symbols sym ON sym.id = res.target_symbol_id
+              WHERE sym.qualified = ?2
+                AND (r.target_qualified IS NULL OR r.target_qualified <> ?2)
+         ),
+",
+                );
+            }
+            StrictResolutionShape::CarryPayload => {
+                const REFS_COLUMNS: &str = "r.id, r.blob_sha, r.parser_id, r.enclosing_id,
+                    r.target_name, r.target_qualified, r.kind, r.type_role,
+                    r.byte_start, r.byte_end, r.line, r.source";
+                sql.push_str(
+                    "         strict_refs (
+             id, blob_sha, parser_id, enclosing_id,
+             target_name, target_qualified, kind, type_role,
+             byte_start, byte_end, line, source,
+             resolution_target_symbol_id, resolution_source,
+             resolution_target_path
+         ) AS (
+             -- Branch A carries the selected resolution beside the raw ref.
+             SELECT ",
+                );
+                sql.push_str(REFS_COLUMNS);
+                sql.push_str(
+                    ",
+                    res.target_symbol_id, res.source, res.target_path
+               FROM refs r
+               LEFT JOIN best_resolution res
+                 ON res.site_blob_sha = r.blob_sha
+                AND res.site_parser_id = r.parser_id
+                AND res.site_byte_start = r.byte_start
+                AND res.site_byte_end = r.byte_end
+                AND res.kind = r.kind
+",
+                );
+                sql.push_str(rank_predicate);
+                sql.push_str(
+                    "              WHERE r.target_qualified = ?2
+             UNION ALL
+             -- Branch B matches and carries the same selected resolution payload.
+             SELECT ",
+                );
+                sql.push_str(REFS_COLUMNS);
+                sql.push_str(
+                    ",
+                    res.target_symbol_id, res.source, res.target_path
+               FROM refs r
+               JOIN best_resolution res
+                 ON res.site_blob_sha = r.blob_sha
+                AND res.site_parser_id = r.parser_id
+                AND res.site_byte_start = r.byte_start
+                AND res.site_byte_end = r.byte_end
+                AND res.kind = r.kind
+",
+                );
+                sql.push_str(rank_predicate);
+                sql.push_str(
+                    "               JOIN symbols match_sym
+                 ON match_sym.id = res.target_symbol_id
+              WHERE match_sym.qualified = ?2
+                AND (r.target_qualified IS NULL OR r.target_qualified <> ?2)
+         ),
+",
+                );
+            }
+        }
+    }
+
+    fn target_path_expr(&self) -> &'static str {
+        match self.shape {
+            #[cfg(test)]
+            StrictResolutionShape::Rejoin => "res.target_path",
+            StrictResolutionShape::CarryPayload => "r.resolution_target_path",
+        }
+    }
+
+    fn resolution_source_expr(&self) -> &'static str {
+        match self.shape {
+            #[cfg(test)]
+            StrictResolutionShape::Rejoin => "res.source",
+            StrictResolutionShape::CarryPayload => "r.resolution_source",
+        }
+    }
+
+    fn append_ref_candidate_resolution_joins(&self, sql: &mut String, _rank_predicate: &str) {
+        match self.shape {
+            #[cfg(test)]
+            StrictResolutionShape::Rejoin => {
+                sql.push_str(
+                    "               LEFT JOIN best_resolution res
+                 ON res.site_blob_sha = r.blob_sha
+                AND res.site_parser_id = r.parser_id
+                AND res.site_byte_start = r.byte_start
+                AND res.site_byte_end = r.byte_end
+                AND res.kind = r.kind
+",
+                );
+                sql.push_str(_rank_predicate);
+                sql.push_str(
+                    "               LEFT JOIN symbols sym ON sym.id = res.target_symbol_id
+",
+                );
+            }
+            StrictResolutionShape::CarryPayload => {
+                sql.push_str(
+                    "               LEFT JOIN symbols sym
+                 ON sym.id = r.resolution_target_symbol_id
+",
+                );
+            }
+        }
+    }
+}
+
+fn current_strict_resolution_shape() -> StrictResolutionShape {
+    #[cfg(test)]
+    {
+        return strict_resolution_shape_for_variant(current_test_query_variant());
+    }
+    #[allow(unreachable_code)]
+    StrictResolutionShape::CarryPayload
+}
+
+#[cfg(test)]
+fn strict_resolution_shape_for_variant(variant: TestQueryVariant) -> StrictResolutionShape {
+    match variant {
+        TestQueryVariant::RejoinOracle => StrictResolutionShape::Rejoin,
+        TestQueryVariant::ProductionCarry => StrictResolutionShape::CarryPayload,
+    }
+}
+
+#[cfg(test)]
+fn resolution_plan_for_variant(variant: TestQueryVariant) -> ResolutionPlan {
+    match variant {
+        TestQueryVariant::RejoinOracle | TestQueryVariant::ProductionCarry => {
+            ResolutionPlan::InlineRanked
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn logical_site_distinct_count_sql() -> String {
+    format!(
+        "SELECT COUNT(*) FROM (
+             SELECT DISTINCT r.blob_sha, r.parser_id, r.byte_start, r.byte_end, r.kind,
+                    {}
+               FROM refs r
+              WHERE r.target_name = ?1
+         )",
+        logical_site_columns_sql("r")
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SupersessionLayout {
+    Fallback,
+    StrictIncoming,
+}
+
+struct SupersessionSql {
+    projection: String,
+}
+
+impl SupersessionSql {
+    fn new(workspace_tier_predicate: &str, layout: SupersessionLayout) -> Self {
+        let projection_indent = match layout {
+            SupersessionLayout::Fallback => "                        ",
+            SupersessionLayout::StrictIncoming => "                    ",
+        };
+
+        Self {
+            projection: format!(
+                "{projection_indent}EXISTS (\n\
+{projection_indent}  SELECT 1\n\
+{projection_indent}    FROM refs t\n\
+{projection_indent}   WHERE t.blob_sha = r.blob_sha\n\
+{projection_indent}     AND ({workspace_tier_predicate})\n\
+{projection_indent}     AND t.line = r.line\n\
+{projection_indent}     AND t.kind = r.kind\n\
+{projection_indent}     AND t.target_name = r.target_name\n\
+{projection_indent}     AND t.enclosing_id IS r.enclosing_id\n\
+{projection_indent}) AS has_workspace_tier_same_line_target_name,\n"
+            ),
+        }
+    }
 }
 
 /// Append the ranking and supersession CTEs shared by both reference queries.
@@ -647,7 +997,11 @@ fn append_ranked_and_surviving_ctes(sql: &mut String) {
                 source_rank > 0
                 AND byte_start = 0
                 AND byte_end = 0
-                AND has_workspace_tier_same_line_target_name
+                AND ",
+    );
+    sql.push_str("has_workspace_tier_same_line_target_name");
+    sql.push_str(
+        "
               )
          )",
     );
@@ -680,7 +1034,51 @@ fn bare_name_from_qualified(symbol: &str) -> &str {
 
 #[cfg(test)]
 mod qualified_helpers_tests {
-    use super::{bare_name_from_qualified, is_qualified_symbol};
+    use super::{
+        ResolutionPlan, StrictResolutionShape, StrictResolutionSql, bare_name_from_qualified,
+        is_qualified_symbol, resolution_plan_for_variant, strict_resolution_shape_for_variant,
+    };
+    use crate::data_rpc::helpers::TestQueryVariant;
+
+    #[test]
+    fn resolution_variants_select_oracle_or_production_shape() {
+        assert_eq!(
+            resolution_plan_for_variant(TestQueryVariant::RejoinOracle),
+            ResolutionPlan::InlineRanked
+        );
+        assert_eq!(
+            strict_resolution_shape_for_variant(TestQueryVariant::RejoinOracle),
+            StrictResolutionShape::Rejoin
+        );
+        assert_eq!(
+            strict_resolution_shape_for_variant(TestQueryVariant::ProductionCarry),
+            StrictResolutionShape::CarryPayload
+        );
+        assert_eq!(
+            resolution_plan_for_variant(TestQueryVariant::ProductionCarry),
+            ResolutionPlan::InlineRanked
+        );
+    }
+
+    #[test]
+    fn strict_payload_carry_declares_union_columns_and_never_selects_r_star() {
+        let mut sql = String::new();
+        StrictResolutionSql::new(StrictResolutionShape::CarryPayload)
+            .append_strict_refs(&mut sql, "                AND res.rn = 1\n");
+        assert_eq!(sql.matches("strict_refs (").count(), 1);
+        assert_eq!(sql.matches("resolution_target_symbol_id").count(), 1);
+        assert_eq!(sql.matches("resolution_source").count(), 1);
+        assert_eq!(sql.matches("resolution_target_path").count(), 1);
+        assert_eq!(sql.matches("SELECT r.*").count(), 0);
+        assert_eq!(sql.matches("UNION ALL").count(), 1);
+        assert_eq!(
+            sql.matches("res.target_symbol_id, res.source, res.target_path")
+                .count(),
+            2
+        );
+        assert_eq!(sql.matches("res.rn = 1").count(), 2);
+        assert_eq!(sql.matches("JOIN best_resolution res").count(), 2);
+    }
 
     #[test]
     fn is_qualified_recognises_rust_double_colon() {

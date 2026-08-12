@@ -30,6 +30,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::future::Future;
+#[cfg(test)]
+use std::time::{Duration, Instant};
+
 use cairn_proto::{
     AnalyzerState, Completeness, Diagnostic, DiagnosticCode, DiagnosticSeverity, Hint, HintAction,
     HintCode, PartialReason, ReasonCode, TierAnalyzerStatus, TierStatus, TierStatusBody,
@@ -49,6 +56,263 @@ use crate::workspace_analyzer::{
 use crate::{Error, Result};
 
 use super::DataCtx;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryPhase {
+    DispatchTotal,
+    IndexOpen,
+    IndexEnumeration,
+    AliasResolution,
+    LeaseAcquire,
+    SnapshotEvaluate,
+    Membership,
+    StrictSql,
+    FallbackSql,
+    Commit,
+    Finalize,
+    LeaseRelease,
+    TierFreshnessSecondPass,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryPhaseEvent {
+    pub(crate) trace_id: &'static str,
+    pub(crate) phase: QueryPhase,
+    pub(crate) elapsed: Duration,
+    pub(crate) rows: Option<usize>,
+    pub(crate) cardinality: Option<usize>,
+    pub(crate) connection_ordinal: usize,
+    pub(crate) repo_ordinal: Option<usize>,
+    pub(crate) executed: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapturedQueryKind {
+    Strict,
+    Fallback,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestQueryVariant {
+    RejoinOracle,
+    ProductionCarry,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedQuerySql {
+    pub(crate) kind: CapturedQueryKind,
+    pub(crate) sql: String,
+    pub(crate) params: Vec<rusqlite::types::Value>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct QueryPhaseObserver {
+    trace_id: &'static str,
+    connection_ordinal: usize,
+    events: Mutex<Vec<QueryPhaseEvent>>,
+    sql: Mutex<Vec<CapturedQuerySql>>,
+    variant: TestQueryVariant,
+    capture_sql_only: bool,
+}
+
+#[cfg(test)]
+impl QueryPhaseObserver {
+    pub(crate) fn new(trace_id: &'static str, connection_ordinal: usize) -> Arc<Self> {
+        Arc::new(Self {
+            trace_id,
+            connection_ordinal,
+            events: Mutex::new(Vec::new()),
+            sql: Mutex::new(Vec::new()),
+            variant: TestQueryVariant::ProductionCarry,
+            capture_sql_only: false,
+        })
+    }
+
+    pub(crate) fn with_variant(
+        trace_id: &'static str,
+        connection_ordinal: usize,
+        variant: TestQueryVariant,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            trace_id,
+            connection_ordinal,
+            events: Mutex::new(Vec::new()),
+            sql: Mutex::new(Vec::new()),
+            variant,
+            capture_sql_only: false,
+        })
+    }
+
+    pub(crate) fn capture_sql_only(
+        trace_id: &'static str,
+        connection_ordinal: usize,
+        variant: TestQueryVariant,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            trace_id,
+            connection_ordinal,
+            events: Mutex::new(Vec::new()),
+            sql: Mutex::new(Vec::new()),
+            variant,
+            capture_sql_only: true,
+        })
+    }
+
+    pub(crate) fn events(&self) -> Vec<QueryPhaseEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn captured_sql(&self) -> Vec<CapturedQuerySql> {
+        self.sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record(
+        &self,
+        phase: QueryPhase,
+        elapsed: Duration,
+        rows: Option<usize>,
+        cardinality: Option<usize>,
+        repo_ordinal: Option<usize>,
+        executed: bool,
+    ) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(QueryPhaseEvent {
+                trace_id: self.trace_id,
+                phase,
+                elapsed,
+                rows,
+                cardinality,
+                connection_ordinal: self.connection_ordinal,
+                repo_ordinal,
+                executed,
+            });
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static QUERY_PHASE_OBSERVER: Arc<QueryPhaseObserver>;
+}
+
+#[cfg(test)]
+thread_local! {
+    static BLOCKING_QUERY_PHASE_OBSERVER: RefCell<Option<Arc<QueryPhaseObserver>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) async fn with_query_phase_observer<F, T>(
+    observer: Arc<QueryPhaseObserver>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    QUERY_PHASE_OBSERVER.scope(observer, future).await
+}
+
+#[cfg(test)]
+struct BlockingObserverGuard(Option<Arc<QueryPhaseObserver>>);
+
+#[cfg(test)]
+impl Drop for BlockingObserverGuard {
+    fn drop(&mut self) {
+        BLOCKING_QUERY_PHASE_OBSERVER.with(|slot| {
+            *slot.borrow_mut() = self.0.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn install_blocking_query_phase_observer(
+    observer: Option<Arc<QueryPhaseObserver>>,
+) -> BlockingObserverGuard {
+    let previous = BLOCKING_QUERY_PHASE_OBSERVER.with(|slot| slot.replace(observer));
+    BlockingObserverGuard(previous)
+}
+
+#[cfg(test)]
+pub(crate) fn record_test_query_phase(
+    phase: QueryPhase,
+    started: Instant,
+    rows: Option<usize>,
+    cardinality: Option<usize>,
+    repo_ordinal: Option<usize>,
+    executed: bool,
+) {
+    BLOCKING_QUERY_PHASE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer.record(
+                phase,
+                started.elapsed(),
+                rows,
+                cardinality,
+                repo_ordinal,
+                executed,
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_test_query_sql(
+    kind: CapturedQueryKind,
+    sql: &str,
+    params: Vec<rusqlite::types::Value>,
+) {
+    BLOCKING_QUERY_PHASE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer
+                .sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(CapturedQuerySql {
+                    kind,
+                    sql: sql.to_string(),
+                    params,
+                });
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn current_test_query_variant() -> TestQueryVariant {
+    BLOCKING_QUERY_PHASE_OBSERVER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(TestQueryVariant::ProductionCarry, |observer| {
+                observer.variant
+            })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_query_capture_only() -> bool {
+    BLOCKING_QUERY_PHASE_OBSERVER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|observer| observer.capture_sql_only)
+    })
+}
+
+#[cfg(test)]
+fn active_query_phase_observer() -> Option<Arc<QueryPhaseObserver>> {
+    QUERY_PHASE_OBSERVER.try_with(Arc::clone).ok()
+}
 
 /// One repository-level reason a snapshot could not be trusted for the
 /// current query. `repo` is the alias (or `"*"` for the aggregate
@@ -254,6 +518,8 @@ where
     let cas_data_dir = ctx.cas_data_dir.clone();
     let lifecycle = ctx.lifecycle.clone();
     let method_name = request.method_name;
+    #[cfg(test)]
+    let phase_observer = active_query_phase_observer();
     let cancellation = crate::daemon::current_request_cancellation();
     let interrupts = QueryInterruptRegistry::new(cancellation.clone());
     let drain = match cancellation.as_ref() {
@@ -278,6 +544,8 @@ where
             .and_then(|cancellation| cancellation.take_blocking_query_start_barrier()),
     };
     let task = tokio::task::spawn_blocking(move || -> Result<SnapshotQueryResult<T>> {
+        #[cfg(test)]
+        let _phase_observer_guard = install_blocking_query_phase_observer(phase_observer);
         let ownership = ownership;
         #[cfg(test)]
         if let Some(barrier) = ownership.start_barrier.as_ref() {
@@ -294,13 +562,26 @@ where
         // path below mirrors that order; `BlockingQueryCancellation::drop`
         // then retires registration before the drain even on panic.
         ensure_query_not_cancelled(&blocking_interrupts)?;
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+        #[cfg(test)]
+        record_test_query_phase(
+            QueryPhase::IndexOpen,
+            phase_started,
+            Some(1),
+            Some(1),
+            None,
+            true,
+        );
         let _index_interrupt = blocking_interrupts.register(&index);
         ensure_query_not_cancelled(&blocking_interrupts)?;
         // Enumeration mode makes lease acquisition, missing-anchor
         // handling and file-not-indexed reporting soft-fail per repo;
         // an explicit request keeps them hard.
         let enumerate_all = request.requested_repo.is_none();
+        #[cfg(test)]
+        let alias_started = Instant::now();
         let aliases = match request.requested_repo.as_deref() {
             Some(name) => {
                 let entry = cas_registry::lookup_by_alias(&index, name)?.ok_or_else(|| {
@@ -312,6 +593,25 @@ where
             }
             None => cas_registry::list_all(&index)?,
         };
+        #[cfg(test)]
+        {
+            record_test_query_phase(
+                QueryPhase::IndexEnumeration,
+                alias_started,
+                request.requested_repo.is_none().then_some(aliases.len()),
+                Some(aliases.len()),
+                None,
+                request.requested_repo.is_none(),
+            );
+            record_test_query_phase(
+                QueryPhase::AliasResolution,
+                alias_started,
+                Some(aliases.len()),
+                Some(aliases.len()),
+                None,
+                true,
+            );
+        }
 
         let mut out = Vec::new();
         let mut captured = Vec::new();
@@ -319,12 +619,18 @@ where
         let mut skipped_unavailable = false;
         let mut freshness_issues = Vec::new();
         let mut exact_member_found = false;
-        for entry in aliases {
+        // Test-only phase ordinals consume the enumerate index.
+        #[cfg_attr(not(test), allow(clippy::unused_enumerate_index))]
+        for (_repo_ordinal, entry) in aliases.into_iter().enumerate() {
+            #[cfg(test)]
+            let repo_ordinal = _repo_ordinal;
             ensure_query_not_cancelled(&blocking_interrupts)?;
             // Enumeration acquires per-repo so a single Removing owner
             // does not fail the whole scan; explicit requests keep the
             // typed RepositoryUnavailable error.
-            let _lease = match &lifecycle {
+            #[cfg(test)]
+            let phase_started = Instant::now();
+            let lease = match &lifecycle {
                 Some(lifecycle) if enumerate_all => {
                     let Some(lease) = lifecycle.acquire_for_enumeration(&entry.repo_hash)? else {
                         skipped_unavailable = true;
@@ -335,6 +641,15 @@ where
                 Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&entry.repo_hash)?),
                 None => None,
             };
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::LeaseAcquire,
+                phase_started,
+                Some(usize::from(lease.is_some())),
+                Some(1),
+                Some(repo_ordinal),
+                lifecycle.is_some(),
+            );
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let mut conn = cas_store::open_existing(&store_path)?;
             let _store_interrupt = blocking_interrupts.register(&conn);
@@ -343,6 +658,8 @@ where
             // check and the query SQL. That is what pins the response to
             // a single manifest even if an anchor moves mid-query.
             let tx = conn.transaction()?;
+            #[cfg(test)]
+            let phase_started = Instant::now();
             let selected = match freshness::evaluate_snapshot(
                 &index,
                 &tx,
@@ -359,6 +676,17 @@ where
                 Err(Error::AnchorNotFound { .. }) if enumerate_all => continue,
                 Err(error) => return Err(error),
             };
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::SnapshotEvaluate,
+                phase_started,
+                Some(1),
+                Some(1),
+                Some(repo_ordinal),
+                true,
+            );
+            #[cfg(test)]
+            let membership_started = Instant::now();
             if let Some(file) = request.exact_file.as_deref() {
                 // Membership is answered inside the same read
                 // transaction, so it cannot disagree with the SQL below.
@@ -384,16 +712,51 @@ where
                 }
                 exact_member_found = true;
             }
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::Membership,
+                membership_started,
+                request
+                    .exact_file
+                    .as_ref()
+                    .map(|_| usize::from(exact_member_found)),
+                Some(1),
+                Some(repo_ordinal),
+                request.exact_file.is_some(),
+            );
             let mut hits = match query_store(&entry, &tx, &selected) {
                 Ok(hits) => hits,
                 Err(Error::AnchorNotFound { .. }) => continue,
                 Err(other) => return Err(other),
             };
             ensure_query_not_cancelled(&blocking_interrupts)?;
+            #[cfg(test)]
+            let phase_started = Instant::now();
             tx.commit()?;
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::Commit,
+                phase_started,
+                Some(hits.len()),
+                Some(hits.len()),
+                Some(repo_ordinal),
+                true,
+            );
             capped |= trim_to_requested_limit(&mut hits, request.effective_limit);
             out.extend(hits);
             captured.push(CapturedSnapshot { entry, selected });
+            #[cfg(test)]
+            let phase_started = Instant::now();
+            drop(lease);
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::LeaseRelease,
+                phase_started,
+                Some(1),
+                Some(1),
+                Some(repo_ordinal),
+                lifecycle.is_some(),
+            );
         }
         // Aggregate marker: no repository in the fan-out carries this
         // path. Reported once with the `*` alias so callers can
@@ -408,8 +771,21 @@ where
         // Caller-supplied merging / sorting / de-duplication may drop
         // rows; re-apply the request cap so the cross-repo total obeys
         // the same limit each per-repo pass already honoured.
+        #[cfg(test)]
+        let phase_started = Instant::now();
+        #[cfg(test)]
+        let before_finalize = out.len();
         finalize(&mut out);
         capped |= trim_to_requested_limit(&mut out, request.effective_limit);
+        #[cfg(test)]
+        record_test_query_phase(
+            QueryPhase::Finalize,
+            phase_started,
+            Some(out.len()),
+            Some(before_finalize),
+            None,
+            true,
+        );
         // Only tier-3 analyzers whose parser touched a surviving row
         // matter for query-scoped status; the finalize step above may
         // have removed rows whose analyzers are otherwise irrelevant.
@@ -417,12 +793,18 @@ where
 
         let mut analyzers = Vec::new();
         let mut repo_wide_analyzers = Vec::new();
-        for mut snapshot in captured {
+        // Test-only phase ordinals consume the enumerate index.
+        #[cfg_attr(not(test), allow(clippy::unused_enumerate_index))]
+        for (_repo_ordinal, mut snapshot) in captured.into_iter().enumerate() {
+            #[cfg(test)]
+            let repo_ordinal = _repo_ordinal;
             ensure_query_not_cancelled(&blocking_interrupts)?;
             // First-pass leases are released before result finalization. Reacquire here so an
             // all-repository query skips a repo that entered Removing between passes, while an
             // explicitly requested repo retains the typed unavailable error contract.
-            let _lease = match &lifecycle {
+            #[cfg(test)]
+            let phase_started = Instant::now();
+            let lease = match &lifecycle {
                 Some(lifecycle) if enumerate_all => {
                     let Some(lease) =
                         lifecycle.acquire_for_enumeration(&snapshot.entry.repo_hash)?
@@ -435,6 +817,17 @@ where
                 Some(lifecycle) => Some(lifecycle.acquire_by_repo_hash(&snapshot.entry.repo_hash)?),
                 None => None,
             };
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::LeaseAcquire,
+                phase_started,
+                Some(usize::from(lease.is_some())),
+                Some(1),
+                Some(repo_ordinal),
+                lifecycle.is_some(),
+            );
+            #[cfg(test)]
+            let second_pass_started = Instant::now();
             let store_path = cas_data_dir.store_db_path(&snapshot.entry.repo_hash);
             let conn = cas_store::open_existing(&store_path)?;
             let _store_interrupt = blocking_interrupts.register(&conn);
@@ -472,6 +865,27 @@ where
                     reason: reason.as_str(),
                 });
             }
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::TierFreshnessSecondPass,
+                second_pass_started,
+                Some(relevant_parser_ids.len()),
+                Some(1),
+                Some(repo_ordinal),
+                true,
+            );
+            #[cfg(test)]
+            let phase_started = Instant::now();
+            drop(lease);
+            #[cfg(test)]
+            record_test_query_phase(
+                QueryPhase::LeaseRelease,
+                phase_started,
+                Some(1),
+                Some(1),
+                Some(repo_ordinal),
+                lifecycle.is_some(),
+            );
         }
         analyzers.sort();
         analyzers.dedup();

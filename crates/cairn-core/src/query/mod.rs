@@ -32,6 +32,8 @@ pub use find_impls::{
 };
 pub use find_imports::{FindImportsArgs, ImportHit, find_imports};
 pub(crate) use find_references::find_references_with_status;
+#[cfg(test)]
+pub(crate) use find_references::logical_site_distinct_count_sql;
 pub use find_references::{FindReferencesArgs, ReferenceHit, find_references};
 pub use find_symbols::{FindSymbolsArgs, SymbolHit, find_symbols};
 pub(crate) use find_symbols::{RankedSymbolHit, find_symbols_with_status};

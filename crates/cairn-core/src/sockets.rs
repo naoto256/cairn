@@ -420,6 +420,7 @@ fn remove_if_exists(p: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileTypeExt;
 
     #[derive(Clone, Default)]
     struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -525,20 +526,49 @@ mod tests {
     }
 
     #[test]
-    fn stale_lockfile_and_socket_are_reusable() {
+    fn stale_socket_probe_fails_closed_or_reclaims_after_definitive_stale_result() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
         paths.ensure().unwrap();
-        std::fs::write(paths.runtime_dir.join(DAEMON_LOCK_FILE), b"old").unwrap();
+        let lock_path = paths.runtime_dir.join(DAEMON_LOCK_FILE);
+        std::fs::write(&lock_path, b"old").unwrap();
 
         let stale_listener = std::os::unix::net::UnixListener::bind(&paths.control).unwrap();
         drop(stale_listener);
+        let cairn_existed_before = paths.cairn.exists();
 
-        let _guard = paths
-            .acquire_daemon_lock()
-            .expect("an unlocked file and unserved socket are stale");
-        paths.ensure().unwrap();
-        assert!(!paths.control.exists());
+        match paths.acquire_daemon_lock() {
+            Ok(guard) => {
+                paths.ensure().unwrap();
+                assert!(!paths.control.exists());
+                let err = paths
+                    .acquire_daemon_lock()
+                    .expect_err("the startup guard must retain exclusive ownership");
+                assert!(matches!(err, Error::InvalidArgument(_)));
+
+                drop(guard);
+                paths
+                    .acquire_daemon_lock()
+                    .expect("dropping the startup guard must release the kernel lock");
+            }
+            Err(Error::InvalidArgument(message)) if message == "legacy daemon socket detected" => {
+                let control_type = std::fs::symlink_metadata(&paths.control)
+                    .expect("a conservative probe must preserve the control socket")
+                    .file_type();
+                assert!(control_type.is_socket());
+
+                let guard = DaemonLockGuard::acquire(&lock_path)
+                    .expect("the failed probe must release the daemon lock");
+                drop(guard);
+
+                let control_type = std::fs::symlink_metadata(&paths.control)
+                    .expect("lock reacquisition must not remove the control socket")
+                    .file_type();
+                assert!(control_type.is_socket());
+                assert_eq!(paths.cairn.exists(), cairn_existed_before);
+            }
+            other => panic!("unexpected stale socket probe result: {other:?}"),
+        }
     }
 
     #[test]
