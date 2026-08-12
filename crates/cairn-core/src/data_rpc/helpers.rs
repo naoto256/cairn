@@ -26,6 +26,8 @@
 //! error" contract of `acquire_by_repo_hash`.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_proto::{
@@ -101,6 +103,128 @@ struct CapturedSnapshot {
     selected: EvaluatedSnapshot,
 }
 
+struct QueryInterruptState {
+    next_id: u64,
+    handles: Vec<(u64, Arc<rusqlite::InterruptHandle>)>,
+}
+
+struct QueryInterruptRegistry {
+    cancelled: AtomicBool,
+    request_cancellation: Option<Arc<crate::daemon::RequestCancellation>>,
+    state: Mutex<QueryInterruptState>,
+}
+
+impl crate::daemon::RequestCancelTarget for QueryInterruptRegistry {
+    fn cancel(&self) {
+        self.cancel();
+        #[cfg(test)]
+        if let Some(cancellation) = self.request_cancellation.as_ref() {
+            cancellation.mark_cooperative_cancel_started();
+        }
+    }
+}
+
+impl QueryInterruptRegistry {
+    fn new(request_cancellation: Option<Arc<crate::daemon::RequestCancellation>>) -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            request_cancellation,
+            state: Mutex::new(QueryInterruptState {
+                next_id: 0,
+                handles: Vec::new(),
+            }),
+        })
+    }
+
+    fn register(self: &Arc<Self>, connection: &rusqlite::Connection) -> RegisteredQueryInterrupt {
+        let handle = Arc::new(connection.get_interrupt_handle());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if self.is_cancelled() {
+            drop(state);
+            handle.interrupt();
+            return RegisteredQueryInterrupt {
+                registry: Arc::clone(self),
+                id: None,
+            };
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.handles.push((id, handle));
+        RegisteredQueryInterrupt {
+            registry: Arc::clone(self),
+            id: Some(id),
+        }
+    }
+
+    fn cancel(&self) {
+        let handles = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            self.cancelled.store(true, Ordering::Release);
+            state
+                .handles
+                .iter()
+                .map(|(_, handle)| Arc::clone(handle))
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            handle.interrupt();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+            || self
+                .request_cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+    }
+
+    fn unregister(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.handles.retain(|(registered, _)| *registered != id);
+    }
+}
+
+struct RegisteredQueryInterrupt {
+    registry: Arc<QueryInterruptRegistry>,
+    id: Option<u64>,
+}
+
+struct BlockingQueryCancellation {
+    interrupts: Option<Arc<QueryInterruptRegistry>>,
+    target_registration: Option<crate::daemon::RequestCancelTargetGuard>,
+    drain: Option<crate::daemon::RequestDrainGuard>,
+    #[cfg(test)]
+    start_barrier: Option<crate::daemon::BlockingQueryStartBarrier>,
+}
+
+impl Drop for BlockingQueryCancellation {
+    fn drop(&mut self) {
+        // A blocking closure may unwind. Retire cancellation targeting only
+        // after its SQLite resources have unwound, and retire the active drain
+        // last so `drained()` always means resource ownership reached zero.
+        drop(self.interrupts.take());
+        drop(self.target_registration.take());
+        drop(self.drain.take());
+    }
+}
+
+impl Drop for RegisteredQueryInterrupt {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.registry.unregister(id);
+        }
+    }
+}
+
+fn ensure_query_not_cancelled(registry: &QueryInterruptRegistry) -> Result<()> {
+    if registry.is_cancelled() {
+        Err(Error::Internal("request cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Execute a query against one immutable manifest per repository.
 ///
 /// Anchor resolution and the query itself share one SQLite read transaction,
@@ -130,8 +254,49 @@ where
     let cas_data_dir = ctx.cas_data_dir.clone();
     let lifecycle = ctx.lifecycle.clone();
     let method_name = request.method_name;
-    tokio::task::spawn_blocking(move || -> Result<SnapshotQueryResult<T>> {
+    let cancellation = crate::daemon::current_request_cancellation();
+    let interrupts = QueryInterruptRegistry::new(cancellation.clone());
+    let drain = match cancellation.as_ref() {
+        Some(cancellation) => Some(
+            cancellation
+                .admit()
+                .ok_or_else(|| Error::Internal("request cancelled".into()))?,
+        ),
+        None => None,
+    };
+    let target_registration = cancellation.as_ref().map(|cancellation| {
+        let target: Arc<dyn crate::daemon::RequestCancelTarget> = interrupts.clone();
+        cancellation.register_target(&target)
+    });
+    let ownership = BlockingQueryCancellation {
+        interrupts: Some(interrupts),
+        target_registration,
+        drain,
+        #[cfg(test)]
+        start_barrier: cancellation
+            .as_ref()
+            .and_then(|cancellation| cancellation.take_blocking_query_start_barrier()),
+    };
+    let task = tokio::task::spawn_blocking(move || -> Result<SnapshotQueryResult<T>> {
+        let ownership = ownership;
+        #[cfg(test)]
+        if let Some(barrier) = ownership.start_barrier.as_ref() {
+            let _ = barrier.started.send(());
+            let _ = barrier.release.recv();
+        }
+        let blocking_interrupts = Arc::clone(
+            ownership
+                .interrupts
+                .as_ref()
+                .expect("blocking cancellation ownership missing registry"),
+        );
+        // Locals declared after `ownership` unwind first. The explicit normal
+        // path below mirrors that order; `BlockingQueryCancellation::drop`
+        // then retires registration before the drain even on panic.
+        ensure_query_not_cancelled(&blocking_interrupts)?;
         let index = cas_registry::open(&cas_data_dir.index_db_path())?;
+        let _index_interrupt = blocking_interrupts.register(&index);
+        ensure_query_not_cancelled(&blocking_interrupts)?;
         // Enumeration mode makes lease acquisition, missing-anchor
         // handling and file-not-indexed reporting soft-fail per repo;
         // an explicit request keeps them hard.
@@ -155,6 +320,7 @@ where
         let mut freshness_issues = Vec::new();
         let mut exact_member_found = false;
         for entry in aliases {
+            ensure_query_not_cancelled(&blocking_interrupts)?;
             // Enumeration acquires per-repo so a single Removing owner
             // does not fail the whole scan; explicit requests keep the
             // typed RepositoryUnavailable error.
@@ -171,6 +337,8 @@ where
             };
             let store_path = cas_data_dir.store_db_path(&entry.repo_hash);
             let mut conn = cas_store::open_existing(&store_path)?;
+            let _store_interrupt = blocking_interrupts.register(&conn);
+            ensure_query_not_cancelled(&blocking_interrupts)?;
             // One read transaction covers snapshot selection, membership
             // check and the query SQL. That is what pins the response to
             // a single manifest even if an anchor moves mid-query.
@@ -221,6 +389,7 @@ where
                 Err(Error::AnchorNotFound { .. }) => continue,
                 Err(other) => return Err(other),
             };
+            ensure_query_not_cancelled(&blocking_interrupts)?;
             tx.commit()?;
             capped |= trim_to_requested_limit(&mut hits, request.effective_limit);
             out.extend(hits);
@@ -249,6 +418,7 @@ where
         let mut analyzers = Vec::new();
         let mut repo_wide_analyzers = Vec::new();
         for mut snapshot in captured {
+            ensure_query_not_cancelled(&blocking_interrupts)?;
             // First-pass leases are released before result finalization. Reacquire here so an
             // all-repository query skips a repo that entered Removing between passes, while an
             // explicitly requested repo retains the typed unavailable error contract.
@@ -267,6 +437,8 @@ where
             };
             let store_path = cas_data_dir.store_db_path(&snapshot.entry.repo_hash);
             let conn = cas_store::open_existing(&store_path)?;
+            let _store_interrupt = blocking_interrupts.register(&conn);
+            ensure_query_not_cancelled(&blocking_interrupts)?;
             analyzers.extend(
                 compute_tier_status_for_parser_ids(
                     &conn,
@@ -293,6 +465,7 @@ where
                 &snapshot.selected,
                 system_now_ns(),
             )?;
+            ensure_query_not_cancelled(&blocking_interrupts)?;
             if let SnapshotFreshness::Stale(reason) = snapshot.selected.freshness {
                 freshness_issues.push(QueryFreshnessIssue {
                     repo: snapshot.entry.alias,
@@ -320,16 +493,29 @@ where
             }
         }
 
-        Ok(SnapshotQueryResult {
+        let result = SnapshotQueryResult {
             items: out,
             capped,
             skipped_unavailable,
             tier3_status,
             freshness_issues,
-        })
-    })
-    .await
-    .map_err(|error| Error::internal_task_panic(method_name, error))?
+        };
+        drop(_index_interrupt);
+        drop(index);
+        drop(blocking_interrupts);
+        drop(ownership);
+        Ok(result)
+    });
+
+    let outcome = task.await;
+    let result = outcome.map_err(|error| Error::internal_task_panic(method_name, error))?;
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation.is_cancelled())
+    {
+        return Err(Error::Internal("request cancelled".into()));
+    }
+    result
 }
 
 /// Wall-clock read used to time freshness evaluation and revalidation.
@@ -1237,8 +1423,35 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use crate::workspace_analyzer::{AnalyzerProgress, WorkspaceFacts, WorkspaceFile};
+
+    struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct NotifyTerminalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for NotifyTerminalOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 
     struct TestAnalyzer {
         id: &'static str,
@@ -1272,6 +1485,247 @@ mod tests {
         ) -> Result<WorkspaceFacts> {
             Ok(WorkspaceFacts::default())
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_query_cancellation_interrupts_after_a_real_sqlite_step() {
+        let fixture = test_support::registered_fixture();
+        let ctx = fixture.ctx.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+        let mut release_guard = ReleaseOnDrop(Some(release_tx));
+        let cancellation = Arc::new(crate::daemon::RequestCancellation::new());
+        let task_cancellation = Arc::clone(&cancellation);
+        let query = tokio::spawn(async move {
+            crate::daemon::with_request_cancellation(task_cancellation, async move {
+                let mut started_tx = Some(started_tx);
+                let mut terminal_tx = Some(terminal_tx);
+                let mut error_tx = Some(error_tx);
+                query_one_or_all_snapshots(
+                    &ctx,
+                    SnapshotQueryRequest {
+                        requested_repo: Some("demo".into()),
+                        anchor: None,
+                        branch: None,
+                        method_name: "interrupt registry test",
+                        effective_limit: 10,
+                        verbose_tier3: false,
+                        exact_file: None,
+                    },
+                    move |_, connection, _| {
+                        let _terminal_guard = NotifyTerminalOnDrop(terminal_tx.take());
+                        let mut statement = connection.prepare(
+                            "WITH RECURSIVE sequence(value) AS (\
+                             SELECT 1 UNION ALL \
+                             SELECT value + 1 FROM sequence WHERE value < 1000000000\
+                             ) SELECT value FROM sequence",
+                        )?;
+                        let mut rows = statement.query([])?;
+                        let first: i64 = rows.next()?.unwrap().get(0)?;
+                        assert_eq!(first, 1, "the query must execute one SQLite step first");
+                        started_tx.take().unwrap().send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        let error = rows
+                            .next()
+                            .expect_err("the next SQLite step must observe cancellation");
+                        if let Some(sender) = error_tx.take() {
+                            let _ = sender.send(error.sqlite_error_code());
+                        }
+                        Err::<Vec<i64>, _>(error.into())
+                    },
+                    |_: &[i64]| BTreeSet::new(),
+                    |_| {},
+                )
+                .await
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("the SQLite query did not reach its first row")
+            .unwrap();
+        cancellation.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cancellation.cooperative_cancel_started(),
+        )
+        .await
+        .expect("the snapshot driver did not issue SQLite interrupts");
+        release_guard.release();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), error_rx)
+            .await
+            .expect("the cancelled SQLite step did not return")
+            .unwrap();
+        assert_eq!(error, Some(rusqlite::ErrorCode::OperationInterrupted));
+        let result = tokio::time::timeout(Duration::from_secs(1), query)
+            .await
+            .expect("the cancelled snapshot query did not terminate")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Internal(message)) if message == "request cancelled"));
+        tokio::time::timeout(Duration::from_secs(1), terminal_rx)
+            .await
+            .expect("the blocking query did not release its SQLite resources")
+            .unwrap();
+    }
+
+    #[test]
+    fn cancellation_before_sqlite_registration_is_rechecked() {
+        let registry = QueryInterruptRegistry::new(None);
+        registry.cancel();
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let _registration = registry.register(&connection);
+
+        assert!(matches!(
+            ensure_query_not_cancelled(&registry),
+            Err(Error::Internal(message)) if message == "request cancelled"
+        ));
+    }
+
+    #[test]
+    fn cancelling_one_interrupt_registry_does_not_affect_another() {
+        let first = QueryInterruptRegistry::new(None);
+        let second = QueryInterruptRegistry::new(None);
+        let first_connection = rusqlite::Connection::open_in_memory().unwrap();
+        let second_connection = rusqlite::Connection::open_in_memory().unwrap();
+        let _first_registration = first.register(&first_connection);
+        let _second_registration = second.register(&second_connection);
+
+        first.cancel();
+
+        assert!(ensure_query_not_cancelled(&first).is_err());
+        assert!(ensure_query_not_cancelled(&second).is_ok());
+        assert_eq!(
+            second_connection
+                .query_row("SELECT 2", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn index_connection_registration_is_interrupted_without_cross_request_effect() {
+        let fixture = test_support::registered_fixture();
+        let index_path = fixture.ctx.cas_data_dir.index_db_path();
+        let first_registry = QueryInterruptRegistry::new(None);
+        let second_registry = QueryInterruptRegistry::new(None);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release_guard = ReleaseOnDrop(Some(release_tx));
+        let blocking_registry = Arc::clone(&first_registry);
+        let query = tokio::task::spawn_blocking(move || {
+            let index = cas_registry::open(&index_path).unwrap();
+            let _registration = blocking_registry.register(&index);
+            let mut statement = index
+                .prepare(
+                    "WITH RECURSIVE sequence(value) AS (\
+                     SELECT 1 UNION ALL SELECT value + 1 FROM sequence \
+                     WHERE value < 1000000000) SELECT value FROM sequence",
+                )
+                .unwrap();
+            let mut rows = statement.query([]).unwrap();
+            assert_eq!(rows.next().unwrap().unwrap().get::<_, i64>(0).unwrap(), 1);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            rows.next().expect_err("index step ignored its interrupt")
+        });
+
+        started_rx.await.unwrap();
+        first_registry.cancel();
+        release_guard.release();
+        let error = query.await.unwrap();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+
+        let second = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let _second_registration = second_registry.register(&second);
+        assert_eq!(
+            second
+                .query_row("SELECT COUNT(*) FROM aliases", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_repositories_prevents_the_second_query() {
+        let fixture = test_support::registered_fixture();
+        let index = cas_registry::open(&fixture.ctx.cas_data_dir.index_db_path()).unwrap();
+        let entry = cas_registry::lookup_by_alias(&index, "demo")
+            .unwrap()
+            .unwrap();
+        index
+            .execute(
+                "INSERT INTO aliases(alias, repo_hash, registered_at_ns) \
+                 VALUES ('demo-two', ?1, ?2)",
+                params![entry.repo_hash, system_now_ns()],
+            )
+            .unwrap();
+        let cancellation = Arc::new(crate::daemon::RequestCancellation::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let closure_calls = Arc::clone(&calls);
+        let closure_cancellation = Arc::clone(&cancellation);
+        let result = crate::daemon::with_request_cancellation(
+            Arc::clone(&cancellation),
+            query_one_or_all_snapshots(
+                &fixture.ctx,
+                SnapshotQueryRequest {
+                    requested_repo: None,
+                    anchor: None,
+                    branch: None,
+                    method_name: "between repositories cancellation test",
+                    effective_limit: 10,
+                    verbose_tier3: false,
+                    exact_file: None,
+                },
+                move |_, _, _| {
+                    closure_calls.fetch_add(1, Ordering::SeqCst);
+                    closure_cancellation.cancel();
+                    Ok(vec![1_i64])
+                },
+                |_: &[i64]| BTreeSet::new(),
+                |_| {},
+            ),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Internal(message)) if message == "request cancelled"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_query_is_not_changed_by_late_cancellation() {
+        let fixture = test_support::registered_fixture();
+        let cancellation = Arc::new(crate::daemon::RequestCancellation::new());
+        let result = crate::daemon::with_request_cancellation(
+            Arc::clone(&cancellation),
+            query_one_or_all_snapshots(
+                &fixture.ctx,
+                SnapshotQueryRequest {
+                    requested_repo: Some("demo".into()),
+                    anchor: None,
+                    branch: None,
+                    method_name: "late cancellation test",
+                    effective_limit: 10,
+                    verbose_tier3: false,
+                    exact_file: None,
+                },
+                |_, _, snapshot| Ok(vec![snapshot.manifest_id.0]),
+                |_: &[i64]| BTreeSet::new(),
+                |_| {},
+            ),
+        )
+        .await
+        .unwrap();
+
+        cancellation.cancel();
+        assert_eq!(result.items.len(), 1);
     }
 
     #[test]
