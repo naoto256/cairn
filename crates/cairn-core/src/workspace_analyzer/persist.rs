@@ -776,6 +776,128 @@ mod tests {
     use crate::cas::store;
     use crate::register::register_repo;
     use crate::testutil::init_repo;
+    use crate::workspace_analyzer::ResolvedRef;
+
+    #[test]
+    fn production_ref_writer_replaces_rows_and_blob_api_cascades_v14_indexes() {
+        let (repo, _) = init_repo(&[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("store.sqlite");
+        let mut conn = store::open(&db_path).unwrap();
+        let registered = register_repo(&mut conn, repo.path(), 1).unwrap();
+        let manifest_id = registered.tentative_manifest;
+        let parser_id: String = conn
+            .query_row("SELECT parser_id FROM blobs LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let blob_sha: String = conn
+            .query_row(
+                "SELECT blob_sha FROM manifest_entries WHERE manifest_id=?1 AND path='src/lib.rs'",
+                [manifest_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let facts = |start: usize| WorkspaceFacts {
+            resolutions: Vec::new(),
+            resolved_refs: vec![ResolvedRef {
+                source_path: "src/lib.rs".into(),
+                source_position: crate::lsp::Position {
+                    line: 1,
+                    character: u32::try_from(start).unwrap(),
+                },
+                source_byte_range: start..start + 6,
+                kind: RefKind::Call,
+                target: Location {
+                    uri: crate::lsp::Url::from_file_path(&repo.path().join("src/lib.rs")).unwrap(),
+                    range: crate::lsp::Range {
+                        start: crate::lsp::Position {
+                            line: 0,
+                            character: 3,
+                        },
+                        end: crate::lsp::Position {
+                            line: 0,
+                            character: 9,
+                        },
+                    },
+                },
+                target_path: Some("src/lib.rs".into()),
+            }],
+        };
+
+        assert_eq!(
+            persist_resolved_refs(
+                &mut conn,
+                manifest_id,
+                "storage-test",
+                "tier3",
+                &parser_id,
+                &facts(10),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            persist_resolved_refs(
+                &mut conn,
+                manifest_id,
+                "storage-test",
+                "tier3",
+                &parser_id,
+                &facts(20),
+            )
+            .unwrap(),
+            1
+        );
+        let source = "tier3-storage-test";
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM refs WHERE source=?1 AND byte_start=10",
+                [source],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM refs INDEXED BY idx_refs_resolution_site
+                  WHERE blob_sha=?1 AND parser_id=?2 AND byte_start=20
+                    AND byte_end=26 AND kind='call'",
+                rusqlite::params![blob_sha, parser_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            crate::cas::blob::delete(&tx, &blob_sha, &parser_id).unwrap(),
+            1
+        );
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM refs WHERE blob_sha=?1",
+                [blob_sha],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(conn);
+        let reopened = store::open_existing(&db_path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
 
     type PersistFn =
         fn(&mut Connection, ManifestId, &str, &str, &str, &WorkspaceFacts) -> Result<usize>;

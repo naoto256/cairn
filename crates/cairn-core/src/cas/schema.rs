@@ -578,6 +578,24 @@ ALTER TABLE anchors
         CHECK(reconcile_generation IS NULL OR reconcile_generation >= 0);
 "#,
     },
+    Migration {
+        version: 14,
+        sql: r#"
+-- `find_references` suppresses a lower-tier fact when a workspace-tier
+-- reference exists at the same logical site. Keep the original correlated
+-- membership semantics, but make the five equality/IS keys an indexed lookup;
+-- `source` is included so the workspace-tier provenance predicate can be
+-- evaluated from the index without a table lookup.
+CREATE INDEX idx_refs_workspace_site_source
+    ON refs(blob_sha, line, kind, target_name, enclosing_id, source);
+
+-- Strict reference resolution probes refs by the complete physical site.
+-- Carrying the chosen resolution payload removes a later rejoin; this index
+-- makes the remaining site lookup keyed instead of scanning a kind bucket.
+CREATE INDEX idx_refs_resolution_site
+    ON refs(blob_sha, parser_id, byte_start, byte_end, kind);
+"#,
+    },
 ];
 
 #[cfg(test)]
@@ -585,7 +603,298 @@ mod tests {
     use rusqlite::Connection;
 
     use super::MIGRATIONS;
-    use crate::migration::{apply, apply_standard_pragmas};
+    use crate::migration::{Migration, apply, apply_standard_pragmas};
+
+    const REFS_WORKSPACE_SITE_INDEX: &str = "idx_refs_workspace_site_source";
+    const REFS_RESOLUTION_SITE_INDEX: &str = "idx_refs_resolution_site";
+
+    fn index_columns(conn: &Connection, pragma: &str) -> Vec<(i64, i64, Option<String>, i64)> {
+        conn.prepare(pragma)
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn index_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn seed_refs(conn: &mut Connection, count: usize, blob_sha: &str) -> std::time::Duration {
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES (?1, 'rust-syn', 1, 0)",
+            [blob_sha],
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO refs
+                       (blob_sha, parser_id, target_name, target_qualified, kind,
+                        byte_start, byte_end, line, source)
+                     VALUES (?1, 'rust-syn', 'target', 'crate::target', 'call',
+                             ?2, ?3, ?4, 'tier3-storage')",
+                )
+                .unwrap();
+            for ordinal in 0..count {
+                let start = i64::try_from(ordinal * 2).unwrap();
+                insert
+                    .execute(rusqlite::params![blob_sha, start, start + 1, ordinal])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        started.elapsed()
+    }
+
+    fn file_stats(conn: &Connection, path: &std::path::Path) -> (i64, u64) {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let pages = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        (pages, std::fs::metadata(path).unwrap().len())
+    }
+
+    #[test]
+    fn migration_v14_installs_exact_refs_query_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            14
+        );
+        assert_eq!(index_count(&conn, REFS_WORKSPACE_SITE_INDEX), 1);
+        assert_eq!(index_count(&conn, REFS_RESOLUTION_SITE_INDEX), 1);
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [REFS_WORKSPACE_SITE_INDEX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE INDEX idx_refs_workspace_site_source\n    ON refs(blob_sha, line, kind, target_name, enclosing_id, source)"
+        );
+        assert_eq!(
+            index_columns(
+                &conn,
+                "PRAGMA index_xinfo('idx_refs_workspace_site_source')"
+            ),
+            vec![
+                (0, 1, Some("blob_sha".into()), 1),
+                (1, 10, Some("line".into()), 1),
+                (2, 6, Some("kind".into()), 1),
+                (3, 4, Some("target_name".into()), 1),
+                (4, 3, Some("enclosing_id".into()), 1),
+                (5, 11, Some("source".into()), 1),
+                (6, -1, None, 0),
+            ]
+        );
+        let resolution_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [REFS_RESOLUTION_SITE_INDEX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolution_sql,
+            "CREATE INDEX idx_refs_resolution_site\n    ON refs(blob_sha, parser_id, byte_start, byte_end, kind)"
+        );
+        assert_eq!(
+            index_columns(&conn, "PRAGMA index_xinfo('idx_refs_resolution_site')"),
+            vec![
+                (0, 1, Some("blob_sha".into()), 1),
+                (1, 2, Some("parser_id".into()), 1),
+                (2, 8, Some("byte_start".into()), 1),
+                (3, 9, Some("byte_end".into()), 1),
+                (4, 6, Some("kind".into()), 1),
+                (5, -1, None, 0),
+            ]
+        );
+        assert_eq!(
+            index_columns(
+                &conn,
+                "SELECT seqno, cid, name, 0, 0, 1 FROM pragma_index_info('idx_refs_resolution_site')"
+            ),
+            vec![
+                (0, 1, Some("blob_sha".into()), 1),
+                (1, 2, Some("parser_id".into()), 1),
+                (2, 8, Some("byte_start".into()), 1),
+                (3, 9, Some("byte_end".into()), 1),
+                (4, 6, Some("kind".into()), 1),
+            ]
+        );
+        assert_eq!(
+            index_columns(
+                &conn,
+                "SELECT seqno, cid, name, 0, 0, 1 FROM pragma_index_info('idx_refs_workspace_site_source')"
+            ),
+            vec![
+                (0, 1, Some("blob_sha".into()), 1),
+                (1, 10, Some("line".into()), 1),
+                (2, 6, Some("kind".into()), 1),
+                (3, 4, Some("target_name".into()), 1),
+                (4, 3, Some("enclosing_id".into()), 1),
+                (5, 11, Some("source".into()), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_v14_rolls_back_with_later_failure_then_reopens_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        let through_v13 = &MIGRATIONS[..13];
+        apply(&mut conn, through_v13).unwrap();
+        let interrupted = [
+            MIGRATIONS[13].clone(),
+            Migration {
+                version: 15,
+                sql: "INSERT INTO migration_failure_missing_table VALUES (1);",
+            },
+        ];
+
+        assert!(apply(&mut conn, &interrupted).is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(index_count(&conn, REFS_WORKSPACE_SITE_INDEX), 0);
+        assert_eq!(index_count(&conn, REFS_RESOLUTION_SITE_INDEX), 0);
+
+        apply(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(index_count(&conn, REFS_WORKSPACE_SITE_INDEX), 1);
+        assert_eq!(index_count(&conn, REFS_RESOLUTION_SITE_INDEX), 1);
+        apply(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(index_count(&conn, REFS_WORKSPACE_SITE_INDEX), 1);
+        assert_eq!(index_count(&conn, REFS_RESOLUTION_SITE_INDEX), 1);
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            14
+        );
+    }
+
+    #[test]
+    fn migration_v14_cost_on_16384_refs_is_bounded_and_reopens_cleanly() {
+        const REFS: usize = 16_384;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("v13.db");
+        let mut conn = Connection::open(&path).unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, &MIGRATIONS[..13]).unwrap();
+        let insert_elapsed = seed_refs(&mut conn, REFS, "migration-blob");
+        let (pages_before, bytes_before) = file_stats(&conn, &path);
+        drop(conn);
+
+        let migration_started = std::time::Instant::now();
+        let mut conn = Connection::open(&path).unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+        let migration_elapsed = migration_started.elapsed();
+        let (pages_after, bytes_after) = file_stats(&conn, &path);
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            14
+        );
+        assert_eq!(index_count(&conn, REFS_WORKSPACE_SITE_INDEX), 1);
+        assert_eq!(index_count(&conn, REFS_RESOLUTION_SITE_INDEX), 1);
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(conn);
+
+        let mut reopened = Connection::open(&path).unwrap();
+        apply_standard_pragmas(&reopened).unwrap();
+        apply(&mut reopened, MIGRATIONS).unwrap();
+        assert_eq!(index_count(&reopened, REFS_WORKSPACE_SITE_INDEX), 1);
+        assert_eq!(index_count(&reopened, REFS_RESOLUTION_SITE_INDEX), 1);
+        eprintln!(
+            "V14_MIGRATION_STORAGE refs={REFS} insert={insert_elapsed:?} migration={migration_elapsed:?} pages_before={pages_before} pages_after={pages_after} bytes_before={bytes_before} bytes_after={bytes_after} temp_hwm=UNKNOWN disk_free_hwm=UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn v14_indexes_report_fresh_store_write_and_storage_delta() {
+        const REFS: usize = 16_384;
+        let root = tempfile::tempdir().unwrap();
+        let mut measurements = Vec::new();
+        for (label, migrations) in [("v13", &MIGRATIONS[..13]), ("v14", MIGRATIONS)] {
+            let path = root.path().join(format!("{label}.db"));
+            let build_started = std::time::Instant::now();
+            let mut conn = Connection::open(&path).unwrap();
+            apply_standard_pragmas(&conn).unwrap();
+            apply(&mut conn, migrations).unwrap();
+            let build_elapsed = build_started.elapsed();
+            let insert_elapsed = seed_refs(&mut conn, REFS, label);
+            let (pages, bytes) = file_stats(&conn, &path);
+            assert_eq!(
+                conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            measurements.push((label, build_elapsed, insert_elapsed, pages, bytes));
+        }
+        assert_eq!(measurements.len(), 2);
+        eprintln!("V14_FRESH_STORAGE measurements={measurements:?}");
+    }
+
+    #[test]
+    fn older_migration_list_leaves_newer_user_version_unchanged() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_standard_pragmas(&conn).unwrap();
+        apply(&mut conn, MIGRATIONS).unwrap();
+        let schema_before: String = conn
+            .query_row(
+                "SELECT group_concat(name || ':' || sql, char(10))
+                   FROM sqlite_master
+                  WHERE sql IS NOT NULL
+                  ORDER BY type, name",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        apply(&mut conn, &MIGRATIONS[..13]).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            14
+        );
+        let schema_after: String = conn
+            .query_row(
+                "SELECT group_concat(name || ':' || sql, char(10))
+                   FROM sqlite_master
+                  WHERE sql IS NOT NULL
+                  ORDER BY type, name",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_before, schema_after);
+    }
 
     #[test]
     fn migration_v13_preserves_anchors_with_unverified_generation() {
@@ -624,7 +933,7 @@ mod tests {
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     /// Schema v6 should apply cleanly on top of all prior migrations
@@ -641,7 +950,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 13);
+        assert_eq!(v, 14);
 
         // Need a parent blob row because of the FK on
         // (site_blob_sha, site_parser_id).
@@ -817,7 +1126,7 @@ mod tests {
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 13);
+        assert_eq!(v, 14);
     }
 
     // ──── EXPLAIN QUERY PLAN: v11 composite partial indexes ────
