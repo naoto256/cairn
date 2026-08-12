@@ -24,7 +24,7 @@
 mod tools;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use self::types::{
@@ -42,7 +42,7 @@ use clap::Args as ClapArgs;
 use linkme::distributed_slice;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::error;
 
@@ -56,6 +56,10 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// answered with an INVALID_REQUEST so a runaway client cannot push
 /// the front-end into unbounded buffering.
 const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MCP_REQUEST_QUEUE_CAPACITY: usize = 64;
+/// Total serialized payload retained behind one active request. Count and byte
+/// caps are independent so 64 maximum-sized MCP lines cannot pin gigabytes.
+const MCP_REQUEST_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
 // ─── tool trait + registry ─────────────────────────────────────────────────
 
@@ -127,35 +131,13 @@ pub async fn run(args: Args) -> Result<()> {
     let dispatcher = Dispatcher::new(paths);
 
     let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-
-    loop {
-        match read_mcp_line_capped(&mut reader, MCP_MAX_LINE_BYTES).await? {
-            McpLine::Eof => break,
-            McpLine::TooLong => {
-                let resp = error_resp(
-                    RequestId::Null,
-                    error_code::INVALID_REQUEST,
-                    format!("JSON-RPC line exceeds {MCP_MAX_LINE_BYTES} bytes"),
-                );
-                stdout.write_all(serialize(&resp).as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
-            }
-            McpLine::Line(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(reply) = dispatcher.handle_line(&line).await {
-                    stdout.write_all(reply.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                }
-            }
-        }
-    }
-    Ok(())
+    run_mcp_session(
+        BufReader::new(stdin),
+        tokio::io::stdout(),
+        dispatcher,
+        SessionLimits::PRODUCTION,
+    )
+    .await
 }
 
 /// Per-session state: the resolved socket paths plus the tool
@@ -546,9 +528,334 @@ fn leak_name(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
 
+#[derive(Clone)]
+struct ActiveRequest {
+    id: RequestId,
+    method: String,
+}
+
+enum PendingItem {
+    Dispatch {
+        line: String,
+        identity: Option<ActiveRequest>,
+    },
+    ReadyReply(RpcResponse),
+}
+
+#[derive(Clone, Copy)]
+struct SessionLimits {
+    queued_items: usize,
+    queued_bytes: usize,
+}
+
+impl SessionLimits {
+    const PRODUCTION: Self = Self {
+        queued_items: MCP_REQUEST_QUEUE_CAPACITY,
+        queued_bytes: MCP_REQUEST_QUEUE_BYTES,
+    };
+}
+
+impl PendingItem {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Dispatch { line, .. } => line.capacity(),
+            Self::ReadyReply(response) => serialize(response).len() + 1,
+        }
+    }
+}
+
+enum ReaderEvent {
+    Line(McpLine),
+    Error(std::io::Error),
+}
+
+struct ReaderPumpGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ReaderPumpGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn pump_mcp_reader<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<ReaderEvent>)
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let event = match read_mcp_line_capped(&mut reader, MCP_MAX_LINE_BYTES).await {
+            Ok(line) => ReaderEvent::Line(line),
+            Err(error) => ReaderEvent::Error(error),
+        };
+        let terminal = matches!(
+            event,
+            ReaderEvent::Line(McpLine::Eof) | ReaderEvent::Error(_)
+        );
+        if sender.send(event).await.is_err() || terminal {
+            return;
+        }
+    }
+}
+
+async fn next_reader_line(
+    receiver: &mut tokio::sync::mpsc::Receiver<ReaderEvent>,
+) -> Result<McpLine> {
+    match receiver.recv().await {
+        Some(ReaderEvent::Line(line)) => Ok(line),
+        Some(ReaderEvent::Error(error)) => Err(error.into()),
+        None => Ok(McpLine::Eof),
+    }
+}
+
+fn request_identity(line: &str) -> Option<ActiveRequest> {
+    let request = serde_json::from_str::<RpcRequest>(line).ok()?;
+    Some(ActiveRequest {
+        id: request.id,
+        method: request.method,
+    })
+}
+
+fn cancellation_target(line: &str) -> Option<RequestId> {
+    let notification = serde_json::from_str::<Value>(line).ok()?;
+    (notification.get("jsonrpc")?.as_str()? == "2.0").then_some(())?;
+    (!notification.as_object()?.contains_key("id")).then_some(())?;
+    (notification.get("method")?.as_str()? == "notifications/cancelled").then_some(())?;
+    let params = notification.get("params")?.as_object()?;
+    if params
+        .get("reason")
+        .is_some_and(|reason| !reason.is_string())
+    {
+        return None;
+    }
+    serde_json::from_value(params.get("requestId")?.clone()).ok()
+}
+
+fn cancellation_matches(active: &ActiveRequest, target: &RequestId) -> bool {
+    active.method != "initialize" && active.id == *target
+}
+
+fn pending_has_id(pending: &VecDeque<PendingItem>, id: &RequestId) -> bool {
+    pending.iter().any(|item| {
+        matches!(
+            item,
+            PendingItem::Dispatch {
+                identity: Some(identity),
+                ..
+            } if identity.id == *id
+        )
+    })
+}
+
+fn cancel_pending(pending: &mut VecDeque<PendingItem>, target: &RequestId) -> usize {
+    let before = pending
+        .iter()
+        .map(PendingItem::retained_bytes)
+        .sum::<usize>();
+    pending.retain(|item| {
+        !matches!(
+            item,
+            PendingItem::Dispatch {
+                identity: Some(identity),
+                ..
+            } if cancellation_matches(identity, target)
+        )
+    });
+    before.saturating_sub(pending.iter().map(PendingItem::retained_bytes).sum())
+}
+
+async fn write_mcp_response<W>(stdout: &mut W, response: &RpcResponse) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    stdout.write_all(serialize(response).as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn run_mcp_session<R, W>(
+    reader: R,
+    mut stdout: W,
+    dispatcher: Dispatcher,
+    limits: SessionLimits,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    // One line of read-ahead is enough to surface EOF/cancellation while the
+    // executor owns the only stdout writer and the bounded FIFO.
+    let (reader_sender, mut reader_receiver) = tokio::sync::mpsc::channel(1);
+    let _reader_pump = ReaderPumpGuard(tokio::spawn(pump_mcp_reader(reader, reader_sender)));
+    let mut pending = VecDeque::new();
+    let mut pending_bytes = 0_usize;
+    loop {
+        let (line, active) = match pending.pop_front() {
+            Some(PendingItem::ReadyReply(response)) => {
+                pending_bytes = pending_bytes.saturating_sub(serialize(&response).len() + 1);
+                write_mcp_response(&mut stdout, &response).await?;
+                continue;
+            }
+            Some(PendingItem::Dispatch { line, identity }) => {
+                pending_bytes = pending_bytes.saturating_sub(line.capacity());
+                (line, identity)
+            }
+            None => match next_reader_line(&mut reader_receiver).await? {
+                McpLine::Eof => return Ok(()),
+                McpLine::TooLong => {
+                    write_mcp_response(
+                        &mut stdout,
+                        &error_resp(
+                            RequestId::Null,
+                            error_code::INVALID_REQUEST,
+                            format!("JSON-RPC line exceeds {MCP_MAX_LINE_BYTES} bytes"),
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
+                McpLine::Line(line) if line.trim().is_empty() => continue,
+                McpLine::Line(line) => {
+                    if cancellation_target(&line).is_some() {
+                        continue;
+                    }
+                    let identity = request_identity(&line);
+                    (line, identity)
+                }
+            },
+        };
+
+        let dispatch = dispatcher.handle_line(&line);
+        tokio::pin!(dispatch);
+        let reply = loop {
+            tokio::select! {
+                biased;
+                reply = &mut dispatch => break reply,
+                next = next_reader_line(&mut reader_receiver) => {
+                    let queued = match next? {
+                        McpLine::Eof => return Ok(()),
+                        McpLine::TooLong => PendingItem::ReadyReply(error_resp(
+                            RequestId::Null,
+                            error_code::INVALID_REQUEST,
+                            format!("JSON-RPC line exceeds {MCP_MAX_LINE_BYTES} bytes"),
+                        )),
+                        McpLine::Line(next_line) if next_line.trim().is_empty() => continue,
+                        McpLine::Line(next_line) => {
+                            if let Some(target) = cancellation_target(&next_line) {
+                                let removed = cancel_pending(&mut pending, &target);
+                                pending_bytes = pending_bytes.saturating_sub(removed);
+                                if active.as_ref().is_some_and(|request| {
+                                    cancellation_matches(request, &target)
+                                }) {
+                                    break None;
+                                }
+                                continue;
+                            }
+                            let identity = request_identity(&next_line);
+                            if let Some(next) = &identity
+                                && (active.as_ref().is_some_and(|request| request.id == next.id)
+                                    || pending_has_id(&pending, &next.id))
+                            {
+                                PendingItem::ReadyReply(error_resp(
+                                    next.id.clone(),
+                                    error_code::INVALID_REQUEST,
+                                    "duplicate in-flight or queued request id",
+                                ))
+                            } else {
+                                PendingItem::Dispatch {
+                                    line: next_line,
+                                    identity,
+                                }
+                            }
+                        }
+                    };
+                    let queued_bytes = queued.retained_bytes();
+                    if pending.len() >= limits.queued_items
+                        || pending_bytes.saturating_add(queued_bytes) > limits.queued_bytes
+                    {
+                        let id = match &queued {
+                            PendingItem::Dispatch {
+                                identity: Some(identity),
+                                ..
+                            } => Some(identity.id.clone()),
+                            PendingItem::Dispatch { identity: None, .. } => None,
+                            PendingItem::ReadyReply(response) => Some(response.id.clone()),
+                        };
+                        if let Some(id) = id {
+                            let response = error_resp(
+                                id,
+                                error_code::INTERNAL_ERROR,
+                                "MCP request queue capacity exceeded; session terminated",
+                            );
+                            let _ = write_mcp_response(&mut stdout, &response).await;
+                        }
+                        return Ok(());
+                    }
+                    pending_bytes += queued_bytes;
+                    pending.push_back(queued);
+                }
+            }
+        };
+        if let Some(reply) = reply {
+            stdout.write_all(reply.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_proto::jsonrpc::ok_response;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixListener;
+    use tokio::sync::Notify;
+
+    const TEST_SESSION_LIMITS: SessionLimits = SessionLimits {
+        queued_items: 2,
+        queued_bytes: 1024,
+    };
+
+    async fn test_dispatcher(paths: SocketPaths) -> Dispatcher {
+        let dispatcher = Dispatcher::new(paths);
+        *dispatcher.version_checked.lock().await = true;
+        dispatcher
+    }
+
+    fn list_repos_call(id: i64) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "list_repos", "arguments": {}}
+        })
+        .to_string()
+    }
+
+    fn padded_list_repos_call(id: i64, padding_bytes: usize) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "list_repos",
+                "arguments": {"padding": "x".repeat(padding_bytes)}
+            }
+        })
+        .to_string()
+    }
+
+    fn cancellation_notification(id: i64) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": id, "reason": "caller cancelled"}
+        })
+        .to_string()
+    }
 
     fn dispatcher() -> Dispatcher {
         let tmp = tempfile::tempdir().unwrap();
@@ -732,5 +1039,848 @@ mod tests {
         assert!(matches!(line, McpLine::TooLong));
         let line = read_mcp_line_capped(&mut reader, 3).await.unwrap();
         assert!(matches!(line, McpLine::Line(s) if s == "ok"));
+    }
+
+    #[tokio::test]
+    async fn stdin_eof_drops_inflight_daemon_request_without_stdout_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let daemon_entered = Arc::new(Notify::new());
+        let daemon_eof = Arc::new(Notify::new());
+        let entered_wait = daemon_entered.notified();
+        let eof_wait = daemon_eof.notified();
+        let daemon_task = tokio::spawn({
+            let daemon_entered = daemon_entered.clone();
+            let daemon_eof = daemon_eof.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                let request: RpcRequest = serde_json::from_str(request.trim()).unwrap();
+                assert_eq!(request.id, RequestId::Number(1));
+                assert_eq!(request.method, "list_repos");
+                daemon_entered.notify_waiters();
+                let mut remainder = Vec::new();
+                reader.read_to_end(&mut remainder).await.unwrap();
+                assert!(remainder.is_empty());
+                daemon_eof.notify_waiters();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, mut output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 73,
+            "method": "tools/call",
+            "params": {"name": "list_repos", "arguments": {}}
+        });
+        input
+            .write_all(request.to_string().as_bytes())
+            .await
+            .unwrap();
+        input.write_all(b"\n").await.unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("daemon request did not enter");
+
+        drop(input);
+
+        tokio::time::timeout(Duration::from_secs(1), eof_wait)
+            .await
+            .expect("MCP stdin EOF did not close the daemon request socket");
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("MCP session did not terminate after stdin EOF")
+            .expect("MCP session task panicked")
+            .expect("MCP session failed");
+        daemon_task.await.unwrap();
+        let mut stdout = Vec::new();
+        output.read_to_end(&mut stdout).await.unwrap();
+        assert!(stdout.is_empty(), "cancelled request wrote an MCP response");
+    }
+
+    #[tokio::test]
+    async fn pipelined_mcp_requests_keep_ids_order_and_single_stdout_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let daemon_task = tokio::spawn(async move {
+            for sequence in 1..=2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(read).read_line(&mut request).await.unwrap();
+                let request: RpcRequest = serde_json::from_str(request.trim()).unwrap();
+                assert_eq!(request.id, RequestId::Number(1));
+                assert_eq!(request.method, "list_repos");
+                let response = ok_response(RequestId::Number(1), json!({"sequence": sequence}));
+                write
+                    .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        for id in [73, 74] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "list_repos", "arguments": {}}
+            });
+            input
+                .write_all(request.to_string().as_bytes())
+                .await
+                .unwrap();
+            input.write_all(b"\n").await.unwrap();
+        }
+        input.flush().await.unwrap();
+
+        let mut output = BufReader::new(output);
+        for expected_id in [73, 74] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("pipelined MCP response timed out")
+                .unwrap();
+            let response: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response.id, RequestId::Number(expected_id));
+        }
+        daemon_task.await.unwrap();
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("MCP session did not terminate")
+            .expect("MCP session task panicked")
+            .expect("MCP session failed");
+        let mut trailing = String::new();
+        assert_eq!(output.read_line(&mut trailing).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn matching_cancel_drops_active_request_then_drains_queued_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let active_entered = Arc::new(Notify::new());
+        let active_eof = Arc::new(Notify::new());
+        let entered_wait = active_entered.notified();
+        let eof_wait = active_eof.notified();
+        let daemon_task = tokio::spawn({
+            let active_entered = active_entered.clone();
+            let active_eof = active_eof.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                active_entered.notify_waiters();
+                let mut remainder = Vec::new();
+                reader.read_to_end(&mut remainder).await.unwrap();
+                assert!(remainder.is_empty());
+                active_eof.notify_waiters();
+
+                for sequence in 1..=2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut request = String::new();
+                    BufReader::new(read).read_line(&mut request).await.unwrap();
+                    let request: RpcRequest = serde_json::from_str(request.trim()).unwrap();
+                    assert_eq!(request.id, RequestId::Number(1));
+                    let response = ok_response(RequestId::Number(1), json!({"sequence": sequence}));
+                    write
+                        .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        input
+            .write_all(list_repos_call(73).as_bytes())
+            .await
+            .unwrap();
+        input.write_all(b"\n").await.unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active daemon request did not enter");
+        for id in [74, 75] {
+            input
+                .write_all(list_repos_call(id).as_bytes())
+                .await
+                .unwrap();
+            input.write_all(b"\n").await.unwrap();
+        }
+        input
+            .write_all(cancellation_notification(73).as_bytes())
+            .await
+            .unwrap();
+        input.write_all(b"\n").await.unwrap();
+        input.flush().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), eof_wait)
+            .await
+            .expect("matching cancellation did not close the active daemon socket");
+        let mut output = BufReader::new(output);
+        for expected_id in [74, 75] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("queued MCP response timed out")
+                .unwrap();
+            let response: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response.id, RequestId::Number(expected_id));
+        }
+        daemon_task.await.unwrap();
+        drop(input);
+        session_task.await.unwrap().unwrap();
+        let mut trailing = String::new();
+        assert_eq!(output.read_line(&mut trailing).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn nonmatching_cancel_keeps_active_request_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(read).read_line(&mut request).await.unwrap();
+                entered.notify_waiters();
+                release.notified().await;
+                let response = ok_response(RequestId::Number(1), json!({"kept": true}));
+                write
+                    .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            SessionLimits {
+                queued_items: 4,
+                queued_bytes: 4096,
+            },
+        ));
+        input
+            .write_all(list_repos_call(73).as_bytes())
+            .await
+            .unwrap();
+        input.write_all(b"\n").await.unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active daemon request did not enter");
+        input
+            .write_all(cancellation_notification(999).as_bytes())
+            .await
+            .unwrap();
+        input.write_all(b"\n").await.unwrap();
+        for invalid in [
+            json!({"jsonrpc":"2.0","id":99,"method":"notifications/cancelled","params":{"requestId":73}}),
+            json!({"method":"notifications/cancelled","params":{"requestId":73}}),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":73,"reason":1}}),
+        ] {
+            assert!(cancellation_target(&invalid.to_string()).is_none());
+            input
+                .write_all(format!("{invalid}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        input.flush().await.unwrap();
+        release.notify_waiters();
+
+        let mut output = BufReader::new(output);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+            .await
+            .expect("active response timed out after nonmatching cancel")
+            .unwrap();
+        let response: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response.id, RequestId::Number(73));
+        daemon_task.await.unwrap();
+        drop(input);
+        session_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn matching_cancel_removes_only_the_queued_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                for sequence in 1..=2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut request = String::new();
+                    BufReader::new(read).read_line(&mut request).await.unwrap();
+                    if sequence == 1 {
+                        entered.notify_waiters();
+                        release.notified().await;
+                    }
+                    let response = ok_response(RequestId::Number(1), json!({"sequence": sequence}));
+                    write
+                        .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        input
+            .write_all(format!("{}\n", list_repos_call(73)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active daemon request did not enter");
+        for id in [74, 75] {
+            input
+                .write_all(format!("{}\n", list_repos_call(id)).as_bytes())
+                .await
+                .unwrap();
+        }
+        input
+            .write_all(format!("{}\n", cancellation_notification(74)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        release.notify_waiters();
+
+        let mut output = BufReader::new(output);
+        for expected_id in [73, 75] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("response after queued cancellation timed out")
+                .unwrap();
+            let response: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response.id, RequestId::Number(expected_id));
+        }
+        daemon_task.await.unwrap();
+        drop(input);
+        session_task.await.unwrap().unwrap();
+        let mut trailing = String::new();
+        assert_eq!(output.read_line(&mut trailing).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_pending_id_keeps_synthetic_error_in_fifo_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                for sequence in 1..=2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut request = String::new();
+                    BufReader::new(read).read_line(&mut request).await.unwrap();
+                    if sequence == 1 {
+                        entered.notify_waiters();
+                        release.notified().await;
+                    }
+                    let response = ok_response(RequestId::Number(1), json!({"sequence": sequence}));
+                    write
+                        .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        input
+            .write_all(format!("{}\n", list_repos_call(73)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active daemon request did not enter");
+        for id in [74, 74] {
+            input
+                .write_all(format!("{}\n", list_repos_call(id)).as_bytes())
+                .await
+                .unwrap();
+        }
+        input.flush().await.unwrap();
+        release.notify_waiters();
+
+        let mut output = BufReader::new(output);
+        for expected_id in [73, 74] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("normal response before duplicate error timed out")
+                .unwrap();
+            let response: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response["id"], expected_id);
+            assert!(response.get("result").is_some());
+        }
+        let mut duplicate = String::new();
+        tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut duplicate))
+            .await
+            .expect("queued duplicate-id error timed out")
+            .unwrap();
+        let duplicate: Value = serde_json::from_str(duplicate.trim()).unwrap();
+        assert_eq!(duplicate["id"], 74);
+        assert_eq!(duplicate["error"]["code"], error_code::INVALID_REQUEST);
+
+        daemon_task.await.unwrap();
+        drop(input);
+        session_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_writes_one_error_then_terminates_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let active_eof = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let eof_wait = active_eof.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let active_eof = active_eof.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                entered.notify_waiters();
+                let mut remainder = Vec::new();
+                reader.read_to_end(&mut remainder).await.unwrap();
+                assert!(remainder.is_empty());
+                active_eof.notify_waiters();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        input
+            .write_all(format!("{}\n", list_repos_call(73)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active daemon request did not enter");
+        for id in [74, 75, 76] {
+            input
+                .write_all(format!("{}\n", list_repos_call(id)).as_bytes())
+                .await
+                .unwrap();
+        }
+        input.flush().await.unwrap();
+
+        let mut output = BufReader::new(output);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+            .await
+            .expect("overflow error timed out")
+            .unwrap();
+        let response: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response["id"], 76);
+        assert_eq!(response["error"]["code"], error_code::INTERNAL_ERROR);
+        tokio::time::timeout(Duration::from_secs(1), eof_wait)
+            .await
+            .expect("overflow did not drop the active daemon request");
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("overflow did not terminate the MCP session")
+            .expect("MCP session task panicked")
+            .expect("MCP session failed");
+        daemon_task.await.unwrap();
+        let mut trailing = String::new();
+        assert_eq!(output.read_line(&mut trailing).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn production_limits_preserve_seventeen_small_requests_in_fifo_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let daemon_task = tokio::spawn(async move {
+            for sequence in 1..=17 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(read).read_line(&mut request).await.unwrap();
+                let response = ok_response(RequestId::Number(1), json!({"sequence": sequence}));
+                write
+                    .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(64 * 1024);
+        let (session_output, output) = tokio::io::duplex(64 * 1024);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            SessionLimits::PRODUCTION,
+        ));
+        for id in 1..=17 {
+            input
+                .write_all(format!("{}\n", list_repos_call(id)).as_bytes())
+                .await
+                .unwrap();
+        }
+        input.flush().await.unwrap();
+
+        let mut output = BufReader::new(output);
+        for expected_id in 1..=17 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("production-limit response timed out")
+                .unwrap();
+            let response: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response.id, RequestId::Number(expected_id));
+        }
+        daemon_task.await.unwrap();
+        drop(input);
+        session_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_large_pending_request_releases_its_byte_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                for sequence in 1..=2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let mut request = String::new();
+                    BufReader::new(read).read_line(&mut request).await.unwrap();
+                    if sequence == 1 {
+                        entered.notify_waiters();
+                        release.notified().await;
+                    }
+                    let response = ok_response(RequestId::Number(1), json!({"sequence": sequence}));
+                    write
+                        .write_all(format!("{}\n", serialize(&response)).as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(32 * 1024);
+        let (session_output, output) = tokio::io::duplex(16 * 1024);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            SessionLimits {
+                queued_items: 4,
+                queued_bytes: 5000,
+            },
+        ));
+        input
+            .write_all(format!("{}\n", list_repos_call(73)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active request did not enter");
+        input
+            .write_all(format!("{}\n", padded_list_repos_call(74, 3000)).as_bytes())
+            .await
+            .unwrap();
+        input
+            .write_all(format!("{}\n", cancellation_notification(74)).as_bytes())
+            .await
+            .unwrap();
+        input
+            .write_all(format!("{}\n", padded_list_repos_call(75, 3000)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        release.notify_waiters();
+
+        let mut output = BufReader::new(output);
+        for expected_id in [73, 75] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("response after pending-byte cancellation timed out")
+                .unwrap();
+            let response: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response.id, RequestId::Number(expected_id));
+        }
+        daemon_task.await.unwrap();
+        drop(input);
+        session_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_byte_budget_overflow_writes_one_error_and_terminates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let active_eof = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let eof_wait = active_eof.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let active_eof = active_eof.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                entered.notify_waiters();
+                let mut remainder = Vec::new();
+                reader.read_to_end(&mut remainder).await.unwrap();
+                assert!(remainder.is_empty());
+                active_eof.notify_waiters();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(32 * 1024);
+        let (session_output, output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            SessionLimits {
+                queued_items: 4,
+                queued_bytes: 5000,
+            },
+        ));
+        input
+            .write_all(format!("{}\n", list_repos_call(73)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active request did not enter");
+        for id in [74, 75] {
+            input
+                .write_all(format!("{}\n", padded_list_repos_call(id, 3000)).as_bytes())
+                .await
+                .unwrap();
+        }
+        input.flush().await.unwrap();
+
+        let mut output = BufReader::new(output);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), output.read_line(&mut line))
+            .await
+            .expect("byte-budget overflow response timed out")
+            .unwrap();
+        let response: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response["id"], 75);
+        assert_eq!(response["error"]["code"], error_code::INTERNAL_ERROR);
+        tokio::time::timeout(Duration::from_secs(1), eof_wait)
+            .await
+            .expect("byte-budget overflow did not drop active daemon request");
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("byte-budget overflow did not terminate session")
+            .unwrap()
+            .unwrap();
+        daemon_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_pump_reaches_terminal_after_eof() {
+        let (input, reader) = tokio::io::duplex(64);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(pump_mcp_reader(BufReader::new(reader), sender));
+        drop(input);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ReaderEvent::Line(McpLine::Eof))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("reader pump did not terminate after EOF")
+            .expect("reader pump panicked");
+    }
+
+    #[tokio::test]
+    async fn notification_overflow_terminates_without_writing_a_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SocketPaths::with_runtime_dir(tmp.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.cairn).unwrap();
+        let entered = Arc::new(Notify::new());
+        let active_eof = Arc::new(Notify::new());
+        let entered_wait = entered.notified();
+        let eof_wait = active_eof.notified();
+        let daemon_task = tokio::spawn({
+            let entered = entered.clone();
+            let active_eof = active_eof.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                entered.notify_waiters();
+                let mut remainder = Vec::new();
+                reader.read_to_end(&mut remainder).await.unwrap();
+                assert!(remainder.is_empty());
+                active_eof.notify_waiters();
+            }
+        });
+
+        let (mut input, session_input) = tokio::io::duplex(4096);
+        let (session_output, mut output) = tokio::io::duplex(4096);
+        let session_task = tokio::spawn(run_mcp_session(
+            BufReader::new(session_input),
+            session_output,
+            test_dispatcher(paths).await,
+            TEST_SESSION_LIMITS,
+        ));
+        input
+            .write_all(format!("{}\n", list_repos_call(73)).as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("active daemon request did not enter");
+        for id in [74, 75] {
+            input
+                .write_all(format!("{}\n", list_repos_call(id)).as_bytes())
+                .await
+                .unwrap();
+        }
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), eof_wait)
+            .await
+            .expect("notification overflow did not drop the daemon request");
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("notification overflow did not terminate the MCP session")
+            .expect("MCP session task panicked")
+            .expect("MCP session failed");
+        daemon_task.await.unwrap();
+        let mut stdout = Vec::new();
+        output.read_to_end(&mut stdout).await.unwrap();
+        assert!(stdout.is_empty(), "notification overflow wrote a response");
+    }
+
+    #[test]
+    fn initialize_request_is_not_cancelled_by_notification() {
+        let active = ActiveRequest {
+            id: RequestId::Number(73),
+            method: "initialize".into(),
+        };
+        assert!(!cancellation_matches(&active, &RequestId::Number(73)));
+        assert!(
+            cancellation_target(
+                &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"wrong":73}})
+                    .to_string()
+            )
+            .is_none()
+        );
+        assert!(
+            cancellation_target(
+                &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":73,"reason":1}})
+                    .to_string()
+            )
+            .is_none()
+        );
     }
 }

@@ -40,7 +40,10 @@ use crate::paths::CasDataDir;
 
 pub mod methods;
 
+#[cfg(not(test))]
 mod helpers;
+#[cfg(test)]
+pub(crate) mod helpers;
 
 // ─── trait + registry ──────────────────────────────────────────────────────
 
