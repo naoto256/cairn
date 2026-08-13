@@ -230,7 +230,8 @@ impl RepoIgnoreMatcher {
     ///
     /// Used by the classifier when a matcher build/reload failed, so
     /// the watcher keeps delivering events (potentially over-broad)
-    /// instead of going silent while the retry thread rebuilds.
+    /// instead of going silent while the fixed matcher-build workers and
+    /// their due-time queue rebuild it.
     pub(crate) fn fail_open(repo_root: &Path) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
