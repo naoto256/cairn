@@ -42,14 +42,16 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use std::{panic::AssertUnwindSafe, panic::catch_unwind};
 
+use futures::FutureExt;
 use serde_json::Value;
-use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::{MissedTickBehavior, interval, timeout, timeout_at};
 use tracing::{debug, warn};
 
 use super::client::LspProcessControl;
@@ -68,6 +70,9 @@ const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Per-victim bound for the sweeper's `shutdown_bounded` call, so a
 /// single wedged entry cannot stall a sweep pass indefinitely.
 const IDLE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Final bounded observation of cleanup tasks that outlived their initiating
+/// call. The tasks themselves remain non-cancellable until runtime teardown.
+const POOL_DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Boxed future produced by a `with_lsp` work closure; borrows the
 /// pooled client for the lifetime of the lease.
@@ -191,7 +196,7 @@ pub struct LspClientPool {
     /// Dedicated single-worker runtime that owns all pool futures and
     /// child I/O tasks, keeping `with_lsp`'s `block_on` independent
     /// of any caller runtime.
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     registry: Arc<StdMutex<PoolRegistry>>,
     capacity: NonZeroUsize,
     /// Handle of the background sweep task; `None` when the idle TTL
@@ -208,6 +213,19 @@ struct PoolRegistry {
     /// reachable regardless of which cleanup path owns the batch.
     draining_entries: HashMap<u64, Vec<Arc<PoolEntry>>>,
     next_drain_id: u64,
+    /// Cleanup tasks which outlived (or may outlive) their first observer.
+    /// Receipts, rather than join handles, allow all callers to observe the
+    /// same coalesced task without acquiring cancellation authority.
+    outstanding_cleanups: HashMap<u64, watch::Receiver<CleanupOutcome>>,
+    next_cleanup_id: u64,
+    /// Cleanup admissions between selecting an epoch and publishing its
+    /// receipt. Final shutdown waits for this to reach zero before its last
+    /// receipt snapshot, closing the admission/snapshot race.
+    active_cleanup_admissions: usize,
+    /// Set at the final-shutdown fixed point under the same mutex as the
+    /// admission count and receipt map. Later callers may join an existing
+    /// cleanup generation, but cannot publish a new task past this barrier.
+    cleanup_admissions_closed: bool,
     /// Monotonic counter; every acquire bumps it and stamps the
     /// record's `last_used`. Overflow at `u64::MAX` is a
     /// (theoretical) fail-closed error rather than a wrap.
@@ -578,6 +596,10 @@ impl LspClientPool {
             entries: HashMap::new(),
             draining_entries: HashMap::new(),
             next_drain_id: 1,
+            outstanding_cleanups: HashMap::new(),
+            next_cleanup_id: 1,
+            active_cleanup_admissions: 0,
+            cleanup_admissions_closed: false,
             access_seq: 0,
         }));
         let idle_sweeper = idle_ttl.map(|idle_ttl| {
@@ -609,7 +631,7 @@ impl LspClientPool {
             "lsp pool initialized"
         );
         Ok(Self {
-            runtime,
+            runtime: Some(runtime),
             registry,
             capacity,
             _idle_sweeper: idle_sweeper,
@@ -635,11 +657,11 @@ impl LspClientPool {
         F: for<'a> FnOnce(&'a mut PooledLsp<'a>) -> ClientWork<'a, T>,
     {
         let lease = self
-            .runtime
+            .runtime()
             .block_on(async { self.acquire_lease(key).await })?;
         let entry = Arc::clone(&lease.entry);
         let result = self
-            .runtime
+            .runtime()
             .block_on(async move { entry.with_lsp_client(spawn_spec, work).await });
         drop(lease);
         // Central poison propagation: any termination-unproven
@@ -736,7 +758,7 @@ impl LspClientPool {
                         .checked_add(1)
                         .ok_or_else(|| Error::Protocol("pool access_seq overflow".into()))?;
                     reg.access_seq = bumped_seq;
-                    let entry = Arc::new(PoolEntry::default());
+                    let entry = PoolEntry::new(key.clone(), &self.registry);
                     reg.entries.insert(
                         key.clone(),
                         PoolRecord {
@@ -939,6 +961,12 @@ impl LspClientPool {
             .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))
     }
 
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("LSP pool runtime is present until Drop")
+    }
+
     /// Gracefully stop all live clients and mark the pool `Stopped`.
     /// Further acquisitions will return [`Error::PoolStopped`].
     ///
@@ -952,7 +980,7 @@ impl LspClientPool {
             reg.publish_live_drain()
         };
         let drain_id = drain.id;
-        let result = self.runtime.block_on(async move {
+        let result = self.runtime().block_on(async move {
             // Shutdown entries concurrently — same rationale as
             // `force_shutdown_all` (independent children, no
             // cross-entry contention).
@@ -1009,17 +1037,64 @@ impl LspClientPool {
             reg.mode = PoolMode::Stopped;
             reg.take_all_for_bounded_shutdown()
         };
-        self.runtime.block_on(async move {
-            let results = futures::future::join_all(
-                entries
-                    .into_iter()
-                    .map(|entry| async move { entry.shutdown_bounded(entry_timeout).await }),
-            )
-            .await;
-            results
-                .into_iter()
-                .find_map(Result::err)
-                .map_or(Ok(()), Err)
+        let registry = Arc::clone(&self.registry);
+        self.runtime().block_on(async move {
+            let deadline = tokio::time::Instant::now() + entry_timeout;
+            match timeout_at(deadline, async move {
+                let mut receipts = Vec::new();
+                let mut outstanding_receipts = HashMap::new();
+                let mut first_error = None;
+                for entry in entries {
+                    match entry.request_cleanup(true, None) {
+                        Ok(Some(receipt)) => receipts.push(receipt),
+                        Ok(None) => {}
+                        Err(error) if first_error.is_none() => first_error = Some(error),
+                        Err(_) => {}
+                    }
+                }
+
+                loop {
+                    let (active_admissions, outstanding, barrier_closed) = {
+                        let mut state = registry
+                            .lock()
+                            .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
+                        let active_admissions = state.active_cleanup_admissions;
+                        let outstanding = state
+                            .outstanding_cleanups
+                            .iter()
+                            .map(|(id, receipt)| (*id, receipt.clone()))
+                            .collect::<Vec<_>>();
+                        let barrier_closed = active_admissions == 0;
+                        if barrier_closed {
+                            state.cleanup_admissions_closed = true;
+                        }
+                        (active_admissions, outstanding, barrier_closed)
+                    };
+                    outstanding_receipts.extend(outstanding);
+                    if barrier_closed {
+                        break;
+                    }
+                    debug_assert_ne!(active_admissions, 0);
+                    tokio::task::yield_now().await;
+                }
+                receipts.extend(outstanding_receipts.into_values());
+
+                for result in
+                    futures::future::join_all(receipts.into_iter().map(observe_cleanup)).await
+                {
+                    if let Err(error) = result
+                        && first_error.is_none()
+                    {
+                        first_error = Some(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(bounded_shutdown_timeout_error(entry_timeout)),
+            }
         })
     }
 
@@ -1075,7 +1150,7 @@ impl LspClientPool {
         // `shutdown_bounded` owns the one per-entry timeout. Wrapping it in a
         // second timeout would create two competing authorities for whether
         // child termination was actually proven.
-        let outcome = self.runtime.block_on(async move {
+        let outcome = self.runtime().block_on(async move {
             let results = futures::future::join_all(
                 drain
                     .entries
@@ -1224,7 +1299,7 @@ impl LspClientPool {
             Arc::clone(&record.entry)
         };
 
-        let result = self.runtime.block_on(entry.shutdown());
+        let result = self.runtime().block_on(entry.shutdown());
         match result {
             Ok(()) => {
                 self.lock_registry()?.entries.remove(key);
@@ -1242,7 +1317,128 @@ impl LspClientPool {
     }
 }
 
-#[derive(Default)]
+impl Drop for LspClientPool {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        // Production uses the static GLOBAL_POOL, which is not dropped during
+        // daemon final shutdown. This path is lifecycle hygiene for tests and
+        // future non-static owners: runtime teardown must never cancel cleanup.
+        let entries = self
+            .registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .entries
+                    .values()
+                    .map(|record| Arc::clone(&record.entry))
+                    .chain(
+                        registry
+                            .draining_entries
+                            .values()
+                            .flat_map(|entries| entries.iter().cloned()),
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _runtime_context = runtime.enter();
+            for entry in entries {
+                if let Err(error) = entry.request_cleanup(true, None) {
+                    warn!(%error, "lsp pool: could not schedule cleanup during drop");
+                }
+            }
+        }));
+
+        let receipts = self
+            .registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .outstanding_cleanups
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if receipts.is_empty() {
+            return;
+        }
+
+        let observe = async {
+            futures::future::join_all(receipts.iter().cloned().map(observe_cleanup)).await
+        };
+        let observed = catch_unwind(AssertUnwindSafe(|| {
+            if Handle::try_current().is_ok() {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            runtime.block_on(async {
+                                timeout(POOL_DROP_CLEANUP_TIMEOUT, observe).await
+                            })
+                        })
+                        .join()
+                        .ok()
+                })
+            } else {
+                Some(runtime.block_on(async { timeout(POOL_DROP_CLEANUP_TIMEOUT, observe).await }))
+            }
+        }))
+        .ok()
+        .flatten();
+        if observed.is_some_and(|result| result.is_ok()) {
+            return;
+        }
+
+        let pending = receipts
+            .into_iter()
+            .filter(|receipt| *receipt.borrow() == CleanupOutcome::Pending)
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+
+        let (runtime_sender, runtime_receiver) =
+            std::sync::mpsc::sync_channel::<(Runtime, Vec<watch::Receiver<CleanupOutcome>>)>(1);
+        let reaper_registry = Arc::clone(&self.registry);
+        match std::thread::Builder::new()
+            .name("cairn-lsp-cleanup-reaper".into())
+            .spawn(move || {
+                if let Ok((runtime, receipts)) = runtime_receiver.recv() {
+                    let reaped = catch_unwind(AssertUnwindSafe(|| {
+                        runtime.block_on(futures::future::join_all(
+                            receipts.into_iter().map(observe_cleanup),
+                        ));
+                    }));
+                    if reaped.is_err() {
+                        if let Ok(mut registry) = reaper_registry.lock() {
+                            registry.mode = PoolMode::Poisoned;
+                        }
+                        std::mem::forget(runtime);
+                    }
+                }
+            }) {
+            Ok(_) => {
+                if let Err(error) = runtime_sender.send((runtime, pending)) {
+                    warn!("lsp pool: cleanup reaper rejected runtime ownership");
+                    std::mem::forget(error.0.0);
+                    if let Ok(mut registry) = self.registry.lock() {
+                        registry.mode = PoolMode::Poisoned;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "lsp pool: could not start cleanup reaper");
+                std::mem::forget(runtime);
+                if let Ok(mut registry) = self.registry.lock() {
+                    registry.mode = PoolMode::Poisoned;
+                }
+            }
+        }
+    }
+}
+
 struct PoolEntry {
     /// Data-plane state: the live client plus per-document version
     /// counters. Held for the whole of `with_lsp_client` — spawn,
@@ -1256,18 +1452,95 @@ struct PoolEntry {
     /// Child-process control is deliberately independent from `state`. Normal
     /// work holds `state` across an analyzer pass, but final daemon shutdown
     /// must still be able to kill and reap the child to unblock that pass.
-    process_control: StdMutex<ProcessControlSlot>,
+    process_control: Arc<StdMutex<ProcessControlSlot>>,
+    /// Identity used only when a timed-out cleanup later proves termination:
+    /// release the exact `Evicting` record, never a same-key successor.
+    registry: Weak<StdMutex<PoolRegistry>>,
+    self_ref: Weak<PoolEntry>,
+    key: Option<PoolKey>,
 }
 
 #[derive(Default)]
 struct ProcessControlSlot {
     /// Set (and never cleared) by `shutdown_bounded` before it
-    /// terminates the child. Once set, `install_process_control`
-    /// rejects new clients, so a racing spawn cannot install a fresh
-    /// child after final shutdown has begun.
+    /// terminates the child. Once set, `install_and_arm` rejects new
+    /// clients, so a racing spawn cannot install a fresh child after
+    /// final shutdown has begun.
     stopping: bool,
+    /// Monotonic identity for the installed control. Cleanup completion may
+    /// mutate the slot only when this value still matches.
+    epoch: u64,
     /// Control handle of the currently-installed client, if any.
     control: Option<LspProcessControl>,
+    /// One coalesced cleanup task/receipt for the current epoch.
+    cleanup: Option<CleanupTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupOutcome {
+    Pending,
+    Proven,
+    Unproven(String),
+}
+
+impl CleanupOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Pending => Err(Error::Protocol(
+                "LSP cleanup receipt observed before completion".into(),
+            )),
+            Self::Proven => Ok(()),
+            Self::Unproven(message) => Err(Error::ChildTerminationFailed(message)),
+        }
+    }
+}
+
+struct CleanupTask {
+    epoch: u64,
+    receipt: watch::Receiver<CleanupOutcome>,
+}
+
+struct CleanupAdmission {
+    registry: Option<Arc<StdMutex<PoolRegistry>>>,
+}
+
+impl CleanupAdmission {
+    fn begin(registry: &Weak<StdMutex<PoolRegistry>>) -> Result<Option<Self>> {
+        let Some(registry) = registry.upgrade() else {
+            return Ok(Some(Self { registry: None }));
+        };
+        {
+            let mut state = registry
+                .lock()
+                .map_err(|_| Error::ChildTerminationFailed("LSP pool registry poisoned".into()))?;
+            if state.cleanup_admissions_closed {
+                return Ok(None);
+            }
+            state.active_cleanup_admissions = state
+                .active_cleanup_admissions
+                .checked_add(1)
+                .ok_or_else(|| Error::Protocol("LSP cleanup admission overflow".into()))?;
+        }
+        Ok(Some(Self {
+            registry: Some(registry),
+        }))
+    }
+}
+
+impl Drop for CleanupAdmission {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.as_ref()
+            && let Ok(mut state) = registry.lock()
+        {
+            state.active_cleanup_admissions = state.active_cleanup_admissions.saturating_sub(1);
+        }
+    }
+}
+
+struct UncommittedExitGuard {
+    entry: Arc<PoolEntry>,
+    epoch: u64,
+    armed: bool,
 }
 
 #[derive(Default)]
@@ -1278,6 +1551,96 @@ struct PoolEntryState {
     /// URI → document version; decides `didOpen` vs `didChange` in
     /// `PooledLsp::sync_document`.
     opened_documents: HashMap<String, i32>,
+}
+
+impl Default for PoolEntry {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(PoolEntryState::default()),
+            shutdown_gate: Mutex::new(()),
+            process_control: Arc::new(StdMutex::new(ProcessControlSlot::default())),
+            registry: Weak::new(),
+            self_ref: Weak::new(),
+            key: None,
+        }
+    }
+}
+
+impl PoolEntry {
+    fn new(key: PoolKey, registry: &Arc<StdMutex<PoolRegistry>>) -> Arc<Self> {
+        Arc::new_cyclic(|self_ref| Self {
+            state: Mutex::new(PoolEntryState::default()),
+            shutdown_gate: Mutex::new(()),
+            process_control: Arc::new(StdMutex::new(ProcessControlSlot::default())),
+            registry: Arc::downgrade(registry),
+            self_ref: self_ref.clone(),
+            key: Some(key),
+        })
+    }
+}
+
+impl UncommittedExitGuard {
+    /// Publish the ready client and disarm the exit guard in one helper. The
+    /// assignment itself is the commit linearization point; no fallible work
+    /// occurs between publication and disarm.
+    fn commit(mut self, state: &mut PoolEntryState, client: LspClient) {
+        state.client = Some(client);
+        self.armed = false;
+    }
+
+    /// Normal error paths use the same cleanup task as `Drop`, but may observe
+    /// its terminal receipt so primary and cleanup failures remain distinct.
+    async fn finish_error(mut self, original: Error) -> Error {
+        let receipt = self.entry.request_cleanup(false, Some(self.epoch));
+        self.armed = false;
+        let cleanup = match receipt {
+            Ok(Some(receipt)) => observe_cleanup(receipt).await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        match cleanup {
+            Ok(()) => original,
+            Err(cleanup) => Error::OperationWithCleanupFailure {
+                original: Box::new(original),
+                cleanup: Box::new(cleanup),
+            },
+        }
+    }
+}
+
+impl Drop for UncommittedExitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.entry.request_cleanup(false, Some(self.epoch)) {
+            self.entry.poison_registry(&error.to_string());
+        }
+    }
+}
+
+async fn observe_cleanup(mut receipt: watch::Receiver<CleanupOutcome>) -> Result<()> {
+    loop {
+        let outcome = receipt.borrow().clone();
+        if outcome != CleanupOutcome::Pending {
+            return outcome.into_result();
+        }
+        if receipt.changed().await.is_err() {
+            return Err(Error::ChildTerminationFailed(
+                "LSP cleanup receipt disconnected before completion".into(),
+            ));
+        }
+    }
+}
+
+async fn observe_cleanup_bounded(
+    receipt: watch::Receiver<CleanupOutcome>,
+    entry_timeout: Duration,
+) -> Result<()> {
+    match timeout(entry_timeout, observe_cleanup(receipt)).await {
+        Ok(result) => result,
+        Err(_) => Err(bounded_shutdown_timeout_error(entry_timeout)),
+    }
 }
 
 async fn check_lsp_available(
@@ -1354,7 +1717,205 @@ fn is_executable(path: &Path) -> bool {
 }
 
 impl PoolEntry {
-    async fn with_lsp_client<T, F>(&self, spec: LspSpawnSpec, work: F) -> Result<T>
+    /// Install the control and arm cleanup while holding the same slot lock.
+    /// There is no published-control / unguarded-exit gap.
+    fn install_and_arm(
+        self: &Arc<Self>,
+        control: LspProcessControl,
+    ) -> Result<UncommittedExitGuard> {
+        let mut slot = self
+            .process_control
+            .lock()
+            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+        if slot.stopping {
+            return Err(Error::PoolStopped);
+        }
+        let prior_cleanup = slot
+            .cleanup
+            .as_ref()
+            .map(|cleanup| cleanup.receipt.borrow().clone());
+        if let Some(prior_cleanup) = prior_cleanup {
+            match prior_cleanup {
+                CleanupOutcome::Pending => return Err(Error::PoolDraining),
+                CleanupOutcome::Unproven(message) => {
+                    return Err(Error::ChildTerminationFailed(message));
+                }
+                CleanupOutcome::Proven => {
+                    slot.control = None;
+                    slot.cleanup = None;
+                }
+            }
+        }
+        if slot.control.is_some() {
+            return Err(Error::PoolDraining);
+        }
+        slot.epoch = slot
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("lsp process-control epoch overflow".into()))?;
+        let epoch = slot.epoch;
+        slot.control = Some(control);
+        Ok(UncommittedExitGuard {
+            entry: Arc::clone(self),
+            epoch,
+            armed: true,
+        })
+    }
+
+    /// Start or join the one cleanup task for the selected epoch. Task
+    /// execution is owned by the pool runtime; dropping any observer only
+    /// stops observation and cannot cancel kill/wait.
+    fn request_cleanup(
+        &self,
+        final_stop: bool,
+        expected_epoch: Option<u64>,
+    ) -> Result<Option<watch::Receiver<CleanupOutcome>>> {
+        let admission = CleanupAdmission::begin(&self.registry)?;
+        let mut slot = self.process_control.lock().map_err(|_| {
+            Error::ChildTerminationFailed("LSP process-control slot poisoned".into())
+        })?;
+        if final_stop {
+            slot.stopping = true;
+        }
+        if expected_epoch.is_some_and(|expected| expected != slot.epoch) {
+            return Ok(None);
+        }
+        let epoch = slot.epoch;
+        if let Some(cleanup) = slot.cleanup.as_ref()
+            && cleanup.epoch == epoch
+        {
+            return Ok(Some(cleanup.receipt.clone()));
+        }
+        let Some(_admission) = admission else {
+            return Err(Error::PoolStopped);
+        };
+
+        let (sender, receiver) = watch::channel(CleanupOutcome::Pending);
+        slot.cleanup = Some(CleanupTask {
+            epoch,
+            receipt: receiver.clone(),
+        });
+        let Some(control) = slot.control.clone() else {
+            sender.send_replace(CleanupOutcome::Proven);
+            return Ok(Some(receiver));
+        };
+        drop(slot);
+
+        let cleanup_id = if let Some(registry) = self.registry.upgrade() {
+            match registry.lock() {
+                Ok(mut registry) => match registry.next_cleanup_id.checked_add(1) {
+                    Some(next) => {
+                        let id = registry.next_cleanup_id;
+                        registry.next_cleanup_id = next;
+                        registry.outstanding_cleanups.insert(id, receiver.clone());
+                        Some(id)
+                    }
+                    None => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let process_control = Arc::clone(&self.process_control);
+        let registry = self.registry.clone();
+        let self_ref = self.self_ref.clone();
+        let key = self.key.clone();
+        let task = async move {
+            let outcome = match AssertUnwindSafe(control.stop_and_terminate())
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => CleanupOutcome::Proven,
+                Ok(Err(error)) => CleanupOutcome::Unproven(error.to_string()),
+                Err(_) => CleanupOutcome::Unproven("LSP cleanup task panicked".into()),
+            };
+
+            if let Ok(mut slot) = process_control.lock()
+                && slot.epoch == epoch
+            {
+                if outcome == CleanupOutcome::Proven {
+                    slot.control = None;
+                }
+            }
+            sender.send_replace(outcome.clone());
+
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            let Ok(mut registry) = registry.lock() else {
+                return;
+            };
+            if let Some(cleanup_id) = cleanup_id {
+                registry.outstanding_cleanups.remove(&cleanup_id);
+            }
+            match outcome {
+                CleanupOutcome::Proven => {
+                    if let (Some(key), Some(entry)) = (key, self_ref.upgrade()) {
+                        let release = registry.entries.get(&key).is_some_and(|record| {
+                            record.state == RecordState::Evicting
+                                && Arc::ptr_eq(&record.entry, &entry)
+                        });
+                        if release {
+                            registry.entries.remove(&key);
+                        }
+                    }
+                }
+                CleanupOutcome::Unproven(message) => {
+                    if registry.mode != PoolMode::Stopped {
+                        warn!(%message, "lsp pool: background cleanup unproven; poisoning pool");
+                        registry.mode = PoolMode::Poisoned;
+                    }
+                }
+                CleanupOutcome::Pending => {}
+            }
+        };
+
+        let spawn_result = Handle::try_current().map_err(|_| ()).and_then(|handle| {
+            catch_unwind(AssertUnwindSafe(|| handle.spawn(task))).map_err(|_| ())
+        });
+        if spawn_result.is_err() {
+            let message = "LSP cleanup task could not be enqueued".to_string();
+            // The sender moved into the task future, which is dropped when
+            // spawning fails. Rebuild a terminal receipt in the slot so future
+            // installs remain fail-closed.
+            let (_terminal_sender, terminal_receiver) =
+                watch::channel(CleanupOutcome::Unproven(message.clone()));
+            if let Ok(mut slot) = self.process_control.lock()
+                && slot.epoch == epoch
+            {
+                slot.cleanup = Some(CleanupTask {
+                    epoch,
+                    receipt: terminal_receiver.clone(),
+                });
+            }
+            if let Some(registry) = self.registry.upgrade()
+                && let Ok(mut registry) = registry.lock()
+                && let Some(cleanup_id) = cleanup_id
+            {
+                registry.outstanding_cleanups.remove(&cleanup_id);
+            }
+            self.poison_registry(&message);
+            return Ok(Some(terminal_receiver));
+        }
+        Ok(Some(receiver))
+    }
+
+    fn poison_registry(&self, message: &str) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let Ok(mut registry) = registry.lock() else {
+            return;
+        };
+        if registry.mode != PoolMode::Stopped {
+            warn!(%message, "lsp pool: cleanup scheduling failed; poisoning pool");
+            registry.mode = PoolMode::Poisoned;
+        }
+    }
+
+    async fn with_lsp_client<T, F>(self: &Arc<Self>, spec: LspSpawnSpec, work: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut PooledLsp<'a>) -> ClientWork<'a, T>,
     {
@@ -1373,10 +1934,9 @@ impl PoolEntry {
             // bounded final shutdown has already flagged `stopping`,
             // this rejects with `PoolStopped` and no child is
             // spawned.
-            self.install_process_control(client.process_control())?;
+            let guard = self.install_and_arm(client.process_control())?;
             if let Err(err) = client.start_process().await {
-                self.clear_process_control()?;
-                return Err(err);
+                return Err(guard.finish_error(err).await);
             }
             // Readiness check runs against a spawned + initialized
             // child. If it fails (timeout or `$/progress` error),
@@ -1390,17 +1950,9 @@ impl PoolEntry {
             })
             .await
             {
-                let result = match client.force_terminate().await {
-                    Ok(()) => err,
-                    Err(cleanup) => Error::OperationWithCleanupFailure {
-                        original: Box::new(err),
-                        cleanup: Box::new(cleanup),
-                    },
-                };
-                self.clear_process_control()?;
-                return Err(result);
+                return Err(guard.finish_error(err).await);
             }
-            state.client = Some(client);
+            guard.commit(&mut state, client);
             state.opened_documents.clear();
         }
 
@@ -1435,17 +1987,19 @@ impl PoolEntry {
         ) {
             let client = state.client.take();
             state.opened_documents.clear();
-            if let Some(client) = client
-                && let Err(cleanup) = client.force_terminate().await
-            {
+            drop(client);
+            let cleanup = match self.request_cleanup(false, None) {
+                Ok(Some(receipt)) => observe_cleanup(receipt).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(cleanup) = cleanup {
                 let original = result.err().expect("just matched Err above");
-                self.clear_process_control()?;
                 return Err(super::Error::OperationWithCleanupFailure {
                     original: Box::new(original),
                     cleanup: Box::new(cleanup),
                 });
             }
-            self.clear_process_control()?;
         }
         result
     }
@@ -1463,7 +2017,12 @@ impl PoolEntry {
             Some(client) => client.shutdown().await,
             None => Ok(()),
         };
-        self.clear_process_control()?;
+        if !result
+            .as_ref()
+            .is_err_and(|error| error.is_termination_unproven())
+        {
+            self.clear_process_control()?;
+        }
         result
     }
 
@@ -1480,47 +2039,12 @@ impl PoolEntry {
     /// This method owns the sole per-entry timeout classification for process
     /// termination; callers must not wrap it in a second timeout.
     async fn shutdown_bounded(&self, entry_timeout: Duration) -> Result<()> {
-        let shutdown = async {
-            let control = {
-                // A poisoned slot leaves kill/reap state unknown, so callers
-                // must treat it as termination-unproven; a reusable pool must
-                // not return to Running or install a replacement.
-                let mut slot = self.process_control.lock().map_err(|_| {
-                    Error::ChildTerminationFailed(
-                        "LSP process-control state unavailable during bounded shutdown".into(),
-                    )
-                })?;
-                slot.stopping = true;
-                slot.control.clone()
-            };
-            let Some(control) = control else {
-                return Ok(());
-            };
-            control.stop_and_terminate().await
+        let Some(receipt) = self.request_cleanup(true, None)? else {
+            return Ok(());
         };
-        match timeout(entry_timeout, shutdown).await {
-            Ok(result) => result,
-            Err(_) => Err(bounded_shutdown_timeout_error(entry_timeout)),
-        }
-    }
-
-    /// Install the control handle for a client that is about to be
-    /// spawned.
-    ///
-    /// # Errors
-    /// [`Error::PoolStopped`] when a final shutdown has already
-    /// flagged the slot as stopping (the caller must not spawn); a
-    /// protocol error when the slot mutex is poisoned.
-    fn install_process_control(&self, control: LspProcessControl) -> Result<()> {
-        let mut slot = self
-            .process_control
-            .lock()
-            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
-        if slot.stopping {
-            return Err(Error::PoolStopped);
-        }
-        slot.control = Some(control);
-        Ok(())
+        // The timeout bounds observation only. `request_cleanup` transferred
+        // kill/wait into a pool-runtime task which continues to completion.
+        observe_cleanup_bounded(receipt, entry_timeout).await
     }
 
     /// Drop the control handle after the child is known terminated
@@ -1530,10 +2054,17 @@ impl PoolEntry {
     /// # Errors
     /// A protocol error when the slot mutex is poisoned.
     fn clear_process_control(&self) -> Result<()> {
-        self.process_control
+        let mut slot = self
+            .process_control
             .lock()
-            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?
-            .control = None;
+            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+        let cleanup_pending = slot
+            .cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.receipt.borrow().clone() == CleanupOutcome::Pending);
+        if !cleanup_pending {
+            slot.control = None;
+        }
         Ok(())
     }
 }

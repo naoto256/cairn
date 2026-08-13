@@ -4,6 +4,13 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing_subscriber::fmt::MakeWriter;
 
+#[cfg(unix)]
+use crate::lsp::client::{
+    classify_group_signal, reject_unverified_child, validate_process_group_identity,
+};
+#[cfg(unix)]
+use rustix::process::Pid;
+
 #[derive(Clone, Default)]
 struct CapturedLog {
     bytes: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -373,7 +380,7 @@ fn pool(capacity: usize) -> LspClientPool {
 // Since `acquire_lease` is async, tests drive it through the
 // pool's own runtime — same path production uses.
 fn acquire(pool: &LspClientPool, key: PoolKey) -> Result<PoolLease> {
-    pool.runtime
+    pool.runtime()
         .block_on(async { pool.acquire_lease(key).await })
 }
 
@@ -609,7 +616,7 @@ fn age_record(pool: &LspClientPool, key: &PoolKey, age: Duration) {
 }
 
 fn sweep_idle(pool: &LspClientPool, ttl: Duration, timeout: Duration) -> Result<usize> {
-    pool.runtime.block_on(LspClientPool::sweep_idle_once(
+    pool.runtime().block_on(LspClientPool::sweep_idle_once(
         &pool.registry,
         Instant::now(),
         ttl,
@@ -655,7 +662,7 @@ fn bounded_final_shutdown_bypasses_graceful_shutdown_gate() {
 
     // Hold the graceful shutdown gate. Bounded final shutdown must
     // bypass it and use the independent process-control path.
-    let gate = pool.runtime.block_on(entry.shutdown_gate.lock());
+    let gate = pool.runtime().block_on(entry.shutdown_gate.lock());
     pool.shutdown_all_bounded(Duration::from_millis(20))
         .expect("bounded final shutdown must not wait on graceful shutdown gate");
     assert_eq!(pool.mode(), PoolMode::Stopped);
@@ -765,7 +772,7 @@ fn pool_concurrent_distinct_keys_never_exceed_capacity() {
         handles.push(std::thread::spawn(move || {
             b.wait();
             let p2 = Arc::clone(&p);
-            p.runtime
+            p.runtime()
                 .block_on(async move { p2.acquire_lease(test_key(i as u32)).await })
         }));
     }
@@ -1005,12 +1012,33 @@ fn client_initialize_failure_kills_child_before_returning() {
 ///   always times out — used to pin readiness cleanup)
 #[cfg(unix)]
 const FAKE_LSP_SCRIPT: &str = r#"#!/usr/bin/env python3
-import sys, os, json
+import sys, os, json, subprocess
+
+spawn_count_file = os.environ.get("CAIRN_TEST_SPAWN_COUNT_FILE")
+spawn_ordinal = 0
+if spawn_count_file:
+    try:
+        with open(spawn_count_file) as f:
+            spawn_ordinal = int(f.read() or "0")
+    except FileNotFoundError:
+        pass
+    spawn_ordinal += 1
+    with open(spawn_count_file, "w") as f:
+        f.write(str(spawn_ordinal))
+        f.flush()
+        os.fsync(f.fileno())
+fail_initialize_ordinal = int(os.environ.get("CAIRN_TEST_FAIL_INITIALIZE_ORDINAL", "-1"))
 
 pid_file = os.environ.get("CAIRN_TEST_PID_FILE")
 if pid_file:
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
+
+grandchild_pid_file = os.environ.get("CAIRN_TEST_GRANDCHILD_PID_FILE")
+if grandchild_pid_file:
+    grandchild = subprocess.Popen(["sleep", "300"])
+    with open(grandchild_pid_file, "w") as f:
+        f.write(str(grandchild.pid))
 
 def read_message():
     headers = {}
@@ -1047,12 +1075,14 @@ while True:
     method = msg.get("method")
     if method:
         log_method(method)
-    if method == "initialize":
+    if method == "initialize" and spawn_ordinal != fail_initialize_ordinal:
         write_message({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
     elif method == "shutdown" and os.environ.get("CAIRN_TEST_RESPOND_SHUTDOWN", "1") == "1":
         write_message({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     elif method == "exit" and os.environ.get("CAIRN_TEST_IGNORE_EXIT", "0") != "1":
         sys.exit(0)
+    elif method == "textDocument/definition" and os.environ.get("CAIRN_TEST_CLOSE_STDOUT_ON_DEFINITION") == "1":
+        os.close(sys.stdout.fileno())
     elif method == "textDocument/definition" and os.environ.get("CAIRN_TEST_EXIT_ON_DEFINITION") == "1":
         sys.stderr.write("test-only: exit after first definition\n")
         sys.stderr.flush()
@@ -1096,6 +1126,15 @@ impl FakeLspBinary {
         )]
     }
 
+    fn env_with_grandchild(&self, grandchild_pid_file: &Path) -> Vec<(String, String)> {
+        let mut env = self.env();
+        env.push((
+            "CAIRN_TEST_GRANDCHILD_PID_FILE".into(),
+            grandchild_pid_file.display().to_string(),
+        ));
+        env
+    }
+
     /// Env that also silences shutdown responses so graceful shutdown would
     /// stall. Force shutdown must bypass that protocol path and terminate the
     /// installed child through process control.
@@ -1105,12 +1144,9 @@ impl FakeLspBinary {
         env
     }
 
-    /// Env that responds to `shutdown` fast but ignores `exit`,
-    /// so `LspClient::shutdown` gets a clean protocol response,
-    /// then sits in `SHUTDOWN_TIMEOUT` graceful wait until
-    /// `force_terminate` reaps. Total ~2s. Used to hold an
-    /// `Evicting` placeholder without polluting the shutdown
-    /// result with a `Handshake`/`RequestTimeout` protocol error.
+    /// Env that responds to `shutdown` but ignores `exit`. Cleanup still uses
+    /// the verified process group without polluting the result with a protocol
+    /// error.
     fn env_shutdown_ok_but_no_exit(&self) -> Vec<(String, String)> {
         let mut env = self.env();
         env.push(("CAIRN_TEST_IGNORE_EXIT".into(), "1".into()));
@@ -1151,6 +1187,17 @@ fn spawn_spec_stall(fake: &FakeLspBinary, request_timeout: Duration) -> LspSpawn
         env: fake.env_stall_shutdown(),
         ..spawn_spec(fake, request_timeout)
     }
+}
+
+fn unstarted_client_for_cleanup() -> LspClient {
+    LspClient::configured(
+        Path::new("test-only-lsp"),
+        Vec::new(),
+        Vec::new(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(1),
+    )
 }
 
 #[cfg(unix)]
@@ -1312,7 +1359,7 @@ fn force_shutdown_all_reaps_stalled_owner_without_poisoning_pool() {
         // Keep the baseline failure leak-free: the current graceful path times
         // out while the owner holds `state`, so use the already-proven control
         // plane solely to let the failing carrier unwind.
-        pool.runtime
+        pool.runtime()
             .block_on(old_entry.shutdown_bounded(Duration::from_secs(2)))
             .expect("baseline cleanup must reap the stalled child");
     }
@@ -1536,7 +1583,7 @@ fn bounded_shutdown_reaps_entry_published_by_concurrent_graceful_drain() {
 
 #[test]
 fn bounded_final_shutdown_rejects_late_process_control_install() {
-    let entry = PoolEntry::default();
+    let entry = Arc::new(PoolEntry::default());
     let runtime = Runtime::new().unwrap();
     runtime
         .block_on(entry.shutdown_bounded(Duration::from_millis(10)))
@@ -1551,7 +1598,7 @@ fn bounded_final_shutdown_rejects_late_process_control_install() {
         Duration::from_secs(1),
     );
     assert!(matches!(
-        entry.install_process_control(client.process_control()),
+        entry.install_and_arm(client.process_control()),
         Err(Error::PoolStopped)
     ));
 }
@@ -1575,10 +1622,10 @@ fn force_shutdown_without_control_rejects_late_process_control_install() {
         serde_json::json!({}),
         Duration::from_secs(1),
     );
-    let install = entry.install_process_control(client.process_control());
+    let install = entry.install_and_arm(client.process_control());
     assert!(
         matches!(install, Err(Error::PoolStopped)),
-        "late process-control install must be rejected, got {install:?}"
+        "late process-control install must be rejected"
     );
 }
 
@@ -1786,6 +1833,439 @@ fn client_force_terminate_on_live_client_kills_pid() {
             .expect("force_terminate must succeed");
         assert!(wait_until_dead(pid, Duration::from_secs(2)));
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_process_group_identity_and_signal_classification_are_fail_closed() {
+    let leader = Pid::from_raw(41_000).unwrap();
+    let other_group = Pid::from_raw(41_001).unwrap();
+    let mismatch = validate_process_group_identity(leader, Ok(other_group))
+        .expect_err("a non-leader process group must be rejected");
+    assert!(mismatch.contains("process-group mismatch"));
+
+    assert!(classify_group_signal(leader, Err(rustix::io::Errno::SRCH), "kill").is_none());
+    let denied = classify_group_signal(leader, Err(rustix::io::Errno::PERM), "kill")
+        .expect("EPERM must remain a containment fact");
+    assert!(
+        denied.contains("Operation not permitted") || denied.contains("operation not permitted")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_group_mismatch_reaps_unpublished_leader_and_never_claims_containment() {
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("sleep must publish a pid");
+        let leader = Pid::from_raw(pid as i32).unwrap();
+        let mismatched = Pid::from_raw(pid.checked_add(1).unwrap() as i32).unwrap();
+        let reason = validate_process_group_identity(leader, Ok(mismatched))
+            .expect_err("mismatch must fail identity validation");
+        let error = reject_unverified_child(&mut child, &reason).await;
+        assert!(error.is_termination_unproven());
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(2)),
+            "unpublished mismatched leader {pid} was not reaped"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_process_group_kill_reaps_leader_and_terminates_grandchild() {
+    let fake = FakeLspBinary::new();
+    let grandchild_pid_file = fake.pid_file.with_file_name("fake-lsp-grandchild.pid");
+    let rt = Runtime::new().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    rt.block_on(async {
+        let mut env = fake.env_with_grandchild(&grandchild_pid_file);
+        env.push(("CAIRN_TEST_IGNORE_EXIT".into(), "1".into()));
+        let client = LspClient::start_configured(
+            &fake.path,
+            Vec::new(),
+            env,
+            workspace.path(),
+            serde_json::json!({}),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let leader = read_pid(
+            &fake.pid_file,
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .expect("leader pid must be written");
+        let grandchild = read_pid(
+            &grandchild_pid_file,
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .expect("grandchild pid must be written");
+
+        let control = client.process_control();
+        let shutdown = timeout(Duration::from_secs(2), client.shutdown()).await;
+        if shutdown.is_err() {
+            // Mutation cleanup: a signal-after-wait or removed-signal variant
+            // stalls while the still-owned leader keeps this PGID safe.
+            let _ = rustix::process::kill_process_group(
+                Pid::from_raw(leader as i32).unwrap(),
+                rustix::process::Signal::KILL,
+            );
+        }
+        shutdown
+            .expect("graceful cleanup must signal before waiting")
+            .expect("verified group kill and leader reap must succeed");
+        assert_eq!(
+            control.leader_wait_count_for_test(),
+            1,
+            "verified group termination must reap the leader exactly once"
+        );
+        assert!(
+            !pid_alive(leader),
+            "shutdown returned before reaping the signalled leader"
+        );
+        assert!(
+            wait_until_dead(grandchild, Duration::from_secs(3)),
+            "owned process-group descendant {grandchild} remained live"
+        );
+    });
+}
+
+#[test]
+fn cleanup_timeout_keeps_one_task_running_and_vetoes_replacement_until_proven() {
+    let runtime = Runtime::new().unwrap();
+    let entry = Arc::new(PoolEntry::default());
+    let client = unstarted_client_for_cleanup();
+    let (mut entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+
+    runtime.block_on(async {
+        let first = entry.request_cleanup(false, None).unwrap().unwrap();
+        timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("cleanup task did not start")
+            .expect("cleanup entry signal disconnected");
+        assert_eq!(client.cleanup_run_count_for_test(), 1);
+
+        let second = entry.request_cleanup(false, None).unwrap().unwrap();
+        assert_eq!(
+            client.cleanup_run_count_for_test(),
+            1,
+            "cleanup must coalesce"
+        );
+        assert!(matches!(
+            entry.install_and_arm(unstarted_client_for_cleanup().process_control()),
+            Err(Error::PoolDraining)
+        ));
+        assert!(matches!(
+            observe_cleanup_bounded(first, Duration::from_millis(1)).await,
+            Err(Error::ChildTerminationFailed(_))
+        ));
+
+        release.send_replace(true);
+        observe_cleanup(second)
+            .await
+            .expect("late cleanup must become proven");
+        assert_eq!(client.cleanup_run_count_for_test(), 1);
+
+        let mut replacement = entry
+            .install_and_arm(unstarted_client_for_cleanup().process_control())
+            .expect("late proof must release the epoch for replacement");
+        replacement.armed = false;
+    });
+}
+
+#[test]
+fn uncommitted_exit_guard_cleans_up_on_panic_and_future_drop() {
+    let runtime = Runtime::new().unwrap();
+    let entry = Arc::new(PoolEntry::default());
+
+    runtime.block_on(async {
+        let panic_client = unstarted_client_for_cleanup();
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = entry
+                .install_and_arm(panic_client.process_control())
+                .unwrap();
+            panic!("test-only uncommitted panic");
+        }));
+        assert!(panicked.is_err());
+        let panic_receipt = entry
+            .process_control
+            .lock()
+            .unwrap()
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .receipt
+            .clone();
+        observe_cleanup(panic_receipt).await.unwrap();
+        assert_eq!(panic_client.cleanup_run_count_for_test(), 1);
+
+        let cancelled_client = unstarted_client_for_cleanup();
+        let cancelled_entry = Arc::clone(&entry);
+        let control = cancelled_client.process_control();
+        let (armed_sender, armed_receiver) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(async move {
+            let _guard = cancelled_entry.install_and_arm(control).unwrap();
+            let _ = armed_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        armed_receiver
+            .await
+            .expect("guard must be armed before abort");
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+
+        let cancelled_receipt = entry
+            .process_control
+            .lock()
+            .unwrap()
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .receipt
+            .clone();
+        observe_cleanup(cancelled_receipt).await.unwrap();
+        assert_eq!(cancelled_client.cleanup_run_count_for_test(), 1);
+
+        let error_client = unstarted_client_for_cleanup();
+        let error_guard = entry
+            .install_and_arm(error_client.process_control())
+            .unwrap();
+        let error = error_guard
+            .finish_error(Error::Handshake("test-only start failure".into()))
+            .await;
+        assert!(matches!(error, Error::Handshake(_)));
+        assert_eq!(error_client.cleanup_run_count_for_test(), 1);
+    });
+}
+
+#[test]
+fn pool_drop_waits_for_outstanding_cleanup_before_runtime_teardown() {
+    let pool = pool(1);
+    let key = PoolKey {
+        canonical_repo_root: PathBuf::from("/tmp/drop-cleanup"),
+        language: "rust".into(),
+        analyzer_id: "drop-cleanup".into(),
+        binary: PathBuf::from("test-only-lsp"),
+        config_hash: "drop-cleanup".into(),
+    };
+    let lease = pool.runtime().block_on(pool.acquire_lease(key)).unwrap();
+    let entry = Arc::clone(&lease.entry);
+    let client = unstarted_client_for_cleanup();
+    let (entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    drop(lease);
+
+    let releaser = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !*entered.borrow() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(*entered.borrow(), "pool drop did not start cleanup");
+        release.send_replace(true);
+    });
+    drop(pool);
+    releaser.join().unwrap();
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+}
+
+#[test]
+fn bounded_final_shutdown_observes_cleanup_no_longer_in_live_registry() {
+    let pool = pool(1);
+    let key = PoolKey {
+        canonical_repo_root: PathBuf::from("/tmp/final-outstanding-cleanup"),
+        language: "rust".into(),
+        analyzer_id: "final-outstanding-cleanup".into(),
+        binary: PathBuf::from("test-only-lsp"),
+        config_hash: "final-outstanding-cleanup".into(),
+    };
+    let entry = PoolEntry::new(key, &pool.registry);
+    let client = unstarted_client_for_cleanup();
+    let (mut entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+
+    let receipt = pool.runtime().block_on(async {
+        let receipt = entry.request_cleanup(false, None).unwrap().unwrap();
+        timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("cleanup task did not start")
+            .expect("cleanup entry signal disconnected");
+        receipt
+    });
+
+    assert!(matches!(
+        pool.shutdown_all_bounded(Duration::from_millis(1)),
+        Err(Error::ChildTerminationFailed(_))
+    ));
+    release.send_replace(true);
+    pool.runtime()
+        .block_on(observe_cleanup(receipt))
+        .expect("outstanding cleanup must still finish after final observation timeout");
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+}
+
+#[test]
+fn final_shutdown_single_deadline_includes_inflight_cleanup_admission() {
+    let pool = Arc::new(pool(1));
+    let key = PoolKey {
+        canonical_repo_root: PathBuf::from("/tmp/final-admission-race"),
+        language: "rust".into(),
+        analyzer_id: "final-admission-race".into(),
+        binary: PathBuf::from("test-only-lsp"),
+        config_hash: "final-admission-race".into(),
+    };
+    let entry = PoolEntry::new(key, &pool.registry);
+    let client = unstarted_client_for_cleanup();
+    let (mut entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+
+    let slot = entry.process_control.lock().unwrap();
+    let request_entry = Arc::clone(&entry);
+    let runtime_handle = pool.runtime().handle().clone();
+    let request = std::thread::spawn(move || {
+        let _runtime_context = runtime_handle.enter();
+        request_entry.request_cleanup(false, None)
+    });
+    let admission_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while pool.registry.lock().unwrap().active_cleanup_admissions == 0
+        && std::time::Instant::now() < admission_deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        pool.registry.lock().unwrap().active_cleanup_admissions,
+        1,
+        "cleanup admission must linearize before final shutdown"
+    );
+
+    let bound = Duration::from_millis(500);
+    let shutdown_pool = Arc::clone(&pool);
+    let shutdown = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = shutdown_pool.shutdown_all_bounded(bound);
+        (result, started.elapsed())
+    });
+    let barrier_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while pool.registry.lock().unwrap().mode != PoolMode::Stopped
+        && std::time::Instant::now() < barrier_deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(pool.registry.lock().unwrap().mode, PoolMode::Stopped);
+
+    let late_key = PoolKey {
+        canonical_repo_root: PathBuf::from("/tmp/final-admission-after-barrier"),
+        language: "rust".into(),
+        analyzer_id: "final-admission-after-barrier".into(),
+        binary: PathBuf::from("test-only-lsp"),
+        config_hash: "final-admission-after-barrier".into(),
+    };
+    let late_entry = PoolEntry::new(late_key, &pool.registry);
+    let late_client = unstarted_client_for_cleanup();
+    let (mut late_entered, late_release) = late_client.pause_cleanup_for_test();
+    let mut late_guard = late_entry
+        .install_and_arm(late_client.process_control())
+        .unwrap();
+    late_guard.armed = false;
+    let late_receipt = {
+        let runtime_handle = pool.runtime().handle().clone();
+        let _runtime_context = runtime_handle.enter();
+        late_entry
+            .request_cleanup(false, None)
+            .unwrap()
+            .expect("post-barrier cleanup admission skipped its epoch")
+    };
+
+    drop(slot);
+    let receipt = request
+        .join()
+        .expect("cleanup admission thread panicked")
+        .expect("cleanup admission failed")
+        .expect("cleanup admission skipped its epoch");
+    let (shutdown_result, elapsed) = shutdown.join().expect("final shutdown thread panicked");
+    assert!(matches!(
+        shutdown_result,
+        Err(Error::ChildTerminationFailed(_))
+    ));
+    assert!(
+        elapsed < bound + Duration::from_millis(200),
+        "final cleanup observation exceeded its single absolute deadline"
+    );
+
+    pool.runtime().block_on(async {
+        timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("late cleanup task did not start")
+            .expect("late cleanup entry signal disconnected");
+        timeout(Duration::from_secs(1), late_entered.changed())
+            .await
+            .expect("post-barrier cleanup task did not start")
+            .expect("post-barrier cleanup entry signal disconnected");
+    });
+    release.send_replace(true);
+    late_release.send_replace(true);
+    pool.runtime()
+        .block_on(async {
+            observe_cleanup(receipt).await?;
+            observe_cleanup(late_receipt).await
+        })
+        .expect("timed-out observer must not cancel late cleanup");
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+    assert_eq!(late_client.cleanup_run_count_for_test(), 1);
+}
+
+#[test]
+fn pool_drop_transfers_pending_cleanup_and_runtime_to_terminal_reaper() {
+    let pool = pool(1);
+    let lease = pool
+        .runtime()
+        .block_on(pool.acquire_lease(test_key(909)))
+        .unwrap();
+    let entry = Arc::clone(&lease.entry);
+    let client = unstarted_client_for_cleanup();
+    let (entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    drop(lease);
+
+    let started = std::time::Instant::now();
+    drop(pool);
+    assert!(
+        started.elapsed() >= POOL_DROP_CLEANUP_TIMEOUT,
+        "pool Drop returned before its bounded observation elapsed"
+    );
+    assert!(*entered.borrow(), "pool Drop did not start cleanup");
+    let receipt = entry
+        .process_control
+        .lock()
+        .unwrap()
+        .cleanup
+        .as_ref()
+        .expect("pool Drop did not publish a cleanup receipt")
+        .receipt
+        .clone();
+    assert_eq!(*receipt.borrow(), CleanupOutcome::Pending);
+
+    release.send_replace(true);
+    Runtime::new()
+        .unwrap()
+        .block_on(async { timeout(Duration::from_secs(2), observe_cleanup(receipt)).await })
+        .expect("detached cleanup reaper dropped its runtime root")
+        .expect("late cleanup must reach a terminal outcome");
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
 }
 
 #[cfg(unix)]
@@ -2145,9 +2625,9 @@ fn wait_for_record_state(
 #[test]
 fn lru_eviction_real_path_placeholder_visible_and_replaced_on_termination_proof() {
     // Real end-to-end LRU eviction via `acquire_lease`:
-    // 1. Populate V (Ready + idle) with a fake whose `shutdown`
-    //    stalls long enough (~2s SHUTDOWN_TIMEOUT + kill window)
-    //    that the test can observe the `Evicting` placeholder.
+    // 1. Populate V (Ready + idle) and hold its existing shutdown gate so the
+    //    test can observe the `Evicting` placeholder without relying on a
+    //    production grace-period delay.
     // 2. Spawn B's `with_lsp` on a background thread — it goes
     //    through the actual acquire path: marks V as Evicting,
     //    drops the registry lock, runs `V.shutdown()`, then on
@@ -2187,6 +2667,8 @@ fn lru_eviction_real_path_placeholder_visible_and_replaced_on_termination_proof(
         pid_alive(victim_pid),
         "V's child must be alive after populate"
     );
+    let victim_entry = pool.registry.lock().unwrap().entries[&v_key].entry.clone();
+    let shutdown_gate = pool.runtime().block_on(victim_entry.shutdown_gate.lock());
     let b_pool = StdArc::clone(&pool);
     let b_key_for_thread = b_key.clone();
     let fake_b_path = fake_b.path.clone();
@@ -2225,6 +2707,7 @@ fn lru_eviction_real_path_placeholder_visible_and_replaced_on_termination_proof(
         "same-key acquire during eviction must see PoolDraining, got {err:?}"
     );
     assert_eq!(pool.len(), 1);
+    drop(shutdown_gate);
     // Ordering invariant: V's child must be dead BEFORE B's
     // child comes into existence. Poll for B's pid_file to
     // appear (that's the earliest observable proof that B has
@@ -2392,6 +2875,22 @@ fn server_exit_clears_state_and_respawn_sends_did_open() {
             Ok::<(), Error>(())
         })
     });
+    if let Err(Error::OperationWithCleanupFailure { cleanup, .. }) = &first_result
+        && cleanup.is_termination_unproven()
+    {
+        // Some Unix kernels report EPERM when the verified group contains
+        // only the already-exited leader. The containment contract is
+        // intentionally fail-closed: retain the group-signal fact, poison the
+        // pool, and forbid a same-key replacement.
+        assert_eq!(pool.mode(), PoolMode::Poisoned);
+        assert!(matches!(
+            pool.with_lsp(key, spawn_spec(&fake, Duration::from_secs(3)), |_| {
+                Box::pin(async { Ok::<(), Error>(()) })
+            }),
+            Err(Error::PoolPoisoned)
+        ));
+        return;
+    }
     assert!(
         matches!(
             first_result,
@@ -2542,6 +3041,106 @@ fn wait_for_logged_method(path: &Path, required_method: &str, timeout: Duration)
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn respawn_initialize_failure_reaps_child_and_allows_next_attempt() {
+    let fake = FakeLspBinary::new();
+    let spawn_count = fake.pid_file.with_file_name("spawn-count");
+    let workspace = tempfile::tempdir().unwrap();
+    let uri = Url::from("file:///tmp/pool-test/respawn.py");
+    let mut env = fake.env();
+    env.push((
+        "CAIRN_TEST_SPAWN_COUNT_FILE".into(),
+        spawn_count.display().to_string(),
+    ));
+    env.push(("CAIRN_TEST_FAIL_INITIALIZE_ORDINAL".into(), "2".into()));
+    env.push(("CAIRN_TEST_CLOSE_STDOUT_ON_DEFINITION".into(), "1".into()));
+
+    Runtime::new().unwrap().block_on(async {
+        let client = LspClient::start_configured(
+            &fake.path,
+            Vec::new(),
+            env,
+            workspace.path(),
+            serde_json::json!({}),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("initial child must initialize");
+
+        let first = client
+            .definition(
+                &uri,
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                first,
+                Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
+            ),
+            "first child must exit before the respawn carrier: {first:?}"
+        );
+        timeout(Duration::from_secs(1), async {
+            while client.transport_generation() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader must publish the first child exit");
+
+        let failed_respawn = client
+            .did_open(&uri, "python", 1, "print('failed respawn')")
+            .await;
+        assert!(
+            failed_respawn.is_err(),
+            "second child must fail its initialize exchange: {failed_respawn:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&spawn_count)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap(),
+            2,
+            "initialize failure must occur on the first respawn: {failed_respawn:?}"
+        );
+        let failed_pid = read_pid(
+            &fake.pid_file,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .expect("failed respawn child must publish its pid");
+        assert!(
+            wait_until_dead(failed_pid, Duration::from_secs(2)),
+            "failed respawn child {failed_pid} was not reaped"
+        );
+
+        client
+            .did_open(&uri, "python", 2, "print('fresh respawn')")
+            .await
+            .expect("remaining restart budget must start a fresh child");
+        let fresh_pid = read_pid(
+            &fake.pid_file,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .expect("fresh respawn child must publish its pid");
+        assert_ne!(fresh_pid, failed_pid, "next respawn must use a new child");
+        assert_eq!(
+            std::fs::read_to_string(&spawn_count)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap(),
+            3,
+            "failed initialize must consume one restart attempt"
+        );
+        client.shutdown().await.expect("fresh child shutdown");
+    });
 }
 
 #[cfg(unix)]
