@@ -115,9 +115,12 @@ impl SocketPaths {
 
 /// Exclusive ownership token for both daemon socket paths.
 ///
-/// The kernel releases the advisory lock when this file is dropped, including
-/// after a process crash. The lockfile itself intentionally remains in the
-/// private runtime directory and is harmless on the next startup.
+/// Normal drop makes a best-effort explicit unlock before closing this file.
+/// If that unlock fails, close alone proves release only when no duplicate of
+/// the same open-file description remains. Process exit or crash is the
+/// fallback that closes every process-owned descriptor. The lockfile itself
+/// intentionally remains in the private runtime directory and is harmless on
+/// the next startup.
 #[derive(Debug)]
 pub(crate) struct DaemonLockGuard {
     _file: File,
@@ -138,6 +141,14 @@ impl DaemonLockGuard {
             )),
             Err(err) => Err(errno_to_io(err).into()),
         }
+    }
+}
+
+impl Drop for DaemonLockGuard {
+    fn drop(&mut self) {
+        // Explicitly unlock before File closes this descriptor; close alone is
+        // authoritative only when the same open-file description has no duplicate.
+        let _ = rustix::fs::flock(&self._file, FlockOperation::Unlock);
     }
 }
 
@@ -526,6 +537,24 @@ mod tests {
     }
 
     #[test]
+    fn daemon_lock_drop_unlocks_while_same_open_file_description_is_retained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join(DAEMON_LOCK_FILE);
+        let guard = DaemonLockGuard::acquire(&lock_path).unwrap();
+        let inherited_duplicate = guard._file.try_clone().unwrap();
+
+        let err = DaemonLockGuard::acquire(&lock_path)
+            .expect_err("a live guard must retain exclusive ownership");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        drop(guard);
+        let reacquired = DaemonLockGuard::acquire(&lock_path)
+            .expect("guard drop must unlock even while a duplicate remains open");
+        drop(reacquired);
+        drop(inherited_duplicate);
+    }
+
+    #[test]
     fn stale_socket_probe_fails_closed_or_reclaims_after_definitive_stale_result() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SocketPaths::with_runtime_dir(tmp.path().join("runtime"));
@@ -533,14 +562,15 @@ mod tests {
         let lock_path = paths.runtime_dir.join(DAEMON_LOCK_FILE);
         std::fs::write(&lock_path, b"old").unwrap();
 
-        let stale_listener = std::os::unix::net::UnixListener::bind(&paths.control).unwrap();
-        drop(stale_listener);
-        let cairn_existed_before = paths.cairn.exists();
+        let stale_control = std::os::unix::net::UnixListener::bind(&paths.control).unwrap();
+        let stale_cairn = std::os::unix::net::UnixListener::bind(&paths.cairn).unwrap();
+        drop((stale_control, stale_cairn));
 
         match paths.acquire_daemon_lock() {
             Ok(guard) => {
                 paths.ensure().unwrap();
                 assert!(!paths.control.exists());
+                assert!(!paths.cairn.exists());
                 let err = paths
                     .acquire_daemon_lock()
                     .expect_err("the startup guard must retain exclusive ownership");
@@ -556,6 +586,10 @@ mod tests {
                     .expect("a conservative probe must preserve the control socket")
                     .file_type();
                 assert!(control_type.is_socket());
+                let cairn_type = std::fs::symlink_metadata(&paths.cairn)
+                    .expect("a conservative probe must preserve the data socket")
+                    .file_type();
+                assert!(cairn_type.is_socket());
 
                 let guard = DaemonLockGuard::acquire(&lock_path)
                     .expect("the failed probe must release the daemon lock");
@@ -565,7 +599,10 @@ mod tests {
                     .expect("lock reacquisition must not remove the control socket")
                     .file_type();
                 assert!(control_type.is_socket());
-                assert_eq!(paths.cairn.exists(), cairn_existed_before);
+                let cairn_type = std::fs::symlink_metadata(&paths.cairn)
+                    .expect("lock reacquisition must not remove the data socket")
+                    .file_type();
+                assert!(cairn_type.is_socket());
             }
             other => panic!("unexpected stale socket probe result: {other:?}"),
         }

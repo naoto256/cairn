@@ -124,6 +124,14 @@ struct CancellationWaitBarrier {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerCloseTestFault {
+    InitialClear,
+    Reader,
+    Observer,
+}
+
+#[cfg(test)]
 impl CancellationWaitBarrier {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -154,6 +162,8 @@ pub(crate) struct RequestCancellation {
     #[cfg(test)]
     non_close_readiness: tokio::sync::Semaphore,
     #[cfg(test)]
+    initial_clear_completed: tokio::sync::Semaphore,
+    #[cfg(test)]
     cancel_wait_enabled: tokio::sync::Semaphore,
     #[cfg(test)]
     cooperative_wait_enabled: tokio::sync::Semaphore,
@@ -161,6 +171,8 @@ pub(crate) struct RequestCancellation {
     cancel_wait_barrier: Mutex<Option<Arc<CancellationWaitBarrier>>>,
     #[cfg(test)]
     blocking_query_start: Mutex<Option<BlockingQueryStartBarrier>>,
+    #[cfg(test)]
+    peer_close_fault: Mutex<Option<PeerCloseTestFault>>,
 }
 
 impl RequestCancellation {
@@ -181,6 +193,8 @@ impl RequestCancellation {
             #[cfg(test)]
             non_close_readiness: tokio::sync::Semaphore::new(0),
             #[cfg(test)]
+            initial_clear_completed: tokio::sync::Semaphore::new(0),
+            #[cfg(test)]
             cancel_wait_enabled: tokio::sync::Semaphore::new(0),
             #[cfg(test)]
             cooperative_wait_enabled: tokio::sync::Semaphore::new(0),
@@ -188,6 +202,8 @@ impl RequestCancellation {
             cancel_wait_barrier: Mutex::new(None),
             #[cfg(test)]
             blocking_query_start: Mutex::new(None),
+            #[cfg(test)]
+            peer_close_fault: Mutex::new(None),
         }
     }
 
@@ -346,6 +362,15 @@ impl RequestCancellation {
     }
 
     #[cfg(test)]
+    async fn initial_clear_completed(&self) {
+        self.initial_clear_completed
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+    }
+
+    #[cfg(test)]
     async fn cancel_wait_is_enabled(&self) {
         self.cancel_wait_enabled.acquire().await.unwrap().forget();
     }
@@ -382,6 +407,29 @@ impl RequestCancellation {
     #[cfg(test)]
     pub(crate) fn take_blocking_query_start_barrier(&self) -> Option<BlockingQueryStartBarrier> {
         self.blocking_query_start.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    fn install_peer_close_fault(&self, fault: PeerCloseTestFault) {
+        *self.peer_close_fault.lock().unwrap() = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn take_peer_close_fault(&self, fault: PeerCloseTestFault) -> Option<std::io::Error> {
+        let mut installed = self.peer_close_fault.lock().unwrap();
+        if *installed != Some(fault) {
+            return None;
+        }
+        installed.take();
+        Some(std::io::Error::other(format!(
+            "injected {fault:?} peer-close observation failure"
+        )))
+    }
+
+    #[cfg(test)]
+    fn active_resources(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.active, state.targets.len())
     }
 }
 
@@ -954,6 +1002,24 @@ async fn clear_initial_writable(observer: &AsyncFd<OwnedFd>) -> std::io::Result<
     Ok(is_write_closed)
 }
 
+async fn clear_initial_writable_for_request(
+    observer: &AsyncFd<OwnedFd>,
+    cancellation: &RequestCancellation,
+) -> std::io::Result<bool> {
+    #[cfg(not(test))]
+    let _ = cancellation;
+    #[cfg(test)]
+    if let Some(error) = cancellation.take_peer_close_fault(PeerCloseTestFault::InitialClear) {
+        return Err(error);
+    }
+    let result = clear_initial_writable(observer).await;
+    #[cfg(test)]
+    if matches!(result, Ok(false)) {
+        cancellation.initial_clear_completed.add_permits(1);
+    }
+    result
+}
+
 #[cfg(test)]
 async fn observe_write_close(observer: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
     observe_write_close_with(observer, None).await
@@ -963,6 +1029,10 @@ async fn observe_write_close_for_request(
     observer: &AsyncFd<OwnedFd>,
     cancellation: &RequestCancellation,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = cancellation.take_peer_close_fault(PeerCloseTestFault::Observer) {
+        return Err(error);
+    }
     observe_write_close_with(observer, Some(cancellation)).await
 }
 
@@ -995,6 +1065,19 @@ async fn reader_has_pending_bytes(
     Ok(!reader.fill_buf().await?.is_empty())
 }
 
+async fn reader_has_pending_bytes_for_request(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    cancellation: &RequestCancellation,
+) -> std::io::Result<bool> {
+    #[cfg(not(test))]
+    let _ = cancellation;
+    #[cfg(test)]
+    if let Some(error) = cancellation.take_peer_close_fault(PeerCloseTestFault::Reader) {
+        return Err(error);
+    }
+    reader_has_pending_bytes(reader).await
+}
+
 async fn cancel_drop_and_drain_handler<F>(
     cancellation: &Arc<RequestCancellation>,
     handler: Pin<Box<F>>,
@@ -1006,6 +1089,18 @@ where
     drop(handler);
     cancellation.drained().await;
     None
+}
+
+async fn cancel_drop_and_drain_handler_after_error<F>(
+    cancellation: &Arc<RequestCancellation>,
+    handler: Pin<Box<F>>,
+    error: std::io::Error,
+) -> std::io::Result<Option<String>>
+where
+    F: Future<Output = Option<String>>,
+{
+    let _ = cancel_drop_and_drain_handler(cancellation, handler).await;
+    Err(error)
 }
 
 async fn handle_with_peer_close_cancellation(
@@ -1021,49 +1116,71 @@ async fn handle_with_peer_close_cancellation(
             .await);
     }
 
-    let observer = duplicate_write_close_observer(write.as_ref())?;
-    let initially_write_closed = clear_initial_writable(&observer).await?;
     let mut handler =
         Box::pin(REQUEST_CANCELLATION.scope(cancellation.clone(), handler.handle(line)));
+    let observer = match duplicate_write_close_observer(write.as_ref()) {
+        Ok(observer) => observer,
+        Err(error) => {
+            return cancel_drop_and_drain_handler_after_error(&cancellation, handler, error).await;
+        }
+    };
+    let initially_write_closed = tokio::select! {
+        biased;
+        response = handler.as_mut() => return Ok(response),
+        result = clear_initial_writable_for_request(&observer, &cancellation) => result,
+    };
+    let initially_write_closed = match initially_write_closed {
+        Ok(closed) => closed,
+        Err(error) => {
+            return cancel_drop_and_drain_handler_after_error(&cancellation, handler, error).await;
+        }
+    };
 
     if initially_write_closed {
         // A close may already be ready when the observer is registered. Late
         // bytes still outrank it: only read EOF plus WRITE_CLOSED is a full
         // peer close that may cancel the handler.
-        return Ok(tokio::select! {
+        let has_pending = tokio::select! {
             biased;
-            response = handler.as_mut() => response,
-            has_pending = reader_has_pending_bytes(reader) => {
-                if has_pending? {
-                    handler.await
-                } else {
-                    cancel_drop_and_drain_handler(&cancellation, handler).await
-                }
+            response = handler.as_mut() => return Ok(response),
+            has_pending = reader_has_pending_bytes_for_request(reader, &cancellation) => has_pending,
+        };
+        return match has_pending {
+            Ok(true) => Ok(handler.await),
+            Ok(false) => Ok(cancel_drop_and_drain_handler(&cancellation, handler).await),
+            Err(error) => {
+                cancel_drop_and_drain_handler_after_error(&cancellation, handler, error).await
             }
-        });
+        };
     }
 
     let first = tokio::select! {
         biased;
         response = handler.as_mut() => return Ok(response),
-        has_pending = reader_has_pending_bytes(reader) => Some(has_pending?),
-        closed = observe_write_close_for_request(&observer, &cancellation) => {
-            closed?;
-            None
-        },
+        has_pending = reader_has_pending_bytes_for_request(reader, &cancellation) => has_pending.map(Some),
+        closed = observe_write_close_for_request(&observer, &cancellation) => closed.map(|()| None),
+    };
+    let first = match first {
+        Ok(first) => first,
+        Err(error) => {
+            return cancel_drop_and_drain_handler_after_error(&cancellation, handler, error).await;
+        }
     };
 
-    Ok(match first {
-        Some(true) => handler.await,
+    match first {
+        Some(true) => Ok(handler.await),
         Some(false) => {
             // Read EOF can be a half-close. Keep the response path alive until
             // either the handler finishes or the write side also closes.
-            tokio::select! {
+            let closed = tokio::select! {
                 biased;
-                response = handler.as_mut() => response,
-                closed = observe_write_close_for_request(&observer, &cancellation) => {
-                    closed?;
-                    cancel_drop_and_drain_handler(&cancellation, handler).await
+                response = handler.as_mut() => return Ok(response),
+                closed = observe_write_close_for_request(&observer, &cancellation) => closed,
+            };
+            match closed {
+                Ok(()) => Ok(cancel_drop_and_drain_handler(&cancellation, handler).await),
+                Err(error) => {
+                    cancel_drop_and_drain_handler_after_error(&cancellation, handler, error).await
                 }
             }
         }
@@ -1071,19 +1188,20 @@ async fn handle_with_peer_close_cancellation(
             // WRITE_CLOSED alone is insufficient when a pipelined request may
             // already be readable. Preserve late bytes and let the handler
             // finish; cancel only when the non-consuming read observes EOF.
-            tokio::select! {
+            let has_pending = tokio::select! {
                 biased;
-                response = handler.as_mut() => response,
-                has_pending = reader_has_pending_bytes(reader) => {
-                    if has_pending? {
-                        handler.await
-                    } else {
-                        cancel_drop_and_drain_handler(&cancellation, handler).await
-                    }
+                response = handler.as_mut() => return Ok(response),
+                has_pending = reader_has_pending_bytes_for_request(reader, &cancellation) => has_pending,
+            };
+            match has_pending {
+                Ok(true) => Ok(handler.await),
+                Ok(false) => Ok(cancel_drop_and_drain_handler(&cancellation, handler).await),
+                Err(error) => {
+                    cancel_drop_and_drain_handler_after_error(&cancellation, handler, error).await
                 }
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1256,6 +1374,12 @@ mod tests {
         dropped: Arc<Notify>,
     }
 
+    struct FaultAfterAdmissionHandler {
+        fault: PeerCloseTestFault,
+        token_sender: Mutex<Option<tokio::sync::oneshot::Sender<Arc<RequestCancellation>>>>,
+        dropped: Arc<Notify>,
+    }
+
     struct SqliteTerminalGuard(Option<tokio::sync::oneshot::Sender<()>>);
 
     impl Drop for SqliteTerminalGuard {
@@ -1279,6 +1403,72 @@ mod tests {
     impl Drop for SyncReleaseOnDrop {
         fn drop(&mut self) {
             self.release();
+        }
+    }
+
+    async fn drain_until_non_close_readiness(
+        peer: &mut UnixStream,
+        cancellation: &RequestCancellation,
+        written: usize,
+        drained: &std::sync::atomic::AtomicUsize,
+    ) -> usize {
+        let mut total = 0_usize;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.non_close_readiness_processed() => return total,
+                result = peer.read(&mut buffer), if total < written => {
+                    match result {
+                        Ok(0) => panic!(
+                            "peer reached EOF before non-close writable readiness"
+                        ),
+                        Ok(read) => {
+                            total += read;
+                            assert!(
+                                total <= written,
+                                "peer drained more bytes than the carrier wrote"
+                            );
+                            drained.store(total, std::sync::atomic::Ordering::Release);
+                        }
+                        Err(error) => panic!(
+                            "draining peer before non-close writable readiness failed: {error}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn drain_until_initial_clear(
+        peer: &mut UnixStream,
+        cancellation: &RequestCancellation,
+        written: usize,
+        drained: &std::sync::atomic::AtomicUsize,
+    ) -> usize {
+        let mut total = 0_usize;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.initial_clear_completed() => return total,
+                result = peer.read(&mut buffer), if total < written => {
+                    match result {
+                        Ok(0) => panic!("peer reached EOF before initial writable clear"),
+                        Ok(read) => {
+                            total += read;
+                            assert!(
+                                total <= written,
+                                "peer drained more bytes than the carrier wrote"
+                            );
+                            drained.store(total, std::sync::atomic::Ordering::Release);
+                        }
+                        Err(error) => {
+                            panic!("draining peer before initial writable clear failed: {error}")
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1406,6 +1596,58 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl LineHandler for FaultAfterAdmissionHandler {
+        async fn handle(&self, _line: &str) -> Option<String> {
+            let _drop_guard = HandlerDropGuard(self.dropped.clone());
+            let cancellation = current_request_cancellation().unwrap();
+            cancellation.install_peer_close_fault(self.fault);
+            let _drain = cancellation
+                .admit()
+                .expect("fault carrier was cancelled before admission");
+            self.token_sender
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(cancellation)
+                .unwrap_or_else(|_| panic!("fault carrier token receiver dropped"));
+            std::future::pending().await
+        }
+    }
+
+    async fn assert_peer_close_error_cancels_and_drains(fault: PeerCloseTestFault) {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let (token_sender, token_receiver) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(Notify::new());
+        let dropped_wait = dropped.notified();
+        let handler: Arc<dyn LineHandler> = Arc::new(FaultAfterAdmissionHandler {
+            fault,
+            token_sender: Mutex::new(Some(token_sender)),
+            dropped: dropped.clone(),
+        });
+        let server_task = tokio::spawn(serve_one(server, handler));
+
+        peer.write_all(b"fault\n").await.unwrap();
+        peer.flush().await.unwrap();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), token_receiver)
+            .await
+            .expect("fault carrier handler was not polled")
+            .expect("fault carrier handler dropped its token sender");
+        let error = tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("peer-close observation error did not terminate serve_one")
+            .expect("serve_one task panicked")
+            .expect_err("injected peer-close observation error was ignored");
+        assert!(error.to_string().contains(&format!("{fault:?}")));
+        tokio::time::timeout(Duration::from_secs(1), dropped_wait)
+            .await
+            .expect("errored handler did not reach terminal drop");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(cancellation.active_resources(), (0, 0));
+        drop(peer);
+    }
+
+    #[async_trait::async_trait]
     impl LineHandler for DropAwareBlockingHandler {
         async fn handle(&self, _line: &str) -> Option<String> {
             let _drop_guard = HandlerDropGuard(self.dropped.clone());
@@ -1518,15 +1760,20 @@ mod tests {
             let cancellation = cancellation.clone();
             async move { observe_write_close_for_request(&observer, &cancellation).await }
         });
-        let mut drained = vec![0_u8; 64 * 1024];
-        let drained_len = peer.read(&mut drained).await.unwrap();
-        assert!(drained_len > 0);
-        tokio::time::timeout(
+        let drained_progress = std::sync::atomic::AtomicUsize::new(0);
+        let drained = tokio::time::timeout(
             Duration::from_secs(1),
-            cancellation.non_close_readiness_processed(),
+            drain_until_non_close_readiness(&mut peer, &cancellation, written, &drained_progress),
         )
         .await
-        .expect("observer did not process non-close writable readiness");
+        .unwrap_or_else(|_| {
+            panic!(
+                "non-close writable readiness timed out: written={written}, drained={}",
+                drained_progress.load(std::sync::atomic::Ordering::Acquire)
+            )
+        });
+        assert!(drained > 0);
+        assert!(drained <= written);
         assert!(
             !observer_task.is_finished(),
             "non-close writable readiness terminated the observer"
@@ -1587,14 +1834,20 @@ mod tests {
             }
         }
 
-        let mut drained = vec![0_u8; 64 * 1024];
-        assert!(peer.read(&mut drained).await.unwrap() > 0);
-        tokio::time::timeout(
+        let drained_progress = std::sync::atomic::AtomicUsize::new(0);
+        let drained = tokio::time::timeout(
             Duration::from_secs(1),
-            cancellation.non_close_readiness_processed(),
+            drain_until_non_close_readiness(&mut peer, &cancellation, written, &drained_progress),
         )
         .await
-        .expect("request observer did not rearm after non-close writable readiness");
+        .unwrap_or_else(|_| {
+            panic!(
+                "non-close writable readiness timed out: written={written}, drained={}",
+                drained_progress.load(std::sync::atomic::Ordering::Acquire)
+            )
+        });
+        assert!(drained > 0);
+        assert!(drained <= written);
         assert!(!cancellation.is_cancelled());
         assert!(!server_task.is_finished());
 
@@ -1621,6 +1874,101 @@ mod tests {
             .expect("serve_one task panicked")
             .expect("serve_one failed");
         drop(duplicate_writer);
+    }
+
+    #[tokio::test]
+    async fn serve_one_polls_handler_while_initial_writable_readiness_is_blocked() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut written = 0_usize;
+        tokio::time::timeout(Duration::from_secs(1), server.writable())
+            .await
+            .expect("server did not become writable within the setup bound")
+            .expect("server writable readiness failed");
+        loop {
+            match server.try_write(&chunk) {
+                Ok(count) => {
+                    assert!(count > 0, "send-buffer fill made zero-byte progress");
+                    written += count;
+                    assert!(
+                        written <= 64 * 1024 * 1024,
+                        "send buffer did not reach backpressure within the 64 MiB carrier bound"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        written > 0,
+                        "send-buffer fill observed WouldBlock before writing any bytes"
+                    );
+                    break;
+                }
+                Err(error) => panic!("filling server send buffer failed: {error}"),
+            }
+        }
+
+        let (token_sender, token_receiver) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(Notify::new());
+        let dropped_wait = dropped.notified();
+        let handler: Arc<dyn LineHandler> = Arc::new(CancellationReportingHandler {
+            token_sender: Mutex::new(Some(token_sender)),
+            dropped: dropped.clone(),
+        });
+        let mut server_task = tokio::spawn(serve_one(server, handler));
+        peer.write_all(b"blocked\n").await.unwrap();
+        peer.flush().await.unwrap();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                token = token_receiver => token.expect("handler dropped its cancellation token sender"),
+                result = &mut server_task => panic!("serve_one terminated before handler admission: {result:?}"),
+            }
+        })
+            .await
+            .expect("handler was not polled before initial writable readiness")
+            ;
+
+        let drained_progress = std::sync::atomic::AtomicUsize::new(0);
+        let drained = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_until_initial_clear(&mut peer, &cancellation, written, &drained_progress),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "initial readiness did not recover: written={written}, drained={}",
+                drained_progress.load(std::sync::atomic::Ordering::Acquire)
+            )
+        });
+        assert!(drained <= written);
+        assert!(!server_task.is_finished());
+        assert!(!cancellation.is_cancelled());
+
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .expect("full close did not cancel the admitted handler");
+        tokio::time::timeout(Duration::from_secs(1), dropped_wait)
+            .await
+            .expect("cancelled handler did not reach terminal drop");
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("serve_one did not terminate after handler cancellation")
+            .expect("serve_one task panicked")
+            .expect("serve_one failed");
+    }
+
+    #[tokio::test]
+    async fn initial_writable_error_cancels_and_drains_admitted_handler() {
+        assert_peer_close_error_cancels_and_drains(PeerCloseTestFault::InitialClear).await;
+    }
+
+    #[tokio::test]
+    async fn reader_error_cancels_and_drains_admitted_handler() {
+        assert_peer_close_error_cancels_and_drains(PeerCloseTestFault::Reader).await;
+    }
+
+    #[tokio::test]
+    async fn observer_error_cancels_and_drains_admitted_handler() {
+        assert_peer_close_error_cancels_and_drains(PeerCloseTestFault::Observer).await;
     }
 
     #[tokio::test]

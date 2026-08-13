@@ -100,6 +100,7 @@ impl FakeMcpDaemonGuard {
             loop {
                 match control.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_millis(100)))
                             .unwrap();
@@ -141,6 +142,7 @@ impl FakeMcpDaemonGuard {
             loop {
                 match data.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_millis(100)))
                             .unwrap();
