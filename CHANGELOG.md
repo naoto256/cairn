@@ -5,6 +5,60 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.3] — 2026-08-13
+
+> Compatibility: no source-code, wire-shape, or on-disk-format breaking
+> changes. Recovery hints that require extending the public `HintCode`
+> vocabulary remain deferred to 0.9.0.
+
+### Changed
+
+- **Structural lookup results carry more trustworthy completion evidence.**
+  Qualified names from `find_symbols` remain valid inputs to downstream
+  reference tools across language separator conventions, and fallback matching
+  no longer overstates completeness. Call-graph queries report partial results
+  when unresolved or omitted call sites remain.
+
+- **Symbol and snapshot selection better match user intent.** Exact fuzzy-name
+  matches rank ahead of partial matches with deterministic ties, while
+  tentative repository capture honors repository ignores,
+  `.git/info/exclude`, and the configured global Git excludes file.
+
+### Fixed
+
+- **Watcher startup and retry handoff no longer lose work.** Watchers are armed
+  before matcher warmup begins, matcher reload requests survive a concurrent
+  retry, non-UTF-8 watcher events fall back to conservative reconciliation,
+  and no-op reconciliations avoid redundant analyzer runs.
+
+- **Ruby LSP configuration changes invalidate Tier-3 analysis correctly.** The
+  analyzer hashes the actual Ruby LSP configuration files instead of treating
+  the generated configuration directory as a regular file.
+
+- **Stalled and abandoned LSP processes are contained and reaped.** Unix LSP
+  children run in verified owned process groups; termination signals the group
+  before reaping the leader. Cleanup continues after caller timeouts, prevents
+  premature same-key replacement, covers every pre-commit exit, and removes a
+  failed respawn before the next attempt.
+
+- **LSP watchdogs follow active work and remain generation-safe.** Stalled
+  definitions and writes are detected from the operation that owns the work,
+  while cleanup remains serialized and observable instead of poisoning the
+  pool or abandoning a child.
+
+- **Cancelled and superseded reference queries release SQLite work.** Daemon
+  disconnects, reader and write-observer failures, and superseding requests
+  cancel and drain admitted blocking work before returning. Reference lookup
+  avoids quadratic scans while preserving stable ranking and cancellation
+  semantics across Linux socket readiness edges.
+
+### PRs
+
+- Structural lookup trust and ranking: #310–#313
+- Matcher, Ruby LSP, and analyzer convergence: #314, #315, #318, #320
+- LSP watchdog and process lifecycle hardening: #316, #317, #321
+- Query cancellation and reference lookup scaling: #319
+
 ## [0.8.2] — 2026-07-30
 
 > Compatibility: no source-code or wire-shape breaking changes. The existing
