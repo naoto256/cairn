@@ -17,6 +17,8 @@ use std::future::{Future, ready};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -24,9 +26,14 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
+#[cfg(test)]
+use tokio::sync::watch;
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::info;
+
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, getpgid, kill_process_group};
 
 use super::error::{Error, Result};
 use super::reader::{PendingRequest, ProgressState, SharedWriter, WriterSlot, reader_loop};
@@ -36,9 +43,6 @@ use super::types::{Location, LocationLink, Position, Url};
 // Default per-request timeout (also bounds the `--version`
 // availability probe in `start`).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-// Shutdown is short by design: after the graceful request times out,
-// the client still sends `exit` and lets process cleanup finish.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // Wait for an LSP server's initial index chatter to quiet down before
 // treating startup as ready; this avoids racing early definition calls.
 const WORKSPACE_LOAD_QUIET_PERIOD: Duration = Duration::from_secs(5);
@@ -55,14 +59,35 @@ const STDERR_HEAD_LINES: usize = 5;
 const STDERR_TAIL_LINES: usize = 5;
 const STDERR_OMISSION_MARKER: &str = " ... ";
 
+/// The leader child plus the immutable containment identity validated before
+/// the process is published to the client. On Unix every production LSP spawn
+/// must own a process group whose id is exactly the leader pid. Other
+/// platforms retain the existing leader-only contract.
+struct OwnedLspChild {
+    child: Child,
+    #[cfg(unix)]
+    pgid: Pid,
+    #[cfg(test)]
+    leader_waits: Arc<AtomicUsize>,
+}
+
+impl OwnedLspChild {
+    async fn wait_leader(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let result = self.child.wait().await;
+        #[cfg(test)]
+        self.leader_waits.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+}
+
 /// Handle to one LSP server subprocess speaking JSON-RPC over
 /// stdio.
 ///
 /// Shared state lives behind `Arc`s so the background reader task
 /// and `LspProcessControl` clones stay valid independently of this
 /// handle. `shutdown(self)` is the graceful exit. Dropping the
-/// client alone does not kill the child: the `Child` sits behind a
-/// shared `Arc<Mutex<..>>`, so `kill_on_drop(true)` fires only
+/// client alone does not kill the child: the owned child/group sits behind a
+/// shared `Arc<Mutex<..>>`, so leader `kill_on_drop(true)` fires only
 /// when the last owner (client or `LspProcessControl` clone)
 /// drops it, and that path skips the `shutdown`/`exit` handshake.
 pub struct LspClient {
@@ -92,13 +117,19 @@ pub struct LspClient {
     // refused with `PoolStopped`.
     stopping: Arc<AtomicBool>,
     writer: WriterSlot,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<OwnedLspChild>>>,
     // In-flight requests by id and owning transport generation. A
     // reader failure drains only its own generation; explicit
     // process termination drains every entry.
     pub(super) pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     progress: Arc<ProgressState>,
     stderr_tail: Arc<Mutex<StderrTail>>,
+    #[cfg(test)]
+    cleanup_pause: Arc<StdMutex<Option<TestCleanupPause>>>,
+    #[cfg(test)]
+    cleanup_runs: Arc<AtomicUsize>,
+    #[cfg(test)]
+    leader_waits: Arc<AtomicUsize>,
 }
 
 /// Cloneable control-plane handle for one LSP child process.
@@ -111,16 +142,51 @@ pub(crate) struct LspProcessControl {
     current_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     writer: WriterSlot,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<OwnedLspChild>>>,
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    #[cfg(test)]
+    cleanup_pause: Arc<StdMutex<Option<TestCleanupPause>>>,
+    #[cfg(test)]
+    cleanup_runs: Arc<AtomicUsize>,
+    #[cfg(test)]
+    leader_waits: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCleanupPause {
+    entered: watch::Sender<bool>,
+    release: watch::Receiver<bool>,
 }
 
 impl LspProcessControl {
+    #[cfg(test)]
+    pub(super) fn leader_wait_count_for_test(&self) -> usize {
+        self.leader_waits.load(Ordering::SeqCst)
+    }
+
     /// Permanently prevent this client from spawning a replacement child, then
     /// terminate and reap the current child without taking the pool entry's
     /// data-plane mutex.
     pub(crate) async fn stop_and_terminate(&self) -> Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            self.cleanup_runs.fetch_add(1, Ordering::SeqCst);
+            let pause = self
+                .cleanup_pause
+                .lock()
+                .expect("test cleanup-pause mutex poisoned")
+                .clone();
+            if let Some(mut pause) = pause {
+                pause.entered.send_replace(true);
+                while !*pause.release.borrow() {
+                    if pause.release.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
         self.force_terminate().await
     }
 
@@ -141,7 +207,7 @@ impl LspProcessControl {
 
     async fn force_terminate_locked(
         &self,
-        child_slot: &mut Option<Child>,
+        child_slot: &mut Option<OwnedLspChild>,
         expected_generation: Option<u64>,
     ) -> Result<bool> {
         match expected_generation {
@@ -157,12 +223,7 @@ impl LspProcessControl {
             None => self.current_generation.store(0, Ordering::SeqCst),
         }
         let termination_err = if let Some(child) = child_slot.as_mut() {
-            let _ = child.kill().await;
-            child
-                .wait()
-                .await
-                .err()
-                .map(|err| Error::ChildTerminationFailed(format!("wait() after kill: {err}")))
+            terminate_owned_child(child).await.err()
         } else {
             None
         };
@@ -219,8 +280,7 @@ impl LspClient {
             request_timeout,
             MAX_RESTARTS,
         );
-        client.spawn_process().await?;
-        Ok(client)
+        client.start_standalone().await
     }
 
     /// Start an LSP subprocess after the caller has performed any
@@ -244,8 +304,7 @@ impl LspClient {
             initialization_options,
             request_timeout,
         );
-        client.start_process().await?;
-        Ok(client)
+        client.start_standalone().await
     }
 
     pub(super) fn configured(
@@ -269,6 +328,22 @@ impl LspClient {
 
     pub(super) async fn start_process(&self) -> Result<()> {
         self.spawn_process().await
+    }
+
+    /// Legacy non-pool constructors have no entry guard, so they retain a
+    /// local cleanup wrapper. The production pool calls `start_process` only
+    /// after `install_and_arm` has made cleanup non-cancellable.
+    async fn start_standalone(self) -> Result<Self> {
+        if let Err(original) = self.start_process().await {
+            return Err(match self.force_terminate().await {
+                Ok(()) => original,
+                Err(cleanup) => Error::OperationWithCleanupFailure {
+                    original: Box::new(original),
+                    cleanup: Box::new(cleanup),
+                },
+            });
+        }
+        Ok(self)
     }
 
     fn new(
@@ -298,7 +373,32 @@ impl LspClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             progress: Arc::new(ProgressState::default()),
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
+            #[cfg(test)]
+            cleanup_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            cleanup_runs: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            leader_waits: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_cleanup_for_test(&self) -> (watch::Receiver<bool>, watch::Sender<bool>) {
+        let (entered_sender, entered_receiver) = watch::channel(false);
+        let (release_sender, release_receiver) = watch::channel(false);
+        *self
+            .cleanup_pause
+            .lock()
+            .expect("test cleanup-pause mutex poisoned") = Some(TestCleanupPause {
+            entered: entered_sender,
+            release: release_receiver,
+        });
+        (entered_receiver, release_sender)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_run_count_for_test(&self) -> usize {
+        self.cleanup_runs.load(Ordering::SeqCst)
     }
 
     /// Test-only constructor over in-memory pipes: no child process
@@ -347,31 +447,37 @@ impl LspClient {
         // instances per key" invariant callers rely on.
         self.force_terminate().await?;
 
-        // `kill_on_drop(true)` is the last-resort backstop: an
-        // unexpected drop of the `LspClient` (panic in caller,
-        // future cancellation) still SIGKILLs the child.
-        // `force_terminate` is preferred on every explicit failure
-        // path because it also reaps the child via `wait()`.
-        let mut child = Command::new(binary_path)
+        // `kill_on_drop(true)` is only a leader-level last resort. The pool's
+        // armed cleanup task is authoritative because it signals the verified
+        // group and reaps the leader even after its first observer times out.
+        let mut command = Command::new(binary_path);
+        command
             .args(&self.args)
             .envs(self.env.iter().map(|(key, value)| (key, value)))
             .current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(Error::Spawn)?;
-        let stdin = match child.stdin.take() {
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().map_err(Error::Spawn)?;
+        let mut child = own_spawned_child(
+            child,
+            #[cfg(test)]
+            Arc::clone(&self.leader_waits),
+        )
+        .await?;
+        let stdin = match child.child.stdin.take() {
             Some(stdin) => stdin,
             None => return Err(reap_local_child(&mut child, "missing child stdin").await),
         };
-        let stdout = match child.stdout.take() {
+        let stdout = match child.child.stdout.take() {
             Some(stdout) => stdout,
             None => return Err(reap_local_child(&mut child, "missing child stdout").await),
         };
         self.stderr_tail.lock().await.clear();
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.child.stderr.take() {
             tokio::spawn(capture_stderr(stderr, Arc::clone(&self.stderr_tail)));
         }
 
@@ -388,27 +494,15 @@ impl LspClient {
             *child_slot = Some(child);
         }
         self.install_transport(stdout, stdin).await;
-        // `install_transport` publishes a new generation and writer. If a
-        // stop raced in after the child was published, undo that via
-        // `force_terminate` (idempotent) and report `PoolStopped`.
+        // Initial pool installation is protected by its uncommitted-exit
+        // guard. A committed client's later respawn failure is cleaned up at
+        // the `ensure_running` boundary. The stopping race stays raw because
+        // the installed final-control cleanup owns it.
         if self.stopping.load(Ordering::SeqCst) {
-            return Err(match self.force_terminate().await {
-                Ok(()) => Error::PoolStopped,
-                Err(cleanup) => Error::OperationWithCleanupFailure {
-                    original: Box::new(Error::PoolStopped),
-                    cleanup: Box::new(cleanup),
-                },
-            });
+            return Err(Error::PoolStopped);
         }
         if let Err(err) = self.initialize().await {
-            let contextual = self.with_stderr_context(err).await;
-            return Err(match self.force_terminate().await {
-                Ok(()) => contextual,
-                Err(cleanup_err) => Error::OperationWithCleanupFailure {
-                    original: Box::new(contextual),
-                    cleanup: Box::new(cleanup_err),
-                },
-            });
+            return Err(self.with_stderr_context(err).await);
         }
         Ok(())
     }
@@ -452,6 +546,12 @@ impl LspClient {
             writer: Arc::clone(&self.writer),
             child: Arc::clone(&self.child),
             pending: Arc::clone(&self.pending),
+            #[cfg(test)]
+            cleanup_pause: Arc::clone(&self.cleanup_pause),
+            #[cfg(test)]
+            cleanup_runs: Arc::clone(&self.cleanup_runs),
+            #[cfg(test)]
+            leader_waits: Arc::clone(&self.leader_waits),
         }
     }
 
@@ -664,10 +764,10 @@ impl LspClient {
         .await
     }
 
-    /// Gracefully stop the server. Always terminates and reaps the
-    /// child before returning: after a bounded graceful window
-    /// (`SHUTDOWN_TIMEOUT`), any remaining child is force-terminated
-    /// via [`Self::force_terminate`]. Graceful protocol errors and
+    /// Gracefully ask the server to stop, then terminate the verified process
+    /// group and reap its leader exactly once. Signalling precedes `wait()` so
+    /// a reaped leader's numeric PGID cannot be reused before containment.
+    /// Graceful protocol errors and
     /// termination-unproven errors are surfaced *distinctly*:
     ///
     /// - Both clean → `Ok(())`
@@ -691,47 +791,7 @@ impl LspClient {
                 Err(e) => protocol_err = Some(e),
             }
         }
-        // Give the child a bounded grace period to exit on its own,
-        // then delegate to `force_terminate` for any remaining
-        // cleanup. If the graceful wait succeeds we drop the child
-        // handle immediately so `force_terminate` has nothing to
-        // do; if it errored or timed out we let `force_terminate`
-        // handle kill + wait uniformly.
-        let graceful_reaped = {
-            let mut child_slot = self.child.lock().await;
-            match child_slot.as_mut() {
-                None => true,
-                Some(child) => match timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
-                    Ok(Ok(_)) => {
-                        *child_slot = None;
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        if protocol_err.is_none() {
-                            protocol_err = Some(Error::Protocol(format!("wait failed: {e}")));
-                        }
-                        false
-                    }
-                    Err(_) => false,
-                },
-            }
-        };
-        let cleanup = if graceful_reaped {
-            // Still clear liveness/writer/pending so the state is
-            // consistent even without a live child.
-            self.current_generation.store(0, Ordering::SeqCst);
-            {
-                let mut writer = self.writer.lock().await;
-                *writer = None;
-            }
-            {
-                let mut pending = self.pending.lock().await;
-                pending.clear();
-            }
-            Ok(())
-        } else {
-            self.force_terminate().await
-        };
+        let cleanup = self.force_terminate().await;
         match (protocol_err, cleanup) {
             (None, Ok(())) => Ok(()),
             (Some(e), Ok(())) => Err(e),
@@ -760,7 +820,17 @@ impl LspClient {
         if attempt > self.max_restarts {
             return Err(Error::ServerExited(None.into()));
         }
-        self.spawn_process().await
+        match self.spawn_process().await {
+            Ok(()) => Ok(()),
+            Err(Error::PoolStopped) => Err(Error::PoolStopped),
+            Err(original) => match self.force_terminate().await {
+                Ok(()) => Err(original),
+                Err(cleanup) => Err(Error::OperationWithCleanupFailure {
+                    original: Box::new(original),
+                    cleanup: Box::new(cleanup),
+                }),
+            },
+        }
     }
 
     /// Send a JSON-RPC request and await its matching response.
@@ -966,20 +1036,143 @@ fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
     })
 }
 
-/// Kill + reap a `Child` that was just spawned but never handed
-/// off to `self.child`. Used by the missing-stdio paths: the local
-/// `child` isn't visible to `force_terminate` yet, so we do the
-/// same kill + wait shape inline and surface both the handshake
-/// error and any termination-unproven signal.
-async fn reap_local_child(child: &mut Child, original: &str) -> Error {
-    let _ = child.kill().await;
-    match child.wait().await {
-        Ok(_) => Error::Handshake(original.into()),
-        Err(e) => Error::OperationWithCleanupFailure {
+#[cfg(unix)]
+async fn own_spawned_child(
+    mut child: Child,
+    #[cfg(test)] leader_waits: Arc<AtomicUsize>,
+) -> Result<OwnedLspChild> {
+    let Some(raw_pid) = child.id() else {
+        return Err(
+            reject_unverified_child(&mut child, "spawned LSP leader has no process id").await,
+        );
+    };
+    let Some(pid) = Pid::from_raw(raw_pid as i32) else {
+        return Err(reject_unverified_child(
+            &mut child,
+            "spawned LSP leader has an invalid process id",
+        )
+        .await);
+    };
+    match validate_process_group_identity(pid, getpgid(Some(pid))) {
+        Ok(pgid) => Ok(OwnedLspChild {
+            child,
+            pgid,
+            #[cfg(test)]
+            leader_waits,
+        }),
+        Err(reason) => Err(reject_unverified_child(&mut child, &reason).await),
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn validate_process_group_identity(
+    leader: Pid,
+    observed: rustix::io::Result<Pid>,
+) -> std::result::Result<Pid, String> {
+    match observed {
+        Ok(pgid) if pgid == leader => Ok(pgid),
+        Ok(pgid) => Err(format!(
+            "spawned LSP process-group mismatch: leader={}, observed={}",
+            leader.as_raw_nonzero(),
+            pgid.as_raw_nonzero()
+        )),
+        Err(error) => Err(format!(
+            "could not validate spawned LSP process group for leader {}: {error}",
+            leader.as_raw_nonzero()
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+async fn own_spawned_child(
+    child: Child,
+    #[cfg(test)] leader_waits: Arc<AtomicUsize>,
+) -> Result<OwnedLspChild> {
+    Ok(OwnedLspChild {
+        child,
+        #[cfg(test)]
+        leader_waits,
+    })
+}
+
+/// A process-group identity failure happens before publication, so only the
+/// local leader handle is safe to operate on. Reap the leader but retain the
+/// containment failure as termination-unproven: a mismatched group must never
+/// be signalled by inference or followed by a replacement spawn.
+#[cfg(unix)]
+pub(super) async fn reject_unverified_child(child: &mut Child, reason: &str) -> Error {
+    let kill_error = child.kill().await.err();
+    let wait_error = child.wait().await.err();
+    let mut facts = vec![reason.to_string()];
+    if let Some(error) = kill_error {
+        facts.push(format!("leader kill after validation failure: {error}"));
+    }
+    if let Some(error) = wait_error {
+        facts.push(format!("leader wait after validation failure: {error}"));
+    }
+    Error::OperationWithCleanupFailure {
+        original: Box::new(Error::Handshake(reason.into())),
+        cleanup: Box::new(Error::ChildTerminationFailed(facts.join("; "))),
+    }
+}
+
+/// Signal the immutable, spawn-validated Unix process group before reaping the
+/// leader exactly once. Group-signal failures are kept even when leader wait
+/// succeeds because descendant containment is then unproven. ESRCH means the
+/// group is already absent, but never substitutes for leader `wait()`.
+async fn terminate_owned_child(child: &mut OwnedLspChild) -> Result<()> {
+    #[cfg(unix)]
+    let group_error = classify_group_signal(
+        child.pgid,
+        kill_process_group(child.pgid, Signal::KILL),
+        "SIGKILL process group",
+    );
+
+    #[cfg(not(unix))]
+    let group_error = {
+        // Non-Unix retains the existing leader-only behavior. This is not a
+        // tree-containment claim; Windows Job Object support is separate work.
+        let _ = child.child.kill().await;
+        None::<String>
+    };
+
+    let wait_error = child.wait_leader().await.err();
+    match (group_error, wait_error) {
+        (None, None) => Ok(()),
+        (group, wait) => {
+            let mut facts = Vec::new();
+            if let Some(error) = group {
+                facts.push(error);
+            }
+            if let Some(error) = wait {
+                facts.push(format!("leader wait after kill: {error}"));
+            }
+            Err(Error::ChildTerminationFailed(facts.join("; ")))
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn classify_group_signal(
+    pgid: Pid,
+    result: rustix::io::Result<()>,
+    stage: &str,
+) -> Option<String> {
+    match result {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => None,
+        Err(error) => Some(format!("{stage} {}: {error}", pgid.as_raw_nonzero())),
+    }
+}
+
+/// Kill + reap a child that was validated but never handed off to
+/// `self.child`. Missing-stdio and stop-before-publication paths use the same
+/// containment operation as installed children.
+async fn reap_local_child(child: &mut OwnedLspChild, original: &str) -> Error {
+    match terminate_owned_child(child).await {
+        Ok(()) => Error::Handshake(original.into()),
+        Err(cleanup) => Error::OperationWithCleanupFailure {
             original: Box::new(Error::Handshake(original.into())),
-            cleanup: Box::new(Error::ChildTerminationFailed(format!(
-                "wait() after kill: {e}"
-            ))),
+            cleanup: Box::new(cleanup),
         },
     }
 }
@@ -1008,6 +1201,10 @@ pub(super) async fn probe_binary(
     args: &[&str],
     timeout_duration: Duration,
 ) -> Result<()> {
+    // Spawn inventory: availability probes are intentionally leader-only.
+    // They execute a bounded `--version`-style command, never become a Ready
+    // LSP transport, and are reaped locally. Only the long-lived server spawn
+    // in `spawn_process` receives owned process-group containment.
     let mut command = Command::new(binary_path);
     command
         .args(args)
