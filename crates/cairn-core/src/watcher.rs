@@ -21,7 +21,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use cairn_watch::{WatchBackend, WatchEvent, WatcherHandle, watch_repo_with_backend};
+use cairn_watch::{
+    WatchBackend, WatchEvent, WatcherHandle, watch_repo_with_backend,
+    watch_repo_with_startup_deferred_matcher,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -62,6 +65,10 @@ pub struct WatchManager {
     fail_watcher_start: bool,
     #[cfg(test)]
     dropped_watchers: Arc<AtomicUsize>,
+    #[cfg(test)]
+    startup_deferred_arms: Arc<AtomicUsize>,
+    #[cfg(test)]
+    dynamic_eager_arms: Arc<AtomicUsize>,
     /// Monotonic arm-id source; ids are unique within this watcher
     /// registry and never reused (see [`Self::allocate_arm_id`]).
     next_arm_id: AtomicU64,
@@ -182,6 +189,10 @@ impl WatchManager {
             fail_watcher_start: false,
             #[cfg(test)]
             dropped_watchers: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            startup_deferred_arms: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            dynamic_eager_arms: Arc::new(AtomicUsize::new(0)),
             next_arm_id: AtomicU64::new(1),
             watchers: Mutex::new(HashMap::new()),
         }
@@ -196,6 +207,8 @@ impl WatchManager {
             reconcile: None,
             fail_watcher_start: true,
             dropped_watchers: Arc::new(AtomicUsize::new(0)),
+            startup_deferred_arms: Arc::new(AtomicUsize::new(0)),
+            dynamic_eager_arms: Arc::new(AtomicUsize::new(0)),
             next_arm_id: AtomicU64::new(1),
             watchers: Mutex::new(HashMap::new()),
         }
@@ -218,9 +231,10 @@ impl WatchManager {
             if repo.removal_request.is_some() {
                 continue;
             }
-            match self
-                .arm_repository_if_absent(repo.repo_hash.clone(), PathBuf::from(repo.root_path))
-            {
+            match self.arm_startup_repository_if_absent(
+                repo.repo_hash.clone(),
+                PathBuf::from(repo.root_path),
+            ) {
                 Ok(_) => {
                     self.persist_watcher_state(&repo.repo_hash, WatcherState::Active, None)?;
                     report.armed.push(repo.repo_hash)
@@ -255,6 +269,29 @@ impl WatchManager {
         repo_hash: String,
         root_path: PathBuf,
     ) -> Result<WatchArmReceipt> {
+        self.arm_repository_if_absent_with_mode(repo_hash, root_path, false)
+    }
+
+    fn arm_startup_repository_if_absent(
+        &self,
+        repo_hash: String,
+        root_path: PathBuf,
+    ) -> Result<WatchArmReceipt> {
+        self.arm_repository_if_absent_with_mode(repo_hash, root_path, true)
+    }
+
+    fn arm_repository_if_absent_with_mode(
+        &self,
+        repo_hash: String,
+        root_path: PathBuf,
+        defer_matcher: bool,
+    ) -> Result<WatchArmReceipt> {
+        #[cfg(test)]
+        if defer_matcher {
+            self.startup_deferred_arms.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.dynamic_eager_arms.fetch_add(1, Ordering::SeqCst);
+        }
         let mut watchers = self.lock_recovering();
         if let Some(existing) = watchers.get(&repo_hash) {
             return Ok(WatchArmReceipt {
@@ -264,7 +301,7 @@ impl WatchManager {
             });
         }
         let arm_id = self.allocate_arm_id()?;
-        let watcher = self.start_watcher(&repo_hash, &root_path, arm_id)?;
+        let watcher = self.start_watcher(&repo_hash, &root_path, arm_id, defer_matcher)?;
         watchers.insert(repo_hash.clone(), watcher);
         drop(watchers);
         info!(
@@ -303,9 +340,11 @@ impl WatchManager {
     /// drop the existing one — an operator-observable failed
     /// state is preferable to a silently blinded repo.
     pub fn watch_repository(&self, repo_hash: String, root_path: PathBuf) -> Result<()> {
+        #[cfg(test)]
+        self.dynamic_eager_arms.fetch_add(1, Ordering::SeqCst);
         let arm_id = self.allocate_arm_id()?;
         let watcher = self
-            .start_watcher(&repo_hash, &root_path, arm_id)
+            .start_watcher(&repo_hash, &root_path, arm_id, false)
             .inspect_err(|err| {
                 self.record_watcher_failed(&repo_hash, &err.to_string());
             })?;
@@ -331,6 +370,7 @@ impl WatchManager {
         repo_hash: &str,
         root_path: &std::path::Path,
         arm_id: u64,
+        defer_matcher: bool,
     ) -> Result<RepoWatcher> {
         #[cfg(test)]
         if self.fail_watcher_start {
@@ -340,10 +380,12 @@ impl WatchManager {
         }
 
         let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
-        let handle =
-            watch_repo_with_backend(root_path, WATCH_DEBOUNCE, tx, self.backend).map_err(|e| {
-                Error::InvalidArgument(format!("watch_repo {}: {e}", root_path.display()))
-            })?;
+        let handle = if defer_matcher {
+            watch_repo_with_startup_deferred_matcher(root_path, WATCH_DEBOUNCE, tx, self.backend)
+        } else {
+            watch_repo_with_backend(root_path, WATCH_DEBOUNCE, tx, self.backend)
+        }
+        .map_err(|e| Error::InvalidArgument(format!("watch_repo {}: {e}", root_path.display())))?;
         let task = tokio::spawn(dispatch_events(
             self.reconcile.clone(),
             repo_hash.to_string(),
@@ -764,6 +806,111 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("applied generation did not reach {expected}"));
+    }
+
+    async fn wait_for_new_desired(cas: &CasDataDir, repo_hash: &str, previous: i64) -> i64 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let index = cas_registry::open(&cas.index_db_path()).unwrap();
+                let state = cas_registry::get_reconcile_state(&index, repo_hash)
+                    .unwrap()
+                    .unwrap();
+                if state.desired_generation > previous {
+                    return state.desired_generation;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("desired generation did not advance past {previous}"))
+    }
+
+    async fn wait_for_clean_terminal_floor(
+        cas: &CasDataDir,
+        repo_hash: &str,
+        desired_floor: i64,
+    ) -> cas_registry::RepoReconcileState {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let index = cas_registry::open(&cas.index_db_path()).unwrap();
+                let state = cas_registry::get_reconcile_state(&index, repo_hash)
+                    .unwrap()
+                    .unwrap();
+                if state.applied_generation >= desired_floor
+                    && state.attempt_generation.is_none()
+                    && state.next_retry_at_ns.is_none()
+                    && state.last_error.is_none()
+                {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("reconcile did not settle past floor {desired_floor}"))
+    }
+
+    fn fsync_fixture_file(path: &std::path::Path, contents: &[u8]) {
+        use std::io::Write;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.write_all(contents).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+    }
+
+    fn selected_manifest_entries(
+        cas: &CasDataDir,
+        repo_hash: &str,
+        root: &std::path::Path,
+    ) -> (ManifestId, Vec<crate::manifest::ManifestEntry>) {
+        let conn = cas_store::open_existing(&cas.store_db_path(repo_hash)).unwrap();
+        let manifest_id = crate::anchor::resolve_tentative_manifest_id(&conn, root)
+            .unwrap()
+            .expect("selected tentative manifest");
+        let entries = crate::manifest::get_entries(&conn, manifest_id).unwrap();
+        (manifest_id, entries)
+    }
+
+    fn selected_target_surfaces(
+        cas: &CasDataDir,
+        repo_hash: &str,
+        manifest_id: ManifestId,
+        target_path: &str,
+        target_sha: &str,
+    ) -> (i64, i64, i64) {
+        let conn = cas_store::open_existing(&cas.store_db_path(repo_hash)).unwrap();
+        let relation = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manifest_entries
+                 WHERE manifest_id = ?1 AND path = ?2 AND blob_sha = ?3",
+                rusqlite::params![manifest_id.0, target_path, target_sha],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blobs = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_sha = ?1",
+                [target_sha],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let refs = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refs WHERE blob_sha = ?1",
+                [target_sha],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (relation, blobs, refs)
     }
 
     async fn wait_for_precondition_failure(cas: &CasDataDir, repo_hash: &str) {
@@ -1835,6 +1982,50 @@ mod tests {
         reconcile.shutdown(Duration::from_secs(1)).await;
     }
 
+    #[tokio::test]
+    async fn start_registered_publishes_many_deferred_watchers_and_keeps_dynamic_eager() {
+        const REPOS: usize = 36;
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let mut roots = Vec::with_capacity(REPOS + 1);
+        {
+            let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            for ordinal in 0..REPOS {
+                let root = tempfile::tempdir().unwrap();
+                let repo_hash = format!("startup-{ordinal:02}");
+                cas_registry::upsert_repository(&tx, &repo_hash, &root.path().to_string_lossy(), 1)
+                    .unwrap();
+                roots.push(root);
+            }
+            tx.commit().unwrap();
+        }
+        let manager = WatchManager::with_backend(cas.clone(), WatchBackend::Poll);
+
+        let report = manager.start_registered().unwrap();
+
+        assert_eq!(report.armed.len(), REPOS);
+        assert!(report.failed.is_empty());
+        assert_eq!(manager.lock_recovering().len(), REPOS);
+        assert_eq!(
+            manager.startup_deferred_arms.load(Ordering::SeqCst),
+            REPOS,
+            "every startup arm must use the deferred matcher path"
+        );
+        assert_eq!(manager.dynamic_eager_arms.load(Ordering::SeqCst), 0);
+        let dynamic_root = tempfile::tempdir().unwrap();
+        manager
+            .watch_repository("dynamic".into(), dynamic_root.path().to_path_buf())
+            .unwrap();
+        assert_eq!(manager.dynamic_eager_arms.load(Ordering::SeqCst), 1);
+        assert!(manager.is_watching_repository("dynamic"));
+        roots.push(dynamic_root);
+        let dropped = manager.dropped_watchers.clone();
+        drop(manager);
+        assert_eq!(dropped.load(Ordering::SeqCst), REPOS + 1);
+    }
+
     #[test]
     fn watcher_registry_recovers_after_mutex_poison() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1925,6 +2116,233 @@ mod tests {
 
         manager.unwatch_repository("h");
         reconcile.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn fail_open_ignore_edges_publish_only_the_latest_scan_policy() {
+        const REPO_HASH: &str = "durable-ignore-policy";
+        const TARGET_PATH: &str = "generated/unique_target.rs";
+        const BASE_PATH: &str = "src/base.rs";
+        let target_contents = b"pub fn durable_target() {}\n\
+                                pub fn durable_caller() { durable_target(); }\n";
+        let target_sha = crate::cas::git_blob_sha(target_contents);
+
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+        run_git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run_git(repo.path(), &["config", "user.name", "Cairn Test"]);
+        write_fixture_file(repo.path(), BASE_PATH, "pub fn baseline() {}\n");
+        run_git(repo.path(), &["add", "."]);
+        run_git(
+            repo.path(),
+            &["-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"],
+        );
+
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        seed_repo(&cas, REPO_HASH, repo.path());
+        cas_store::open(&cas.store_db_path(REPO_HASH)).unwrap();
+        let jobs = JobManager::new(cas.clone());
+        let reconcile = RepoReconcileManager::new(cas.clone(), Some(jobs.clone()));
+
+        reconcile
+            .request_dirty_by_repo_hash(REPO_HASH.into(), ReconcileTrigger::WatchEvent)
+            .await
+            .unwrap();
+        let baseline = wait_for_clean_terminal_floor(&cas, REPO_HASH, 1).await;
+        assert_eq!(baseline.desired_generation, 1);
+        assert_eq!(baseline.applied_generation, 1);
+        let (baseline_manifest, baseline_entries) =
+            selected_manifest_entries(&cas, REPO_HASH, repo.path());
+        assert_eq!(
+            baseline_entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![BASE_PATH]
+        );
+        assert_eq!(
+            selected_target_surfaces(&cas, REPO_HASH, baseline_manifest, TARGET_PATH, &target_sha,),
+            (0, 0, 0),
+            "fresh target content must be absent from every selected/index surface"
+        );
+
+        let ignore_path = repo.path().join(".gitignore");
+        let target_path = repo.path().join(TARGET_PATH);
+        fsync_fixture_file(&ignore_path, b"generated/\n");
+        fsync_fixture_file(&target_path, target_contents);
+        let scan = cairn_watch::scan::walk_repo(repo.path());
+        assert!(scan.errors.is_empty());
+        assert!(
+            !scan
+                .into_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == target_path),
+            "the production scanner must observe the new ignore policy first"
+        );
+
+        let (tx, rx) = mpsc::channel(WATCH_EDGE_CAPACITY);
+        let dispatch = tokio::spawn(dispatch_events(
+            Some(reconcile.clone()),
+            REPO_HASH.into(),
+            rx,
+        ));
+        tx.send(WatchEvent::File {
+            path: ignore_path.clone(),
+            change: cairn_watch::FileChange::Touched,
+        })
+        .await
+        .unwrap();
+        tx.send(WatchEvent::File {
+            path: target_path.clone(),
+            change: cairn_watch::FileChange::Touched,
+        })
+        .await
+        .unwrap();
+        let ignored_floor = wait_for_new_desired(&cas, REPO_HASH, 1).await;
+        let ignored_terminal = wait_for_clean_terminal_floor(&cas, REPO_HASH, ignored_floor).await;
+        let (ignored_manifest, ignored_entries) =
+            selected_manifest_entries(&cas, REPO_HASH, repo.path());
+        assert_eq!(ignored_terminal.applied_generation, ignored_floor);
+        assert_eq!(ignored_manifest, baseline_manifest);
+        assert_eq!(
+            ignored_entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![BASE_PATH],
+            ".gitignore is a control file, not a selected source; the ignored target adds nothing"
+        );
+        assert_eq!(
+            selected_target_surfaces(&cas, REPO_HASH, ignored_manifest, TARGET_PATH, &target_sha,),
+            (0, 0, 0)
+        );
+
+        tx.send(WatchEvent::Rescan {
+            reason: cairn_watch::RescanReason::MatcherRecovered,
+        })
+        .await
+        .unwrap();
+        let recovery_floor = wait_for_new_desired(&cas, REPO_HASH, ignored_floor).await;
+        let recovery_terminal =
+            wait_for_clean_terminal_floor(&cas, REPO_HASH, recovery_floor).await;
+        let (recovery_manifest, recovery_entries) =
+            selected_manifest_entries(&cas, REPO_HASH, repo.path());
+        assert!(recovery_terminal.applied_generation >= recovery_floor);
+        assert_eq!(recovery_manifest, ignored_manifest);
+        assert_eq!(recovery_entries, ignored_entries);
+        assert_eq!(
+            selected_target_surfaces(&cas, REPO_HASH, recovery_manifest, TARGET_PATH, &target_sha,),
+            (0, 0, 0),
+            "temporary fail-open delivery must not durably publish ignored content"
+        );
+
+        fsync_fixture_file(&ignore_path, b"");
+        fsync_fixture_file(&target_path, target_contents);
+        tx.send(WatchEvent::File {
+            path: ignore_path,
+            change: cairn_watch::FileChange::Touched,
+        })
+        .await
+        .unwrap();
+        tx.send(WatchEvent::File {
+            path: target_path,
+            change: cairn_watch::FileChange::Touched,
+        })
+        .await
+        .unwrap();
+        let unignore_floor = wait_for_new_desired(&cas, REPO_HASH, recovery_floor).await;
+        let unignore_terminal =
+            wait_for_clean_terminal_floor(&cas, REPO_HASH, unignore_floor).await;
+        let (unignore_manifest, unignore_entries) =
+            selected_manifest_entries(&cas, REPO_HASH, repo.path());
+        assert!(unignore_terminal.applied_generation >= unignore_floor);
+        assert_ne!(unignore_manifest, recovery_manifest);
+        assert_eq!(
+            unignore_entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.blob_sha.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (TARGET_PATH, target_sha.as_str()),
+                (BASE_PATH, baseline_entries[0].blob_sha.as_str())
+            ]
+        );
+        let (relation, blobs, refs) =
+            selected_target_surfaces(&cas, REPO_HASH, unignore_manifest, TARGET_PATH, &target_sha);
+        assert_eq!(relation, 1);
+        assert!(
+            blobs >= 1,
+            "unignored target must enter the parsed blob index"
+        );
+        assert!(
+            refs > 0,
+            "the deterministic Rust parser must emit a positive ref"
+        );
+
+        let successful_manifest = unignore_manifest;
+        let successful_paths = unignore_entries;
+        let successful_applied = unignore_terminal.applied_generation;
+        let successful_last_success = unignore_terminal.last_success_ns;
+        fsync_fixture_file(&repo.path().join(".gitignore"), &[0xff]);
+        tx.send(WatchEvent::File {
+            path: repo.path().join(".gitignore"),
+            change: cairn_watch::FileChange::Touched,
+        })
+        .await
+        .unwrap();
+        let failure_floor = wait_for_new_desired(&cas, REPO_HASH, unignore_floor).await;
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let index = cas_registry::open(&cas.index_db_path()).unwrap();
+                let state = cas_registry::get_reconcile_state(&index, REPO_HASH)
+                    .unwrap()
+                    .unwrap();
+                if state.desired_generation >= failure_floor
+                    && state.consecutive_failures > 0
+                    && state.attempt_generation.is_none()
+                {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("incomplete matcher scan did not reach a typed failed terminal");
+        assert_eq!(failed.applied_generation, successful_applied);
+        assert_eq!(failed.last_success_ns, successful_last_success);
+        assert!(failed.next_retry_at_ns.is_some());
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("scan:"))
+        );
+        let (after_failure_manifest, after_failure_paths) =
+            selected_manifest_entries(&cas, REPO_HASH, repo.path());
+        assert_eq!(after_failure_manifest, successful_manifest);
+        assert_eq!(after_failure_paths, successful_paths);
+        assert_eq!(
+            selected_target_surfaces(
+                &cas,
+                REPO_HASH,
+                after_failure_manifest,
+                TARGET_PATH,
+                &target_sha,
+            ),
+            (1, blobs, refs),
+            "an incomplete fail-open walk must not publish a partial or empty success"
+        );
+
+        drop(tx);
+        dispatch.await.unwrap();
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        jobs.shutdown(Duration::from_secs(1)).await;
     }
 
     #[tokio::test]
