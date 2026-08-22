@@ -267,7 +267,7 @@ fn run_job_blocking(
         .ok_or_else(|| Error::InvalidArgument(format!("unknown analyzer: {}", job.analyzer_id)))?;
     let entries = manifest::get_entries(&conn, job.manifest_id)?;
     let now = now_ns();
-    info!(
+    debug!(
         alias = %job.alias,
         analyzer_id = %job.analyzer_id,
         job_id = job.id,
@@ -290,7 +290,7 @@ fn run_job_blocking(
         },
     )?;
     runtime_metrics.mark_finished(job.id, outcome.status.as_str());
-    info!(
+    debug!(
         alias = %job.alias,
         analyzer_id = %job.analyzer_id,
         job_id = job.id,
