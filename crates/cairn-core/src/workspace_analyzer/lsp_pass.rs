@@ -2383,7 +2383,7 @@ while True:
             binary: binary.clone(),
             workspace_root: fixture.path().to_path_buf(),
             config_hash: analyzer_id.to_string(),
-            request_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_millis(500),
             availability: AvailabilityStrategy::PathExistsExecutable,
             readiness: ReadinessStrategy::InitializeResponseOnly,
             language_id: "ruby",
