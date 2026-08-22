@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use cairn_proto::RefKind;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, stream::FuturesUnordered};
 use tracing::{debug, warn};
 
 use crate::lsp::pool::{self as lsp_pool, LspSpawnSpec, PoolKey, PooledLsp};
@@ -27,8 +27,13 @@ use super::{AnalyzerProgress, ResolvedRef, WorkspaceFacts, WorkspaceFile};
 /// retry flavour (content-modified, empty-definition, file-not-found).
 const MAX_DEFINITION_ATTEMPTS: usize = 3;
 /// Maximum in-flight `textDocument/definition` requests per document
-/// (the `buffer_unordered` width of the site pipeline).
+/// (the width of the site pipeline).
 const DEFINITION_PIPELINE_CONCURRENCY: usize = 16;
+/// Abort a definition pass after this many consecutive terminal
+/// request timeouts. Successful or otherwise-terminal outcomes reset
+/// the streak; retryable outcomes are resolved inside the per-site
+/// retry ladder before they reach this budget.
+const MAX_CONSECUTIVE_DEFINITION_TIMEOUTS: usize = 10;
 /// Fixed delay before the single always-on content-modified retry.
 const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Initial backoff for the opt-in empty-definition and
@@ -250,7 +255,8 @@ pub fn run_lsp_multi_kind_definition_pass(
 /// - files without a `worktree_path` are skipped (nothing on disk
 ///   for the language server to open);
 /// - a failed definition request skips only that site (counted and
-///   logged by the batch collector);
+///   logged by the batch collector), unless consecutive request
+///   timeouts exhaust the pass-wide circuit breaker;
 /// - out-of-repo definition targets are kept with
 ///   `target_path = None`; the persist layer decides their fate;
 /// - a failed `textDocument/didClose` only logs a warning;
@@ -269,6 +275,7 @@ async fn collect_resolved_refs(
     progress: AnalyzerProgress,
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
+    let mut timeout_budget = DefinitionTimeoutBudget::default();
     for file in files {
         ensure_analyzer_active(&progress)?;
         let Some(path) = &file.worktree_path else {
@@ -297,8 +304,9 @@ async fn collect_resolved_refs(
             &uri,
             suppress_definition_targets_at_requested_sites,
             progress.clone(),
+            &mut timeout_budget,
         )
-        .await;
+        .await?;
         ensure_analyzer_active(&progress)?;
         let definition_elapsed = definition_started.elapsed();
         debug!(
@@ -354,6 +362,7 @@ async fn collect_multi_kind_resolved_refs(
     progress: AnalyzerProgress,
     facts: &mut WorkspaceFacts,
 ) -> Result<()> {
+    let mut timeout_budget = DefinitionTimeoutBudget::default();
     for file in files {
         ensure_analyzer_active(&progress)?;
         let Some(path) = &file.worktree_path else {
@@ -395,8 +404,9 @@ async fn collect_multi_kind_resolved_refs(
             &uri,
             suppress_definition_targets_at_requested_sites,
             progress.clone(),
+            &mut timeout_budget,
         )
-        .await;
+        .await?;
         ensure_analyzer_active(&progress)?;
         let definition_elapsed = definition_started.elapsed();
         debug!(
@@ -480,6 +490,105 @@ struct MultiKindDefinitionBatch {
     error_counts_by_kind: Vec<(RefKind, usize)>,
 }
 
+/// Pass-wide circuit breaker for definition servers that remain live
+/// but stop answering requests. The streak follows completion order,
+/// which is the only order observable in the concurrent pipeline.
+#[derive(Debug, Default)]
+struct DefinitionTimeoutBudget {
+    consecutive: usize,
+}
+
+impl DefinitionTimeoutBudget {
+    fn observe<T>(&mut self, result: &Result<T>) -> Result<()> {
+        if matches!(result, Err(Error::Lsp(crate::lsp::Error::RequestTimeout))) {
+            self.consecutive += 1;
+            if self.consecutive >= MAX_CONSECUTIVE_DEFINITION_TIMEOUTS {
+                return Err(Error::Lsp(crate::lsp::Error::RequestTimeout));
+            }
+        } else {
+            // Success, cancellation, and other terminal errors all break a
+            // consecutive timeout streak. Retryable outcomes never reach this
+            // layer: the per-site retry ladder resolves them first.
+            self.consecutive = 0;
+        }
+        Ok(())
+    }
+}
+
+/// Drive one pass-wide definition pipeline. Once the timeout budget trips,
+/// the input iterator is never polled again, while requests that were already
+/// in flight are drained so their client-side pending slots reach a terminal
+/// outcome instead of being abandoned in the reusable LSP connection.
+#[allow(clippy::too_many_arguments)]
+async fn run_definition_pipeline<T, F, Fut, S>(
+    requests: Vec<T>,
+    site_of: S,
+    definition: F,
+    retry: DefinitionRetryPolicy,
+    analyzer_id: &str,
+    uri: &Url,
+    progress: &AnalyzerProgress,
+    timeout_budget: &mut DefinitionTimeoutBudget,
+) -> Result<Vec<(T, Result<Vec<Location>>)>>
+where
+    F: Fn(DefinitionSite) -> Fut,
+    Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
+    S: Fn(&T) -> DefinitionSite,
+{
+    let mut pending = requests.into_iter();
+    let make_request = |request: T| {
+        let site = site_of(&request);
+        let definition = &definition;
+        async move {
+            let result = definition_with_retry_from(
+                || definition(site),
+                retry,
+                analyzer_id,
+                uri,
+                site.position,
+                Some(progress),
+            )
+            .await;
+            (request, result)
+        }
+    };
+    let mut in_flight = FuturesUnordered::new();
+    for request in pending.by_ref().take(DEFINITION_PIPELINE_CONCURRENCY) {
+        in_flight.push(make_request(request));
+    }
+
+    let mut results = Vec::new();
+    let mut budget_error = None;
+    while let Some((request, result)) = in_flight.next().await {
+        progress.tick();
+        if budget_error.is_none() {
+            match timeout_budget.observe(&result) {
+                Ok(()) => {
+                    if let Some(next) = pending.next() {
+                        in_flight.push(make_request(next));
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        analyzer_id,
+                        uri = uri.as_str(),
+                        limit = MAX_CONSECUTIVE_DEFINITION_TIMEOUTS,
+                        "definition request timeout budget exhausted; aborting pass"
+                    );
+                    budget_error = Some(err);
+                }
+            }
+        }
+        results.push((request, result));
+    }
+
+    if let Some(err) = budget_error {
+        Err(err)
+    } else {
+        Ok(results)
+    }
+}
+
 /// Resolve every site through `definition` with bounded concurrency,
 /// then re-sort by source position so batch output is deterministic
 /// regardless of completion order. Failed sites are counted, logged,
@@ -487,7 +596,9 @@ struct MultiKindDefinitionBatch {
 /// requested-site filter) are dropped silently. Cancellation is
 /// observed per attempt inside the retry wrapper, so a cancelled
 /// batch fails its remaining sites fast and the caller's post-batch
-/// check aborts the pass.
+/// check aborts the pass. Consecutive terminal request timeouts abort
+/// the pass after already in-flight requests have drained.
+#[allow(clippy::too_many_arguments)]
 async fn collect_definition_site_locations<F, Fut>(
     sites: Vec<DefinitionSite>,
     definition: F,
@@ -496,33 +607,24 @@ async fn collect_definition_site_locations<F, Fut>(
     uri: &Url,
     suppress_definition_targets_at_requested_sites: bool,
     progress: AnalyzerProgress,
-) -> DefinitionBatch
+    timeout_budget: &mut DefinitionTimeoutBudget,
+) -> Result<DefinitionBatch>
 where
     F: Fn(DefinitionSite) -> Fut,
     Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
 {
     let requested_sites = sites.clone();
-    let mut results = stream::iter(sites)
-        .map(|site| {
-            let definition = &definition;
-            let progress = progress.clone();
-            async move {
-                let result = definition_with_retry_from(
-                    || definition(site),
-                    retry,
-                    analyzer_id,
-                    uri,
-                    site.position,
-                    Some(&progress),
-                )
-                .await;
-                progress.tick();
-                (site, result)
-            }
-        })
-        .buffer_unordered(DEFINITION_PIPELINE_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+    let mut results = run_definition_pipeline(
+        sites,
+        |site| *site,
+        definition,
+        retry,
+        analyzer_id,
+        uri,
+        &progress,
+        timeout_budget,
+    )
+    .await?;
     results.sort_by_key(|(site, _)| {
         (
             site.position.line,
@@ -560,12 +662,13 @@ where
             }
         }
     }
-    batch
+    Ok(batch)
 }
 
 /// Multi-kind sibling of `collect_definition_site_locations`; the
 /// extra ref-kind sort key keeps output deterministic when several
 /// collectors emit sites at the same source position.
+#[allow(clippy::too_many_arguments)]
 async fn collect_multi_kind_definition_site_locations<F, Fut>(
     sites: Vec<DefinitionRequestSite>,
     definition: F,
@@ -574,33 +677,24 @@ async fn collect_multi_kind_definition_site_locations<F, Fut>(
     uri: &Url,
     suppress_definition_targets_at_requested_sites: bool,
     progress: AnalyzerProgress,
-) -> MultiKindDefinitionBatch
+    timeout_budget: &mut DefinitionTimeoutBudget,
+) -> Result<MultiKindDefinitionBatch>
 where
     F: Fn(DefinitionSite) -> Fut,
     Fut: Future<Output = crate::lsp::Result<Vec<Location>>>,
 {
     let requested_sites = sites.iter().map(|request| request.site).collect::<Vec<_>>();
-    let mut results = stream::iter(sites)
-        .map(|request| {
-            let definition = &definition;
-            let progress = progress.clone();
-            async move {
-                let result = definition_with_retry_from(
-                    || definition(request.site),
-                    retry,
-                    analyzer_id,
-                    uri,
-                    request.site.position,
-                    Some(&progress),
-                )
-                .await;
-                progress.tick();
-                (request, result)
-            }
-        })
-        .buffer_unordered(DEFINITION_PIPELINE_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+    let mut results = run_definition_pipeline(
+        sites,
+        |request| request.site,
+        definition,
+        retry,
+        analyzer_id,
+        uri,
+        &progress,
+        timeout_budget,
+    )
+    .await?;
     results.sort_by_key(|(request, _)| {
         (
             request.site.position.line,
@@ -643,7 +737,7 @@ where
             }
         }
     }
-    batch
+    Ok(batch)
 }
 
 /// Apply the opt-in "server echoed the use-site back" filter: when
@@ -832,7 +926,13 @@ fn ref_kind_name(kind: RefKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::manifest::{ManifestEntry, ManifestId};
     use crate::workspace_analyzer::StallWatchdogEvent;
+    #[cfg(unix)]
+    use crate::workspace_analyzer::{
+        AnalyzerRunRequest, RunStatus, WorkspaceAnalyzer, run_one_workspace_analyzer_with_timeout,
+    };
     use std::cell::Cell;
     #[cfg(unix)]
     use std::fs;
@@ -843,6 +943,7 @@ mod tests {
         mpsc,
     };
     use std::time::Instant;
+    use tokio::sync::Semaphore;
 
     #[cfg(unix)]
     use crate::lsp::pool::{AvailabilityStrategy, LspClientPool, ReadinessStrategy};
@@ -902,7 +1003,7 @@ while True:
         while not os.path.exists(initialize_release):
             time.sleep(0.001)
         respond(message["id"], {"capabilities": {}})
-    elif method == "textDocument/definition":
+    elif method == "textDocument/definition" and not os.environ.get("CAIRN_TEST_WEDGE_DEFINITION"):
         respond(message["id"], [])
     elif method == "shutdown":
         respond(message["id"], None)
@@ -986,6 +1087,63 @@ while True:
             byte_start: 0,
             byte_end: 1,
         }])
+    }
+
+    #[cfg(unix)]
+    fn many_definition_sites(_source: &[u8]) -> Result<Vec<DefinitionSite>> {
+        Ok((0..100).map(test_site).collect())
+    }
+
+    #[cfg(unix)]
+    struct WedgedDefinitionAnalyzer {
+        spawn_spec: LspSpawnSpec,
+    }
+
+    #[cfg(unix)]
+    impl WorkspaceAnalyzer for WedgedDefinitionAnalyzer {
+        fn id(&self) -> &'static str {
+            "wedged-definition-budget-test"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "wedged-definition-test"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-wedged-definition-test"
+        }
+
+        fn defer_stall_watchdog_until_active_work(&self) -> bool {
+            true
+        }
+
+        fn analyze_workspace(
+            &self,
+            repo_root: &Path,
+            _manifest_id: ManifestId,
+            files: &[WorkspaceFile],
+            progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            run_lsp_definition_pass(
+                LspDefinitionPass {
+                    analyzer_id: self.id(),
+                    pool_analyzer_id: None,
+                    language: self.language(),
+                    ref_kind: RefKind::Call,
+                    spawn_spec: self.spawn_spec.clone(),
+                    retry: DefinitionRetryPolicy::default(),
+                    collect_definition_sites: many_definition_sites,
+                    suppress_definition_targets_at_requested_sites: false,
+                },
+                repo_root,
+                files,
+                progress,
+            )
+        }
     }
 
     #[cfg(unix)]
@@ -1862,8 +2020,10 @@ while True:
             &test_uri(),
             false,
             progress.clone(),
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 100);
         assert_eq!(progress.snapshot(), 100);
@@ -1899,11 +2059,91 @@ while True:
             &test_uri(),
             false,
             progress,
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(resolved.resolved.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn consecutive_definition_timeouts_stop_pipeline_replenishment() {
+        let sites = (0..100).map(test_site).collect::<Vec<_>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_initial_wave = Arc::new(Semaphore::new(0));
+        let progress = AnalyzerProgress::default();
+        let err = collect_definition_site_locations(
+            sites,
+            {
+                let calls = Arc::clone(&calls);
+                let release_initial_wave = Arc::clone(&release_initial_wave);
+                move |_site| {
+                    let calls = Arc::clone(&calls);
+                    let release_initial_wave = Arc::clone(&release_initial_wave);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) + 1
+                            == DEFINITION_PIPELINE_CONCURRENCY
+                        {
+                            release_initial_wave.add_permits(100);
+                        }
+                        release_initial_wave.acquire().await.unwrap().forget();
+                        Err(crate::lsp::Error::RequestTimeout)
+                    }
+                }
+            },
+            DefinitionRetryPolicy::default(),
+            "wedged-test-lsp",
+            &test_uri(),
+            false,
+            progress.clone(),
+            &mut DefinitionTimeoutBudget::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::Lsp(crate::lsp::Error::RequestTimeout)),
+            "unexpected wedged-pass error: {err:?}"
+        );
+        assert_eq!(
+            progress.snapshot(),
+            (DEFINITION_PIPELINE_CONCURRENCY + MAX_CONSECUTIVE_DEFINITION_TIMEOUTS - 1) as u64
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEFINITION_PIPELINE_CONCURRENCY + MAX_CONSECUTIVE_DEFINITION_TIMEOUTS - 1,
+            "only requests admitted before the threshold may start"
+        );
+    }
+
+    #[test]
+    fn timeout_budget_resets_on_success_transient_and_cancellation() {
+        let mut budget = DefinitionTimeoutBudget::default();
+        let prime = |budget: &mut DefinitionTimeoutBudget| {
+            for _ in 0..MAX_CONSECUTIVE_DEFINITION_TIMEOUTS - 1 {
+                budget
+                    .observe::<()>(&Err(Error::Lsp(crate::lsp::Error::RequestTimeout)))
+                    .unwrap();
+            }
+        };
+
+        prime(&mut budget);
+        budget
+            .observe(&Ok::<Vec<Location>, Error>(Vec::new()))
+            .unwrap();
+        assert_eq!(budget.consecutive, 0);
+        prime(&mut budget);
+        budget
+            .observe::<()>(&Err(Error::Lsp(content_modified())))
+            .unwrap();
+        assert_eq!(budget.consecutive, 0);
+        prime(&mut budget);
+        budget
+            .observe::<()>(&Err(analyzer_cancelled_error()))
+            .unwrap();
+        assert_eq!(budget.consecutive, 0);
     }
 
     #[tokio::test]
@@ -1924,8 +2164,10 @@ while True:
             &test_uri(),
             false,
             progress.clone(),
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(progress.snapshot(), 5);
         assert_eq!(resolved.error_count, 1);
@@ -1951,8 +2193,10 @@ while True:
             &test_uri(),
             false,
             AnalyzerProgress::default(),
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         let lines = resolved
             .resolved
@@ -1985,8 +2229,10 @@ while True:
             &test_uri(),
             true,
             AnalyzerProgress::default(),
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(resolved.resolved.len(), 1);
         assert_eq!(resolved.resolved[0].site.position.line, 3);
@@ -2016,8 +2262,10 @@ while True:
                 &test_uri(),
                 false,
                 AnalyzerProgress::default(),
+                &mut DefinitionTimeoutBudget::default(),
             )
-            .await;
+            .await
+            .unwrap();
 
         let observed = resolved
             .resolved
@@ -2059,8 +2307,10 @@ while True:
             &test_uri(),
             false,
             progress.clone(),
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(progress.snapshot(), 3);
         assert_eq!(resolved.resolved.len(), 1);
@@ -2091,8 +2341,10 @@ while True:
             &test_uri(),
             true,
             AnalyzerProgress::default(),
+            &mut DefinitionTimeoutBudget::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(resolved.resolved.len(), 1);
         assert_eq!(resolved.resolved[0].ref_kind, RefKind::Import);
@@ -2104,6 +2356,150 @@ while True:
     #[test]
     fn single_definition_pass_arms_after_pool_readiness_before_request() {
         assert_production_pass_arms_after_pool_readiness(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wedged_definition_server_hits_shared_budget_and_stops_scheduling() {
+        let _placement_lock = PLACEMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = tempfile::tempdir().unwrap();
+        let binary = fixture.path().join("wedged-definition-lsp.py");
+        let methods = fixture.path().join("methods.log");
+        let initialize_marker = fixture.path().join("initialize.marker");
+        let initialize_release = fixture.path().join("initialize.release");
+        let stderr = fixture.path().join("stderr.log");
+        let source = fixture.path().join("source.rb");
+        fs::write(&binary, WATCHDOG_FAKE_LSP).unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        fs::write(&initialize_release, "release\n").unwrap();
+        fs::write(&source, "target\n").unwrap();
+
+        let analyzer_id = "wedged-definition-budget-test";
+        let spawn_spec = LspSpawnSpec {
+            binary: binary.clone(),
+            workspace_root: fixture.path().to_path_buf(),
+            config_hash: analyzer_id.to_string(),
+            request_timeout: Duration::from_secs(1),
+            availability: AvailabilityStrategy::PathExistsExecutable,
+            readiness: ReadinessStrategy::InitializeResponseOnly,
+            language_id: "ruby",
+            launch_args: Vec::new(),
+            env: vec![
+                (
+                    "CAIRN_TEST_METHODS_FILE".into(),
+                    methods.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_INITIALIZE_MARKER".into(),
+                    initialize_marker.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_INITIALIZE_RELEASE".into(),
+                    initialize_release.display().to_string(),
+                ),
+                (
+                    "CAIRN_TEST_STDERR_FILE".into(),
+                    stderr.display().to_string(),
+                ),
+                ("CAIRN_TEST_WEDGE_DEFINITION".into(), "1".into()),
+            ],
+            initialization_options: serde_json::json!({}),
+        };
+        let key = PoolKey::lsp(
+            "wedged-definition-test",
+            fixture.path(),
+            analyzer_id,
+            &binary,
+            analyzer_id,
+        )
+        .unwrap();
+        let pool_cleanup = PlacementPoolCleanupGuard::new(lsp_pool::global().unwrap(), key);
+        let progress = AnalyzerProgress::default();
+        let store_path = fixture.path().join("store.db");
+        let mut conn = crate::cas::store::open(&store_path).unwrap();
+        conn.execute(
+            "INSERT INTO manifests (manifest_id, kind, built_at_ns)
+             VALUES (1, 'tentative', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (blob_sha, parser_id, parser_revision, parsed_at_ns)
+             VALUES ('test-blob', 'tree-sitter-wedged-definition-test', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, blob_sha)
+             VALUES (1, 'source.rb', 'test-blob')",
+            [],
+        )
+        .unwrap();
+        let entries = [ManifestEntry {
+            path: "source.rb".into(),
+            blob_sha: "test-blob".into(),
+        }];
+        let started = Instant::now();
+        let execution = run_one_workspace_analyzer_with_timeout(
+            &mut conn,
+            AnalyzerRunRequest {
+                analyzer: Box::new(WedgedDefinitionAnalyzer { spawn_spec }),
+                repo_root: fixture.path(),
+                manifest_id: ManifestId(1),
+                entries: &entries,
+                now_ns: 42,
+                analyzer_stall_timeout: Duration::from_secs(5),
+                job_id: Some(324),
+                progress: Some(progress.clone()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(execution.status, RunStatus::Failed);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("LSP request timed out")),
+            "unexpected wedged-pass execution: {execution:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "definition timeout budget did not bound the wedged pass"
+        );
+        assert_eq!(
+            progress.snapshot(),
+            (DEFINITION_PIPELINE_CONCURRENCY + MAX_CONSECUTIVE_DEFINITION_TIMEOUTS - 1) as u64
+        );
+        let definition_requests = fs::read_to_string(&methods)
+            .unwrap()
+            .lines()
+            .filter(|method| *method == "textDocument/definition")
+            .count();
+        assert_eq!(
+            definition_requests,
+            DEFINITION_PIPELINE_CONCURRENCY + MAX_CONSECUTIVE_DEFINITION_TIMEOUTS - 1,
+            "the budget must leave every later site unscheduled"
+        );
+        let durable_status: String = conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs
+                 WHERE analyzer_id = 'wedged-definition-budget-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            durable_status, "failed",
+            "a --wait poll must observe the analyzer job as terminal"
+        );
+        pool_cleanup
+            .finish()
+            .expect("wedged definition test pool entry cleanup must succeed");
     }
 
     #[cfg(unix)]
