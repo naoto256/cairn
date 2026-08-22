@@ -786,7 +786,7 @@ impl RepoReconcileManager {
                 .request_periodic_if_due(repo_hash.clone(), due_age)
                 .await
             {
-                Ok(Some(generation)) => info!(
+                Ok(Some(generation)) => debug!(
                     repo_hash = %repo_hash,
                     generation,
                     trigger = ?ReconcileTrigger::PeriodicFullReconcile,
@@ -1260,7 +1260,7 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
         #[cfg(test)]
         mgr.test_attempts_started.fetch_add(1, Ordering::SeqCst);
         match attempt_res {
-            Ok(AttemptOutcome::Completed) => info!(
+            Ok(AttemptOutcome::Completed) => debug!(
                 repo_hash = %repo_hash,
                 generation,
                 forced,

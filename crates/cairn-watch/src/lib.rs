@@ -331,6 +331,7 @@ const MATCHER_RETRY_RUNNING_REQUESTED: u8 = 3;
 const MATCHER_BUILD_CONCURRENCY: usize = 2;
 const MATCHER_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const MATCHER_RETRY_MAX: Duration = Duration::from_secs(2);
+const MATCHER_RETRY_WARNING_WINDOW: Duration = Duration::from_secs(60);
 // A nonempty queue rechecks closed receivers at this cadence. An empty queue
 // waits indefinitely and relies on admission or shutdown to provide a wake.
 const MATCHER_QUEUE_CLOSE_POLL: Duration = Duration::from_millis(50);
@@ -358,6 +359,7 @@ struct MatcherBuildTarget {
     state: Arc<AtomicU8>,
     desired_generation: AtomicU64,
     commit: Mutex<MatcherCommitState>,
+    failure_log: Mutex<Option<MatcherRetryFailureWindow>>,
     tx: Sender<WatchEvent>,
     scheduler: Arc<MatcherBuildScheduler>,
     #[cfg(test)]
@@ -376,6 +378,13 @@ struct MatcherBuildTarget {
     generation_overflow_warning_count: std::sync::atomic::AtomicUsize,
 }
 
+struct MatcherRetryFailureWindow {
+    kind: std::io::ErrorKind,
+    message: String,
+    started_at: Instant,
+    suppressed: u64,
+}
+
 struct MatcherCommitState {
     desired_generation: u64,
 }
@@ -388,6 +397,68 @@ enum MatcherCommitOutcome {
 }
 
 impl MatcherBuildTarget {
+    fn log_matcher_retry_failure(&self, err: &std::io::Error) {
+        let next = MatcherRetryFailureWindow {
+            kind: err.kind(),
+            message: err.to_string(),
+            started_at: Instant::now(),
+            suppressed: 0,
+        };
+        let previous = {
+            let mut active = self
+                .failure_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(current) = active.as_mut()
+                && current.kind == next.kind
+                && current.message == next.message
+                && next
+                    .started_at
+                    .saturating_duration_since(current.started_at)
+                    < MATCHER_RETRY_WARNING_WINDOW
+            {
+                current.suppressed = current.suppressed.saturating_add(1);
+                return;
+            }
+            active.replace(next)
+        };
+        if let Some(previous) = previous {
+            if previous.kind == err.kind() && previous.message == err.to_string() {
+                warn!(
+                    error = %err,
+                    suppressed = previous.suppressed,
+                    "ignore matcher retry failed"
+                );
+                return;
+            }
+            if previous.suppressed > 0 {
+                warn!(
+                    error_kind = ?previous.kind,
+                    error = %previous.message,
+                    suppressed = previous.suppressed,
+                    "suppressed repeated ignore matcher retry failures"
+                );
+            }
+        }
+        warn!(error = %err, "ignore matcher retry failed");
+    }
+
+    fn log_matcher_retry_recovery(&self) {
+        let previous = self
+            .failure_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(previous) = previous.filter(|previous| previous.suppressed > 0) {
+            warn!(
+                error_kind = ?previous.kind,
+                error = %previous.message,
+                suppressed = previous.suppressed,
+                "ignore matcher retry recovered after suppressed failures"
+            );
+        }
+    }
+
     fn commit_matcher(
         &self,
         matcher: RepoIgnoreMatcher,
@@ -1085,12 +1156,15 @@ impl MatcherBuildScheduler {
             return;
         }
         let (commit_outcome, failed) = match outcome {
-            Ok(Ok(matcher)) => (
-                target.commit_matcher(matcher, job.attempt_generation),
-                false,
-            ),
+            Ok(Ok(matcher)) => {
+                let commit_outcome = target.commit_matcher(matcher, job.attempt_generation);
+                if commit_outcome == MatcherCommitOutcome::Committed {
+                    target.log_matcher_retry_recovery();
+                }
+                (commit_outcome, false)
+            }
             Ok(Err(err)) => {
-                warn!(error = %err, "ignore matcher retry failed");
+                target.log_matcher_retry_failure(&err);
                 (MatcherCommitOutcome::Stale, true)
             }
             Err(_) => {
@@ -1327,6 +1401,7 @@ impl EventClassifier {
             commit: Mutex::new(MatcherCommitState {
                 desired_generation: 0,
             }),
+            failure_log: Mutex::new(None),
             tx: tx.clone(),
             scheduler,
             #[cfg(test)]
@@ -4985,6 +5060,31 @@ mod tests {
         reached_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("failed attempt did not reach its finish barrier");
+        let repeated_error = {
+            let failure_log = classifier
+                .matcher_target
+                .failure_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let failure = failure_log
+                .as_ref()
+                .expect("first matcher failure was not recorded");
+            std::io::Error::new(failure.kind, failure.message.clone())
+        };
+        classifier
+            .matcher_target
+            .log_matcher_retry_failure(&repeated_error);
+        assert_eq!(
+            classifier
+                .matcher_target
+                .failure_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("repeated matcher failure lost its window")
+                .suppressed,
+            1
+        );
         for _ in 0..REQUESTS {
             classifier.reload_matcher();
         }
@@ -5063,6 +5163,15 @@ mod tests {
             Some(WatchEvent::Rescan {
                 reason: RescanReason::MatcherRecovered
             })
+        );
+        assert!(
+            classifier
+                .matcher_target
+                .failure_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "successful matcher rebuild must close the suppression window"
         );
         wait_for_matcher_retry_idle(&classifier).await;
         assert!(
