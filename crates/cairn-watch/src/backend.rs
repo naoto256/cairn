@@ -227,7 +227,9 @@ impl WatcherDebouncer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileChange, RescanReason};
+    use crate::FileChange;
+    #[cfg(target_os = "macos")]
+    use crate::RescanReason;
 
     /// Wait for the first touched edge of a session where the FSEvents
     /// stream may still be settling. The probe file
