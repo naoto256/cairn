@@ -1851,6 +1851,130 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, Copy)]
+    enum NativeRenameOperation {
+        AtomicSave,
+        FileRename,
+        DirectoryRename,
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn assert_native_rename_converges_once(operation: NativeRenameOperation) {
+        let initial: &[(&str, &str)] = match operation {
+            NativeRenameOperation::AtomicSave => &[
+                ("src/atomic.rs", "old\n"),
+                ("src/failure.churn-precondition", "precondition\n"),
+            ],
+            NativeRenameOperation::FileRename => &[
+                ("src/rename-old.rs", "file\n"),
+                ("src/failure.churn-precondition", "precondition\n"),
+            ],
+            NativeRenameOperation::DirectoryRename => &[
+                ("src/old-dir/nested.rs", "nested\n"),
+                ("src/failure.churn-precondition", "precondition\n"),
+            ],
+        };
+        let fixture = churn_fixture(initial).await;
+        let (reconcile, jobs) = running_reconcile(&fixture);
+        let (recorder, _recorder_guard) =
+            churn_recorder::install(fixture.repo_hash.clone(), fixture.repo.path());
+        recorder.wait_for_terminal_after_publication();
+        let watcher = watcher_for_backend(&fixture, reconcile.clone(), WatchBackend::Recommended);
+
+        match operation {
+            NativeRenameOperation::AtomicSave => {
+                let staging = fixture.repo.path().parent().unwrap().join(format!(
+                    ".{}.atomic-stage",
+                    fixture.repo.path().file_name().unwrap().to_string_lossy()
+                ));
+                std::fs::write(&staging, "new\n").unwrap();
+                std::fs::rename(&staging, fixture.repo.path().join("src/atomic.rs")).unwrap();
+            }
+            NativeRenameOperation::FileRename => {
+                std::fs::rename(
+                    fixture.repo.path().join("src/rename-old.rs"),
+                    fixture.repo.path().join("src/rename-new.rs"),
+                )
+                .unwrap();
+            }
+            NativeRenameOperation::DirectoryRename => {
+                std::fs::rename(
+                    fixture.repo.path().join("src/old-dir"),
+                    fixture.repo.path().join("src/new-dir"),
+                )
+                .unwrap();
+            }
+        }
+
+        wait_for_applied(&fixture.cas, &fixture.repo_hash, 2).await;
+        assert_generation_stable(&fixture, 2).await;
+        watcher.unwatch_repository(&fixture.repo_hash);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        jobs.shutdown(Duration::from_secs(1)).await;
+
+        let snapshot = recorder.snapshot();
+        assert!(!snapshot.watch.is_empty(), "{operation:?} produced no edge");
+        assert!(
+            snapshot
+                .watch
+                .iter()
+                .all(|record| { record.source_batch_ordinal == 1 && record.generation == Some(2) }),
+            "{operation:?} escaped one source batch/generation: {:?}",
+            snapshot.watch
+        );
+        assert_eq!(
+            snapshot.reconcile.len(),
+            1,
+            "{operation:?} must reconcile exactly once"
+        );
+        assert_eq!(snapshot.reconcile[0].generation, 2);
+        assert!(
+            snapshot.observation_failures.is_empty(),
+            "{operation:?} observation failures: {:?}",
+            snapshot.observation_failures
+        );
+
+        let state = cas_registry::open(&fixture.cas.index_db_path())
+            .ok()
+            .and_then(|index| {
+                cas_registry::get_reconcile_state(&index, &fixture.repo_hash)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap();
+        assert_eq!((state.desired_generation, state.applied_generation), (2, 2));
+        let (_, entries) =
+            selected_manifest_entries(&fixture.cas, &fixture.repo_hash, fixture.repo.path());
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        match operation {
+            NativeRenameOperation::AtomicSave => assert!(paths.contains(&"src/atomic.rs")),
+            NativeRenameOperation::FileRename => {
+                assert!(!paths.contains(&"src/rename-old.rs"));
+                assert!(paths.contains(&"src/rename-new.rs"));
+            }
+            NativeRenameOperation::DirectoryRename => {
+                assert!(!paths.contains(&"src/old-dir/nested.rs"));
+                assert!(paths.contains(&"src/new-dir/nested.rs"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_rename_operations_converge_without_trailing_churn() {
+        for operation in [
+            NativeRenameOperation::AtomicSave,
+            NativeRenameOperation::FileRename,
+            NativeRenameOperation::DirectoryRename,
+        ] {
+            assert_native_rename_converges_once(operation).await;
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn polling_ignored_generated_write_does_not_enqueue_analyzers() {
         assert_ignored_write_contract(
