@@ -2923,6 +2923,7 @@ mod tests {
         let runtime_tmp = runtime_tempdir();
         let data_tmp = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
         let paths = SocketPaths::with_runtime_dir(runtime_tmp.path().join("runtime"));
         let cas = Arc::new(CasDataDir::with_root(data_tmp.path().to_path_buf()));
         cas.ensure().unwrap();
