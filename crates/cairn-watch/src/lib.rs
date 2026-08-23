@@ -30,8 +30,10 @@ use matcher::{
 };
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode};
+#[cfg(not(target_os = "macos"))]
+use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::{
-    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, new_debouncer_opt,
+    DebounceEventHandler, DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt,
 };
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, warn};
@@ -113,8 +115,35 @@ enum WatcherDebouncer {
     // This enum is intentionally concrete: the production and test
     // backends both rely on Drop side effects from notify-debouncer,
     // and the extra enum size is paid once per watched repo.
-    Recommended(Debouncer<RecommendedWatcher, RecommendedCache>),
+    Recommended(Debouncer<RecommendedWatcher, NativeRecommendedCache>),
     Poll(Debouncer<PollWatcher, RecommendedCache>),
+}
+
+#[cfg(target_os = "macos")]
+type NativeRecommendedCache = notify_debouncer_full::NoCache;
+#[cfg(not(target_os = "macos"))]
+type NativeRecommendedCache = RecommendedCache;
+
+#[cfg(target_os = "macos")]
+fn new_native_debouncer<F: DebounceEventHandler>(
+    debounce: Duration,
+    event_handler: F,
+) -> notify::Result<Debouncer<RecommendedWatcher, NativeRecommendedCache>> {
+    new_debouncer_opt::<_, RecommendedWatcher, NativeRecommendedCache>(
+        debounce,
+        None,
+        event_handler,
+        NativeRecommendedCache::new(),
+        Config::default(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn new_native_debouncer<F: DebounceEventHandler>(
+    debounce: Duration,
+    event_handler: F,
+) -> notify::Result<Debouncer<RecommendedWatcher, NativeRecommendedCache>> {
+    new_debouncer(debounce, None, event_handler)
 }
 
 /// Native watcher backend choice.
@@ -227,7 +256,7 @@ fn watch_repo_with_backend_mode_after_arm(
     };
     let mut debouncer = match backend {
         WatchBackend::Recommended => {
-            WatcherDebouncer::Recommended(new_debouncer(debounce, None, event_handler)?)
+            WatcherDebouncer::Recommended(new_native_debouncer(debounce, event_handler)?)
         }
         WatchBackend::Poll => {
             WatcherDebouncer::Poll(new_debouncer_opt::<_, PollWatcher, RecommendedCache>(
@@ -5775,5 +5804,150 @@ mod tests {
     #[tokio::test]
     async fn native_watcher_observes_exact_ruby_lsp_config_controls() {
         assert_ruby_lsp_config_edges_for_backend(WatchBackend::Recommended).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_watcher_without_file_id_cache_preserves_dirty_edges() {
+        async fn receive_matching(
+            rx: &mut tokio::sync::mpsc::Receiver<WatchEvent>,
+            matches: impl Fn(&WatchEvent) -> bool,
+        ) -> WatchEvent {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = rx.recv().await.expect("watch event channel closed");
+                    if matches(&event) {
+                        return event;
+                    }
+                }
+            })
+            .await
+            .expect("native watcher delivered no matching dirty edge")
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let atomic_dst = root.join("atomic.rs");
+        let old_file = root.join("rename-old.rs");
+        let new_file = root.join("rename-new.rs");
+        let old_dir = root.join("rename-old-dir");
+        let new_dir = root.join("rename-new-dir");
+        let deleted = root.join("deleted.rs");
+        std::fs::write(&atomic_dst, "old").unwrap();
+        std::fs::write(&old_file, "file").unwrap();
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("nested.rs"), "nested").unwrap();
+        std::fs::write(&deleted, "delete me").unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let _handle = watch_repo_with_backend(
+            &root,
+            Duration::from_millis(50),
+            tx,
+            WatchBackend::Recommended,
+        )
+        .unwrap();
+        let probe = root.join("probe.rs");
+        assert!(
+            wait_for_probe_with_retries(
+                &mut rx,
+                &probe,
+                Duration::from_secs(5),
+                Duration::from_millis(250),
+            )
+            .await
+            .is_some(),
+            "native watcher did not arm"
+        );
+
+        std::fs::write(&probe, "modified").unwrap();
+        receive_matching(
+            &mut rx,
+            |event| matches!(event, WatchEvent::File { path, .. } if path == &probe),
+        )
+        .await;
+
+        let atomic_tmp = root.join("atomic.tmp");
+        std::fs::write(&atomic_tmp, "new").unwrap();
+        std::fs::rename(&atomic_tmp, &atomic_dst).unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(event, WatchEvent::File { path, change: FileChange::Touched } if path == &atomic_dst)
+                || matches!(event, WatchEvent::Rescan { .. })
+        })
+        .await;
+
+        std::fs::rename(&old_file, &new_file).unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(event, WatchEvent::File { path, change: FileChange::Touched } if path == &old_file || path == &new_file)
+                || matches!(event, WatchEvent::Rescan { .. })
+        })
+        .await;
+
+        std::fs::rename(&old_dir, &new_dir).unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(
+                event,
+                WatchEvent::Rescan {
+                    reason: RescanReason::DirectoryTopologyChanged
+                }
+            )
+        })
+        .await;
+
+        let created = root.join("created.rs");
+        std::fs::write(&created, "created").unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(event, WatchEvent::File { path, change: FileChange::Touched } if path == &created)
+        })
+        .await;
+        std::fs::remove_file(&deleted).unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(event, WatchEvent::File { path, change: FileChange::Deleted | FileChange::Touched } if path == &deleted)
+        })
+        .await;
+
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(
+                event,
+                WatchEvent::Rescan {
+                    reason: RescanReason::IgnoreRulesChanged
+                }
+            )
+        })
+        .await;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/next\n").unwrap();
+        receive_matching(&mut rx, |event| matches!(event, WatchEvent::Git(_))).await;
+
+        let nested_git = root.join("nested/.git");
+        std::fs::create_dir_all(nested_git.parent().unwrap()).unwrap();
+        std::fs::write(&nested_git, "gitdir: elsewhere\n").unwrap();
+        receive_matching(&mut rx, |event| {
+            matches!(
+                event,
+                WatchEvent::Rescan {
+                    reason: RescanReason::DirectoryTopologyChanged
+                }
+            )
+        })
+        .await;
+
+        while rx.try_recv().is_ok() {}
+        let ignored = root.join("target/ignored.rs");
+        std::fs::create_dir_all(ignored.parent().unwrap()).unwrap();
+        std::fs::write(&ignored, "ignored").unwrap();
+        let leaked = tokio::time::timeout(Duration::from_millis(500), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, WatchEvent::File { path, .. } if path == ignored) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(!leaked, "native watcher leaked an ignored target edge");
     }
 }
