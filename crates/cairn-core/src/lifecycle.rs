@@ -60,6 +60,120 @@ use crate::{Error, Result};
 /// retried later, so a stuck lease delays but never cancels removal.
 const LEASE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub(crate) const TERMINAL_FAILURES_TO_QUARANTINE: i64 = 3;
+pub(crate) const TERMINAL_FAILURE_GRACE: Duration = Duration::from_secs(60 * 60);
+pub(crate) const QUARANTINE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const QUARANTINE_AUTO_REMOVE_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Result of the narrow filesystem probe used for stale-registration policy.
+/// Operational Git failures are deliberately `Ambiguous`, never inferred from
+/// stderr text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegistrationHealthEvidence {
+    Healthy,
+    Terminal(cas_registry::TerminalFailureKind),
+    Ambiguous(String),
+}
+
+pub(crate) fn classify_registration_health(root: &Path) -> RegistrationHealthEvidence {
+    use cas_registry::TerminalFailureKind;
+    use std::io::ErrorKind;
+
+    let root_link = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return RegistrationHealthEvidence::Terminal(TerminalFailureKind::RootMissing);
+        }
+        Err(error) => {
+            return RegistrationHealthEvidence::Ambiguous(format!(
+                "root metadata unavailable: {error}"
+            ));
+        }
+    };
+    let root_metadata = if root_link.file_type().is_symlink() {
+        match std::fs::metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return RegistrationHealthEvidence::Terminal(TerminalFailureKind::RootMissing);
+            }
+            Err(error) => {
+                return RegistrationHealthEvidence::Ambiguous(format!(
+                    "root symlink target unavailable: {error}"
+                ));
+            }
+        }
+    } else {
+        root_link
+    };
+    if !root_metadata.is_dir() {
+        return RegistrationHealthEvidence::Terminal(TerminalFailureKind::RootNotDirectory);
+    }
+
+    let dot_git = root.join(".git");
+    let dot_git_link = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return RegistrationHealthEvidence::Terminal(TerminalFailureKind::GitAdminMissing);
+        }
+        Err(error) => {
+            return RegistrationHealthEvidence::Ambiguous(format!(
+                ".git metadata unavailable: {error}"
+            ));
+        }
+    };
+    if dot_git_link.is_dir() {
+        return RegistrationHealthEvidence::Healthy;
+    }
+    if dot_git_link.file_type().is_symlink() {
+        return RegistrationHealthEvidence::Ambiguous(
+            ".git symlink is outside the supported structural contract".into(),
+        );
+    }
+    if !dot_git_link.is_file() {
+        return RegistrationHealthEvidence::Ambiguous(
+            ".git is neither a directory nor a regular gitdir file".into(),
+        );
+    }
+
+    let contents = match std::fs::read_to_string(&dot_git) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return RegistrationHealthEvidence::Terminal(TerminalFailureKind::GitAdminMissing);
+        }
+        Err(error) => {
+            return RegistrationHealthEvidence::Ambiguous(format!(".git file unreadable: {error}"));
+        }
+    };
+    let mut lines = contents.lines();
+    let Some(target) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir: "))
+        .map(str::trim)
+        .filter(|target| !target.is_empty() && !target.contains('\0'))
+    else {
+        return RegistrationHealthEvidence::Ambiguous("malformed .git gitdir file".into());
+    };
+    if lines.next().is_some() {
+        return RegistrationHealthEvidence::Ambiguous("malformed multiline .git file".into());
+    }
+    let target = Path::new(target);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        root.join(target)
+    };
+    match std::fs::metadata(&target) {
+        Ok(metadata) if metadata.is_dir() => RegistrationHealthEvidence::Healthy,
+        Ok(_) => RegistrationHealthEvidence::Ambiguous("gitdir target is not a directory".into()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            RegistrationHealthEvidence::Terminal(TerminalFailureKind::GitAdminMissing)
+        }
+        Err(error) => {
+            RegistrationHealthEvidence::Ambiguous(format!("gitdir target unavailable: {error}"))
+        }
+    }
+}
+
 /// Admission state of one canonical repository gate. Transitions
 /// only move forward (`Registering → Active → Removing → Removed`),
 /// except that a failed publication for a newly created owner
@@ -325,10 +439,13 @@ pub struct StartupSweepReport {
 /// `RepositoryRemovalReason` recorded with the pre-delete intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemovalIntent {
-    /// A runtime detector saw the root path gone. Re-validated
-    /// against the filesystem (and against `persistent`) before any
-    /// durable step, so a transient watcher edge cannot delete.
-    MissingRoot { repo_hash: String },
+    /// A quarantined stale registration crossed its removal grace. The epoch
+    /// prevents a queued intent from deleting a recovered/re-registered owner.
+    AgedStale {
+        repo_hash: String,
+        kind: cas_registry::TerminalFailureKind,
+        health_epoch: i64,
+    },
     /// The final alias for this owner was removed by the operator.
     LastAliasRemoved { repo_hash: String },
     /// An alias retarget left this old owner unreachable (zero
@@ -340,7 +457,7 @@ pub enum RemovalIntent {
 impl RemovalIntent {
     fn repo_hash(&self) -> &str {
         match self {
-            Self::MissingRoot { repo_hash }
+            Self::AgedStale { repo_hash, .. }
             | Self::LastAliasRemoved { repo_hash }
             | Self::AliasRetargeted { repo_hash } => repo_hash,
         }
@@ -348,11 +465,25 @@ impl RemovalIntent {
 
     fn reason(&self) -> RepositoryRemovalReason {
         match self {
-            Self::MissingRoot { .. } => RepositoryRemovalReason::MissingRoot,
+            Self::AgedStale { kind, .. } => match kind {
+                cas_registry::TerminalFailureKind::RootMissing => {
+                    RepositoryRemovalReason::MissingRoot
+                }
+                cas_registry::TerminalFailureKind::GitAdminMissing => {
+                    RepositoryRemovalReason::StaleGitMetadata
+                }
+                cas_registry::TerminalFailureKind::RootNotDirectory => {
+                    RepositoryRemovalReason::MissingRoot
+                }
+            },
             Self::LastAliasRemoved { .. } => RepositoryRemovalReason::LastAliasRemoved,
             Self::AliasRetargeted { .. } => RepositoryRemovalReason::AliasRetargeted,
         }
     }
+}
+
+struct PreparedRemoval {
+    repo: RepositoryEntry,
 }
 
 /// Weak handles to the daemon-owned runtime managers a removal must
@@ -587,22 +718,36 @@ impl RepoLifecycleManager {
     /// return `Ok` (idempotent).
     async fn process_runtime_removal(&self, intent: &RemovalIntent) -> Result<()> {
         let repo_hash = intent.repo_hash().to_string();
+        let aged_stale = matches!(intent, RemovalIntent::AgedStale { .. });
+        if let RemovalIntent::AgedStale {
+            kind, health_epoch, ..
+        } = intent
         {
+            let reason = stale_removal_reason(*kind);
+            let already_prepared = {
+                let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+                cas_registry::lookup_repository(&index, &repo_hash)?
+                    .and_then(|repo| repo.removal_request)
+                    .is_some_and(|request| Some(request.reason) == reason)
+            };
+            if already_prepared {
+                self.ensure_gate(&repo_hash, RepoActivityState::Removing);
+            } else if self
+                .prepare_aged_stale_removal(&repo_hash, *kind, *health_epoch)?
+                .is_none()
+            {
+                return Ok(());
+            }
+        } else {
             let _transition = self.transition.lock().map_err(|_| {
                 Error::Internal("repository lifecycle transition mutex poisoned".into())
             })?;
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let Some(repo) = cas_registry::lookup_repository(&index, &repo_hash)? else {
+            if cas_registry::lookup_repository(&index, &repo_hash)?.is_none() {
                 return Ok(());
-            };
-            // Missing-root is the only *inferred* reason, so it is
-            // re-validated at the last moment: persistent owners are
-            // exempt by policy, and only a definitive NotFound (not
-            // a transient IO error) may proceed to a durable intent.
-            if matches!(intent, RemovalIntent::MissingRoot { .. }) {
-                if repo.persistent || !root_is_definitively_missing(Path::new(&repo.root_path))? {
-                    return Ok(());
-                }
+            }
+            if matches!(intent, RemovalIntent::AgedStale { .. }) {
+                return Ok(());
             }
             let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::mark_removal_requested(&tx, &repo_hash, intent.reason(), now_ns())?;
@@ -625,27 +770,78 @@ impl RepoLifecycleManager {
         jobs.cancel_repository(&repo_hash)?;
         gate.wait_idle(LEASE_DRAIN_TIMEOUT).await?;
 
-        // Producers are stopped and leases drained: delete the owner
-        // row and record the removal event (state `pending`) in one
-        // transaction. `None` here means the durable intent vanished,
-        // which no production path does — treat as corruption.
-        let event_id = {
-            let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let event_id = cas_registry::delete_repository_with_event(&tx, &repo_hash, now_ns())?
-                .ok_or_else(|| {
-                Error::Internal(format!("missing removal request for {repo_hash}"))
-            })?;
-            tx.commit()?;
-            event_id
-        };
-        // Store-directory removal happens after the registry commit;
-        // a crash between the two leaves the event `pending` and the
-        // next startup retries the directory cleanup.
-        self.finish_store_cleanup(&repo_hash, event_id)?;
-        gate.mark_removed();
-        info!(repo_hash = %repo_hash, "repository lifecycle removal complete");
+        self.finish_prepared_removal(&repo_hash, &gate)?;
+        if aged_stale {
+            tracing::debug!(repo_hash = %repo_hash, "stale repository lifecycle removal complete");
+        } else {
+            info!(repo_hash = %repo_hash, "repository lifecycle removal complete");
+        }
         Ok(())
+    }
+
+    /// Final stale-removal linearization shared by startup and runtime. The
+    /// filesystem probe runs under the transition mutex but outside a DB
+    /// transaction; the following IMMEDIATE transaction rechecks epoch and
+    /// evidence fields before committing the durable removal intent.
+    fn prepare_aged_stale_removal(
+        &self,
+        repo_hash: &str,
+        kind: cas_registry::TerminalFailureKind,
+        health_epoch: i64,
+    ) -> Result<Option<PreparedRemoval>> {
+        let _transition = self.transition.lock().map_err(|_| {
+            Error::Internal("repository lifecycle transition mutex poisoned".into())
+        })?;
+        let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+        let Some(repo) = cas_registry::lookup_repository(&index, repo_hash)? else {
+            return Ok(None);
+        };
+        let Some(state) = cas_registry::get_reconcile_state(&index, repo_hash)? else {
+            return Ok(None);
+        };
+        let decision_ns = now_ns();
+        if !aged_stale_state_matches(&repo, &state, kind, health_epoch, decision_ns)
+            || classify_registration_health(Path::new(&repo.root_path))
+                != RegistrationHealthEvidence::Terminal(kind)
+        {
+            return Ok(None);
+        }
+        drop(index);
+
+        let reason = stale_removal_reason(kind).ok_or_else(|| {
+            Error::InvalidArgument("non-removable structural evidence reached finalizer".into())
+        })?;
+        let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+        let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(current_repo) = cas_registry::lookup_repository(&tx, repo_hash)? else {
+            return Ok(None);
+        };
+        let Some(current_state) = cas_registry::get_reconcile_state(&tx, repo_hash)? else {
+            return Ok(None);
+        };
+        if !aged_stale_state_matches(
+            &current_repo,
+            &current_state,
+            kind,
+            health_epoch,
+            decision_ns,
+        ) {
+            return Ok(None);
+        }
+        if !cas_registry::mark_removal_requested(&tx, repo_hash, reason, decision_ns)? {
+            return Err(Error::Internal(format!(
+                "stale removal intent race for repo_hash={repo_hash}"
+            )));
+        }
+        tx.commit()?;
+        self.ensure_gate(repo_hash, RepoActivityState::Active)
+            .begin_removal()?;
+        info!(
+            %repo_hash,
+            reason = reason.as_db_str(),
+            "removing quarantined stale repository registration"
+        );
+        Ok(Some(PreparedRemoval { repo }))
     }
 
     /// Remove the per-repo store directory and record the outcome on
@@ -671,6 +867,27 @@ impl RepoLifecycleManager {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Destructive finalizer shared by startup and runtime after admission is
+    /// closed and the durable removal request exists. Runtime callers stop
+    /// producers and drain leases first; startup has no live producers yet.
+    fn finish_prepared_removal(&self, repo_hash: &str, gate: &RepoActivityGate) -> Result<()> {
+        let event_id = {
+            let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let event_id = cas_registry::delete_repository_with_event(&tx, repo_hash, now_ns())?
+                .ok_or_else(|| {
+                    Error::Internal(format!("missing removal request for {repo_hash}"))
+                })?;
+            tx.commit()?;
+            event_id
+        };
+        // A crash after the registry commit leaves a pending event, which the
+        // next startup resumes before scanning live registrations.
+        self.finish_store_cleanup(repo_hash, event_id)?;
+        gate.mark_removed();
         Ok(())
     }
 
@@ -852,6 +1069,10 @@ impl RepoLifecycleManager {
             }
             let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             cas_registry::upsert_repository(&tx, &repo_hash, &root_path, registered_at_ns)?;
+            // Admission itself invalidates queued stale-removal actions. It
+            // does not clear evidence: only a complete reconcile success may
+            // declare the registration healthy again.
+            cas_registry::bump_health_epoch(&tx, &repo_hash)?;
             tx.commit()?;
             existing.is_none()
         };
@@ -1147,6 +1368,7 @@ impl RepoLifecycleManager {
             // A durable request always wins: resuming an interrupted
             // removal keeps its original operator-visible reason.
             let requested_reason = repo.removal_request.as_ref().map(|request| request.reason);
+            let mut aged_action = None;
             let reason = if let Some(reason) = requested_reason {
                 Some(reason)
             } else if alias_count == 0 {
@@ -1154,30 +1376,125 @@ impl RepoLifecycleManager {
                 // user-facing path; persistence does not protect it.
                 Some(RepositoryRemovalReason::StartupAliasless)
             } else {
-                match std::fs::metadata(&repo.root_path) {
-                    Ok(metadata) if metadata.is_dir() => None,
-                    // Root exists but is not a directory: keep the
-                    // registration, surface it as degraded.
-                    Ok(_) => {
+                match classify_registration_health(Path::new(&repo.root_path)) {
+                    RegistrationHealthEvidence::Healthy => {
+                        let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+                        let tx = index
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        let state = cas_registry::get_reconcile_state(&tx, &repo.repo_hash)?
+                            .ok_or_else(|| {
+                                Error::Internal(format!(
+                                    "missing reconcile state for {}",
+                                    repo.repo_hash
+                                ))
+                            })?;
+                        if state.quarantined_at_ns.is_some() {
+                            if state.desired_generation <= state.applied_generation {
+                                cas_registry::increment_immediate_desired_generation(
+                                    &tx,
+                                    &repo.repo_hash,
+                                    now_ns(),
+                                )?;
+                            } else {
+                                let changed = tx.execute(
+                                    "UPDATE repo_reconcile_state
+                                     SET next_retry_at_ns = NULL
+                                     WHERE repo_hash = ?1",
+                                    rusqlite::params![repo.repo_hash],
+                                )?;
+                                if changed != 1 {
+                                    return Err(Error::Internal(format!(
+                                        "missing quarantined reconcile state for {}",
+                                        repo.repo_hash
+                                    )));
+                                }
+                            }
+                        }
+                        tx.commit()?;
+                        None
+                    }
+                    RegistrationHealthEvidence::Ambiguous(_) => {
+                        let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+                        let tx = index
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        let observed_at_ns = now_ns();
+                        cas_registry::record_ambiguous_failure(&tx, &repo.repo_hash)?;
+                        let state = cas_registry::get_reconcile_state(&tx, &repo.repo_hash)?
+                            .ok_or_else(|| {
+                                Error::Internal(format!(
+                                    "missing reconcile state for {}",
+                                    repo.repo_hash
+                                ))
+                            })?;
+                        if state.quarantined_at_ns.is_some() {
+                            tx.execute(
+                                "UPDATE repo_reconcile_state
+                                 SET next_retry_at_ns = ?1
+                                 WHERE repo_hash = ?2",
+                                rusqlite::params![
+                                    observed_at_ns.saturating_add(duration_ns(
+                                        QUARANTINE_REVALIDATION_INTERVAL
+                                    )),
+                                    repo.repo_hash
+                                ],
+                            )?;
+                        }
+                        tx.commit()?;
                         report.repositories_degraded.push(repo.repo_hash.clone());
                         None
                     }
-                    // Only a definitive NotFound on an ephemeral
-                    // owner triggers the missing-root auto-removal;
-                    // persistent owners are exempt by policy.
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && !repo.persistent => {
-                        Some(RepositoryRemovalReason::MissingRoot)
-                    }
-                    // Transient/permission errors must not delete
-                    // data, and a persistent owner with a missing
-                    // root also lands here: keep the owner, flag it.
-                    Err(_) => {
-                        report.repositories_degraded.push(repo.repo_hash.clone());
-                        None
+                    RegistrationHealthEvidence::Terminal(kind) => {
+                        let transition = {
+                            let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+                            let tx = index.transaction_with_behavior(
+                                rusqlite::TransactionBehavior::Immediate,
+                            )?;
+                            let observed_at_ns = now_ns();
+                            let transition = cas_registry::record_terminal_failure(
+                                &tx,
+                                &repo.repo_hash,
+                                kind,
+                                observed_at_ns,
+                                TERMINAL_FAILURES_TO_QUARANTINE,
+                                duration_ns(TERMINAL_FAILURE_GRACE),
+                                duration_ns(QUARANTINE_AUTO_REMOVE_GRACE),
+                            )?;
+                            if transition.quarantined_at_ns.is_some() {
+                                tx.execute(
+                                    "UPDATE repo_reconcile_state
+                                     SET next_retry_at_ns = ?1
+                                     WHERE repo_hash = ?2",
+                                    rusqlite::params![
+                                        observed_at_ns.saturating_add(duration_ns(
+                                            QUARANTINE_REVALIDATION_INTERVAL
+                                        )),
+                                        repo.repo_hash
+                                    ],
+                                )?;
+                            }
+                            tx.commit()?;
+                            transition
+                        };
+                        if !repo.persistent && transition.auto_remove_eligible {
+                            aged_action = Some((kind, transition.health_epoch));
+                            None
+                        } else {
+                            report.repositories_degraded.push(repo.repo_hash.clone());
+                            None
+                        }
                     }
                 }
             };
 
+            if let Some((kind, health_epoch)) = aged_action {
+                if let Some(prepared) =
+                    self.prepare_aged_stale_removal(&repo.repo_hash, kind, health_epoch)?
+                {
+                    self.remove_startup_prepared(&prepared.repo)?;
+                    report.repositories_removed.push(repo.repo_hash);
+                    continue;
+                }
+            }
             if let Some(reason) = reason {
                 self.remove_startup_exclusive(&repo, reason)?;
                 report.repositories_removed.push(repo.repo_hash);
@@ -1236,41 +1553,38 @@ impl RepoLifecycleManager {
         repo: &RepositoryEntry,
         reason: RepositoryRemovalReason,
     ) -> Result<()> {
+        self.finish_startup_removal(repo, Some(reason))
+    }
+
+    /// Finish a startup removal whose durable stale intent and Removing gate
+    /// were established by [`Self::prepare_aged_stale_removal`].
+    fn remove_startup_prepared(&self, repo: &RepositoryEntry) -> Result<()> {
+        self.finish_startup_removal(repo, None)
+    }
+
+    fn finish_startup_removal(
+        &self,
+        repo: &RepositoryEntry,
+        reason_to_prepare: Option<RepositoryRemovalReason>,
+    ) -> Result<()> {
         let gate = self.ensure_gate(&repo.repo_hash, RepoActivityState::Removing);
-        gate.begin_removal()?;
-        let event_id = {
+        if reason_to_prepare.is_some() {
+            gate.begin_removal()?;
+        }
+        {
             let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
             let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            // First-request-wins: when resuming an already-requested
-            // removal this is a no-op that keeps the original
-            // reason; the delete below requires the intent to exist.
-            cas_registry::mark_removal_requested(&tx, &repo.repo_hash, reason, now_ns())?;
-            let event_id =
-                cas_registry::delete_repository_with_event(&tx, &repo.repo_hash, now_ns())?
-                    .ok_or_else(|| {
-                        Error::Internal(format!("missing removal request for {}", repo.repo_hash))
-                    })?;
+            if let Some(reason) = reason_to_prepare {
+                // First-request-wins: when resuming an already-requested
+                // removal this is a no-op that keeps the original reason.
+                cas_registry::mark_removal_requested(&tx, &repo.repo_hash, reason, now_ns())?;
+            }
             tx.commit()?;
-            event_id
-        };
-        let repo_dir = self.cas_data_dir.repo_dir(&repo.repo_hash);
-        let cleanup = std::fs::remove_dir_all(&repo_dir);
-        let mut index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
-        let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        match cleanup {
-            Ok(()) => {
-                cas_registry::mark_store_cleanup_complete(&tx, event_id)?;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                cas_registry::mark_store_cleanup_complete(&tx, event_id)?;
-            }
-            Err(err) => {
-                cas_registry::mark_store_cleanup_error(&tx, event_id, &err.to_string())?;
-            }
         }
-        tx.commit()?;
-        gate.mark_removed();
-        info!(repo_hash = %repo.repo_hash, ?reason, "repository removed during startup sweep");
+        self.finish_prepared_removal(&repo.repo_hash, &gate)?;
+        if let Some(reason) = reason_to_prepare {
+            info!(repo_hash = %repo.repo_hash, ?reason, "repository removed during startup sweep");
+        }
         Ok(())
     }
 
@@ -1302,27 +1616,62 @@ fn now_ns() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// `true` only for a definitive NotFound. Any other stat failure
-/// (permissions, transient IO) propagates as `Err` so an inferred
-/// missing-root removal never proceeds on ambiguous evidence.
-fn root_is_definitively_missing(path: &Path) -> Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(_) => Ok(false),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(err) => Err(err.into()),
+fn duration_ns(duration: Duration) -> i64 {
+    i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+}
+
+fn stale_removal_reason(
+    kind: cas_registry::TerminalFailureKind,
+) -> Option<RepositoryRemovalReason> {
+    match kind {
+        cas_registry::TerminalFailureKind::RootMissing => {
+            Some(RepositoryRemovalReason::MissingRoot)
+        }
+        cas_registry::TerminalFailureKind::GitAdminMissing => {
+            Some(RepositoryRemovalReason::StaleGitMetadata)
+        }
+        cas_registry::TerminalFailureKind::RootNotDirectory => {
+            Some(RepositoryRemovalReason::MissingRoot)
+        }
     }
+}
+
+fn aged_stale_state_matches(
+    repo: &RepositoryEntry,
+    state: &cas_registry::RepoReconcileState,
+    kind: cas_registry::TerminalFailureKind,
+    health_epoch: i64,
+    decision_ns: i64,
+) -> bool {
+    let Some(since_ns) = state.terminal_failure_since_ns else {
+        return false;
+    };
+    let Some(quarantined_at_ns) = state.quarantined_at_ns else {
+        return false;
+    };
+    !repo.persistent
+        && repo.removal_request.is_none()
+        && state.health_epoch == health_epoch
+        && state.terminal_failure_kind == Some(kind)
+        && state.terminal_failure_count >= TERMINAL_FAILURES_TO_QUARANTINE
+        && decision_ns >= since_ns.saturating_add(duration_ns(TERMINAL_FAILURE_GRACE))
+        && decision_ns
+            >= quarantined_at_ns
+                .max(since_ns)
+                .saturating_add(duration_ns(QUARANTINE_AUTO_REMOVE_GRACE))
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
     use super::*;
     use crate::cas::registry;
     use crate::cas::registry::StoreCleanupState;
     use crate::jobs::JobManager;
-    use crate::reconcile::{ReconcileTrigger, RepoReconcileManager};
+    use crate::reconcile::{Clock, ReconcileTrigger, RepoReconcileManager, RetryPolicy};
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
@@ -1353,6 +1702,108 @@ mod tests {
         fn make_writer(&'writer self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    struct LifecycleTestClock(AtomicI64);
+
+    impl LifecycleTestClock {
+        fn new(now_ns: i64) -> Arc<Self> {
+            Arc::new(Self(AtomicI64::new(now_ns)))
+        }
+
+        fn advance(&self, delta_ns: i64) {
+            self.0.fetch_add(delta_ns, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for LifecycleTestClock {
+        fn now_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_health_classifier_is_symlink_safe_and_strict_about_gitdir_files() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert_eq!(
+            classify_registration_health(&missing),
+            RegistrationHealthEvidence::Terminal(registry::TerminalFailureKind::RootMissing)
+        );
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Terminal(registry::TerminalFailureKind::GitAdminMissing)
+        );
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Healthy
+        );
+        std::fs::remove_dir(root.join(".git")).unwrap();
+
+        let git_admin = root.join("admin");
+        std::fs::create_dir(&git_admin).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: admin\r\n").unwrap();
+        assert_eq!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Healthy
+        );
+        std::fs::write(root.join(".git"), "gitdir: admin\nextra\n").unwrap();
+        assert!(matches!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Ambiguous(_)
+        ));
+        std::fs::write(root.join(".git"), "gitdir: admin\n\n").unwrap();
+        assert!(matches!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Ambiguous(_)
+        ));
+        std::fs::write(root.join(".git"), [0xff, 0xfe]).unwrap();
+        assert!(matches!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Ambiguous(_)
+        ));
+        std::fs::write(root.join(".git"), "gitdir: vanished\n").unwrap();
+        assert_eq!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Terminal(registry::TerminalFailureKind::GitAdminMissing)
+        );
+        std::fs::remove_file(root.join(".git")).unwrap();
+
+        symlink(&git_admin, root.join(".git")).unwrap();
+        assert!(matches!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Ambiguous(_)
+        ));
+        std::fs::remove_file(root.join(".git")).unwrap();
+        symlink(root.join("missing-admin"), root.join(".git")).unwrap();
+        assert!(matches!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Ambiguous(_)
+        ));
+        std::fs::remove_file(root.join(".git")).unwrap();
+
+        let socket = UnixListener::bind(root.join(".git")).unwrap();
+        assert!(matches!(
+            classify_registration_health(&root),
+            RegistrationHealthEvidence::Ambiguous(_)
+        ));
+        drop(socket);
+        std::fs::remove_file(root.join(".git")).unwrap();
+
+        let file_root = tmp.path().join("not-directory");
+        std::fs::write(&file_root, "x").unwrap();
+        assert_eq!(
+            classify_registration_health(&file_root),
+            RegistrationHealthEvidence::Terminal(registry::TerminalFailureKind::RootNotDirectory)
+        );
     }
 
     #[test]
@@ -1393,7 +1844,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
         let lifecycle = RepoLifecycleManager::new(cas);
-        let expected = RemovalIntent::MissingRoot {
+        let expected = RemovalIntent::LastAliasRemoved {
             repo_hash: "poisoned".to_string(),
         };
 
@@ -1435,7 +1886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_sweep_removes_missing_ephemeral_and_preserves_persistent() {
+    async fn startup_sweep_removes_only_aged_missing_ephemeral_and_preserves_persistent() {
         let data = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
         cas.ensure().unwrap();
@@ -1460,6 +1911,18 @@ mod tests {
         )
         .unwrap();
         registry::set_repository_persistent(&tx, "persistent-hash", true).unwrap();
+        let old = now_ns().saturating_sub(duration_ns(Duration::from_secs(25 * 60 * 60)));
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'root_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 7
+             WHERE repo_hash IN ('ephemeral-hash', 'persistent-hash')",
+            rusqlite::params![old],
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let lifecycle = RepoLifecycleManager::new(cas.clone());
@@ -1481,16 +1944,183 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_sweep_resumes_explicit_request_while_root_exists() {
+    async fn startup_healthy_quarantine_admits_existing_recovery_generation_immediately() {
         let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
         let data = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
         cas.ensure().unwrap();
         let mut index = registry::open(&cas.index_db_path()).unwrap();
         let tx = index.transaction().unwrap();
         registry::upsert(&tx, "demo", &repo.path().to_string_lossy(), "hash", 1).unwrap();
-        registry::mark_removal_requested(&tx, "hash", RepositoryRemovalReason::LastAliasRemoved, 2)
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET desired_generation = 1,
+                 dirty_since_ns = 1,
+                 next_retry_at_ns = 999,
+                 terminal_failure_kind = 'git_admin_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = 1,
+                 quarantined_at_ns = 2,
+                 health_epoch = 4
+             WHERE repo_hash = 'hash'",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let report = lifecycle.startup_sweep().await.unwrap();
+
+        assert_eq!(report.repositories_active, vec!["hash"]);
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        let state = registry::get_reconcile_state(&index, "hash")
+            .unwrap()
             .unwrap();
+        assert_eq!(state.desired_generation, 1);
+        assert_eq!(state.next_retry_at_ns, None);
+        assert_eq!(state.quarantined_at_ns, Some(2));
+    }
+
+    #[tokio::test]
+    async fn startup_rearms_kept_quarantine_before_runtime_can_attempt() {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let terminal_root = data.path().join("missing-root");
+        let ambiguous_root = data.path().join("ambiguous-root");
+        std::fs::create_dir(&ambiguous_root).unwrap();
+        std::fs::write(ambiguous_root.join(".git"), "not a gitdir record\n").unwrap();
+        let now = now_ns();
+        let recent = now.saturating_sub(duration_ns(Duration::from_secs(2 * 60 * 60)));
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(
+            &tx,
+            "terminal",
+            &terminal_root.to_string_lossy(),
+            "terminal-hash",
+            1,
+        )
+        .unwrap();
+        registry::upsert(
+            &tx,
+            "ambiguous",
+            &ambiguous_root.to_string_lossy(),
+            "ambiguous-hash",
+            1,
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET desired_generation = 1,
+                 dirty_since_ns = 1,
+                 next_retry_at_ns = 0,
+                 terminal_failure_kind = 'git_admin_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 4
+             WHERE repo_hash IN ('terminal-hash', 'ambiguous-hash')",
+            rusqlite::params![recent],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let before = now_ns();
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        lifecycle.startup_sweep().await.unwrap();
+        let after = now_ns();
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        for hash in ["terminal-hash", "ambiguous-hash"] {
+            let state = registry::get_reconcile_state(&index, hash)
+                .unwrap()
+                .unwrap();
+            let retry = state.next_retry_at_ns.unwrap();
+            assert!(retry >= before.saturating_add(duration_ns(QUARANTINE_REVALIDATION_INTERVAL)));
+            assert!(retry <= after.saturating_add(duration_ns(QUARANTINE_REVALIDATION_INTERVAL)));
+        }
+        drop(index);
+
+        let reconcile = RepoReconcileManager::new(cas, None);
+        reconcile
+            .request_dirty_by_repo_hash("terminal-hash".into(), ReconcileTrigger::WatchEvent)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(reconcile.test_attempts_started(), 0);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn startup_stale_git_removal_uses_shared_finalizer_and_records_one_info() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let old = now_ns().saturating_sub(duration_ns(Duration::from_secs(25 * 60 * 60)));
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(&tx, "demo", &repo.path().to_string_lossy(), "hash", 1).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'git_admin_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 4
+             WHERE repo_hash = 'hash'",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer(output.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let report = lifecycle.startup_sweep().await.unwrap();
+        drop(_subscriber);
+
+        assert_eq!(report.repositories_removed, vec!["hash"]);
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        let history = registry::list_recent_completed_removals(&index, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].reason, RepositoryRemovalReason::StaleGitMetadata);
+        assert_eq!(
+            output
+                .contents()
+                .matches("removing quarantined stale repository registration")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn aged_root_not_directory_uses_missing_root_removal_reason() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("repo-file");
+        std::fs::write(&root, "not a directory").unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().join("cas")));
+        cas.ensure().unwrap();
+        let old = now_ns().saturating_sub(duration_ns(Duration::from_secs(25 * 60 * 60)));
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(&tx, "demo", &root.to_string_lossy(), "hash", 1).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'root_not_directory',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 2
+             WHERE repo_hash = 'hash'",
+            rusqlite::params![old],
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let lifecycle = RepoLifecycleManager::new(cas.clone());
@@ -1503,11 +2133,309 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
+            registry::list_recent_completed_removals(&index, 10).unwrap()[0].reason,
+            RepositoryRemovalReason::MissingRoot
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_stale_git_removal_uses_shared_finalizer() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let old = now_ns().saturating_sub(duration_ns(Duration::from_secs(25 * 60 * 60)));
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(&tx, "demo", &repo.path().to_string_lossy(), "hash", 1).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'git_admin_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 4
+             WHERE repo_hash = 'hash'",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(index);
+
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        lifecycle.ensure_gate("hash", RepoActivityState::Active);
+        let jobs = JobManager::new(cas.clone());
+        let reconcile = RepoReconcileManager::new(cas.clone(), None);
+        let watchers = Arc::new(WatchManager::with_reconcile(cas.clone(), reconcile.clone()));
+        lifecycle
+            .bind_runtime(
+                Arc::downgrade(&jobs),
+                Arc::downgrade(&watchers),
+                Arc::downgrade(&reconcile),
+            )
+            .unwrap();
+
+        lifecycle
+            .process_runtime_removal(&RemovalIntent::AgedStale {
+                repo_hash: "hash".into(),
+                kind: registry::TerminalFailureKind::GitAdminMissing,
+                health_epoch: 4,
+            })
+            .await
+            .unwrap();
+
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        assert!(
+            registry::lookup_repository(&index, "hash")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry::list_recent_completed_removals(&index, 10).unwrap()[0].reason,
+            RepositoryRemovalReason::StaleGitMetadata
+        );
+        drop(index);
+        lifecycle.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_final_revalidation_keeps_worker_for_one_deadline_recovery() {
+        const HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(&tx, "demo", &repo.path().to_string_lossy(), "hash", 1).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'git_admin_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = 0,
+                 quarantined_at_ns = 0,
+                 health_epoch = 4
+             WHERE repo_hash = 'hash'",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(index);
+
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        lifecycle.ensure_gate("hash", RepoActivityState::Active);
+        let clock = LifecycleTestClock::new(25 * HOUR_NS);
+        let reconcile = RepoReconcileManager::with_config_and_lifecycle(
+            cas.clone(),
+            None,
+            Some(lifecycle.clone()),
+            clock.clone(),
+            RetryPolicy {
+                base_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(60),
+            },
+        );
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let recoveries_hook = recoveries.clone();
+        reconcile.set_test_register_hook(Arc::new(move |_, _, _, _| {
+            recoveries_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let jobs = JobManager::new(cas.clone());
+        let watchers = Arc::new(WatchManager::with_reconcile(cas.clone(), reconcile.clone()));
+        lifecycle
+            .bind_runtime(
+                Arc::downgrade(&jobs),
+                Arc::downgrade(&watchers),
+                Arc::downgrade(&reconcile),
+            )
+            .unwrap();
+        std::fs::remove_dir(repo.path().join(".git")).unwrap();
+
+        let (transition_held_tx, transition_held_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_transition_tx, release_transition_rx) = std::sync::mpsc::sync_channel(1);
+        let lifecycle_for_transition = lifecycle.clone();
+        let transition_holder = std::thread::spawn(move || {
+            let _transition = lifecycle_for_transition.transition.lock().unwrap();
+            transition_held_tx.send(()).unwrap();
+            release_transition_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        });
+        transition_held_rx.recv().unwrap();
+        reconcile
+            .request_dirty_by_repo_hash("hash".into(), ReconcileTrigger::WatchEvent)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while reconcile.test_attempts_started() < 1 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while lifecycle.lock_pending_intents().contains_key("hash") {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            reconcile.test_worker_running("hash"),
+            "an enqueued aged intent must not retire the worker before gate closure"
+        );
+        let failed = {
+            let index = registry::open(&cas.index_db_path()).unwrap();
+            registry::get_reconcile_state(&index, "hash")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(failed.next_retry_at_ns, Some(26 * HOUR_NS));
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        release_transition_tx.send(()).unwrap();
+        transition_holder.join().unwrap();
+
+        // The owner loop is serial. Consuming this no-op intent proves the
+        // preceding final revalidation completed after observing the restored
+        // root, without adding a test-only lifecycle acknowledgement.
+        lifecycle
+            .request_removal(RemovalIntent::LastAliasRemoved {
+                repo_hash: "final-revalidation-observed".into(),
+            })
+            .unwrap();
+        while lifecycle
+            .lock_pending_intents()
+            .contains_key("final-revalidation-observed")
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        reconcile
+            .request_dirty_by_repo_hash("hash".into(), ReconcileTrigger::WatchEvent)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(reconcile.test_attempts_started(), 1);
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        let owner = registry::lookup_repository(&index, "hash")
+            .unwrap()
+            .unwrap();
+        assert!(owner.removal_request.is_none());
+        assert!(
             registry::list_recent_completed_removals(&index, 10)
                 .unwrap()
-                .len(),
-            1
+                .is_empty()
         );
+        drop(index);
+        assert_eq!(
+            lifecycle.lock_gates().get("hash").unwrap().snapshot(),
+            (RepoActivityState::Active, 0)
+        );
+        assert!(!lifecycle.lock_pending_intents().contains_key("hash"));
+
+        clock.advance(HOUR_NS);
+        reconcile
+            .request_dirty_by_repo_hash("hash".into(), ReconcileTrigger::WatchEvent)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while reconcile.test_attempts_started() < 2 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        let state = registry::get_reconcile_state(&index, "hash")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.terminal_failure_kind, None);
+        assert_eq!(state.terminal_failure_count, 0);
+        assert_eq!(state.terminal_failure_since_ns, None);
+        assert_eq!(state.quarantined_at_ns, None);
+        drop(index);
+        reconcile.shutdown(Duration::from_secs(1)).await;
+        lifecycle.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(!reconcile.test_worker_running("hash"));
+        assert!(lifecycle.owner_task.lock().unwrap().is_none());
+        assert!(lifecycle.lock_pending_intents().is_empty());
+    }
+
+    #[test]
+    fn registration_admission_invalidates_queued_stale_action_without_clearing_evidence() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let old = now_ns().saturating_sub(duration_ns(Duration::from_secs(25 * 60 * 60)));
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(&tx, "demo", &repo.path().to_string_lossy(), "hash", 1).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'git_admin_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 9
+             WHERE repo_hash = 'hash'",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(index);
+
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        let permit = lifecycle
+            .begin_registration("hash".into(), repo.path().to_path_buf(), 2)
+            .unwrap();
+        lifecycle.abort_registration_sync(permit).unwrap();
+
+        assert!(
+            lifecycle
+                .prepare_aged_stale_removal(
+                    "hash",
+                    registry::TerminalFailureKind::GitAdminMissing,
+                    9,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        let state = registry::get_reconcile_state(&index, "hash")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.health_epoch, 10);
+        assert_eq!(
+            state.terminal_failure_kind,
+            Some(registry::TerminalFailureKind::GitAdminMissing)
+        );
+        assert_eq!(state.terminal_failure_count, 3);
+        assert_eq!(state.quarantined_at_ns, Some(old));
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_resumes_explicit_request_while_root_exists() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let mut index = registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        registry::upsert(&tx, "demo", &repo.path().to_string_lossy(), "hash", 1).unwrap();
+        registry::mark_removal_requested(&tx, "hash", RepositoryRemovalReason::MissingRoot, 2)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let lifecycle = RepoLifecycleManager::new(cas.clone());
+        lifecycle.startup_sweep().await.unwrap();
+
+        let index = registry::open(&cas.index_db_path()).unwrap();
+        assert!(
+            registry::lookup_repository(&index, "hash")
+                .unwrap()
+                .is_none()
+        );
+        let events = registry::list_recent_completed_removals(&index, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, RepositoryRemovalReason::MissingRoot);
     }
 
     #[tokio::test]
@@ -2064,12 +2992,25 @@ mod tests {
     async fn missing_root_reconcile_routes_through_lifecycle_owner() {
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().to_path_buf();
+        std::fs::create_dir(root.join(".git")).unwrap();
         let data = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
         cas.ensure().unwrap();
         let mut index = registry::open(&cas.index_db_path()).unwrap();
         let tx = index.transaction().unwrap();
         registry::upsert(&tx, "demo", &root.to_string_lossy(), "hash", 1).unwrap();
+        let old = now_ns().saturating_sub(duration_ns(Duration::from_secs(25 * 60 * 60)));
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET terminal_failure_kind = 'root_missing',
+                 terminal_failure_count = 3,
+                 terminal_failure_since_ns = ?1,
+                 quarantined_at_ns = ?1,
+                 health_epoch = 5
+             WHERE repo_hash = 'hash'",
+            rusqlite::params![old],
+        )
+        .unwrap();
         tx.commit().unwrap();
         drop(crate::cas::store::open(&cas.store_db_path("hash")).unwrap());
 
