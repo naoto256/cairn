@@ -211,6 +211,113 @@ CREATE INDEX idx_repository_removal_events_cleanup
     ON repository_removal_events(store_cleanup_state, event_id);
 "#,
     },
+    Migration {
+        // Typed stale-registration evidence and a truthful removal reason.
+        // Existing generic reconcile failures are deliberately not backfilled:
+        // only observations made by the structural classifier may contribute
+        // to quarantine or automatic removal.
+        version: 6,
+        sql: r#"
+CREATE TABLE repositories_v6 (
+    repo_hash        TEXT PRIMARY KEY,
+    root_path        TEXT NOT NULL UNIQUE,
+    registered_at_ns INTEGER NOT NULL,
+    persistent       INTEGER NOT NULL DEFAULT 0 CHECK(persistent IN (0, 1)),
+    removal_requested_at_ns INTEGER,
+    removal_reason TEXT
+        CHECK(removal_reason IS NULL OR removal_reason IN
+            ('missing_root','stale_git_metadata','last_alias_removed',
+             'alias_retargeted','startup_aliasless','registration_aborted'))
+);
+
+CREATE TABLE aliases_v6 (
+    alias            TEXT PRIMARY KEY,
+    repo_hash        TEXT NOT NULL REFERENCES repositories_v6(repo_hash) ON DELETE CASCADE,
+    registered_at_ns INTEGER NOT NULL
+);
+
+CREATE TABLE repo_reconcile_state_v6 (
+    repo_hash             TEXT PRIMARY KEY REFERENCES repositories_v6(repo_hash) ON DELETE CASCADE,
+    desired_generation    INTEGER NOT NULL DEFAULT 0 CHECK(desired_generation >= 0),
+    applied_generation    INTEGER NOT NULL DEFAULT 0 CHECK(applied_generation >= 0),
+    force_generation      INTEGER NOT NULL DEFAULT 0 CHECK(force_generation >= 0),
+    attempt_generation    INTEGER,
+    dirty_since_ns        INTEGER,
+    last_attempt_ns       INTEGER,
+    last_success_ns       INTEGER,
+    consecutive_failures  INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+    next_retry_at_ns      INTEGER,
+    last_error            TEXT,
+    watcher_state         TEXT NOT NULL DEFAULT 'starting'
+        CHECK(watcher_state IN ('starting','active','failed','stopped')),
+    watcher_error         TEXT,
+    terminal_failure_kind TEXT
+        CHECK(terminal_failure_kind IS NULL OR terminal_failure_kind IN
+            ('root_missing','root_not_directory','git_admin_missing')),
+    terminal_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(terminal_failure_count >= 0),
+    terminal_failure_since_ns INTEGER,
+    quarantined_at_ns     INTEGER,
+    health_epoch          INTEGER NOT NULL DEFAULT 0 CHECK(health_epoch >= 0),
+    CHECK(applied_generation <= desired_generation),
+    CHECK(force_generation <= desired_generation),
+    CHECK(attempt_generation IS NULL
+          OR (attempt_generation >= 0 AND attempt_generation <= desired_generation)),
+    CHECK((terminal_failure_kind IS NULL
+           AND terminal_failure_count = 0
+           AND terminal_failure_since_ns IS NULL)
+          OR (terminal_failure_kind IS NOT NULL
+              AND terminal_failure_count > 0
+              AND terminal_failure_since_ns IS NOT NULL))
+);
+
+CREATE TABLE repository_removal_events_v6 (
+    event_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_hash            TEXT NOT NULL,
+    root_path            TEXT NOT NULL,
+    removed_at_ns        INTEGER NOT NULL,
+    reason               TEXT NOT NULL CHECK(reason IN
+        ('missing_root','stale_git_metadata','last_alias_removed',
+         'alias_retargeted','startup_aliasless','registration_aborted')),
+    store_cleanup_state  TEXT NOT NULL
+        CHECK(store_cleanup_state IN ('pending','complete','error')),
+    cleanup_error        TEXT
+);
+
+INSERT INTO repositories_v6
+SELECT repo_hash, root_path, registered_at_ns, persistent,
+       removal_requested_at_ns, removal_reason
+FROM repositories;
+INSERT INTO aliases_v6
+SELECT alias, repo_hash, registered_at_ns FROM aliases;
+INSERT INTO repo_reconcile_state_v6 (
+    repo_hash, desired_generation, applied_generation, force_generation,
+    attempt_generation, dirty_since_ns, last_attempt_ns, last_success_ns,
+    consecutive_failures, next_retry_at_ns, last_error,
+    watcher_state, watcher_error
+)
+SELECT repo_hash, desired_generation, applied_generation, force_generation,
+       attempt_generation, dirty_since_ns, last_attempt_ns, last_success_ns,
+       consecutive_failures, next_retry_at_ns, last_error,
+       watcher_state, watcher_error
+FROM repo_reconcile_state;
+INSERT INTO repository_removal_events_v6
+SELECT event_id, repo_hash, root_path, removed_at_ns, reason,
+       store_cleanup_state, cleanup_error
+FROM repository_removal_events;
+
+DROP TABLE aliases;
+DROP TABLE repo_reconcile_state;
+DROP TABLE repository_removal_events;
+DROP TABLE repositories;
+ALTER TABLE repositories_v6 RENAME TO repositories;
+ALTER TABLE aliases_v6 RENAME TO aliases;
+ALTER TABLE repo_reconcile_state_v6 RENAME TO repo_reconcile_state;
+ALTER TABLE repository_removal_events_v6 RENAME TO repository_removal_events;
+CREATE INDEX idx_aliases_repo_hash ON aliases(repo_hash);
+CREATE INDEX idx_repository_removal_events_cleanup
+    ON repository_removal_events(store_cleanup_state, event_id);
+"#,
+    },
 ];
 
 /// Insert every id in `ids` into the `ambiguous_job_ids` tombstone
@@ -317,6 +424,10 @@ pub enum RepositoryRemovalReason {
     /// and the repository is not marked persistent. Recorded by
     /// the startup sweep and the runtime missing-root path.
     MissingRoot,
+    /// The canonical root remains, but its linked-worktree Git
+    /// administration directory stayed definitively absent through
+    /// quarantine and final revalidation.
+    StaleGitMetadata,
     /// An unregister deleted the last label referencing the
     /// repository.
     LastAliasRemoved,
@@ -339,6 +450,7 @@ impl RepositoryRemovalReason {
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::MissingRoot => "missing_root",
+            Self::StaleGitMetadata => "stale_git_metadata",
             Self::LastAliasRemoved => "last_alias_removed",
             Self::AliasRetargeted => "alias_retargeted",
             Self::StartupAliasless => "startup_aliasless",
@@ -349,6 +461,7 @@ impl RepositoryRemovalReason {
     fn from_db_str(value: &str) -> Option<Self> {
         Some(match value {
             "missing_root" => Self::MissingRoot,
+            "stale_git_metadata" => Self::StaleGitMetadata,
             "last_alias_removed" => Self::LastAliasRemoved,
             "alias_retargeted" => Self::AliasRetargeted,
             "startup_aliasless" => Self::StartupAliasless,
@@ -477,6 +590,51 @@ pub struct RepoReconcileState {
     pub last_error: Option<String>,
     pub watcher_state: WatcherState,
     pub watcher_error: Option<String>,
+    pub terminal_failure_kind: Option<TerminalFailureKind>,
+    pub terminal_failure_count: i64,
+    pub terminal_failure_since_ns: Option<i64>,
+    pub quarantined_at_ns: Option<i64>,
+    pub health_epoch: i64,
+}
+
+/// Structural failure evidence that may make a stale registration eligible
+/// for quarantine. Operational Git/tool/IO errors never map to this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalFailureKind {
+    RootMissing,
+    RootNotDirectory,
+    GitAdminMissing,
+}
+
+impl TerminalFailureKind {
+    #[must_use]
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::RootMissing => "root_missing",
+            Self::RootNotDirectory => "root_not_directory",
+            Self::GitAdminMissing => "git_admin_missing",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "root_missing" => Self::RootMissing,
+            "root_not_directory" => Self::RootNotDirectory,
+            "git_admin_missing" => Self::GitAdminMissing,
+            _ => return None,
+        })
+    }
+}
+
+/// Result of atomically recording one structural observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalFailureTransition {
+    pub kind: TerminalFailureKind,
+    pub count: i64,
+    pub since_ns: i64,
+    pub quarantined_at_ns: Option<i64>,
+    pub health_epoch: i64,
+    pub auto_remove_eligible: bool,
 }
 
 /// A relationship between durable generation columns that the
@@ -1137,6 +1295,18 @@ fn row_to_reconcile_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepoReconci
             format!("unknown watcher_state: {watcher_state_str}").into(),
         )
     })?;
+    let terminal_failure_kind = r
+        .get::<_, Option<String>>(13)?
+        .map(|value| {
+            TerminalFailureKind::from_db_str(&value).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    format!("unknown terminal_failure_kind: {value}").into(),
+                )
+            })
+        })
+        .transpose()?;
     Ok(RepoReconcileState {
         repo_hash: r.get(0)?,
         desired_generation: r.get(1)?,
@@ -1151,6 +1321,11 @@ fn row_to_reconcile_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepoReconci
         last_error: r.get(10)?,
         watcher_state,
         watcher_error: r.get(12)?,
+        terminal_failure_kind,
+        terminal_failure_count: r.get(14)?,
+        terminal_failure_since_ns: r.get(15)?,
+        quarantined_at_ns: r.get(16)?,
+        health_epoch: r.get(17)?,
     })
 }
 
@@ -1160,7 +1335,8 @@ fn row_to_reconcile_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepoReconci
 const RECONCILE_STATE_COLUMNS: &str = "repo_hash, desired_generation, applied_generation, \
      force_generation, attempt_generation, dirty_since_ns, last_attempt_ns, \
      last_success_ns, consecutive_failures, next_retry_at_ns, last_error, \
-     watcher_state, watcher_error";
+     watcher_state, watcher_error, terminal_failure_kind, terminal_failure_count, \
+     terminal_failure_since_ns, quarantined_at_ns, health_epoch";
 
 /// Fetch the durable reconcile state for `repo_hash`. Returns
 /// `Ok(None)` when the repository has no row yet (i.e. the
@@ -1261,18 +1437,35 @@ pub fn increment_immediate_desired_generation(
 /// so a counter overflow or any SQLite failure rolls back every bump.
 pub fn prime_startup_generations(tx: &Transaction<'_>, now_ns: i64) -> Result<Vec<(String, i64)>> {
     let mut stmt = tx.prepare(
-        "SELECT repo_hash FROM repositories
-         WHERE removal_requested_at_ns IS NULL
-         ORDER BY repo_hash",
+        "SELECT r.repo_hash, s.quarantined_at_ns,
+                s.desired_generation, s.applied_generation
+         FROM repositories r
+         JOIN repo_reconcile_state s ON s.repo_hash = r.repo_hash
+         WHERE r.removal_requested_at_ns IS NULL
+         ORDER BY r.repo_hash",
     )?;
     let repo_hashes = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
     let mut primed = Vec::with_capacity(repo_hashes.len());
-    for repo_hash in repo_hashes {
-        let generation = increment_immediate_desired_generation(tx, &repo_hash, now_ns)?;
+    for (repo_hash, quarantined_at_ns, desired, applied) in repo_hashes {
+        let generation = if quarantined_at_ns.is_some() {
+            if desired <= applied {
+                continue;
+            }
+            desired
+        } else {
+            increment_immediate_desired_generation(tx, &repo_hash, now_ns)?
+        };
         primed.push((repo_hash, generation));
     }
     Ok(primed)
@@ -1309,6 +1502,7 @@ pub fn increment_periodic_generation_if_due(
     let due: bool = tx
         .query_row(
             "SELECT r.removal_requested_at_ns IS NULL
+                    AND s.quarantined_at_ns IS NULL
                     AND s.desired_generation = s.applied_generation
                     AND s.attempt_generation IS NULL
                     AND (s.last_success_ns IS NULL OR s.last_success_ns <= ?1)
@@ -1333,8 +1527,10 @@ pub fn increment_periodic_generation_if_due(
 /// picks the max desired but honours `force_generation` for the
 /// analyzer-enqueue variant.
 ///
-/// A manual force request clears an existing retry deadline so
-/// the operator's newly requested attempt can run immediately.
+/// A manual force request clears an ordinary retry deadline so
+/// the operator's newly requested attempt can run immediately. A
+/// quarantined registration keeps its fixed structural-probe deadline;
+/// normal reconcile requests cannot bypass quarantine.
 /// If that attempt fails, `mark_attempt_failure` installs a new
 /// deadline which the worker must honour even while this force
 /// generation remains pending.
@@ -1346,9 +1542,15 @@ pub fn increment_force_generation(
     repo_hash: &str,
     now_ns: i64,
 ) -> Result<i64> {
-    let next = increment_immediate_desired_generation(tx, repo_hash, now_ns)?;
+    let next = increment_desired_generation(tx, repo_hash, now_ns)?;
     tx.execute(
-        "UPDATE repo_reconcile_state SET force_generation = ?1 WHERE repo_hash = ?2",
+        "UPDATE repo_reconcile_state
+         SET force_generation = ?1,
+             next_retry_at_ns = CASE
+                 WHEN quarantined_at_ns IS NULL THEN NULL
+                 ELSE next_retry_at_ns
+             END
+         WHERE repo_hash = ?2",
         params![next, repo_hash],
     )?;
     Ok(next)
@@ -1443,12 +1645,18 @@ pub fn mark_attempt_success(
              consecutive_failures = 0,
              next_retry_at_ns = NULL,
              last_error = NULL,
+             terminal_failure_kind = NULL,
+             terminal_failure_count = 0,
+             terminal_failure_since_ns = NULL,
+             quarantined_at_ns = NULL,
+             health_epoch = health_epoch + 1,
              dirty_since_ns = CASE
                  WHEN desired_generation <= MAX(applied_generation, ?1) THEN NULL
                  ELSE dirty_since_ns
              END
          WHERE repo_hash = ?3
-           AND attempt_generation = ?1",
+           AND attempt_generation = ?1
+           AND health_epoch < 9223372036854775807",
         params![generation, now_ns, repo_hash],
     )?;
     if n != 1 {
@@ -1524,6 +1732,141 @@ pub fn mark_attempt_failure(
         )));
     }
     Ok(())
+}
+
+/// Record one structurally terminal registration failure. Only callers that
+/// obtained typed filesystem evidence may invoke this helper; generic
+/// reconcile failures remain intentionally separate.
+pub fn record_terminal_failure(
+    tx: &Transaction<'_>,
+    repo_hash: &str,
+    kind: TerminalFailureKind,
+    now_ns: i64,
+    failures_to_quarantine: i64,
+    quarantine_grace_ns: i64,
+    auto_remove_grace_ns: i64,
+) -> Result<TerminalFailureTransition> {
+    let current = get_reconcile_state(tx, repo_hash)?.ok_or_else(|| {
+        invalid_transition(&format!(
+            "terminal failure: no reconcile row for repo_hash={repo_hash}"
+        ))
+    })?;
+    let same_kind = current.terminal_failure_kind == Some(kind);
+    let count = if same_kind {
+        current.terminal_failure_count.saturating_add(1)
+    } else {
+        1
+    };
+    let since_ns = if same_kind {
+        current.terminal_failure_since_ns.unwrap_or(now_ns)
+    } else {
+        now_ns
+    };
+    // Quarantine is durable operator history. A changed kind keeps that
+    // history but must earn a fresh same-kind count/since window before it
+    // can authorize removal.
+    let mut quarantined_at_ns = current.quarantined_at_ns;
+    if quarantined_at_ns.is_none()
+        && count >= failures_to_quarantine
+        && now_ns >= since_ns.saturating_add(quarantine_grace_ns)
+    {
+        quarantined_at_ns = Some(now_ns);
+    }
+    let health_epoch = current
+        .health_epoch
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Internal("registration health epoch overflow".into()))?;
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET terminal_failure_kind = ?1,
+             terminal_failure_count = ?2,
+             terminal_failure_since_ns = ?3,
+             quarantined_at_ns = ?4,
+             health_epoch = ?5
+         WHERE repo_hash = ?6 AND health_epoch = ?7",
+        params![
+            kind.as_db_str(),
+            count,
+            since_ns,
+            quarantined_at_ns,
+            health_epoch,
+            repo_hash,
+            current.health_epoch
+        ],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "terminal failure: health epoch race for repo_hash={repo_hash}"
+        )));
+    }
+    let continuous_since = quarantined_at_ns.map(|at| at.max(since_ns));
+    let auto_remove_eligible = count >= failures_to_quarantine
+        && now_ns >= since_ns.saturating_add(quarantine_grace_ns)
+        && continuous_since.is_some_and(|at| now_ns >= at.saturating_add(auto_remove_grace_ns));
+    Ok(TerminalFailureTransition {
+        kind,
+        count,
+        since_ns,
+        quarantined_at_ns,
+        health_epoch,
+        auto_remove_eligible,
+    })
+}
+
+/// Prevent ambiguous operational failures from contributing to a terminal
+/// streak. Typed evidence is cleared while durable quarantine history is
+/// retained, so ambiguous evidence can never authorize deletion.
+pub fn record_ambiguous_failure(tx: &Transaction<'_>, repo_hash: &str) -> Result<()> {
+    let current = get_reconcile_state(tx, repo_hash)?.ok_or_else(|| {
+        invalid_transition(&format!(
+            "ambiguous failure: no reconcile row for repo_hash={repo_hash}"
+        ))
+    })?;
+    let health_epoch = current
+        .health_epoch
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Internal("registration health epoch overflow".into()))?;
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state
+         SET terminal_failure_kind = NULL,
+             terminal_failure_count = 0,
+             terminal_failure_since_ns = NULL,
+             health_epoch = ?1
+         WHERE repo_hash = ?2 AND health_epoch = ?3",
+        params![health_epoch, repo_hash, current.health_epoch],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "ambiguous failure: health epoch race for repo_hash={repo_hash}"
+        )));
+    }
+    Ok(())
+}
+
+/// Invalidate any queued stale-removal action when registration begins,
+/// without claiming that the root has recovered. The evidence itself is
+/// cleared only by a complete reconcile success.
+pub fn bump_health_epoch(tx: &Transaction<'_>, repo_hash: &str) -> Result<i64> {
+    let current = get_reconcile_state(tx, repo_hash)?.ok_or_else(|| {
+        invalid_transition(&format!(
+            "registration epoch: no reconcile row for repo_hash={repo_hash}"
+        ))
+    })?;
+    let next = current
+        .health_epoch
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Internal("registration health epoch overflow".into()))?;
+    let n = tx.execute(
+        "UPDATE repo_reconcile_state SET health_epoch = ?1
+         WHERE repo_hash = ?2 AND health_epoch = ?3",
+        params![next, repo_hash, current.health_epoch],
+    )?;
+    if n != 1 {
+        return Err(invalid_transition(&format!(
+            "registration epoch: race for repo_hash={repo_hash}"
+        )));
+    }
+    Ok(next)
 }
 
 /// Sweep every repository whose `attempt_generation` is non-NULL:
@@ -1622,6 +1965,11 @@ mod tests {
             last_error: Some("EMFILE".into()),
             watcher_state: WatcherState::Failed,
             watcher_error: Some("watch failed".into()),
+            terminal_failure_kind: None,
+            terminal_failure_count: 0,
+            terminal_failure_since_ns: None,
+            quarantined_at_ns: None,
+            health_epoch: 0,
         }
     }
 
@@ -2021,6 +2369,43 @@ mod tests {
     }
 
     #[test]
+    fn startup_prime_does_not_create_quarantined_work_but_wakes_admitted_recovery() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "idle", "/idle", 0).unwrap();
+        upsert_repository(&tx, "recovery", "/recovery", 0).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state
+             SET quarantined_at_ns = 1,
+                 desired_generation = CASE repo_hash WHEN 'recovery' THEN 1 ELSE 0 END,
+                 dirty_since_ns = CASE repo_hash WHEN 'recovery' THEN 1 ELSE NULL END,
+                 next_retry_at_ns = 50
+             WHERE repo_hash IN ('idle', 'recovery')",
+            [],
+        )
+        .unwrap();
+        let primed = prime_startup_generations(&tx, 10).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(primed, vec![("recovery".to_string(), 1)]);
+        assert_eq!(
+            get_reconcile_state(&c, "idle")
+                .unwrap()
+                .unwrap()
+                .desired_generation,
+            0
+        );
+        assert_eq!(
+            get_reconcile_state(&c, "recovery")
+                .unwrap()
+                .unwrap()
+                .next_retry_at_ns,
+            Some(50),
+            "startup priming must not bypass the structural-probe deadline"
+        );
+    }
+
+    #[test]
     fn startup_prime_overflow_rolls_back_every_repository() {
         let (_t, mut c) = fresh();
         {
@@ -2187,6 +2572,27 @@ mod tests {
         assert_eq!(s.last_error.as_deref(), Some("transient failure"));
     }
 
+    #[test]
+    fn force_generation_cannot_bypass_quarantine_probe_deadline() {
+        let (_t, mut c) = fresh();
+        let tx = c.transaction().unwrap();
+        upsert_repository(&tx, "h", "/p", 0).unwrap();
+        increment_desired_generation(&tx, "h", 10).unwrap();
+        mark_attempt_start(&tx, "h", 1, 20).unwrap();
+        mark_attempt_failure(&tx, "h", 1, "terminal", 5_000).unwrap();
+        tx.execute(
+            "UPDATE repo_reconcile_state SET quarantined_at_ns = 30 WHERE repo_hash = 'h'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(increment_force_generation(&tx, "h", 40).unwrap(), 2);
+        tx.commit().unwrap();
+
+        let state = get_reconcile_state(&c, "h").unwrap().unwrap();
+        assert_eq!(state.force_generation, 2);
+        assert_eq!(state.next_retry_at_ns, Some(5_000));
+    }
+
     // ─── MF-3: direct v3 → v4 migration path ────────────────────
 
     /// Open a fresh temp DB and apply migrations v1..v3 ONLY,
@@ -2281,13 +2687,25 @@ mod tests {
 
         // Reconcile state row is seeded exactly once, at
         // generation 0 with defaults intact.
-        let s = get_reconcile_state(&c, "h_a").unwrap().unwrap();
-        assert_eq!(s.desired_generation, 0);
-        assert_eq!(s.applied_generation, 0);
-        assert_eq!(s.force_generation, 0);
-        assert!(s.attempt_generation.is_none());
-        assert_eq!(s.consecutive_failures, 0);
-        assert_eq!(s.watcher_state, WatcherState::Starting);
+        let s: (i64, i64, i64, Option<i64>, i64, String) = c
+            .query_row(
+                "SELECT desired_generation, applied_generation, force_generation,
+                        attempt_generation, consecutive_failures, watcher_state
+                 FROM repo_reconcile_state WHERE repo_hash = 'h_a'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(s, (0, 0, 0, None, 0, "starting".into()));
     }
 
     #[test]
@@ -2549,6 +2967,144 @@ mod tests {
         assert!(repo.removal_request.is_none());
         assert_eq!(aliases_for_repo(&conn, "hash").unwrap(), vec!["demo"]);
         assert!(get_reconcile_state(&conn, "hash").unwrap().is_some());
+    }
+
+    #[test]
+    fn v6_preserves_v5_rows_and_history_without_backfilling_health() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migration::apply(&mut conn, &MIGRATIONS[..5]).unwrap();
+        conn.execute(
+            "INSERT INTO repositories
+             (repo_hash, root_path, registered_at_ns, persistent)
+             VALUES ('live', '/live', 1, 1), ('gone', '/gone', 2, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO aliases (alias, repo_hash, registered_at_ns)
+             VALUES ('demo', 'live', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_reconcile_state
+             (repo_hash, consecutive_failures, last_error)
+             VALUES ('live', 7, 'operational'), ('gone', 0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repository_removal_events
+             (repo_hash, root_path, removed_at_ns, reason, store_cleanup_state)
+             VALUES ('gone', '/gone', 3, 'missing_root', 'complete')",
+            [],
+        )
+        .unwrap();
+
+        crate::migration::apply(&mut conn, MIGRATIONS).unwrap();
+
+        let repo = lookup_repository(&conn, "live").unwrap().unwrap();
+        assert!(repo.persistent);
+        assert_eq!(aliases_for_repo(&conn, "live").unwrap(), vec!["demo"]);
+        let state = get_reconcile_state(&conn, "live").unwrap().unwrap();
+        assert_eq!(state.consecutive_failures, 7);
+        assert_eq!(state.last_error.as_deref(), Some("operational"));
+        assert_eq!(state.terminal_failure_kind, None);
+        assert_eq!(state.terminal_failure_count, 0);
+        assert_eq!(state.health_epoch, 0);
+        assert_eq!(
+            list_recent_completed_removals(&conn, 10).unwrap()[0].reason,
+            RepositoryRemovalReason::MissingRoot
+        );
+
+        let tx = conn.transaction().unwrap();
+        assert!(
+            mark_removal_requested(&tx, "live", RepositoryRemovalReason::StaleGitMetadata, 10,)
+                .unwrap()
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn typed_health_requires_fresh_continuous_evidence_after_ambiguity() {
+        const HOUR: i64 = 60 * 60 * 1_000_000_000;
+        let (_t, mut conn) = fresh();
+        let tx = conn.transaction().unwrap();
+        upsert_repository(&tx, "h", "/repo", 0).unwrap();
+
+        let first = record_terminal_failure(
+            &tx,
+            "h",
+            TerminalFailureKind::GitAdminMissing,
+            0,
+            3,
+            HOUR,
+            24 * HOUR,
+        )
+        .unwrap();
+        assert_eq!(first.count, 1);
+        assert_eq!(first.quarantined_at_ns, None);
+        record_terminal_failure(
+            &tx,
+            "h",
+            TerminalFailureKind::GitAdminMissing,
+            HOUR / 2,
+            3,
+            HOUR,
+            24 * HOUR,
+        )
+        .unwrap();
+        let quarantined = record_terminal_failure(
+            &tx,
+            "h",
+            TerminalFailureKind::GitAdminMissing,
+            HOUR,
+            3,
+            HOUR,
+            24 * HOUR,
+        )
+        .unwrap();
+        assert_eq!(quarantined.quarantined_at_ns, Some(HOUR));
+        assert!(!quarantined.auto_remove_eligible);
+
+        record_ambiguous_failure(&tx, "h").unwrap();
+        let ambiguous = get_reconcile_state(&tx, "h").unwrap().unwrap();
+        assert_eq!(ambiguous.terminal_failure_kind, None);
+        assert_eq!(ambiguous.terminal_failure_since_ns, None);
+        assert_eq!(ambiguous.quarantined_at_ns, Some(HOUR));
+
+        let restarted = record_terminal_failure(
+            &tx,
+            "h",
+            TerminalFailureKind::GitAdminMissing,
+            25 * HOUR,
+            3,
+            HOUR,
+            24 * HOUR,
+        )
+        .unwrap();
+        assert_eq!(restarted.count, 1);
+        assert!(!restarted.auto_remove_eligible);
+        let changed = record_terminal_failure(
+            &tx,
+            "h",
+            TerminalFailureKind::RootMissing,
+            26 * HOUR,
+            3,
+            HOUR,
+            24 * HOUR,
+        )
+        .unwrap();
+        assert_eq!(changed.count, 1);
+        assert_eq!(changed.since_ns, 26 * HOUR);
+        assert_eq!(changed.quarantined_at_ns, Some(HOUR));
+        assert!(!changed.auto_remove_eligible);
+        let epoch = bump_health_epoch(&tx, "h").unwrap();
+        let after_registration = get_reconcile_state(&tx, "h").unwrap().unwrap();
+        assert_eq!(after_registration.health_epoch, epoch);
+        assert_eq!(after_registration.terminal_failure_kind, Some(changed.kind));
+        assert_eq!(after_registration.quarantined_at_ns, Some(HOUR));
+        tx.commit().unwrap();
     }
 
     #[test]

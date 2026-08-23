@@ -45,7 +45,11 @@ use tracing::{debug, info, warn};
 use crate::cas::registry::{self as cas_registry, WatcherState};
 use crate::cas::store as cas_store;
 use crate::jobs::JobManager;
-use crate::lifecycle::{RemovalIntent, RepoLifecycleManager};
+use crate::lifecycle::{
+    QUARANTINE_AUTO_REMOVE_GRACE, QUARANTINE_REVALIDATION_INTERVAL, RegistrationHealthEvidence,
+    RemovalIntent, RepoLifecycleManager, TERMINAL_FAILURE_GRACE, TERMINAL_FAILURES_TO_QUARANTINE,
+    classify_registration_health,
+};
 use crate::paths::CasDataDir;
 use crate::register::{
     ReconcilePublicationReceipt, ReconcileRegistration, register_repo_reconcile,
@@ -1038,6 +1042,13 @@ impl RepoReconcileManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn test_worker_running(&self, repo_hash: &str) -> bool {
+        self.lock_runtimes()
+            .get(repo_hash)
+            .is_some_and(|runtime| runtime.worker_running)
+    }
+
     /// Returns `true` when the worker may exit — the runtime entry is
     /// already gone, or no request landed since `observed_seq`. On a
     /// clean exit with the entry still present it also transitions the
@@ -1266,18 +1277,6 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
                 forced,
                 "reconcile attempt succeeded"
             ),
-            // The lifecycle owner now drives removal of this
-            // repository; the worker exits rather than racing the
-            // delete with further attempts.
-            Ok(AttemptOutcome::RemovalRequested) => {
-                info!(
-                    repo_hash = %repo_hash,
-                    generation,
-                    "reconcile worker handed missing root to lifecycle owner; exiting"
-                );
-                mgr.clear_worker_running(&repo_hash);
-                return;
-            }
             Err(failure) => {
                 let err = &failure.error;
                 warn!(
@@ -1318,9 +1317,12 @@ async fn worker_loop(mgr: Arc<RepoReconcileManager>, repo_hash: String, notify: 
 enum AttemptOutcome {
     /// The attempt ran to a durable `mark_attempt_success`.
     Completed,
-    /// An ephemeral repo's root vanished; removal was handed to
-    /// the lifecycle owner and no attempt was started.
-    RemovalRequested,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StaleRemovalAction {
+    kind: cas_registry::TerminalFailureKind,
+    health_epoch: i64,
 }
 
 /// Failure classification for worker retry pacing.
@@ -1394,42 +1396,34 @@ async fn run_attempt(
         ),
         None => None,
     };
-    // Ephemeral-root check: a non-persistent repository whose
-    // root directory vanished is handed to the lifecycle owner
-    // for removal instead of burning an attempt that could only
-    // fail. Runs before Phase A so the durable attempt slot
-    // (`attempt_generation`) is never claimed for it — the global
-    // concurrency permit, though, is already held at this point.
-    if let Some(lifecycle) = &mgr.lifecycle {
+    // Load structural policy state before Phase A. Terminal evidence is
+    // finalized like any other failed attempt so the streak and next probe
+    // deadline are durable across crashes.
+    let (root, persistent, was_quarantined) = {
         let cas_data_dir = mgr.cas_data_dir.clone();
         let hash = repo_hash.to_string();
-        let missing_ephemeral = tokio::task::spawn_blocking(move || -> Result<bool> {
+        tokio::task::spawn_blocking(move || -> Result<_> {
             let index = cas_registry::open(&cas_data_dir.index_db_path())?;
-            let Some(repo) = cas_registry::lookup_repository(&index, &hash)? else {
-                return Ok(false);
-            };
-            if repo.persistent {
-                return Ok(false);
-            }
-            match std::fs::metadata(&repo.root_path) {
-                Ok(_) => Ok(false),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-                Err(err) => Err(err.into()),
-            }
+            let repo = cas_registry::lookup_repository(&index, &hash)?.ok_or_else(|| {
+                Error::RepoNotFound {
+                    alias: hash.clone(),
+                }
+            })?;
+            let state = cas_registry::get_reconcile_state(&index, &hash)?.ok_or_else(|| {
+                Error::Internal(format!("missing reconcile state for repo_hash={hash}"))
+            })?;
+            Ok((
+                PathBuf::from(repo.root_path),
+                repo.persistent,
+                state.quarantined_at_ns.is_some(),
+            ))
         })
         .await
-        .map_err(|e| Error::internal_task_panic("reconcile root lifecycle check", e))
+        .map_err(|e| Error::internal_task_panic("reconcile registration health load", e))
         .map_err(AttemptFailure::before_start)?
-        .map_err(AttemptFailure::before_start)?;
-        if missing_ephemeral {
-            lifecycle
-                .request_removal(RemovalIntent::MissingRoot {
-                    repo_hash: repo_hash.to_string(),
-                })
-                .map_err(AttemptFailure::before_start)?;
-            return Ok(AttemptOutcome::RemovalRequested);
-        }
-    }
+        .map_err(AttemptFailure::before_start)?
+    };
+    let initial_evidence = classify_registration_health(&root);
     let now_ns = mgr.clock.now_ns();
     let cas_data_dir = mgr.cas_data_dir.clone();
     let hash = repo_hash.to_string();
@@ -1477,7 +1471,13 @@ async fn run_attempt(
     let test_hook = mgr.take_test_register_hook_snapshot();
     #[cfg(not(test))]
     let test_hook: Option<()> = None;
-    let register_result = if let Some(_h) = &test_hook {
+    let register_result = if matches!(initial_evidence, RegistrationHealthEvidence::Terminal(_))
+        || (was_quarantined && !matches!(initial_evidence, RegistrationHealthEvidence::Healthy))
+    {
+        Err(Error::InvalidArgument(format!(
+            "registration structural revalidation failed: {initial_evidence:?}"
+        )))
+    } else if let Some(_h) = &test_hook {
         #[cfg(test)]
         {
             let cas_data_dir_hook = cas_data_dir.clone();
@@ -1515,11 +1515,17 @@ async fn run_attempt(
         .map(|_| ())
     };
 
+    let failure_evidence = register_result
+        .as_ref()
+        .err()
+        .map(|_| classify_registration_health(&root));
+
     // Phase C: commit success or failure to index.db.
     let policy = mgr.retry;
     let finalize_res = tokio::task::spawn_blocking({
         let cas_data_dir = cas_data_dir.clone();
         let hash = hash.clone();
+        let failure_evidence = failure_evidence.clone();
         // Only the error text crosses into the blocking closure;
         // the typed `register_result` is kept outside so the
         // caller can propagate it after finalization.
@@ -1528,12 +1534,13 @@ async fn run_attempt(
             .map(|_| ())
             .map_err(|e| e.to_string());
         let now_ns_finalize = mgr.clock.now_ns();
-        move || -> Result<()> {
+        move || -> Result<Option<StaleRemovalAction>> {
             let mut index = cas_registry::open(&cas_data_dir.index_db_path())?;
             let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            match register_result {
+            let removal = match register_result {
                 Ok(()) => {
                     cas_registry::mark_attempt_success(&tx, &hash, generation, now_ns_finalize)?;
+                    None
                 }
                 Err(err_str) => {
                     // Compute next retry from the pre-update
@@ -1543,7 +1550,47 @@ async fn run_attempt(
                         .map(|s| s.consecutive_failures)
                         .unwrap_or(0);
                     let next_failures = current.saturating_add(1);
-                    let next_retry_at = policy.next_retry_at_ns(now_ns_finalize, next_failures);
+                    let removal = match failure_evidence.as_ref() {
+                        Some(RegistrationHealthEvidence::Terminal(kind)) => {
+                            let transition = cas_registry::record_terminal_failure(
+                                &tx,
+                                &hash,
+                                *kind,
+                                now_ns_finalize,
+                                TERMINAL_FAILURES_TO_QUARANTINE,
+                                i64::try_from(TERMINAL_FAILURE_GRACE.as_nanos())
+                                    .unwrap_or(i64::MAX),
+                                i64::try_from(QUARANTINE_AUTO_REMOVE_GRACE.as_nanos())
+                                    .unwrap_or(i64::MAX),
+                            )?;
+                            (!persistent && transition.auto_remove_eligible).then_some(
+                                StaleRemovalAction {
+                                    kind: *kind,
+                                    health_epoch: transition.health_epoch,
+                                },
+                            )
+                        }
+                        Some(RegistrationHealthEvidence::Healthy)
+                        | Some(RegistrationHealthEvidence::Ambiguous(_))
+                        | None => {
+                            cas_registry::record_ambiguous_failure(&tx, &hash)?;
+                            None
+                        }
+                    };
+                    let health =
+                        cas_registry::get_reconcile_state(&tx, &hash)?.ok_or_else(|| {
+                            Error::Internal(format!(
+                                "missing reconcile state after health update for repo_hash={hash}"
+                            ))
+                        })?;
+                    let next_retry_at = if health.quarantined_at_ns.is_some() {
+                        now_ns_finalize.saturating_add(
+                            i64::try_from(QUARANTINE_REVALIDATION_INTERVAL.as_nanos())
+                                .unwrap_or(i64::MAX),
+                        )
+                    } else {
+                        policy.next_retry_at_ns(now_ns_finalize, next_failures)
+                    };
                     cas_registry::mark_attempt_failure(
                         &tx,
                         &hash,
@@ -1551,10 +1598,11 @@ async fn run_attempt(
                         &err_str,
                         next_retry_at,
                     )?;
+                    removal
                 }
-            }
+            };
             tx.commit()?;
-            Ok(())
+            Ok(removal)
         }
     })
     .await
@@ -1564,7 +1612,19 @@ async fn run_attempt(
     // transition itself could not be committed, the attempt slot
     // stays claimed and startup recovery later clears it as an
     // interrupted attempt.
-    finalize_res.map_err(AttemptFailure::after_start)?;
+    let removal = finalize_res.map_err(AttemptFailure::after_start)?;
+    drop(_lease);
+    if let Some(removal) = removal
+        && let Some(lifecycle) = &mgr.lifecycle
+    {
+        lifecycle
+            .request_removal(RemovalIntent::AgedStale {
+                repo_hash: repo_hash.to_string(),
+                kind: removal.kind,
+                health_epoch: removal.health_epoch,
+            })
+            .map_err(AttemptFailure::after_start)?;
+    }
     register_result
         .map(|_| AttemptOutcome::Completed)
         .map_err(AttemptFailure::after_start)

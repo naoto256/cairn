@@ -217,16 +217,28 @@ fn fresh_cas() -> (tempfile::TempDir, Arc<CasDataDir>) {
 }
 
 fn seed_repo(cas: &CasDataDir, alias: &str, root: &str, repo_hash: &str) {
+    let supplied = std::path::Path::new(root);
+    let root = if supplied.exists() {
+        supplied.to_path_buf()
+    } else {
+        let fixture = cas.root().join("reconcile-fixtures").join(repo_hash);
+        std::fs::create_dir_all(fixture.join(".git")).unwrap();
+        fixture
+    };
     let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
     let tx = index.transaction().unwrap();
-    cas_registry::upsert(&tx, alias, root, repo_hash, 1).unwrap();
+    cas_registry::upsert(&tx, alias, &root.to_string_lossy(), repo_hash, 1).unwrap();
     tx.commit().unwrap();
 }
 
-fn seed_extra_alias(cas: &CasDataDir, alias: &str, root: &str, repo_hash: &str) {
+fn seed_extra_alias(cas: &CasDataDir, alias: &str, _root: &str, repo_hash: &str) {
     let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+    let root = cas_registry::lookup_repository(&index, repo_hash)
+        .unwrap()
+        .unwrap()
+        .root_path;
     let tx = index.transaction().unwrap();
-    cas_registry::upsert(&tx, alias, root, repo_hash, 2).unwrap();
+    cas_registry::upsert(&tx, alias, &root, repo_hash, 2).unwrap();
     tx.commit().unwrap();
 }
 
@@ -275,6 +287,92 @@ async fn wait_for(mut cond: impl FnMut() -> bool, ms: u64, label: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for {label}");
+}
+
+#[tokio::test]
+async fn quarantine_stops_normal_attempts_until_fixed_probe_recovers() {
+    const HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
+    let (_t, cas) = fresh_cas();
+    seed_repo(&cas, "demo", "/unused", "h");
+    let root = {
+        let index = cas_registry::open(&cas.index_db_path()).unwrap();
+        cas_registry::lookup_repository(&index, "h")
+            .unwrap()
+            .unwrap()
+            .root_path
+    };
+    std::fs::remove_dir(std::path::Path::new(&root).join(".git")).unwrap();
+    let clock = ManualClock::new(0);
+    let mgr = build_manager(cas.clone(), clock.clone());
+    let register = FakeRegister::new();
+    mgr.set_test_register_hook(register.as_hook());
+
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || mgr.test_attempts_started() == 1,
+        1_000,
+        "first structural probe",
+    )
+    .await;
+
+    clock.advance(HOUR_NS / 2);
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || mgr.test_attempts_started() == 2,
+        1_000,
+        "second structural probe",
+    )
+    .await;
+
+    clock.advance(HOUR_NS / 2);
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || mgr.test_attempts_started() == 3,
+        1_000,
+        "quarantine transition",
+    )
+    .await;
+    let quarantined = read_state(&cas, "h");
+    assert_eq!(quarantined.terminal_failure_count, 3);
+    assert_eq!(quarantined.quarantined_at_ns, Some(HOUR_NS));
+    assert_eq!(quarantined.next_retry_at_ns, Some(2 * HOUR_NS));
+    assert_eq!(register.call_count(), 0);
+
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        mgr.test_attempts_started(),
+        3,
+        "normal reconcile notifications must not bypass quarantine"
+    );
+
+    std::fs::create_dir(std::path::Path::new(&root).join(".git")).unwrap();
+    clock.advance(HOUR_NS);
+    mgr.request_dirty_by_alias("demo".into(), ReconcileTrigger::WatchEvent)
+        .await
+        .unwrap();
+    wait_for(
+        || register.call_count() == 1,
+        1_000,
+        "healthy recovery reconcile",
+    )
+    .await;
+    wait_for(
+        || read_state(&cas, "h").quarantined_at_ns.is_none(),
+        1_000,
+        "recovery success clear",
+    )
+    .await;
+    assert_eq!(register.call_count(), 1);
+    mgr.shutdown(Duration::from_secs(2)).await;
 }
 
 #[test]
@@ -1348,6 +1446,7 @@ async fn periodic_cycle_does_not_stack_on_a_dirty_repository() {
 #[tokio::test]
 async fn periodic_cycle_skips_registering_owner_until_publication() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
     let (_t, cas) = fresh_cas();
     let lifecycle = RepoLifecycleManager::new(cas.clone());
     let permit = lifecycle
@@ -1378,6 +1477,7 @@ async fn periodic_cycle_skips_registering_owner_until_publication() {
 #[tokio::test(start_paused = true)]
 async fn lifecycle_rejection_before_attempt_start_is_locally_paced() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
     let (_t, cas) = fresh_cas();
     let lifecycle = RepoLifecycleManager::new(cas.clone());
     let permit = lifecycle
