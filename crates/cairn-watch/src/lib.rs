@@ -5918,6 +5918,15 @@ mod tests {
             )
         })
         .await;
+        receive_matching(&mut rx, |event| {
+            matches!(
+                event,
+                WatchEvent::Rescan {
+                    reason: RescanReason::MatcherRecovered
+                }
+            )
+        })
+        .await;
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/next\n").unwrap();
         receive_matching(&mut rx, |event| matches!(event, WatchEvent::Git(_))).await;
 
