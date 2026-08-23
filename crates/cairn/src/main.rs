@@ -104,6 +104,8 @@ const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 #[cfg(target_os = "macos")]
 const DAEMON_LOG_FILE_NAME: &str = "daemon.log";
 #[cfg(target_os = "macos")]
+const DAEMON_LOG_LOCK_FILE_NAME: &str = "daemon.log.lock";
+#[cfg(target_os = "macos")]
 const DAEMON_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const DAEMON_LOG_FILE_COUNT: usize = 5;
@@ -191,10 +193,12 @@ impl RotatingLogWriter {
     fn open_with_limits(path: PathBuf, max_bytes: u64, file_count: usize) -> io::Result<Self> {
         debug_assert!(max_bytes > 0);
         debug_assert!(file_count > 1);
+        let lock = DaemonLogLockGuard::acquire(&path.with_file_name(DAEMON_LOG_LOCK_FILE_NAME))?;
         let file = open_private_log(&path)?;
         let bytes = file.metadata()?.len();
         Ok(Self {
             state: Arc::new(Mutex::new(RotatingLogState {
+                _lock: lock,
                 path,
                 file,
                 bytes,
@@ -252,12 +256,42 @@ impl Drop for RotatingLogEvent {
 
 #[cfg(target_os = "macos")]
 struct RotatingLogState {
+    _lock: DaemonLogLockGuard,
     path: PathBuf,
     file: File,
     bytes: u64,
     max_bytes: u64,
     file_count: usize,
     rotation_failed: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct DaemonLogLockGuard {
+    file: File,
+}
+
+#[cfg(target_os = "macos")]
+impl DaemonLogLockGuard {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        use rustix::fs::{FlockOperation, Mode, OFlags};
+
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        let file = File::from(fd);
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DaemonLogLockGuard {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -361,6 +395,18 @@ mod tests {
                 .path,
             data_dir.join(super::DAEMON_LOG_FILE_NAME)
         );
+        let lock_path = data_dir.join(super::DAEMON_LOG_LOCK_FILE_NAME);
+        assert_eq!(
+            std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let retained_owner = writer.clone();
+        drop(writer);
+        let log_path = data_dir.join(super::DAEMON_LOG_FILE_NAME);
+        assert!(super::RotatingLogWriter::open(log_path.clone()).is_err());
+        drop(retained_owner);
+        super::RotatingLogWriter::open(log_path).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -392,7 +438,7 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 5);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 6);
     }
 
     #[cfg(target_os = "macos")]
