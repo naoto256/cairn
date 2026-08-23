@@ -1612,7 +1612,17 @@ mod tests {
         jobs.shutdown(Duration::from_secs(1)).await;
 
         let snapshot = recorder.snapshot();
-        if snapshot.watch.len() != 1 {
+        let valid_watch_batch = !snapshot.watch.is_empty()
+            && snapshot.watch.iter().all(|record| {
+                record.source_batch_ordinal == 1
+                    && record.generation == Some(2)
+                    && matches!(
+                        &record.output,
+                        WatchOutput::File { path, change: "touched" }
+                            if path == b"src/watch_probe.ts" || path == b"src"
+                    )
+            });
+        if !valid_watch_batch {
             let state = cas_registry::open(&fixture.cas.index_db_path())
                 .ok()
                 .and_then(|index| {
@@ -1650,16 +1660,16 @@ mod tests {
                 snapshot.watch, snapshot.reconcile,
             );
         }
-        assert_eq!(snapshot.watch[0].source_batch_ordinal, 1);
-        assert_eq!(snapshot.watch[0].generation, Some(2));
-        assert!(
-            matches!(
-                &snapshot.watch[0].output,
-                WatchOutput::File { path, change: "touched" }
-                    if path == b"src/watch_probe.ts" || path == b"src"
-            ),
-            "Poll may report the created child or its immediate parent across the snapshot timing boundary: {:?}",
-            snapshot.watch[0].output
+        let source_batches = snapshot
+            .watch
+            .iter()
+            .map(|record| record.source_batch_ordinal)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            source_batches,
+            std::collections::BTreeSet::from([1]),
+            "Poll may report the created child, its immediate parent, or both within one source batch: {:?}",
+            snapshot.watch
         );
         assert_eq!(snapshot.reconcile.len(), 1);
         assert_eq!(snapshot.reconcile[0].generation, 2);
@@ -2070,6 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn ruby_lsp_writes_do_not_advance_reconcile_generation() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
         cas.ensure().unwrap();
