@@ -100,6 +100,20 @@ pub enum WatchArmDisposition {
     Armed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchArmLogLevel {
+    Debug,
+    Info,
+}
+
+fn watch_arm_log_level(defer_matcher: bool) -> WatchArmLogLevel {
+    if defer_matcher {
+        WatchArmLogLevel::Debug
+    } else {
+        WatchArmLogLevel::Info
+    }
+}
+
 /// Opaque ownership receipt for a watcher arm operation. Rollback only
 /// removes the exact watcher created by this receipt, never a replacement.
 #[derive(Debug)]
@@ -409,18 +423,21 @@ impl WatchManager {
         let watcher = self.start_watcher(&repo_hash, &root_path, arm_id, defer_matcher)?;
         watchers.insert(repo_hash.clone(), watcher);
         drop(watchers);
-        if defer_matcher {
-            debug!(
-                repo_hash = %repo_hash,
-                path = %root_path.display(),
-                "repo watcher armed"
-            );
-        } else {
-            info!(
-                repo_hash = %repo_hash,
-                path = %root_path.display(),
-                "repo watcher armed"
-            );
+        match watch_arm_log_level(defer_matcher) {
+            WatchArmLogLevel::Debug => {
+                debug!(
+                    repo_hash = %repo_hash,
+                    path = %root_path.display(),
+                    "repo watcher armed"
+                );
+            }
+            WatchArmLogLevel::Info => {
+                info!(
+                    repo_hash = %repo_hash,
+                    path = %root_path.display(),
+                    "repo watcher armed"
+                );
+            }
         }
         Ok(WatchArmReceipt {
             repo_hash,
@@ -2221,29 +2238,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_arm_keeps_per_repository_info_event() {
+    async fn dynamic_arm_uses_per_repository_info_level() {
         let root = tempfile::tempdir().unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
         cas.ensure().unwrap();
         let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
 
-        let (receipt, captured) = capture_logs(|| {
-            manager
-                .arm_repository_if_absent("dynamic".into(), root.path().to_path_buf())
-                .unwrap()
-        });
+        let receipt = manager
+            .arm_repository_if_absent("dynamic".into(), root.path().to_path_buf())
+            .unwrap();
 
         assert_eq!(receipt.disposition(), WatchArmDisposition::Armed);
-        let event = captured
-            .lines()
-            .find(|line| line.contains("repo watcher armed"))
-            .expect("dynamic watcher arm did not emit its event");
         assert_eq!(
-            event.split_whitespace().next(),
-            Some("INFO"),
-            "dynamic arm was not INFO: {event}"
+            watch_arm_log_level(false),
+            WatchArmLogLevel::Info,
+            "dynamic arm must retain its per-repository INFO event"
         );
+        assert_eq!(
+            watch_arm_log_level(true),
+            WatchArmLogLevel::Debug,
+            "startup arm must retain its aggregate-only DEBUG event"
+        );
+        assert_eq!(manager.dynamic_eager_arms.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
