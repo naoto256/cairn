@@ -332,6 +332,7 @@ const MATCHER_BUILD_CONCURRENCY: usize = 2;
 const MATCHER_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const MATCHER_RETRY_MAX: Duration = Duration::from_secs(2);
 const MATCHER_RETRY_WARNING_WINDOW: Duration = Duration::from_secs(60);
+const MATCHER_BUILD_PANIC_ERROR: &str = "ignore matcher build panicked; watcher remains fail-open";
 // A nonempty queue rechecks closed receivers at this cadence. An empty queue
 // waits indefinitely and relies on admission or shutdown to provide a wake.
 const MATCHER_QUEUE_CLOSE_POLL: Duration = Duration::from_millis(50);
@@ -1168,7 +1169,7 @@ impl MatcherBuildScheduler {
                 (MatcherCommitOutcome::Stale, true)
             }
             Err(_) => {
-                warn!("ignore matcher build panicked; watcher remains fail-open");
+                target.log_matcher_retry_failure(&std::io::Error::other(MATCHER_BUILD_PANIC_ERROR));
                 (MatcherCommitOutcome::Stale, true)
             }
         };
@@ -5164,6 +5165,19 @@ mod tests {
                 reason: RescanReason::MatcherRecovered
             })
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while classifier
+                .matcher_target
+                .failure_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful matcher rebuild did not close the suppression window");
         assert!(
             classifier
                 .matcher_target
