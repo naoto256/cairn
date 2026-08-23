@@ -1761,7 +1761,12 @@ pub(crate) fn reconcile_state_checks(cas_data_dir: &CasDataDir) -> Result<Vec<Do
                 ),
             )),
             Some(state) => {
-                checks.extend(classify_reconcile_state(&label, &state, now_ns));
+                checks.extend(classify_reconcile_state(
+                    &label,
+                    &state,
+                    repo.persistent,
+                    now_ns,
+                ));
             }
         }
     }
@@ -1829,6 +1834,7 @@ fn format_repo_label(repo_hash: &str, aliases: &[String]) -> String {
 fn classify_reconcile_state(
     label: &str,
     state: &cas_registry::RepoReconcileState,
+    persistent: bool,
     now_ns: i64,
 ) -> Vec<DoctorCheck> {
     let mut out = Vec::new();
@@ -1862,6 +1868,52 @@ fn classify_reconcile_state(
                     .unwrap_or_default()
             )),
             Some("Restart the daemon to re-open the watcher, or manual reindex until then.".into()),
+        ));
+    }
+
+    if let Some(kind) = state.terminal_failure_kind {
+        let (status, phase) = if state.quarantined_at_ns.is_some() {
+            (DoctorStatus::Warn, "quarantined")
+        } else {
+            (DoctorStatus::Warn, "candidate")
+        };
+        let exemption = if persistent {
+            "; persistent registration is exempt from automatic removal"
+        } else {
+            ""
+        };
+        out.push(doctor_check(
+            format!("registration health: {label}"),
+            status,
+            Some(format!(
+                "{phase}: kind={}, observations={}, first_seen_ns={:?}, quarantined_at_ns={:?}{exemption}",
+                kind.as_db_str(),
+                state.terminal_failure_count,
+                state.terminal_failure_since_ns,
+                state.quarantined_at_ns,
+            )),
+            Some(if state.quarantined_at_ns.is_some() {
+                "Cairn is running low-frequency structural revalidation; restore the repository root or Git administration metadata.".into()
+            } else {
+                "Restore the repository root or Git administration metadata before the quarantine threshold is reached.".into()
+            }),
+        ));
+    } else if state.quarantined_at_ns.is_some() {
+        out.push(doctor_check(
+            format!("registration health: {label}"),
+            DoctorStatus::Warn,
+            Some(format!(
+                "quarantined history retained; current structural evidence is ambiguous{}",
+                if persistent {
+                    "; persistent registration is exempt from automatic removal"
+                } else {
+                    ""
+                }
+            )),
+            Some(
+                "Cairn will continue low-frequency structural probes until a healthy recovery reconcile succeeds."
+                    .into(),
+            ),
         ));
     }
 
@@ -3733,6 +3785,59 @@ mod tests {
         assert_eq!(
             check.detail.as_deref(),
             Some("/repos/old (alias_retargeted)")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_live_quarantine_and_stale_git_removal_history() {
+        let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
+        set_state(&cas, "h", |tx| {
+            tx.execute(
+                "UPDATE repositories SET persistent = 1 WHERE repo_hash = 'h'",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE repo_reconcile_state
+                 SET terminal_failure_kind = 'git_admin_missing',
+                     terminal_failure_count = 3,
+                     terminal_failure_since_ns = 10,
+                     quarantined_at_ns = 20,
+                     health_epoch = 4
+                 WHERE repo_hash = 'h'",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO repository_removal_events
+                 (repo_hash, root_path, removed_at_ns, reason, store_cleanup_state)
+                 VALUES ('old', '/old', 30, 'stale_git_metadata', 'complete')",
+                [],
+            )
+            .unwrap();
+        });
+
+        let checks = reconcile_state_checks(&cas).unwrap();
+        let health = checks
+            .iter()
+            .find(|check| check.name == "registration health: demo")
+            .expect("live quarantine must be visible");
+        assert_eq!(health.status, DoctorStatus::Warn);
+        let detail = health.detail.as_deref().unwrap();
+        assert!(detail.contains("quarantined"));
+        assert!(detail.contains("git_admin_missing"));
+        assert!(detail.contains("persistent registration is exempt"));
+
+        let history = checks
+            .iter()
+            .find(|check| check.name == "recent repository removals")
+            .expect("post-delete stale history must remain visible");
+        assert!(
+            history
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("/old (stale_git_metadata)")
         );
     }
 
