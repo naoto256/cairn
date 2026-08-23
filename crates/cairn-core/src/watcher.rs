@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cairn_watch::{
     WatchBackend, WatchEvent, WatcherHandle, watch_repo_with_backend,
@@ -132,6 +132,47 @@ pub struct WatchStartupReport {
     pub failed: Vec<WatchStartFailure>,
 }
 
+const STARTUP_SLOWEST_ARMS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupArmOutcome {
+    Armed,
+    AlreadyArmed,
+    Failed,
+}
+
+impl StartupArmOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Armed => "armed",
+            Self::AlreadyArmed => "already_armed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupArmTiming {
+    repo_hash: String,
+    elapsed: Duration,
+    outcome: StartupArmOutcome,
+}
+
+fn retain_slowest_startup_arm(slowest: &mut Vec<StartupArmTiming>, timing: StartupArmTiming) {
+    slowest.push(timing);
+    slowest.sort_by(|left, right| {
+        right
+            .elapsed
+            .cmp(&left.elapsed)
+            .then_with(|| left.repo_hash.cmp(&right.repo_hash))
+    });
+    slowest.truncate(STARTUP_SLOWEST_ARMS);
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl Drop for RepoWatcher {
     fn drop(&mut self) {
         #[cfg(test)]
@@ -223,40 +264,104 @@ impl WatchManager {
     /// via [`RepoReconcileManager::set_watcher_state_by_repo_hash`]
     /// so `repo_status` / doctor can observe them.
     pub fn start_registered(&self) -> Result<WatchStartupReport> {
+        let total_started = Instant::now();
+        let registry_started = Instant::now();
         let index = cas_registry::open(&self.cas_data_dir.index_db_path())?;
+        let repositories = cas_registry::list_repositories(&index)?;
+        let registry_elapsed = registry_started.elapsed();
+        let repos_total = repositories.len();
         let mut report = WatchStartupReport::default();
-        for repo in cas_registry::list_repositories(&index)? {
+        let mut skipped_removal = 0usize;
+        let mut attempted = 0usize;
+        let mut arm_elapsed = Duration::ZERO;
+        let mut persist_elapsed = Duration::ZERO;
+        let mut slowest_arms = Vec::with_capacity(STARTUP_SLOWEST_ARMS + 1);
+        for repo in repositories {
             // A repo with a persisted removal intent must not be
             // re-armed; the lifecycle owner is tearing it down.
             if repo.removal_request.is_some() {
+                skipped_removal += 1;
                 continue;
             }
-            match self.arm_startup_repository_if_absent(
+            attempted += 1;
+            let arm_started = Instant::now();
+            let arm_result = self.arm_startup_repository_if_absent(
                 repo.repo_hash.clone(),
                 PathBuf::from(repo.root_path),
-            ) {
-                Ok(_) => {
-                    self.persist_watcher_state(&repo.repo_hash, WatcherState::Active, None)?;
-                    report.armed.push(repo.repo_hash)
+            );
+            let repo_arm_elapsed = arm_started.elapsed();
+            arm_elapsed += repo_arm_elapsed;
+            let outcome = match arm_result {
+                Ok(receipt) => {
+                    let outcome = match receipt.disposition() {
+                        WatchArmDisposition::Armed => StartupArmOutcome::Armed,
+                        WatchArmDisposition::AlreadyArmed => StartupArmOutcome::AlreadyArmed,
+                    };
+                    let persist_started = Instant::now();
+                    let persist_result =
+                        self.persist_watcher_state(&repo.repo_hash, WatcherState::Active, None);
+                    persist_elapsed += persist_started.elapsed();
+                    persist_result?;
+                    report.armed.push(repo.repo_hash.clone());
+                    outcome
                 }
                 Err(err) => {
-                    self.persist_watcher_state(
+                    let error = err.to_string();
+                    let persist_started = Instant::now();
+                    let persist_result = self.persist_watcher_state(
                         &repo.repo_hash,
                         WatcherState::Failed,
-                        Some(&err.to_string()),
-                    )?;
+                        Some(&error),
+                    );
+                    persist_elapsed += persist_started.elapsed();
+                    persist_result?;
                     warn!(
                         repo_hash = %repo.repo_hash,
-                        error = %err,
+                        error = %error,
                         "failed to start repo watcher"
                     );
                     report.failed.push(WatchStartFailure {
-                        repo_hash: repo.repo_hash,
-                        error: err.to_string(),
+                        repo_hash: repo.repo_hash.clone(),
+                        error,
                     });
+                    StartupArmOutcome::Failed
                 }
-            }
+            };
+            retain_slowest_startup_arm(
+                &mut slowest_arms,
+                StartupArmTiming {
+                    repo_hash: repo.repo_hash,
+                    elapsed: repo_arm_elapsed,
+                    outcome,
+                },
+            );
         }
+        let total_elapsed = total_started.elapsed();
+        debug_assert_eq!(repos_total, skipped_removal + attempted);
+        debug_assert_eq!(attempted, report.armed.len() + report.failed.len());
+        let slowest_arms = slowest_arms
+            .iter()
+            .map(|timing| {
+                (
+                    timing.repo_hash.as_str(),
+                    duration_millis(timing.elapsed),
+                    timing.outcome.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        info!(
+            repos_total,
+            skipped_removal,
+            attempted,
+            armed = report.armed.len(),
+            failed = report.failed.len(),
+            total_ms = duration_millis(total_elapsed),
+            registry_ms = duration_millis(registry_elapsed),
+            arm_ms = duration_millis(arm_elapsed),
+            persist_ms = duration_millis(persist_elapsed),
+            slowest_arms = ?slowest_arms,
+            "registered repository watcher barrier complete"
+        );
         Ok(report)
     }
 
@@ -304,11 +409,19 @@ impl WatchManager {
         let watcher = self.start_watcher(&repo_hash, &root_path, arm_id, defer_matcher)?;
         watchers.insert(repo_hash.clone(), watcher);
         drop(watchers);
-        info!(
-            repo_hash = %repo_hash,
-            path = %root_path.display(),
-            "repo watcher armed"
-        );
+        if defer_matcher {
+            debug!(
+                repo_hash = %repo_hash,
+                path = %root_path.display(),
+                "repo watcher armed"
+            );
+        } else {
+            info!(
+                repo_hash = %repo_hash,
+                path = %root_path.display(),
+                "repo watcher armed"
+            );
+        }
         Ok(WatchArmReceipt {
             repo_hash,
             arm_id,
@@ -659,6 +772,46 @@ mod tests {
         AnalyzerProgress, WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
     };
     use std::process::Command;
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let output = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(output.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        (result, output.contents())
+    }
 
     const PRECONDITION_ANALYZER_ID: &str = "churn-precondition-failure";
     const PRECONDITION_PARSER_ID: &str = "churn-precondition-parser";
@@ -1820,6 +1973,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_slowest_arm_reducer_is_bounded_and_deterministic() {
+        let mut slowest = Vec::new();
+        for (repo_hash, millis, outcome) in [
+            ("a", 10, StartupArmOutcome::Armed),
+            ("c", 30, StartupArmOutcome::Failed),
+            ("b", 30, StartupArmOutcome::AlreadyArmed),
+            ("d", 20, StartupArmOutcome::Armed),
+        ] {
+            retain_slowest_startup_arm(
+                &mut slowest,
+                StartupArmTiming {
+                    repo_hash: repo_hash.into(),
+                    elapsed: Duration::from_millis(millis),
+                    outcome,
+                },
+            );
+        }
+        assert_eq!(slowest.len(), STARTUP_SLOWEST_ARMS);
+        assert_eq!(
+            slowest
+                .iter()
+                .map(|timing| (timing.repo_hash.as_str(), timing.outcome))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b", StartupArmOutcome::AlreadyArmed),
+                ("c", StartupArmOutcome::Failed),
+                ("d", StartupArmOutcome::Armed),
+            ]
+        );
+
+        slowest.clear();
+        assert!(slowest.is_empty());
+        for repo_hash in ["z", "y"] {
+            retain_slowest_startup_arm(
+                &mut slowest,
+                StartupArmTiming {
+                    repo_hash: repo_hash.into(),
+                    elapsed: Duration::from_millis(5),
+                    outcome: StartupArmOutcome::Armed,
+                },
+            );
+        }
+        assert_eq!(
+            slowest
+                .iter()
+                .map(|timing| timing.repo_hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["y", "z"]
+        );
+    }
+
     #[tokio::test]
     async fn watch_repository_replaces_existing_watcher_after_new_start_succeeds() {
         let old_root = tempfile::tempdir().unwrap();
@@ -1889,6 +2094,32 @@ mod tests {
         assert_eq!(manager.dropped_watcher_count(), 0);
         manager.rollback_arm(second);
         assert!(manager.is_watching_repository("h"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_arm_keeps_per_repository_info_event() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
+
+        let (receipt, captured) = capture_logs(|| {
+            manager
+                .arm_repository_if_absent("dynamic".into(), root.path().to_path_buf())
+                .unwrap()
+        });
+
+        assert_eq!(receipt.disposition(), WatchArmDisposition::Armed);
+        let event = captured
+            .lines()
+            .find(|line| line.contains("repo watcher armed"))
+            .expect("dynamic watcher arm did not emit its event");
+        assert_eq!(
+            event.split_whitespace().next(),
+            Some("INFO"),
+            "dynamic arm was not INFO: {event}"
+        );
     }
 
     #[tokio::test]
@@ -1964,7 +2195,7 @@ mod tests {
             reconcile.clone(),
         );
 
-        let report = manager.start_registered().unwrap();
+        let (report, captured) = capture_logs(|| manager.start_registered().unwrap());
 
         assert_eq!(report.armed, vec!["good"]);
         assert_eq!(report.failed.len(), 1);
@@ -1981,6 +2212,25 @@ mod tests {
         assert_eq!(good.watcher_state, WatcherState::Active);
         assert_eq!(missing.watcher_state, WatcherState::Failed);
         assert!(missing.watcher_error.is_some());
+        assert_eq!(
+            captured
+                .matches("registered repository watcher barrier complete")
+                .count(),
+            1
+        );
+        for field in [
+            "repos_total=2",
+            "skipped_removal=0",
+            "attempted=2",
+            "armed=1",
+            "failed=1",
+            "slowest_arms=",
+        ] {
+            assert!(
+                captured.contains(field),
+                "summary omitted {field}: {captured}"
+            );
+        }
 
         let primed = reconcile.prime_startup_reconcile(Vec::new()).await.unwrap();
         assert_eq!(
@@ -2013,7 +2263,7 @@ mod tests {
         }
         let manager = WatchManager::with_backend(cas.clone(), WatchBackend::Poll);
 
-        let report = manager.start_registered().unwrap();
+        let (report, captured) = capture_logs(|| manager.start_registered().unwrap());
 
         assert_eq!(report.armed.len(), REPOS);
         assert!(report.failed.is_empty());
@@ -2024,6 +2274,23 @@ mod tests {
             "every startup arm must use the deferred matcher path"
         );
         assert_eq!(manager.dynamic_eager_arms.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            captured
+                .matches("registered repository watcher barrier complete")
+                .count(),
+            1
+        );
+        let startup_events = captured
+            .lines()
+            .filter(|line| line.contains("repo watcher armed"))
+            .collect::<Vec<_>>();
+        assert_eq!(startup_events.len(), REPOS);
+        assert!(
+            startup_events
+                .iter()
+                .all(|line| line.split_whitespace().next() == Some("DEBUG")),
+            "startup arms must not emit per-repository INFO: {startup_events:?}"
+        );
         let dynamic_root = tempfile::tempdir().unwrap();
         manager
             .watch_repository("dynamic".into(), dynamic_root.path().to_path_buf())
@@ -2034,6 +2301,60 @@ mod tests {
         let dropped = manager.dropped_watchers.clone();
         drop(manager);
         assert_eq!(dropped.load(Ordering::SeqCst), REPOS + 1);
+    }
+
+    #[test]
+    fn removal_only_startup_reports_skip_without_attempting_arm() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
+        let tx = index.transaction().unwrap();
+        cas_registry::upsert_repository(&tx, "removed", &root.path().to_string_lossy(), 1).unwrap();
+        assert!(
+            cas_registry::mark_removal_requested(
+                &tx,
+                "removed",
+                cas_registry::RepositoryRemovalReason::MissingRoot,
+                2,
+            )
+            .unwrap()
+        );
+        tx.commit().unwrap();
+        let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
+
+        let (report, captured) = capture_logs(|| manager.start_registered().unwrap());
+
+        assert!(report.armed.is_empty());
+        assert!(report.failed.is_empty());
+        for field in [
+            "repos_total=1",
+            "skipped_removal=1",
+            "attempted=0",
+            "armed=0",
+            "failed=0",
+            "slowest_arms=[]",
+        ] {
+            assert!(
+                captured.contains(field),
+                "summary omitted {field}: {captured}"
+            );
+        }
+    }
+
+    #[test]
+    fn fatal_registry_error_emits_no_complete_startup_event() {
+        let data_root = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasDataDir::with_root(data_root.path().to_path_buf()));
+        cas.ensure().unwrap();
+        std::fs::create_dir(cas.index_db_path()).unwrap();
+        let manager = WatchManager::with_backend(cas, WatchBackend::Poll);
+
+        let (result, captured) = capture_logs(|| manager.start_registered());
+
+        assert!(result.is_err());
+        assert!(!captured.contains("registered repository watcher barrier complete"));
     }
 
     #[test]

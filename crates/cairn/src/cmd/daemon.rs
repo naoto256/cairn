@@ -296,12 +296,7 @@ async fn initialize_runtime(
             DaemonInitializationPhase::WatcherBarrier,
             Some(DaemonInitializationDetail::ArmingRegisteredWatchers),
         )?;
-        let watch_report = start_registered_watchers(watch_manager).await?;
-        info!(
-            armed = watch_report.armed.len(),
-            failed = watch_report.failed.len(),
-            "registered repository watcher barrier complete"
-        );
+        start_registered_watchers(watch_manager).await?;
         gate.advance(
             DaemonInitializationPhase::ReconcilePrime,
             Some(DaemonInitializationDetail::RecordingStartupGenerations),
