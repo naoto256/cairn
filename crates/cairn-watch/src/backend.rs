@@ -109,7 +109,7 @@ pub fn watch_repo_with_backend(
 /// watcher begins fail-open, so ignore filtering cannot hide filesystem events
 /// while the matcher warms in the bounded recovery pool. At its commit
 /// linearization point, a successful warm-up installs the matcher for the
-/// attempted generation and publishes [`RescanReason::MatcherRecovered`], or
+/// attempted generation and publishes [`crate::RescanReason::MatcherRecovered`], or
 /// coalesces it into an already-pending dirty edge. That edge does not
 /// guarantee that its consumer has observed the latest semantic generation.
 /// If both fixed workers are permanently stalled, later warm-ups are starved
@@ -184,7 +184,13 @@ pub(super) fn watch_repo_with_backend_mode_after_arm(
     // info/exclude in the common git dir. Watch both identities.
     for git_root in git_metadata.watch_roots() {
         if git_root.is_dir() {
-            let _ = debouncer.watch(&git_root, RecursiveMode::Recursive);
+            if let Err(err) = debouncer.watch(&git_root, RecursiveMode::Recursive) {
+                warn!(
+                    root = %git_root.display(),
+                    error = %err,
+                    "git metadata watch registration failed; watcher remains fail-open"
+                );
+            }
         }
     }
     after_arm(&classifier);
