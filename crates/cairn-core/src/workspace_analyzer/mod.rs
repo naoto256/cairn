@@ -520,6 +520,53 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         files: &[WorkspaceFile],
         progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts>;
+
+    /// Analyze with runner-owned filesystem context.
+    ///
+    /// The default preserves analyzers that only need the repository root.
+    /// An analyzer that maintains private writable state outside the worktree
+    /// can override this method and use [`WorkspaceAnalyzerContext::state_dir`]
+    /// instead of rediscovering the daemon's platform-default data directory.
+    fn analyze_workspace_with_context(
+        &self,
+        context: &WorkspaceAnalyzerContext<'_>,
+        manifest_id: ManifestId,
+        files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
+    ) -> Result<WorkspaceFacts> {
+        self.analyze_workspace(context.repo_root(), manifest_id, files, progress)
+    }
+}
+
+/// Filesystem context for one workspace analyzer invocation.
+///
+/// `state_dir` is the directory containing the current repository's CAS
+/// store. It therefore follows the effective daemon `--data-dir`, remains
+/// stable across restarts, and is isolated from another daemon using a
+/// different data root. In-memory stores have no state directory.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceAnalyzerContext<'a> {
+    repo_root: &'a Path,
+    state_dir: Option<&'a Path>,
+}
+
+impl<'a> WorkspaceAnalyzerContext<'a> {
+    pub(crate) fn new(repo_root: &'a Path, state_dir: Option<&'a Path>) -> Self {
+        Self {
+            repo_root,
+            state_dir,
+        }
+    }
+
+    #[must_use]
+    pub fn repo_root(&self) -> &'a Path {
+        self.repo_root
+    }
+
+    #[must_use]
+    pub fn state_dir(&self) -> Option<&'a Path> {
+        self.state_dir
+    }
 }
 
 /// Compute the per-run staleness inputs for one analyzer instance: the
