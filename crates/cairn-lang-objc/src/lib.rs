@@ -74,9 +74,9 @@ impl LanguageBackend for ObjcBackend {
     }
 
     fn parser_revision(&self) -> u32 {
-        // v5 invalidates cached facts so AFNetworking availability wrappers
-        // no longer corrupt the declaration that follows them.
-        5
+        // v6 invalidates cached facts so Objective-C block declarators are
+        // emitted after AFNetworking availability wrappers are neutralized.
+        6
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -702,11 +702,14 @@ fn classify_declarator(node: Node<'_>) -> Option<(Node<'_>, bool)> {
         | "pointer_declarator"
         | "array_declarator"
         | "attributed_declarator"
+        | "block_pointer_declarator"
         | "parenthesized_declarator" => classify_declarator(declarator_child(node)?),
         "function_declarator" => {
             let inner = child_by_field(node, "declarator")?;
             let is_pointer = inner.kind() == "parenthesized_declarator"
-                && first_named_child(inner).is_some_and(|n| n.kind() == "pointer_declarator");
+                && first_named_child(inner).is_some_and(|n| {
+                    matches!(n.kind(), "pointer_declarator" | "block_pointer_declarator")
+                });
             let (name, _) = classify_declarator(inner)?;
             Some((name, !is_pointer))
         }
@@ -977,8 +980,8 @@ mod tests {
     }
 
     #[test]
-    fn parser_revision_tracks_macro_neutralization() {
-        assert_eq!(ObjcBackend.parser_revision(), 5);
+    fn parser_revision_tracks_block_declarators() {
+        assert_eq!(ObjcBackend.parser_revision(), 6);
     }
 
     #[test]
@@ -998,6 +1001,7 @@ static int cairn_objc_probe(void) { return 1; }
 "#;
 
         let facts = facts(src);
+        assert_eq!(find(&facts, "AFMetricsBlock").kind, SymbolKind::TypeAlias);
         assert!(
             facts
                 .symbols
@@ -1016,6 +1020,13 @@ static int cairn_objc_probe(void) { return 1; }
                 .iter()
                 .any(|symbol| symbol.qualified == "CairnObjcProbe")
         );
+    }
+
+    #[test]
+    fn block_declaration_is_a_variable_not_a_function() {
+        let facts = facts(b"void (^handler)(void);\n");
+
+        assert_eq!(find(&facts, "handler").kind, SymbolKind::Variable);
     }
 
     #[test]
