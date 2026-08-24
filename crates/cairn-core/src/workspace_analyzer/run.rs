@@ -26,8 +26,8 @@ use crate::{Error, Result};
 
 use super::persist::{persist_resolutions_in_transaction, persist_resolved_refs_in_transaction};
 use super::{
-    AnalyzerProgress, StallWatchdogEvent, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
-    all_workspace_analyzers,
+    AnalyzerProgress, StallWatchdogEvent, WorkspaceAnalyzer, WorkspaceAnalyzerContext,
+    WorkspaceFacts, WorkspaceFile, all_workspace_analyzers,
 };
 
 // Timeout is a hang detector, not a total work cap. T3 measured nlohmann's
@@ -330,9 +330,14 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             error: Some(message.into()),
         });
     }
-    match analyze_workspace_with_timeout(
+    let workspace_state_dir = conn
+        .path()
+        .and_then(|path| Path::new(path).parent())
+        .map(Path::to_path_buf);
+    match analyze_workspace_with_timeout_and_state_dir(
         analyzer,
         repo_root,
+        workspace_state_dir.as_deref(),
         manifest_id,
         &files,
         analyzer_stall_timeout,
@@ -649,9 +654,30 @@ impl Drop for WorkerCompletion {
 /// force-shutdown of the global LSP pool is attempted (failures are
 /// logged); a worker that still does not finish is leaked rather
 /// than joined.
+#[cfg(test)]
 fn analyze_workspace_with_timeout(
     analyzer: Box<dyn WorkspaceAnalyzer>,
     repo_root: &Path,
+    manifest_id: ManifestId,
+    files: &[WorkspaceFile],
+    timeout: Duration,
+    progress: AnalyzerProgress,
+) -> AnalyzerRun {
+    analyze_workspace_with_timeout_and_state_dir(
+        analyzer,
+        repo_root,
+        None,
+        manifest_id,
+        files,
+        timeout,
+        progress,
+    )
+}
+
+fn analyze_workspace_with_timeout_and_state_dir(
+    analyzer: Box<dyn WorkspaceAnalyzer>,
+    repo_root: &Path,
+    workspace_state_dir: Option<&Path>,
     manifest_id: ManifestId,
     files: &[WorkspaceFile],
     timeout: Duration,
@@ -665,6 +691,7 @@ fn analyze_workspace_with_timeout(
         }
     };
     let repo_root = repo_root.to_path_buf();
+    let workspace_state_dir = workspace_state_dir.map(Path::to_path_buf);
     let files = files.to_vec();
     let (event_tx, event_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
@@ -674,7 +701,13 @@ fn analyze_workspace_with_timeout(
         events: Some(event_tx),
     };
     let worker = std::thread::spawn(move || {
-        let result = analyzer.analyze_workspace(&repo_root, manifest_id, &files, &worker_progress);
+        let context = WorkspaceAnalyzerContext::new(&repo_root, workspace_state_dir.as_deref());
+        let result = analyzer.analyze_workspace_with_context(
+            &context,
+            manifest_id,
+            &files,
+            &worker_progress,
+        );
         completion.complete(result);
     });
 
@@ -2231,6 +2264,104 @@ mod tests {
             fs::write(generated_dir.join("Gemfile.lock"), "GEM\n").unwrap();
             Ok(WorkspaceFacts::default())
         }
+    }
+
+    struct StateDirCapturingAnalyzer {
+        observed: mpsc::SyncSender<PathBuf>,
+    }
+
+    impl WorkspaceAnalyzer for StateDirCapturingAnalyzer {
+        fn id(&self) -> &'static str {
+            "state-dir-capturing"
+        }
+
+        fn revision(&self) -> u32 {
+            1
+        }
+
+        fn language(&self) -> &'static str {
+            "fake"
+        }
+
+        fn parser_id(&self) -> &'static str {
+            "tree-sitter-test"
+        }
+
+        fn analyze_workspace(
+            &self,
+            _repo_root: &Path,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            panic!("runner must use analyze_workspace_with_context")
+        }
+
+        fn analyze_workspace_with_context(
+            &self,
+            context: &WorkspaceAnalyzerContext<'_>,
+            _manifest_id: ManifestId,
+            _files: &[WorkspaceFile],
+            _progress: &AnalyzerProgress,
+        ) -> Result<WorkspaceFacts> {
+            self.observed
+                .send(
+                    context
+                        .state_dir()
+                        .expect("file-backed store")
+                        .to_path_buf(),
+                )
+                .unwrap();
+            Ok(WorkspaceFacts::default())
+        }
+    }
+
+    #[test]
+    fn runner_context_uses_effective_store_parent_and_is_stable_per_data_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let first_state = root.path().join("daemon-a/repos/repo-hash");
+        let second_state = root.path().join("daemon-b/repos/repo-hash");
+        fs::create_dir_all(&first_state).unwrap();
+        fs::create_dir_all(&second_state).unwrap();
+        let (mut first_conn, first_entry) =
+            seed_fixture(&first_state.join("store-a.db"), "src/lib.rs");
+        let (mut first_again_conn, first_again_entry) =
+            seed_fixture(&first_state.join("store-b.db"), "src/lib.rs");
+        let (mut second_conn, second_entry) =
+            seed_fixture(&second_state.join("store.db"), "src/lib.rs");
+        let (observed_tx, observed_rx) = mpsc::sync_channel(3);
+
+        for (conn, entry) in [
+            (&mut first_conn, &first_entry),
+            (&mut first_again_conn, &first_again_entry),
+            (&mut second_conn, &second_entry),
+        ] {
+            let execution = run_one_workspace_analyzer_with_timeout(
+                conn,
+                AnalyzerRunRequest {
+                    analyzer: Box::new(StateDirCapturingAnalyzer {
+                        observed: observed_tx.clone(),
+                    }),
+                    repo_root: &repo,
+                    manifest_id: ManifestId(1),
+                    entries: std::slice::from_ref(entry),
+                    now_ns: 1,
+                    analyzer_stall_timeout: Duration::from_secs(1),
+                    job_id: None,
+                    progress: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(execution.status, RunStatus::Succeeded);
+        }
+
+        let first_state = first_state.canonicalize().unwrap();
+        let second_state = second_state.canonicalize().unwrap();
+        assert_eq!(observed_rx.recv().unwrap(), first_state);
+        assert_eq!(observed_rx.recv().unwrap(), first_state);
+        assert_eq!(observed_rx.recv().unwrap(), second_state);
     }
 
     #[test]

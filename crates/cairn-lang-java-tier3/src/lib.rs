@@ -17,7 +17,8 @@ use cairn_core::manifest::ManifestId;
 use cairn_core::paths::path_hash;
 use cairn_core::workspace_analyzer::{
     AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
-    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceAnalyzerContext, WorkspaceFacts,
+    WorkspaceFile, run_lsp_definition_pass,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -65,7 +66,17 @@ impl WorkspaceAnalyzer for JdtlsWorkspaceAnalyzer {
         files: &[WorkspaceFile],
         progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_jdtls_passes(repo_root, files, progress)
+        run_jdtls_passes(repo_root, None, files, progress)
+    }
+
+    fn analyze_workspace_with_context(
+        &self,
+        context: &WorkspaceAnalyzerContext<'_>,
+        _manifest_id: ManifestId,
+        files: &[WorkspaceFile],
+        progress: &AnalyzerProgress,
+    ) -> Result<WorkspaceFacts> {
+        run_jdtls_passes(context.repo_root(), context.state_dir(), files, progress)
     }
 }
 
@@ -92,29 +103,39 @@ fn java_config_paths() -> &'static [&'static str] {
 
 fn run_jdtls_passes(
     repo_root: &Path,
+    workspace_state_dir: Option<&Path>,
     files: &[WorkspaceFile],
     progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
     let mut facts = run_jdtls_pass(
         repo_root,
+        workspace_state_dir,
         files,
         RefKind::Call,
         collect_method_calls,
         progress,
     )?;
-    let type_facts = run_jdtls_pass(repo_root, files, RefKind::Type, collect_type_refs, progress)?;
+    let type_facts = run_jdtls_pass(
+        repo_root,
+        workspace_state_dir,
+        files,
+        RefKind::Type,
+        collect_type_refs,
+        progress,
+    )?;
     facts.resolved_refs.extend(type_facts.resolved_refs);
     Ok(facts)
 }
 
 fn run_jdtls_pass(
     repo_root: &Path,
+    workspace_state_dir: Option<&Path>,
     files: &[WorkspaceFile],
     ref_kind: RefKind,
     collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
     progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
-    let dirs = jdtls_workspace_dirs(repo_root)?;
+    let dirs = jdtls_workspace_dirs(repo_root, workspace_state_dir)?;
     run_lsp_definition_pass(
         LspDefinitionPass {
             analyzer_id: ANALYZER_ID,
@@ -172,7 +193,11 @@ fn jdtls_launch_args(configuration_dir: &Path, data_dir: &Path) -> Vec<String> {
     ]
 }
 
-fn jdtls_workspace_dir(repo_root: &Path) -> Result<PathBuf> {
+fn jdtls_workspace_dir(repo_root: &Path, workspace_state_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(state_dir) = workspace_state_dir {
+        return Ok(state_dir.join("jdtls-workspace"));
+    }
+
     // jdtls expects stable per-workspace metadata dirs for its persistent
     // index and OSGi state. We derive one root from the canonicalised repo
     // path so sibling checkouts do not collide, while a single checkout
@@ -188,10 +213,10 @@ fn jdtls_workspace_dir(repo_root: &Path) -> Result<PathBuf> {
         .join(path_hash(&root)))
 }
 
-fn jdtls_fallback_workspace_dir(repo_root: &Path) -> PathBuf {
-    let root = repo_root
+fn jdtls_fallback_workspace_dir(identity_root: &Path) -> PathBuf {
+    let root = identity_root
         .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+        .unwrap_or_else(|_| identity_root.to_path_buf());
     std::env::temp_dir()
         .join("cairn-jdtls-workspaces")
         .join(path_hash(&root))
@@ -202,17 +227,32 @@ struct JdtlsWorkspaceDirs {
     data: PathBuf,
 }
 
-fn jdtls_workspace_dirs(repo_root: &Path) -> Result<JdtlsWorkspaceDirs> {
-    match prepare_jdtls_workspace_dirs(jdtls_workspace_dir(repo_root)?) {
+fn jdtls_workspace_dirs(
+    repo_root: &Path,
+    workspace_state_dir: Option<&Path>,
+) -> Result<JdtlsWorkspaceDirs> {
+    jdtls_workspace_dirs_with_prepare(repo_root, workspace_state_dir, prepare_jdtls_workspace_dirs)
+}
+
+fn jdtls_workspace_dirs_with_prepare<F>(
+    repo_root: &Path,
+    workspace_state_dir: Option<&Path>,
+    mut prepare: F,
+) -> Result<JdtlsWorkspaceDirs>
+where
+    F: FnMut(PathBuf) -> std::io::Result<JdtlsWorkspaceDirs>,
+{
+    match prepare(jdtls_workspace_dir(repo_root, workspace_state_dir)?) {
         Ok(dirs) => Ok(dirs),
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            let fallback = jdtls_fallback_workspace_dir(repo_root);
+            let fallback_identity = workspace_state_dir.unwrap_or(repo_root);
+            let fallback = jdtls_fallback_workspace_dir(fallback_identity);
             warn!(
                 primary_error = %error,
                 fallback = %fallback.display(),
                 "falling back to temporary jdtls workspace directory"
             );
-            prepare_jdtls_workspace_dirs(fallback).map_err(Error::Io)
+            prepare(fallback).map_err(Error::Io)
         }
         Err(error) => Err(Error::Io(error)),
     }
@@ -338,8 +378,8 @@ mod tests {
         let repo = tmp.path().join("repo");
         fs::create_dir(&repo).unwrap();
 
-        let first = jdtls_workspace_dir(&repo).unwrap();
-        let second = jdtls_workspace_dir(&repo).unwrap();
+        let first = jdtls_workspace_dir(&repo, None).unwrap();
+        let second = jdtls_workspace_dir(&repo, None).unwrap();
 
         assert_eq!(first, second);
         assert!(first.ends_with(path_hash(&repo.canonicalize().unwrap())));
@@ -349,6 +389,107 @@ mod tests {
                 .any(|component| component.as_os_str() == "cairn")
         );
         assert!(!first.starts_with(&repo));
+    }
+
+    #[test]
+    fn jdtls_workspace_dir_follows_effective_repository_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let first_state = tmp.path().join("daemon-a/repos/repo-hash");
+        let second_state = tmp.path().join("daemon-b/repos/repo-hash");
+        fs::create_dir(&repo).unwrap();
+
+        let first = jdtls_workspace_dir(&repo, Some(&first_state)).unwrap();
+        let first_again = jdtls_workspace_dir(&repo, Some(&first_state)).unwrap();
+        let second = jdtls_workspace_dir(&repo, Some(&second_state)).unwrap();
+
+        assert_eq!(first, first_state.join("jdtls-workspace"));
+        assert_eq!(first, first_again);
+        assert_eq!(second, second_state.join("jdtls-workspace"));
+        assert_ne!(first, second);
+        assert!(!first.starts_with(&repo));
+        assert!(!second.starts_with(&repo));
+    }
+
+    #[test]
+    fn explicit_state_dir_prepares_only_daemon_owned_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let state = tmp.path().join("daemon/repos/repo-hash");
+        fs::create_dir(&repo).unwrap();
+        let platform_default = jdtls_workspace_dir(&repo, None).unwrap();
+        assert!(!platform_default.exists());
+
+        let dirs = jdtls_workspace_dirs(&repo, Some(&state)).unwrap();
+
+        assert_eq!(
+            dirs.configuration,
+            state.join("jdtls-workspace/configuration")
+        );
+        assert_eq!(dirs.data, state.join("jdtls-workspace/data"));
+        assert!(dirs.configuration.is_dir());
+        assert!(dirs.data.is_dir());
+        assert!(
+            !platform_default.exists(),
+            "explicit daemon state must not write the platform-default live directory"
+        );
+    }
+
+    #[test]
+    fn permission_denied_fallback_preserves_explicit_state_identity() {
+        fn select_fallback(repo: &Path, state: &Path) -> (JdtlsWorkspaceDirs, Vec<PathBuf>) {
+            let mut attempts = Vec::new();
+            let dirs = jdtls_workspace_dirs_with_prepare(repo, Some(state), |workspace| {
+                attempts.push(workspace.clone());
+                if attempts.len() == 1 {
+                    Err(std::io::Error::from(ErrorKind::PermissionDenied))
+                } else {
+                    Ok(JdtlsWorkspaceDirs {
+                        configuration: workspace.join("configuration"),
+                        data: workspace.join("data"),
+                    })
+                }
+            })
+            .unwrap();
+            (dirs, attempts)
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let state_a = tmp.path().join("daemon-a/repos/repo-hash");
+        let state_b = tmp.path().join("daemon-b/repos/repo-hash");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir_all(&state_a).unwrap();
+        fs::create_dir_all(&state_b).unwrap();
+
+        let (first_a, attempts_a) = select_fallback(&repo, &state_a);
+        let (second_a, attempts_a_again) = select_fallback(&repo, &state_a);
+        let (first_b, attempts_b) = select_fallback(&repo, &state_b);
+        let fallback_a = jdtls_fallback_workspace_dir(&state_a);
+        let fallback_b = jdtls_fallback_workspace_dir(&state_b);
+        let repo_fallback = jdtls_fallback_workspace_dir(&repo);
+        let platform_default = jdtls_workspace_dir(&repo, None).unwrap();
+
+        assert_eq!(
+            attempts_a,
+            [state_a.join("jdtls-workspace"), fallback_a.clone()]
+        );
+        assert_eq!(attempts_a_again, attempts_a);
+        assert_eq!(
+            attempts_b,
+            [state_b.join("jdtls-workspace"), fallback_b.clone()]
+        );
+        assert_eq!(first_a.configuration, fallback_a.join("configuration"));
+        assert_eq!(first_a.data, fallback_a.join("data"));
+        assert_eq!(second_a.configuration, first_a.configuration);
+        assert_eq!(second_a.data, first_a.data);
+        assert_eq!(first_b.configuration, fallback_b.join("configuration"));
+        assert_eq!(first_b.data, fallback_b.join("data"));
+        assert_ne!(fallback_a, fallback_b);
+        assert_ne!(fallback_a, repo_fallback);
+        assert_ne!(fallback_b, repo_fallback);
+        assert_ne!(fallback_a, platform_default);
+        assert_ne!(fallback_b, platform_default);
     }
 
     #[test]
