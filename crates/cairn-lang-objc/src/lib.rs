@@ -74,9 +74,9 @@ impl LanguageBackend for ObjcBackend {
     }
 
     fn parser_revision(&self) -> u32 {
-        // v4 invalidates cached facts because class-extension ivars now
-        // use Objective-C's private default.
-        4
+        // v5 invalidates cached facts so AFNetworking availability wrappers
+        // no longer corrupt the declaration that follows them.
+        5
     }
 
     fn extract_syntactic(&self, source: &[u8]) -> Result<SyntacticFacts, ExtractError> {
@@ -977,8 +977,45 @@ mod tests {
     }
 
     #[test]
-    fn parser_revision_tracks_ivar_default_visibility() {
-        assert_eq!(ObjcBackend.parser_revision(), 4);
+    fn parser_revision_tracks_macro_neutralization() {
+        assert_eq!(ObjcBackend.parser_revision(), 5);
+    }
+
+    #[test]
+    fn afnetworking_availability_wrappers_do_not_swallow_following_declarations() {
+        let src = br#"
+typedef void (^AFMetricsBlock)(id session, id task) AF_API_AVAILABLE(ios(10), macosx(10.12));
+
+@interface AFManager : NSObject
+@property (nonatomic, strong) id metrics AF_API_AVAILABLE(ios(10), macosx(10.12));
+@property (nonatomic, copy) id backgroundHandler AF_API_UNAVAILABLE(macos);
+@end
+
+static int cairn_objc_probe(void) { return 1; }
+
+@interface CairnObjcProbe : NSObject
+@end
+"#;
+
+        let facts = facts(src);
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified == "AFManager")
+        );
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified == "cairn_objc_probe")
+        );
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified == "CairnObjcProbe")
+        );
     }
 
     #[test]
