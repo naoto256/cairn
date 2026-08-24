@@ -1100,6 +1100,17 @@ async fn forced_failure_honours_backoff_after_one_immediate_attempt() {
                 "retry at the persisted deadline",
             )
             .await;
+            wait_for(
+                || {
+                    let state = read_state(&cas, "h");
+                    state.consecutive_failures == 3
+                        && state.attempt_generation.is_none()
+                        && state.next_retry_at_ns.is_some()
+                },
+                2000,
+                "second forced failure publication",
+            )
+            .await;
         } else {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
