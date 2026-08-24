@@ -104,7 +104,9 @@ fn dotnet_sdk_root(
     roots: impl IntoIterator<Item = PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(root) = dotnet_root {
-        return Some(root);
+        if root.join("sdk").is_dir() {
+            return Some(root);
+        }
     }
     roots.into_iter().find(|root| root.join("sdk").is_dir())
 }
@@ -363,10 +365,25 @@ mod tests {
     fn dotnet_sdk_root_respects_existing_dotnet_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("dotnet");
+        std::fs::create_dir_all(root.join("sdk")).unwrap();
 
         assert_eq!(
             dotnet_sdk_root(Some(root.clone()), std::iter::empty()),
             Some(root)
+        );
+    }
+
+    #[test]
+    fn dotnet_sdk_root_falls_back_when_dotnet_root_has_no_sdk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let invalid = tmp.path().join("invalid");
+        let standard = tmp.path().join("standard");
+        std::fs::create_dir_all(&invalid).unwrap();
+        std::fs::create_dir_all(standard.join("sdk")).unwrap();
+
+        assert_eq!(
+            dotnet_sdk_root(Some(invalid), [standard.clone()]),
+            Some(standard)
         );
     }
 

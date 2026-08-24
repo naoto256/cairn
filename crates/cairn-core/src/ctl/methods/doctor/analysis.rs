@@ -341,6 +341,7 @@ fn parser_drift_rerun_check(
     let mut any_pending_stale: Option<(String, String, u32, Option<u32>)> = None;
     let mut any_row_missing = false;
     let mut any_stale_succeeded: Option<(String, u32, u32)> = None;
+    let mut any_unknown_status: Option<(String, String)> = None;
     let mut every_succeeded_at_current = !expected_analyzer_ids.is_empty();
 
     for analyzer_id in expected_analyzer_ids {
@@ -414,6 +415,7 @@ fn parser_drift_rerun_check(
                         every_succeeded_at_current = false;
                     }
                     _ => {
+                        any_unknown_status.get_or_insert((analyzer_id.clone(), run.status.clone()));
                         every_succeeded_at_current = false;
                     }
                 }
@@ -521,6 +523,18 @@ fn parser_drift_rerun_check(
             )),
             Some(format!(
                 "Check the daemon log (e.g. `journalctl -u cairn` or your daemon log path) and grep for `{alias}` plus `staleness` to find scanner enqueue failures or coalesced jobs. Then run `cairn ctl repo reindex {alias}` for a manual recovery.",
+            )),
+        );
+    }
+    if let Some((analyzer_id, status)) = any_unknown_status {
+        return doctor_check(
+            name,
+            DoctorStatus::Warn,
+            Some(format!(
+                "parser drift remains and analyzer `{analyzer_id}` reported unrecognized status `{status}`. Parser drift summary: {parser_summary}",
+            )),
+            Some(format!(
+                "Run `cairn ctl repo reindex {alias}` and inspect the daemon log if the status persists.",
             )),
         );
     }
@@ -1933,5 +1947,17 @@ mod tests {
         );
     }
 
-    // Reconcile-state doctor suite.
+    #[test]
+    fn parser_drift_unknown_analyzer_status_is_warn_not_pass() {
+        let probes = vec![parser_drift_probe(
+            "moshi",
+            &[("kotlin-resolver", 5)],
+            vec![run_row("kotlin-resolver", 5, "paused", None)],
+        )];
+        let checks = analyzer_rerun_health_checks(&probes);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("kotlin-resolver") && detail.contains("paused"));
+    }
 }

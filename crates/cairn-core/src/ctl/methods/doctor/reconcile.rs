@@ -287,19 +287,12 @@ mod tests {
         (tmp, cas)
     }
 
-    fn set_state(
-        cas: &CasDataDir,
-        repo_hash: &str,
-        mutate: impl FnOnce(&rusqlite::Transaction<'_>),
-    ) {
+    fn set_state(cas: &CasDataDir, mutate: impl FnOnce(&rusqlite::Transaction<'_>)) {
         let mut index = cas_registry::open(&cas.index_db_path()).unwrap();
         let tx = index
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
         mutate(&tx);
-        // Ensure the row exists as v4 always seeds it, but do
-        // nothing more here.
-        let _ = repo_hash;
         tx.commit().unwrap();
     }
 
@@ -327,7 +320,7 @@ mod tests {
     #[test]
     fn doctor_reports_live_quarantine_and_stale_git_removal_history() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repositories SET persistent = 1 WHERE repo_hash = 'h'",
                 [],
@@ -387,7 +380,7 @@ mod tests {
             .unwrap()
             .as_nanos() as i64
             - 10 * 60 * 1_000_000_000;
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET desired_generation = 1, dirty_since_ns = ?1
@@ -414,7 +407,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET desired_generation = 1, dirty_since_ns = ?1
@@ -437,7 +430,7 @@ mod tests {
     #[test]
     fn mf7_doctor_retry_backoff_warns() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET desired_generation = 1,
@@ -468,7 +461,7 @@ mod tests {
             .unwrap()
             .as_nanos() as i64
             - 20 * 60 * 1_000_000_000;
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET desired_generation = 1,
@@ -496,7 +489,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET desired_generation = 1,
@@ -520,7 +513,7 @@ mod tests {
     #[test]
     fn mf9_doctor_watcher_failed_warns() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET watcher_state = 'failed', watcher_error = 'git open failed'
@@ -548,7 +541,7 @@ mod tests {
     #[test]
     fn mf9_doctor_watcher_active_silent() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET watcher_state = 'active'
@@ -571,7 +564,7 @@ mod tests {
     #[test]
     fn mf10_doctor_applied_over_desired_fails() {
         let (_t, cas) = seeded_cas(&[("demo", "/p", "h")]);
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             // CHECK constraints prevent this via UPDATE; simulate
             // corruption by writing directly to the underlying
             // column via a temporary CHECK-less path. Use SQLite
@@ -605,7 +598,7 @@ mod tests {
             .unwrap()
             .as_nanos() as i64
             - 20 * 60 * 1_000_000_000;
-        set_state(&cas, "h", |tx| {
+        set_state(&cas, |tx| {
             tx.execute(
                 "UPDATE repo_reconcile_state
                  SET desired_generation = 1, dirty_since_ns = ?1
