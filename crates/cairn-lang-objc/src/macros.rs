@@ -266,6 +266,9 @@ mod tests {
 
         assert!(!out.contains("AF_API_AVAILABLE"));
         assert!(!out.contains("AF_API_UNAVAILABLE"));
+        assert!(!out.contains("ios(10)"));
+        assert!(!out.contains("macosx(10.12)"));
+        assert!(!out.contains("macos"));
         assert_eq!(out.lines().count(), 2);
     }
 

@@ -1002,6 +1002,11 @@ static int cairn_objc_probe(void) { return 1; }
 
         let facts = facts(src);
         assert_eq!(find(&facts, "AFMetricsBlock").kind, SymbolKind::TypeAlias);
+        assert_eq!(find(&facts, "AFManager.metrics").kind, SymbolKind::Property);
+        assert_eq!(
+            find(&facts, "AFManager.backgroundHandler").kind,
+            SymbolKind::Property
+        );
         assert!(
             facts
                 .symbols
