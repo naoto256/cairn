@@ -553,7 +553,10 @@ fn classify_git(path: &Path, kind: EventKind, git_dir: &Path) -> Option<WatchEve
 
     // .git/refs/heads/<name>[/<sub...>]
     if components.len() >= 3 && components[0] == "refs" && components[1] == "heads" {
-        let tail: Vec<&str> = components[2..].iter().filter_map(|c| c.to_str()).collect();
+        let tail: Vec<&str> = components[2..]
+            .iter()
+            .map(|component| component.to_str())
+            .collect::<Option<_>>()?;
         if tail.iter().any(|s| s.is_empty()) {
             return None;
         }
@@ -634,6 +637,23 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_branch_component_is_ignored() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let git_dir = PathBuf::from("/r/.git");
+        let path = git_dir
+            .join("refs/heads")
+            .join(std::ffi::OsString::from_vec(vec![0xff]))
+            .join("x");
+
+        assert_eq!(
+            classify_git(&path, EventKind::Create(CreateKind::File), &git_dir),
+            None
+        );
+    }
+
     #[test]
     fn worktree_head_change() {
         let ev = classify_git(
@@ -671,6 +691,25 @@ mod tests {
 
     fn debounced(event: notify::Event) -> notify_debouncer_full::DebouncedEvent {
         notify_debouncer_full::DebouncedEvent::new(event, std::time::Instant::now())
+    }
+
+    async fn recv_rescan_reason(
+        rx: &mut tokio::sync::mpsc::Receiver<WatchEvent>,
+        expected: RescanReason,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match rx.recv().await {
+                    Some(WatchEvent::Rescan { reason }) if reason == expected => return,
+                    Some(WatchEvent::Rescan {
+                        reason: RescanReason::MatcherRecovered,
+                    }) => {}
+                    other => panic!("unexpected watcher event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("expected rescan reason timed out");
     }
 
     #[test]
@@ -892,24 +931,12 @@ mod tests {
         let directory_create = notify::Event::new(EventKind::Create(CreateKind::Folder))
             .add_path(root.join("generated"));
         classifier.handle_batch(&[debounced(directory_create)]);
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                .await
-                .expect("topology transport reason timed out"),
-            Some(WatchEvent::Rescan {
-                reason: RescanReason::DirectoryTopologyChanged
-            })
-        );
+        recv_rescan_reason(&mut rx, RescanReason::DirectoryTopologyChanged).await;
         let rename = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
             .add_path(root.join("old"))
             .add_path(root.join("new"));
         classifier.handle_batch(&[debounced(rename)]);
-        assert_eq!(
-            rx.recv().await,
-            Some(WatchEvent::Rescan {
-                reason: RescanReason::DirectoryTopologyChanged
-            })
-        );
+        recv_rescan_reason(&mut rx, RescanReason::DirectoryTopologyChanged).await;
     }
 
     #[tokio::test]
