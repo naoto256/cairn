@@ -5,6 +5,83 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.4] — 2026-08-25
+
+> Compatibility: no public Rust API, CLI, JSON-RPC, or MCP wire-shape
+> breaking changes. The repository registry receives an automatic additive
+> migration for stale-registration health, and macOS daemon and JDTLS log/state
+> locations now follow the effective Cairn data directory.
+
+### Added
+
+- **Stale repository registrations are quarantined before conservative
+  cleanup.** Cairn distinguishes missing roots, non-directory roots, and
+  missing Git administration metadata from ambiguous I/O failures. Three
+  matching observations over one hour quarantine an ephemeral registration;
+  only a further continuous 24-hour grace period and final structural
+  revalidation permit removal. Persistent registrations are never removed
+  automatically, and Doctor reports live health and completed cleanup history.
+
+- **macOS daemon logs are size-bounded and process-owned.** The daemon writes
+  `<data-dir>/daemon.log`, rotates at 20 MiB, retains the current file plus four
+  archives, and uses a non-inherited process lock so concurrent daemons cannot
+  own the same log. Supervisor stdout and stderr remain fallback channels; the
+  recommended Homebrew service update is documented in
+  `docs/homebrew-0.8.4-service-update.md`.
+
+### Changed
+
+- **macOS watcher startup no longer scans every file to populate a rename
+  cache.** Native FSEvents watching now uses the dependency's no-cache mode,
+  while Cairn's existing source-batch coalescing preserves one durable
+  generation for atomic saves and file or directory renames. Instrumentation
+  reports aggregate arm timing and bounded slowest repositories. In the
+  measured 46-repository dogfood set, startup fell from minutes to subsecond
+  without watcher failures.
+
+- **Routine daemon activity produces substantially less log volume.** Normal
+  analyzer job and reconcile lifecycle events move to debug level. Repeated
+  matcher failures and panics retain the first warning and aggregate identical
+  retries over a fixed 60-second window.
+
+- **JDTLS workspaces follow each daemon's data directory.** Java Tier-3 state
+  is isolated beneath the repository store, including a data-directory-keyed
+  fallback when the primary location is not writable. Two daemons analyzing
+  the same repository no longer share JDTLS configuration or data directories.
+
+- **Large internal modules are split by responsibility.** Watcher backend,
+  classification, and matcher recovery; Doctor checks; and data RPC query,
+  feedback, and tier-status helpers now have explicit module boundaries with
+  behavior preserved.
+
+### Fixed
+
+- **Repeated LSP definition timeouts terminate with a typed failure.** A
+  shared consecutive-timeout budget stops admitting new definition requests,
+  drains in-flight work, and propagates `RequestTimeout` instead of leaving a
+  workspace-analysis pass wedged indefinitely.
+
+- **Objective-C indexing recognizes AFNetworking availability wrappers and
+  block typedefs.** `AF_API_AVAILABLE` and `AF_API_UNAVAILABLE` decorations are
+  neutralized without swallowing the following declaration, and block pointer
+  declarators emit the correct type-alias or variable kind.
+
+- **Watcher and Doctor edge cases fail closed.** Metadata classification,
+  platform-scoped watcher tests, and diagnostic handling now preserve
+  conservative behavior for malformed, inaccessible, or platform-specific
+  inputs.
+
+### PRs
+
+- LSP definition timeout containment: #325
+- Daemon log amplification and rotation: #326, #327
+- Stale-registration quarantine and cleanup: #328
+- macOS watcher startup and instrumentation: #329
+- Responsibility-focused internal restructuring: #330–#332
+- Deterministic reconcile publication fixture: #333
+- Objective-C AFNetworking and block-declarator support: #334
+- JDTLS data-directory isolation: #335
+
 ## [0.8.3] — 2026-08-13
 
 > Compatibility: no source-code, wire-shape, or on-disk-format breaking
