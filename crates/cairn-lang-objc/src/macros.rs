@@ -73,6 +73,11 @@ const KNOWN_MACRO_PREFIXES: &[&str] = &[
     "API_AVAILABLE",
     "API_UNAVAILABLE",
     "API_DEPRECATED",
+    // AFNetworking wraps Apple's availability macros so it can compile
+    // against older SDKs. The wrappers have the same declaration-suffix
+    // grammar and must be neutralized for the same reason.
+    "AF_API_AVAILABLE",
+    "AF_API_UNAVAILABLE",
     "__OSX_AVAILABLE",
     "__IOS_AVAILABLE",
     "__TVOS_AVAILABLE",
@@ -250,6 +255,18 @@ mod tests {
         let out = blank("NS_CLASS_AVAILABLE_IOS(7_0) @interface Foo : Bar\n@end\n");
         assert!(out.contains("@interface Foo : Bar"));
         assert!(!out.contains("NS_CLASS_AVAILABLE_IOS"));
+    }
+
+    #[test]
+    fn handles_afnetworking_availability_wrappers() {
+        let out = blank(
+            "id task AF_API_AVAILABLE(ios(10), macosx(10.12));\n\
+             id legacy AF_API_UNAVAILABLE(macos);\n",
+        );
+
+        assert!(!out.contains("AF_API_AVAILABLE"));
+        assert!(!out.contains("AF_API_UNAVAILABLE"));
+        assert_eq!(out.lines().count(), 2);
     }
 
     #[test]
