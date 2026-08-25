@@ -130,6 +130,12 @@ pub enum AvailabilityStrategy {
 pub enum ReadinessStrategy {
     /// Wait for `$/progress` workspace-load quiescence.
     ProgressQuiescence { timeout: Duration },
+    /// Wait for semantic `$/progress` quiescence under immutable hard and
+    /// no-progress deadlines. Rust Tier3 is the only current caller.
+    SemanticProgressQuiescence {
+        hard_timeout: Duration,
+        stall_timeout: Duration,
+    },
     /// The initialize response is the readiness gate.
     InitializeResponseOnly,
 }
@@ -1945,8 +1951,23 @@ impl PoolEntry {
             // else will reap it. Any cleanup error is surfaced
             // alongside the original readiness failure so the
             // caller / test can inspect both.
-            if let Err(err) = dispatch_readiness(&spec.readiness, |timeout| {
-                client.wait_for_workspace_load(timeout)
+            if let Err(err) = dispatch_readiness(&spec.readiness, |wait| {
+                let client = &client;
+                async move {
+                    match wait {
+                        ReadinessWait::Raw { timeout } => {
+                            client.wait_for_workspace_load(timeout).await
+                        }
+                        ReadinessWait::Semantic {
+                            hard_timeout,
+                            stall_timeout,
+                        } => {
+                            client
+                                .wait_for_workspace_load_bounded(hard_timeout, stall_timeout)
+                                .await
+                        }
+                    }
+                }
             })
             .await
             {
@@ -2076,15 +2097,36 @@ async fn dispatch_readiness<F, Fut>(
     wait_for_workspace_load: F,
 ) -> Result<()>
 where
-    F: FnOnce(Duration) -> Fut,
+    F: FnOnce(ReadinessWait) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     match readiness {
         ReadinessStrategy::ProgressQuiescence { timeout } => {
-            wait_for_workspace_load(*timeout).await
+            wait_for_workspace_load(ReadinessWait::Raw { timeout: *timeout }).await
+        }
+        ReadinessStrategy::SemanticProgressQuiescence {
+            hard_timeout,
+            stall_timeout,
+        } => {
+            wait_for_workspace_load(ReadinessWait::Semantic {
+                hard_timeout: *hard_timeout,
+                stall_timeout: *stall_timeout,
+            })
+            .await
         }
         ReadinessStrategy::InitializeResponseOnly => Ok(()),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessWait {
+    Raw {
+        timeout: Duration,
+    },
+    Semantic {
+        hard_timeout: Duration,
+        stall_timeout: Duration,
+    },
 }
 
 fn bounded_shutdown_timeout_error(entry_timeout: Duration) -> Error {

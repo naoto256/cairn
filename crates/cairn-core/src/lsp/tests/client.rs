@@ -276,6 +276,35 @@ async fn workspace_load_waits_for_progress_quiescence() {
     server.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn semantic_workspace_load_stop_outranks_readiness_deadlines() {
+    let client = Arc::new(LspClient::configured(
+        Path::new("/unused/fake-lsp"),
+        Vec::new(),
+        Vec::new(),
+        Path::new("/tmp/cairn"),
+        Value::Null,
+        Duration::from_secs(1),
+    ));
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let (client_reader, client_writer) = split(client_io);
+    client.install_transport(client_reader, client_writer).await;
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .wait_for_workspace_load_bounded(Duration::from_secs(120), Duration::from_secs(90))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    client.process_control().stop_and_terminate().await.unwrap();
+
+    assert!(matches!(waiter.await.unwrap(), Err(Error::PoolStopped)));
+    drop(server_io);
+}
+
 #[tokio::test]
 async fn workspace_load_ignores_server_status_without_progress() {
     let (client_io, server_io) = tokio::io::duplex(8192);
