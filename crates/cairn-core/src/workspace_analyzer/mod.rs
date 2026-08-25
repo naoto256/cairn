@@ -128,7 +128,8 @@ pub(crate) use expected::{
 };
 pub use lsp_pass::{
     DefinitionRetryPolicy, DefinitionSite, LspDefinitionCollector, LspDefinitionPass,
-    LspMultiKindDefinitionPass, run_lsp_definition_pass, run_lsp_multi_kind_definition_pass,
+    LspMultiKindDefinitionPass, run_lsp_definition_pass,
+    run_lsp_definition_pass_with_semantic_readiness, run_lsp_multi_kind_definition_pass,
 };
 pub use run::run_registered_workspace_analyzers;
 pub(crate) use run::{

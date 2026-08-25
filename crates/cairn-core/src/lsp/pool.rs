@@ -130,14 +130,20 @@ pub enum AvailabilityStrategy {
 pub enum ReadinessStrategy {
     /// Wait for `$/progress` workspace-load quiescence.
     ProgressQuiescence { timeout: Duration },
-    /// Wait for semantic `$/progress` quiescence under immutable hard and
-    /// no-progress deadlines. Rust Tier3 is the only current caller.
-    SemanticProgressQuiescence {
+    /// The initialize response is the readiness gate.
+    InitializeResponseOnly,
+}
+
+/// Internal readiness routing for definition passes. Public spawn specs keep
+/// their pre-0.8.5 shape; Rust's semantic policy is selected only by the
+/// purpose-specific workspace-analyzer bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefinitionReadiness {
+    SpawnSpec,
+    Semantic {
         hard_timeout: Duration,
         stall_timeout: Duration,
     },
-    /// The initialize response is the readiness gate.
-    InitializeResponseOnly,
 }
 
 /// Launch and readiness settings for a pooled LSP client.
@@ -662,13 +668,26 @@ impl LspClientPool {
     where
         F: for<'a> FnOnce(&'a mut PooledLsp<'a>) -> ClientWork<'a, T>,
     {
+        self.with_lsp_readiness(key, spawn_spec, DefinitionReadiness::SpawnSpec, work)
+    }
+
+    pub(crate) fn with_lsp_readiness<T, F>(
+        &self,
+        key: PoolKey,
+        spawn_spec: LspSpawnSpec,
+        readiness: DefinitionReadiness,
+        work: F,
+    ) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut PooledLsp<'a>) -> ClientWork<'a, T>,
+    {
         let lease = self
             .runtime()
             .block_on(async { self.acquire_lease(key).await })?;
         let entry = Arc::clone(&lease.entry);
         let result = self
             .runtime()
-            .block_on(async move { entry.with_lsp_client(spawn_spec, work).await });
+            .block_on(async move { entry.with_lsp_client(spawn_spec, readiness, work).await });
         drop(lease);
         // Central poison propagation: any termination-unproven
         // error observed on the normal path (spawn/initialize/
@@ -1921,7 +1940,12 @@ impl PoolEntry {
         }
     }
 
-    async fn with_lsp_client<T, F>(self: &Arc<Self>, spec: LspSpawnSpec, work: F) -> Result<T>
+    async fn with_lsp_client<T, F>(
+        self: &Arc<Self>,
+        spec: LspSpawnSpec,
+        readiness: DefinitionReadiness,
+        work: F,
+    ) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut PooledLsp<'a>) -> ClientWork<'a, T>,
     {
@@ -1951,7 +1975,7 @@ impl PoolEntry {
             // else will reap it. Any cleanup error is surfaced
             // alongside the original readiness failure so the
             // caller / test can inspect both.
-            if let Err(err) = dispatch_readiness(&spec.readiness, |wait| {
+            if let Err(err) = dispatch_readiness(&spec.readiness, readiness, |wait| {
                 let client = &client;
                 async move {
                     match wait {
@@ -2094,27 +2118,31 @@ impl PoolEntry {
 /// client; `InitializeResponseOnly` needs no extra wait.
 async fn dispatch_readiness<F, Fut>(
     readiness: &ReadinessStrategy,
+    dispatch: DefinitionReadiness,
     wait_for_workspace_load: F,
 ) -> Result<()>
 where
     F: FnOnce(ReadinessWait) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    match readiness {
-        ReadinessStrategy::ProgressQuiescence { timeout } => {
-            wait_for_workspace_load(ReadinessWait::Raw { timeout: *timeout }).await
-        }
-        ReadinessStrategy::SemanticProgressQuiescence {
+    let wait = match dispatch {
+        DefinitionReadiness::SpawnSpec => match readiness {
+            ReadinessStrategy::ProgressQuiescence { timeout } => {
+                Some(ReadinessWait::Raw { timeout: *timeout })
+            }
+            ReadinessStrategy::InitializeResponseOnly => None,
+        },
+        DefinitionReadiness::Semantic {
             hard_timeout,
             stall_timeout,
-        } => {
-            wait_for_workspace_load(ReadinessWait::Semantic {
-                hard_timeout: *hard_timeout,
-                stall_timeout: *stall_timeout,
-            })
-            .await
-        }
-        ReadinessStrategy::InitializeResponseOnly => Ok(()),
+        } => Some(ReadinessWait::Semantic {
+            hard_timeout,
+            stall_timeout,
+        }),
+    };
+    match wait {
+        Some(wait) => wait_for_workspace_load(wait).await,
+        None => Ok(()),
     }
 }
 

@@ -714,7 +714,7 @@ impl LspClient {
     ///
     /// This policy is currently selected only by Rust Tier3. Existing LSP
     /// integrations retain the raw progress strategy above.
-    pub async fn wait_for_workspace_load_bounded(
+    pub(crate) async fn wait_for_workspace_load_bounded(
         &self,
         hard_timeout: Duration,
         stall_timeout: Duration,

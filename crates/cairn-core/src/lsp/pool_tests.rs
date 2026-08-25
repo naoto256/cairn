@@ -275,6 +275,7 @@ fn lsp_pool_dispatches_progress_quiescence_readiness_to_wait_hook() {
     runtime
         .block_on(dispatch_readiness(
             &ReadinessStrategy::ProgressQuiescence { timeout },
+            DefinitionReadiness::SpawnSpec,
             |wait| {
                 waited = Some(wait);
                 async { Ok(()) }
@@ -294,7 +295,10 @@ fn lsp_pool_dispatches_semantic_readiness_deadlines_to_wait_hook() {
 
     runtime
         .block_on(dispatch_readiness(
-            &ReadinessStrategy::SemanticProgressQuiescence {
+            &ReadinessStrategy::ProgressQuiescence {
+                timeout: Duration::from_secs(1),
+            },
+            DefinitionReadiness::Semantic {
                 hard_timeout,
                 stall_timeout,
             },
@@ -322,6 +326,7 @@ fn lsp_pool_skips_wait_hook_for_initialize_response_readiness() {
     runtime
         .block_on(dispatch_readiness(
             &ReadinessStrategy::InitializeResponseOnly,
+            DefinitionReadiness::SpawnSpec,
             |wait| {
                 let _ = wait;
                 waited = true;
@@ -335,6 +340,16 @@ fn lsp_pool_skips_wait_hook_for_initialize_response_readiness() {
 
 #[test]
 fn lsp_pool_dispatches_readiness_strategy_per_server() {
+    fn readiness_name(readiness: &ReadinessStrategy) -> &'static str {
+        match readiness {
+            ReadinessStrategy::ProgressQuiescence { .. } => "progress",
+            ReadinessStrategy::InitializeResponseOnly => "initialize",
+        }
+    }
+
+    // Keep this as a complete pre-0.8.5 public struct literal plus an
+    // exhaustive two-variant match. Together they catch source-incompatible
+    // public field/type or closed-enum changes.
     let rust = LspSpawnSpec {
         binary: PathBuf::from("rust-analyzer"),
         workspace_root: PathBuf::from("/tmp/repo"),
@@ -375,6 +390,8 @@ fn lsp_pool_dispatches_readiness_strategy_per_server() {
     );
     assert_eq!(pyright.launch_args, vec!["--stdio"]);
     assert_eq!(pyright.initialization_options, serde_json::json!({}));
+    assert_eq!(readiness_name(&rust.readiness), "progress");
+    assert_eq!(readiness_name(&pyright.readiness), "initialize");
 }
 
 #[test]
