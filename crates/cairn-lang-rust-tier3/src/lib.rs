@@ -128,7 +128,7 @@ fn rust_analyzer_binary() -> PathBuf {
 fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
     json!({
         "cairnConfigHash": config_hash,
-        "checkOnSave": false,
+        "checkOnSave": { "enable": false },
         "experimental": {
             "serverStatusNotification": true
         },
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(ANALYZER_REVISION, 3);
         assert_eq!(POOL_CONFIG_ID, "rust-analyzer-lsp-v2");
         assert_eq!(
-            rust_analyzer_initialization_options(POOL_CONFIG_ID)["checkOnSave"],
+            rust_analyzer_initialization_options(POOL_CONFIG_ID)["checkOnSave"]["enable"],
             false
         );
         assert_eq!(WORKSPACE_LOAD_HARD_TIMEOUT, Duration::from_secs(120));
