@@ -16,7 +16,9 @@ use cairn_proto::RefKind;
 use futures::{StreamExt, stream::FuturesUnordered};
 use tracing::{debug, warn};
 
-use crate::lsp::pool::{self as lsp_pool, LspSpawnSpec, PoolKey, PooledLsp};
+use crate::lsp::pool::{
+    self as lsp_pool, DefinitionReadiness, LspSpawnSpec, PoolKey, PooledLsp, ReadinessStrategy,
+};
 use crate::lsp::{Location, Position, Url};
 use crate::{Error, Result};
 
@@ -143,6 +145,60 @@ pub fn run_lsp_definition_pass(
     files: &[WorkspaceFile],
     progress: &AnalyzerProgress,
 ) -> Result<WorkspaceFacts> {
+    run_lsp_definition_pass_with_readiness(
+        pass,
+        repo_root,
+        files,
+        progress,
+        DefinitionReadiness::SpawnSpec,
+    )
+}
+
+/// Run one LSP definition pass with semantic progress readiness.
+///
+/// The hard deadline remains the single timeout stored in
+/// [`ReadinessStrategy::ProgressQuiescence`]; this bridge adds only the
+/// semantic no-progress deadline used by Rust Tier3. Passing
+/// [`ReadinessStrategy::InitializeResponseOnly`] is rejected before pool
+/// acquisition or process spawn.
+///
+/// # Errors
+/// Returns [`Error::Lsp`] for an incompatible readiness strategy, and the same
+/// LSP/read/protocol errors as [`run_lsp_definition_pass`] otherwise.
+pub fn run_lsp_definition_pass_with_semantic_readiness(
+    pass: LspDefinitionPass,
+    repo_root: &Path,
+    files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
+    stall_timeout: Duration,
+) -> Result<WorkspaceFacts> {
+    let hard_timeout = match &pass.spawn_spec.readiness {
+        ReadinessStrategy::ProgressQuiescence { timeout } => *timeout,
+        ReadinessStrategy::InitializeResponseOnly => {
+            return Err(Error::Lsp(crate::lsp::Error::Protocol(
+                "semantic readiness requires ProgressQuiescence hard timeout".into(),
+            )));
+        }
+    };
+    run_lsp_definition_pass_with_readiness(
+        pass,
+        repo_root,
+        files,
+        progress,
+        DefinitionReadiness::Semantic {
+            hard_timeout,
+            stall_timeout,
+        },
+    )
+}
+
+fn run_lsp_definition_pass_with_readiness(
+    pass: LspDefinitionPass,
+    repo_root: &Path,
+    files: &[WorkspaceFile],
+    progress: &AnalyzerProgress,
+    readiness: DefinitionReadiness,
+) -> Result<WorkspaceFacts> {
     let key = PoolKey::lsp(
         pass.language,
         repo_root,
@@ -161,12 +217,12 @@ pub fn run_lsp_definition_pass(
     let suppress_definition_targets_at_requested_sites =
         pass.suppress_definition_targets_at_requested_sites;
     let progress = progress.clone();
-    pool.with_lsp(key, pass.spawn_spec, move |client| {
+    pool.with_lsp_readiness(key, pass.spawn_spec, readiness, move |client| {
         Box::pin(async move {
-            // `with_lsp` has taken pool ownership and finished readiness before
-            // this closure runs, so arming here keeps queueing and server
-            // startup out of the stall window and starts it at the first
-            // request this pass issues.
+            // The pool has taken ownership and finished readiness before this
+            // closure runs, so arming here keeps queueing and server startup
+            // out of the stall window and starts it at the first request this
+            // pass issues.
             progress.arm_stall_watchdog();
             let mut facts = WorkspaceFacts::default();
             collect_resolved_refs(
@@ -1075,6 +1131,45 @@ while True:
             code: -32603,
             message: "file not found".into(),
         }
+    }
+
+    #[test]
+    fn semantic_readiness_rejects_initialize_only_before_pool_acquisition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let error = run_lsp_definition_pass_with_semantic_readiness(
+            LspDefinitionPass {
+                analyzer_id: "semantic-readiness-contract-test",
+                pool_analyzer_id: None,
+                language: "test",
+                ref_kind: RefKind::Call,
+                spawn_spec: LspSpawnSpec {
+                    binary: fixture.path().join("must-not-spawn"),
+                    workspace_root: fixture.path().to_path_buf(),
+                    config_hash: "test".into(),
+                    request_timeout: Duration::from_secs(1),
+                    availability: crate::lsp::pool::AvailabilityStrategy::VersionFlag,
+                    readiness: ReadinessStrategy::InitializeResponseOnly,
+                    language_id: "test",
+                    launch_args: Vec::new(),
+                    env: Vec::new(),
+                    initialization_options: serde_json::json!({}),
+                },
+                retry: DefinitionRetryPolicy::default(),
+                collect_definition_sites: |_| Ok(Vec::new()),
+                suppress_definition_targets_at_requested_sites: false,
+            },
+            fixture.path(),
+            &[],
+            &AnalyzerProgress::default(),
+            Duration::from_secs(90),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Lsp(crate::lsp::Error::Protocol(message))
+                if message == "semantic readiness requires ProgressQuiescence hard timeout"
+        ));
     }
 
     #[cfg(unix)]

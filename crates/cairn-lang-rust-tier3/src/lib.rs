@@ -33,7 +33,8 @@ use cairn_core::lsp_discovery::discover_lsp_binary;
 use cairn_core::manifest::ManifestId;
 use cairn_core::workspace_analyzer::{
     AnalyzerProgress, DefinitionRetryPolicy, DefinitionSite, LspDefinitionPass, RefKind,
-    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile, run_lsp_definition_pass,
+    WORKSPACE_ANALYZERS, WorkspaceAnalyzer, WorkspaceFacts, WorkspaceFile,
+    run_lsp_definition_pass_with_semantic_readiness,
 };
 use cairn_core::{Error, Result};
 use linkme::distributed_slice;
@@ -81,37 +82,12 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
         files: &[WorkspaceFile],
         progress: &AnalyzerProgress,
     ) -> Result<WorkspaceFacts> {
-        run_lsp_definition_pass(
-            LspDefinitionPass {
-                analyzer_id: ANALYZER_ID,
-                pool_analyzer_id: None,
-                language: "rust",
-                ref_kind: RefKind::Call,
-                spawn_spec: LspSpawnSpec {
-                    binary: rust_analyzer_binary(),
-                    workspace_root: repo_root.to_path_buf(),
-                    config_hash: POOL_CONFIG_ID.to_string(),
-                    request_timeout: REQUEST_TIMEOUT,
-                    availability: AvailabilityStrategy::VersionFlag,
-                    readiness: ReadinessStrategy::SemanticProgressQuiescence {
-                        hard_timeout: WORKSPACE_LOAD_HARD_TIMEOUT,
-                        stall_timeout: WORKSPACE_LOAD_STALL_TIMEOUT,
-                    },
-                    language_id: "rust",
-                    launch_args: Vec::new(),
-                    env: Vec::new(),
-                    initialization_options: rust_analyzer_initialization_options(POOL_CONFIG_ID),
-                },
-                retry: DefinitionRetryPolicy {
-                    retry_empty_definition: false,
-                    retry_file_not_found: true,
-                },
-                collect_definition_sites: collect_method_calls,
-                suppress_definition_targets_at_requested_sites: false,
-            },
+        run_lsp_definition_pass_with_semantic_readiness(
+            rust_analyzer_definition_pass(repo_root),
             repo_root,
             files,
             progress,
+            WORKSPACE_LOAD_STALL_TIMEOUT,
         )
     }
 }
@@ -119,6 +95,35 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
 #[distributed_slice(WORKSPACE_ANALYZERS)]
 static REGISTER_RUST_WORKSPACE_ANALYZER: fn() -> Box<dyn WorkspaceAnalyzer> =
     || Box::new(RustAnalyzerWorkspaceAnalyzer);
+
+fn rust_analyzer_definition_pass(repo_root: &Path) -> LspDefinitionPass {
+    LspDefinitionPass {
+        analyzer_id: ANALYZER_ID,
+        pool_analyzer_id: None,
+        language: "rust",
+        ref_kind: RefKind::Call,
+        spawn_spec: LspSpawnSpec {
+            binary: rust_analyzer_binary(),
+            workspace_root: repo_root.to_path_buf(),
+            config_hash: POOL_CONFIG_ID.to_string(),
+            request_timeout: REQUEST_TIMEOUT,
+            availability: AvailabilityStrategy::VersionFlag,
+            readiness: ReadinessStrategy::ProgressQuiescence {
+                timeout: WORKSPACE_LOAD_HARD_TIMEOUT,
+            },
+            language_id: "rust",
+            launch_args: Vec::new(),
+            env: Vec::new(),
+            initialization_options: rust_analyzer_initialization_options(POOL_CONFIG_ID),
+        },
+        retry: DefinitionRetryPolicy {
+            retry_empty_definition: false,
+            retry_file_not_found: true,
+        },
+        collect_definition_sites: collect_method_calls,
+        suppress_definition_targets_at_requested_sites: false,
+    }
+}
 
 fn rust_analyzer_binary() -> PathBuf {
     discover_lsp_binary("rust-analyzer", Some("RUST_ANALYZER"))
@@ -200,13 +205,20 @@ mod tests {
 
     #[test]
     fn rust_analyzer_uses_bounded_semantic_readiness_without_flycheck() {
+        let pass = rust_analyzer_definition_pass(Path::new("/tmp/repo"));
+
         assert_eq!(ANALYZER_REVISION, 3);
         assert_eq!(POOL_CONFIG_ID, "rust-analyzer-lsp-v2");
         assert_eq!(
-            rust_analyzer_initialization_options(POOL_CONFIG_ID)["checkOnSave"]["enable"],
+            pass.spawn_spec.initialization_options["checkOnSave"]["enable"],
             false
         );
-        assert_eq!(WORKSPACE_LOAD_HARD_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(pass.spawn_spec.config_hash, POOL_CONFIG_ID);
+        assert!(matches!(
+            pass.spawn_spec.readiness,
+            ReadinessStrategy::ProgressQuiescence { timeout }
+                if timeout == Duration::from_secs(120)
+        ));
         assert_eq!(WORKSPACE_LOAD_STALL_TIMEOUT, Duration::from_secs(90));
     }
 
