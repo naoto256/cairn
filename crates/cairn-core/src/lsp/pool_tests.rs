@@ -275,14 +275,43 @@ fn lsp_pool_dispatches_progress_quiescence_readiness_to_wait_hook() {
     runtime
         .block_on(dispatch_readiness(
             &ReadinessStrategy::ProgressQuiescence { timeout },
-            |timeout| {
-                waited = Some(timeout);
+            |wait| {
+                waited = Some(wait);
                 async { Ok(()) }
             },
         ))
         .unwrap();
 
-    assert_eq!(waited, Some(timeout));
+    assert_eq!(waited, Some(ReadinessWait::Raw { timeout }));
+}
+
+#[test]
+fn lsp_pool_dispatches_semantic_readiness_deadlines_to_wait_hook() {
+    let runtime = Runtime::new().unwrap();
+    let hard_timeout = Duration::from_secs(120);
+    let stall_timeout = Duration::from_secs(90);
+    let mut waited = None;
+
+    runtime
+        .block_on(dispatch_readiness(
+            &ReadinessStrategy::SemanticProgressQuiescence {
+                hard_timeout,
+                stall_timeout,
+            },
+            |wait| {
+                waited = Some(wait);
+                async { Ok(()) }
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        waited,
+        Some(ReadinessWait::Semantic {
+            hard_timeout,
+            stall_timeout,
+        })
+    );
 }
 
 #[test]
@@ -293,8 +322,8 @@ fn lsp_pool_skips_wait_hook_for_initialize_response_readiness() {
     runtime
         .block_on(dispatch_readiness(
             &ReadinessStrategy::InitializeResponseOnly,
-            |timeout| {
-                let _ = timeout;
+            |wait| {
+                let _ = wait;
                 waited = true;
                 async { Ok(()) }
             },

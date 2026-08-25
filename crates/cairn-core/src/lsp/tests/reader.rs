@@ -238,6 +238,333 @@ async fn progress_state_reset_clears_active_tokens_from_prior_session() {
     assert_eq!(outcome, WorkspaceLoadComplete::ProgressQuiescence);
 }
 
+fn semantic_progress_message(token: &str, kind: &str, payload: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "$/progress",
+        "params": {
+            "token": token,
+            "value": { "kind": kind, "message": payload }
+        }
+    })
+}
+
+#[test]
+fn semantic_progress_reducer_accepts_only_material_active_token_changes() {
+    let mut active = HashMap::new();
+    let mut saw_begin = false;
+    let begin = json!({"kind": "begin", "title": "workspace"});
+    let duplicate_begin = json!({"kind": "begin", "title": "duplicate"});
+    let report_one = json!({"kind": "report", "message": "1/2"});
+    let report_two = json!({"kind": "report", "message": "2/2"});
+    let end = json!({"kind": "end", "message": "done"});
+
+    assert!(!reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "inactive".into(),
+        "report",
+        &report_one,
+    ));
+    assert!(reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "begin",
+        &begin,
+    ));
+    assert!(saw_begin);
+    assert_eq!(active.get("load"), Some(&begin));
+    assert!(!reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "begin",
+        &duplicate_begin,
+    ));
+    assert_eq!(active.get("load"), Some(&begin));
+    assert!(reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "report",
+        &report_one,
+    ));
+    assert!(!reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "report",
+        &report_one,
+    ));
+    assert!(reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "report",
+        &report_two,
+    ));
+    assert!(reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "end",
+        &end,
+    ));
+    assert!(!reduce_semantic_progress(
+        &mut active,
+        &mut saw_begin,
+        "load".into(),
+        "end",
+        &end,
+    ));
+    assert!(active.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_quiet_ignores_duplicate_progress_and_server_status_noise() {
+    let progress = ProgressState::default();
+    progress
+        .record(&semantic_progress_message("load", "begin", "workspace"))
+        .await;
+    progress
+        .record(&semantic_progress_message("load", "end", "done"))
+        .await;
+    let started = tokio::time::Instant::now();
+    let wait = progress.wait_for_semantic_quiescence(
+        started,
+        started + Duration::from_millis(120),
+        Duration::from_millis(90),
+        Duration::from_millis(5),
+    );
+    tokio::pin!(wait);
+
+    tokio::select! {
+        biased;
+        outcome = &mut wait => panic!("quiet completed early: {outcome:?}"),
+        () = tokio::time::advance(Duration::from_micros(4_900)) => {}
+    }
+    progress
+        .record(&semantic_progress_message("load", "end", "duplicate"))
+        .await;
+    progress
+        .record(&semantic_progress_message("inactive", "report", "noise"))
+        .await;
+    progress
+        .record_server_status(&json!({
+            "params": {"health": "ok", "quiescent": true}
+        }))
+        .await;
+    progress
+        .record_server_status(&json!({
+            "params": {"health": "ok", "quiescent": true}
+        }))
+        .await;
+    tokio::time::advance(Duration::from_micros(100)).await;
+
+    assert_eq!(
+        wait.await,
+        WorkspaceLoadWaitOutcome::Complete(WorkspaceLoadComplete::ProgressQuiescence)
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_millis(5),
+        "duplicate noise must not refresh the semantic quiet deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_raw_quiet_still_refreshes_on_duplicate_progress() {
+    let progress = ProgressState::default();
+    progress.record(&progress_message("load", "begin")).await;
+    progress.record(&progress_message("load", "end")).await;
+    let started = tokio::time::Instant::now();
+    let wait = progress.wait_for_quiescence(Duration::from_millis(5));
+    tokio::pin!(wait);
+
+    tokio::select! {
+        biased;
+        outcome = &mut wait => panic!("raw quiet completed early: {outcome:?}"),
+        () = tokio::time::advance(Duration::from_micros(4_900)) => {}
+    }
+    progress.record(&progress_message("load", "end")).await;
+    tokio::select! {
+        biased;
+        outcome = &mut wait => panic!("duplicate raw progress did not refresh quiet: {outcome:?}"),
+        () = tokio::time::advance(Duration::from_micros(4_900)) => {}
+    }
+    tokio::time::advance(Duration::from_micros(100)).await;
+    assert_eq!(wait.await, WorkspaceLoadComplete::ProgressQuiescence);
+    let elapsed = tokio::time::Instant::now() - started;
+    assert!(
+        elapsed >= Duration::from_micros(9_900) && elapsed <= Duration::from_millis(11),
+        "legacy relative sleep should restart after duplicate progress: {elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_stall_deadline_has_exact_ninety_second_boundary() {
+    let progress = ProgressState::default();
+    progress
+        .record(&semantic_progress_message("load", "begin", "workspace"))
+        .await;
+    let started = tokio::time::Instant::now();
+    let wait = progress.wait_for_semantic_quiescence(
+        started,
+        started + Duration::from_millis(200),
+        Duration::from_millis(90),
+        Duration::from_millis(5),
+    );
+    tokio::pin!(wait);
+
+    tokio::select! {
+        biased;
+        outcome = &mut wait => panic!("stall completed before 89.9: {outcome:?}"),
+        () = tokio::time::advance(Duration::from_micros(89_900)) => {}
+    }
+    tokio::time::advance(Duration::from_micros(200)).await;
+    assert_eq!(
+        wait.await,
+        WorkspaceLoadWaitOutcome::Deadline(WorkspaceLoadDeadline::Stall)
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_micros(90_100),
+        "stall deadline must be scheduled independently of the hard cap"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_hard_deadline_caps_endless_unique_progress_at_one_twenty() {
+    let progress = ProgressState::default();
+    progress
+        .record(&semantic_progress_message("load", "begin", "workspace"))
+        .await;
+    let started = tokio::time::Instant::now();
+    let wait = progress.wait_for_semantic_quiescence(
+        started,
+        started + Duration::from_millis(120),
+        Duration::from_millis(90),
+        Duration::from_millis(5),
+    );
+    tokio::pin!(wait);
+
+    for (step, elapsed) in [("one", 30), ("two", 30), ("three", 30)] {
+        tokio::select! {
+            biased;
+            outcome = &mut wait => panic!("hard deadline completed early: {outcome:?}"),
+            () = tokio::time::advance(Duration::from_millis(elapsed)) => {}
+        }
+        progress
+            .record(&semantic_progress_message("load", "report", step))
+            .await;
+    }
+    tokio::select! {
+        biased;
+        outcome = &mut wait => panic!("hard deadline completed before 119.9: {outcome:?}"),
+        () = tokio::time::advance(Duration::from_micros(29_900)) => {}
+    }
+    tokio::time::advance(Duration::from_micros(200)).await;
+    assert_eq!(
+        wait.await,
+        WorkspaceLoadWaitOutcome::Deadline(WorkspaceLoadDeadline::Hard)
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_micros(120_100),
+        "hard deadline must be scheduled independently of semantic progress"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_lock_trace_accepts_sixty_and_stalls_one_twenty_and_one_fifty() {
+    let progress = ProgressState::default();
+
+    progress
+        .record(&semantic_progress_message("load-60", "begin", "workspace"))
+        .await;
+    let started = tokio::time::Instant::now();
+    let wait_60 = progress.wait_for_semantic_quiescence(
+        started,
+        started + Duration::from_millis(120),
+        Duration::from_millis(90),
+        Duration::from_millis(5),
+    );
+    tokio::pin!(wait_60);
+    tokio::select! {
+        biased;
+        outcome = &mut wait_60 => panic!("60-second trace completed early: {outcome:?}"),
+        () = tokio::time::advance(Duration::from_millis(60)) => {}
+    }
+    progress
+        .record(&semantic_progress_message(
+            "load-60",
+            "report",
+            "lock released",
+        ))
+        .await;
+    progress
+        .record(&semantic_progress_message("load-60", "end", "ready"))
+        .await;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    assert!(matches!(
+        wait_60.await,
+        WorkspaceLoadWaitOutcome::Complete(_)
+    ));
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_millis(65)
+    );
+
+    for label in ["load-120", "load-150"] {
+        progress.reset().await;
+        progress
+            .record(&semantic_progress_message(label, "begin", "workspace"))
+            .await;
+        let started = tokio::time::Instant::now();
+        let wait = progress.wait_for_semantic_quiescence(
+            started,
+            started + Duration::from_millis(120),
+            Duration::from_millis(90),
+            Duration::from_millis(5),
+        );
+        tokio::pin!(wait);
+        tokio::time::advance(Duration::from_millis(90)).await;
+        assert_eq!(
+            wait.await,
+            WorkspaceLoadWaitOutcome::Deadline(WorkspaceLoadDeadline::Stall),
+            "{label} must stop at the semantic-stall deadline"
+        );
+    }
+}
+
+#[tokio::test]
+async fn semantic_progress_is_scoped_to_transport_generation_and_resets_payloads() {
+    let progress = ProgressState::default();
+    progress.reset_for_generation(7).await;
+    progress
+        .record_for_generation(7, &semantic_progress_message("old", "begin", "workspace"))
+        .await;
+    assert_eq!(progress.semantic_snapshot().await, (7, 1, true, 1));
+
+    progress.reset_for_generation(8).await;
+    progress
+        .record_for_generation(7, &semantic_progress_message("old", "report", "late"))
+        .await;
+    progress
+        .record_for_generation(7, &semantic_progress_message("old", "end", "late"))
+        .await;
+    assert_eq!(progress.semantic_snapshot().await, (8, 0, false, 0));
+
+    progress
+        .record_for_generation(8, &semantic_progress_message("new", "begin", "workspace"))
+        .await;
+    progress
+        .record_for_generation(8, &semantic_progress_message("new", "end", "ready"))
+        .await;
+    assert_eq!(progress.semantic_snapshot().await, (8, 0, true, 2));
+}
+
 #[test]
 fn response_result_preserves_lsp_error_code() {
     let (_, result) = response_result(&json!({

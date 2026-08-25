@@ -9,7 +9,7 @@
 //! are tagged with the installed transport generation so delayed EOF,
 //! responses, or progress from a replaced child cannot affect its
 //! successor.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::{Future, ready};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, oneshot};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info};
 
 use super::error::{Error, Result};
@@ -132,8 +132,9 @@ pub(super) struct ProgressState {
 struct ProgressSnapshot {
     /// Transport generation that owns this readiness snapshot.
     generation: u64,
-    /// Progress tokens with a `begin` but no matching `end` yet.
-    active_tokens: HashSet<String>,
+    /// Progress tokens with a `begin` but no matching `end` yet,
+    /// together with the last payload accepted as semantic progress.
+    active_tokens: HashMap<String, Value>,
     /// True once any `begin` has been seen since the last `reset`.
     /// Guards against declaring quiescence before the server has
     /// started reporting work at all.
@@ -141,6 +142,13 @@ struct ProgressSnapshot {
     /// Monotonic count of recorded progress events; lets
     /// `wait_for_quiescence` detect churn during its quiet period.
     change_seq: u64,
+    /// Monotonic count of progress events that materially advanced an
+    /// active token. Rust's bounded readiness policy uses this sequence;
+    /// the legacy strategy intentionally continues to use `change_seq`.
+    semantic_change_seq: u64,
+    /// Receipt time of the latest semantic progress event in this
+    /// transport generation.
+    last_semantic_at: Option<Instant>,
 }
 
 impl ProgressState {
@@ -159,6 +167,8 @@ impl ProgressState {
         inner.active_tokens.clear();
         inner.saw_begin = false;
         inner.change_seq = 0;
+        inner.semantic_change_seq = 0;
+        inner.last_semantic_at = None;
     }
 
     /// Fold one `$/progress` notification into the snapshot.
@@ -200,15 +210,23 @@ impl ProgressState {
             return;
         }
         inner.change_seq = inner.change_seq.saturating_add(1);
-        match kind {
-            "begin" => {
-                inner.active_tokens.insert(token);
-                inner.saw_begin = true;
-            }
-            "end" => {
-                inner.active_tokens.remove(&token);
-            }
-            _ => {}
+        let semantic_advanced = {
+            let ProgressSnapshot {
+                active_tokens,
+                saw_begin,
+                ..
+            } = &mut *inner;
+            reduce_semantic_progress(
+                active_tokens,
+                saw_begin,
+                token,
+                kind,
+                params.get("value").expect("progress kind came from value"),
+            )
+        };
+        if semantic_advanced {
+            inner.semantic_change_seq = inner.semantic_change_seq.saturating_add(1);
+            inner.last_semantic_at = Some(Instant::now());
         }
         drop(inner);
         self.notify.notify_waiters();
@@ -224,10 +242,21 @@ impl ProgressState {
         self.record_for_generation(0, message).await;
     }
 
+    #[cfg(test)]
+    pub(super) async fn semantic_snapshot(&self) -> (u64, usize, bool, u64) {
+        let inner = self.inner.lock().await;
+        (
+            inner.generation,
+            inner.active_tokens.len(),
+            inner.saw_begin,
+            inner.semantic_change_seq,
+        )
+    }
+
     /// Log `rust-analyzer/serverStatus` notifications. Observability
     /// only: the `quiescent` flag is not fed into the readiness
     /// decision, which relies solely on `$/progress` bookkeeping.
-    async fn record_server_status(&self, message: &Value) {
+    pub(super) async fn record_server_status(&self, message: &Value) {
         let quiescent = message
             .get("params")
             .and_then(|params| params.get("quiescent"))
@@ -324,6 +353,114 @@ impl ProgressState {
         self.wait_for_quiescence_inner(quiet_period, after_snapshot)
             .await
     }
+
+    /// Resolve Rust's bounded readiness policy using only semantic
+    /// progress to refresh its stall and quiet deadlines.
+    ///
+    /// `hard_deadline` and `readiness_started_at` are fixed by the caller
+    /// immediately before entering this wait. Duplicate/no-op progress can
+    /// wake the loop, but cannot move either absolute deadline.
+    pub(super) async fn wait_for_semantic_quiescence(
+        &self,
+        readiness_started_at: Instant,
+        hard_deadline: Instant,
+        stall_timeout: Duration,
+        quiet_period: Duration,
+    ) -> WorkspaceLoadWaitOutcome {
+        loop {
+            // Pre-arm notification before observing state so a semantic
+            // begin/end pair cannot be lost between snapshot and wait.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let (semantic_seq, ready, last_semantic_at) = {
+                let inner = self.inner.lock().await;
+                (
+                    inner.semantic_change_seq,
+                    inner.saw_begin && inner.active_tokens.is_empty(),
+                    inner.last_semantic_at,
+                )
+            };
+            let semantic_base = last_semantic_at
+                .map(|at| at.max(readiness_started_at))
+                .unwrap_or(readiness_started_at);
+            let stall_deadline = semantic_base + stall_timeout;
+            let quiet_deadline = ready.then_some(semantic_base + quiet_period);
+            let next_deadline = quiet_deadline
+                .map(|quiet| quiet.min(stall_deadline).min(hard_deadline))
+                .unwrap_or_else(|| stall_deadline.min(hard_deadline));
+
+            tokio::select! {
+                biased;
+                () = sleep_until(next_deadline) => {
+                    let now = Instant::now();
+                    // Terminal deadlines intentionally outrank success at an
+                    // exact shared instant. Hard outranks stall when both are
+                    // reached together.
+                    if now >= hard_deadline {
+                        return WorkspaceLoadWaitOutcome::Deadline(
+                            WorkspaceLoadDeadline::Hard,
+                        );
+                    }
+
+                    let inner = self.inner.lock().await;
+                    let current_semantic_base = inner
+                        .last_semantic_at
+                        .map(|at| at.max(readiness_started_at))
+                        .unwrap_or(readiness_started_at);
+                    if now >= current_semantic_base + stall_timeout {
+                        return WorkspaceLoadWaitOutcome::Deadline(
+                            WorkspaceLoadDeadline::Stall,
+                        );
+                    }
+                    if inner.saw_begin
+                        && inner.active_tokens.is_empty()
+                        && inner.semantic_change_seq == semantic_seq
+                        && now >= current_semantic_base + quiet_period
+                    {
+                        return WorkspaceLoadWaitOutcome::Complete(
+                            WorkspaceLoadComplete::ProgressQuiescence,
+                        );
+                    }
+                }
+                () = &mut notified => {}
+            }
+        }
+    }
+}
+
+/// Apply one progress notification to the semantic token table.
+///
+/// The table owns payloads only while their tokens are active. This pure
+/// reducer is deliberately stricter than the legacy raw sequence: duplicate
+/// begin/end, inactive reports, and exact duplicate payloads are no-ops.
+pub(super) fn reduce_semantic_progress(
+    active_tokens: &mut HashMap<String, Value>,
+    saw_begin: &mut bool,
+    token: String,
+    kind: &str,
+    value: &Value,
+) -> bool {
+    match kind {
+        "begin" => match active_tokens.entry(token) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(value.clone());
+                *saw_begin = true;
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        },
+        "report" => match active_tokens.get_mut(&token) {
+            Some(previous) if previous != value => {
+                *previous = value.clone();
+                true
+            }
+            _ => false,
+        },
+        "end" => active_tokens.remove(&token).is_some(),
+        _ => false,
+    }
 }
 
 /// Reason `wait_for_quiescence` returned. Currently the only signal
@@ -331,6 +468,18 @@ impl ProgressState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkspaceLoadComplete {
     ProgressQuiescence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceLoadDeadline {
+    Hard,
+    Stall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceLoadWaitOutcome {
+    Complete(WorkspaceLoadComplete),
+    Deadline(WorkspaceLoadDeadline),
 }
 
 // LSP progress tokens may be integers or strings; normalize both to

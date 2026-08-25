@@ -14,13 +14,13 @@
 //! `Cargo.toml`, `rust-toolchain.toml`, `rust-toolchain`. Editing any
 //! forces a rust-analyzer re-run even when no source blob changed.
 //!
-//! `readiness: ProgressQuiescence` defers all definition requests
-//! until rust-analyzer's `$/progress` stream is quiet (bounded by
-//! `WORKSPACE_LOAD_TIMEOUT`). Alongside that, `retry_empty_definition
+//! Rust's semantic-progress readiness policy defers all definition
+//! requests until rust-analyzer's `$/progress` stream is quiet,
+//! bounded by immutable hard and semantic-stall deadlines. Alongside
+//! that, `retry_empty_definition
 //! = false` is a Rust-specific policy choice; readiness does not
-//! determine retry policy. Java (jdtls) and Kotlin
-//! (kotlin-language-server) use the same readiness gate with
-//! retry enabled.
+//! determine retry policy. Other languages retain their existing
+//! readiness strategies.
 
 #![forbid(unsafe_code)]
 
@@ -41,10 +41,11 @@ use serde_json::{Value, json};
 use tree_sitter::Node;
 
 const ANALYZER_ID: &str = "rust-analyzer-lsp";
-const ANALYZER_REVISION: u32 = 2;
-const POOL_CONFIG_ID: &str = "rust-analyzer-lsp-v1";
+const ANALYZER_REVISION: u32 = 3;
+const POOL_CONFIG_ID: &str = "rust-analyzer-lsp-v2";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const WORKSPACE_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKSPACE_LOAD_HARD_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKSPACE_LOAD_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct RustAnalyzerWorkspaceAnalyzer;
 
@@ -92,8 +93,9 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
                     config_hash: POOL_CONFIG_ID.to_string(),
                     request_timeout: REQUEST_TIMEOUT,
                     availability: AvailabilityStrategy::VersionFlag,
-                    readiness: ReadinessStrategy::ProgressQuiescence {
-                        timeout: WORKSPACE_LOAD_TIMEOUT,
+                    readiness: ReadinessStrategy::SemanticProgressQuiescence {
+                        hard_timeout: WORKSPACE_LOAD_HARD_TIMEOUT,
+                        stall_timeout: WORKSPACE_LOAD_STALL_TIMEOUT,
                     },
                     language_id: "rust",
                     launch_args: Vec::new(),
@@ -126,6 +128,7 @@ fn rust_analyzer_binary() -> PathBuf {
 fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
     json!({
         "cairnConfigHash": config_hash,
+        "checkOnSave": false,
         "experimental": {
             "serverStatusNotification": true
         },
@@ -194,6 +197,18 @@ fn last_identifier_child(node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_analyzer_uses_bounded_semantic_readiness_without_flycheck() {
+        assert_eq!(ANALYZER_REVISION, 3);
+        assert_eq!(POOL_CONFIG_ID, "rust-analyzer-lsp-v2");
+        assert_eq!(
+            rust_analyzer_initialization_options(POOL_CONFIG_ID)["checkOnSave"],
+            false
+        );
+        assert_eq!(WORKSPACE_LOAD_HARD_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(WORKSPACE_LOAD_STALL_TIMEOUT, Duration::from_secs(90));
+    }
 
     #[test]
     fn method_call_collector_finds_method_identifier_positions() {
