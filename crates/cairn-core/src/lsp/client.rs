@@ -28,15 +28,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 #[cfg(test)]
 use tokio::sync::watch;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, getpgid, kill_process_group};
 
 use super::error::{Error, Result};
-use super::reader::{PendingRequest, ProgressState, SharedWriter, WriterSlot, reader_loop};
+use super::reader::{
+    PendingRequest, ProgressState, SharedWriter, WorkspaceLoadDeadline, WorkspaceLoadWaitOutcome,
+    WriterSlot, reader_loop,
+};
 use super::transport::write_lsp_message;
 use super::types::{Location, LocationLink, Position, Url};
 
@@ -116,6 +119,10 @@ pub struct LspClient {
     // One-way latch: once set (shutdown or pool stop), respawns are
     // refused with `PoolStopped`.
     stopping: Arc<AtomicBool>,
+    // Wakes Rust's bounded readiness wait when the control plane stops the
+    // client. The atomic remains the source of truth; this notification only
+    // provides prompt cancellation without moving either deadline.
+    stopping_notify: Arc<Notify>,
     writer: WriterSlot,
     child: Arc<Mutex<Option<OwnedLspChild>>>,
     // In-flight requests by id and owning transport generation. A
@@ -141,6 +148,7 @@ pub struct LspClient {
 pub(crate) struct LspProcessControl {
     current_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
+    stopping_notify: Arc<Notify>,
     writer: WriterSlot,
     child: Arc<Mutex<Option<OwnedLspChild>>>,
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
@@ -170,6 +178,7 @@ impl LspProcessControl {
     /// data-plane mutex.
     pub(crate) async fn stop_and_terminate(&self) -> Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
+        self.stopping_notify.notify_waiters();
         #[cfg(test)]
         {
             self.cleanup_runs.fetch_add(1, Ordering::SeqCst);
@@ -368,6 +377,7 @@ impl LspClient {
             current_generation: Arc::new(AtomicU64::new(0)),
             next_transport_generation: AtomicU64::new(1),
             stopping: Arc::new(AtomicBool::new(false)),
+            stopping_notify: Arc::new(Notify::new()),
             writer: Arc::new(Mutex::new(None)),
             child: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -543,6 +553,7 @@ impl LspClient {
         LspProcessControl {
             current_generation: Arc::clone(&self.current_generation),
             stopping: Arc::clone(&self.stopping),
+            stopping_notify: Arc::clone(&self.stopping_notify),
             writer: Arc::clone(&self.writer),
             child: Arc::clone(&self.child),
             pending: Arc::clone(&self.pending),
@@ -698,6 +709,70 @@ impl LspClient {
         Ok(())
     }
 
+    /// Wait for semantic progress quiescence under immutable hard and
+    /// semantic-stall deadlines.
+    ///
+    /// This policy is currently selected only by Rust Tier3. Existing LSP
+    /// integrations retain the raw progress strategy above.
+    pub async fn wait_for_workspace_load_bounded(
+        &self,
+        hard_timeout: Duration,
+        stall_timeout: Duration,
+    ) -> Result<()> {
+        self.ensure_running().await?;
+        let generation = self.current_generation.load(Ordering::SeqCst);
+        let readiness_started_at = Instant::now();
+        let hard_deadline = readiness_started_at + hard_timeout;
+        let stopped = self.stopping_notify.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        // Close the check-to-subscribe race: a stop that landed after
+        // `ensure_running` but before the notification was armed has already
+        // set the durable atomic latch even though its wake was not retained.
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::PoolStopped);
+        }
+        let outcome = tokio::select! {
+            biased;
+            () = &mut stopped => return Err(Error::PoolStopped),
+            outcome = self.progress.wait_for_semantic_quiescence(
+                readiness_started_at,
+                hard_deadline,
+                stall_timeout,
+                WORKSPACE_LOAD_QUIET_PERIOD,
+            ) => outcome,
+        };
+
+        // A concurrent stop or transport exit outranks readiness success and
+        // deadline classification. Never publish a dead generation as ready.
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::PoolStopped);
+        }
+        if self.current_generation.load(Ordering::SeqCst) != generation {
+            return Err(Error::ServerExited(None.into()));
+        }
+
+        match outcome {
+            WorkspaceLoadWaitOutcome::Complete(completed_via) => {
+                info!(?completed_via, "workspace load complete");
+                Ok(())
+            }
+            WorkspaceLoadWaitOutcome::Deadline(deadline) => {
+                let deadline = match deadline {
+                    WorkspaceLoadDeadline::Hard => "hard",
+                    WorkspaceLoadDeadline::Stall => "stall",
+                };
+                warn!(
+                    deadline,
+                    hard_ms = hard_timeout.as_millis(),
+                    stall_ms = stall_timeout.as_millis(),
+                    "workspace load readiness deadline exceeded"
+                );
+                Err(Error::ReadinessTimeout)
+            }
+        }
+    }
+
     /// Open a text document in the server using full-text synchronization.
     ///
     /// # Errors
@@ -780,6 +855,7 @@ impl LspClient {
     /// See the mapping above.
     pub async fn shutdown(self) -> Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
+        self.stopping_notify.notify_waiters();
         let mut protocol_err: Option<Error> = None;
         if self.current_generation.load(Ordering::SeqCst) != 0 {
             match self.request::<Value>("shutdown", Value::Null).await {
