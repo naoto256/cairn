@@ -5,6 +5,25 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.6] — 2026-08-26
+
+> Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
+> or on-disk schema changes.
+
+### Fixed
+
+- **Rust Tier-3 proc-macro loading no longer stalls on large macOS
+  worktrees.** File-backed rust-analyzer runs now place Cargo artifacts in a
+  stable, daemon-owned per-repository state directory instead of the source
+  worktree. The effective target identity participates in analyzer pooling,
+  separate Cairn data roots remain isolated, and invalid state paths fail
+  before rust-analyzer starts. Repository removal cleans up the target with the
+  rest of the repository state.
+
+### PRs
+
+- Rust Tier-3 target isolation and proc-macro loading: #342
+
 ## [0.8.5] — 2026-08-26
 
 > Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
