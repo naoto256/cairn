@@ -5,6 +5,27 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.5] — 2026-08-26
+
+> Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
+> or on-disk schema changes.
+
+### Fixed
+
+- **Rust Tier-3 indexing now reaches readiness reliably on cold workspaces.**
+  Cairn disables rust-analyzer check-on-save flychecks with the object-form
+  `checkOnSave.enable=false` setting, avoiding competing Cargo work that could
+  hold the build lock during workspace loading.
+- **Readiness follows semantic progress without becoming unbounded.** Rust
+  analyzers now use a fixed 120-second hard deadline, a 90-second no-progress
+  deadline, and a five-second quiet period. Duplicate progress notifications
+  cannot extend either completion or the stall budget, while cancellation,
+  shutdown, and transport replacement remain terminal.
+
+### PRs
+
+- Rust Tier-3 cold readiness and rust-analyzer compatibility: #338, #339
+
 ## [0.8.4] — 2026-08-25
 
 > Compatibility: no public Rust API, CLI, JSON-RPC, or MCP wire-shape
