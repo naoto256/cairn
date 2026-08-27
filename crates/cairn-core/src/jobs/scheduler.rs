@@ -320,6 +320,7 @@ impl JobScheduler {
 #[cfg(test)]
 fn test_pool_group_for_analyzer_id(analyzer_id: &str) -> Option<Option<&'static str>> {
     match analyzer_id {
+        "rust-analyzer-lsp" => Some(Some("rust-analyzer-cargo")),
         "clangd-c-lsp" | "clangd-cpp-lsp" | "clangd-objc-lsp" => Some(Some("clangd-lsp")),
         "typescript-language-server-ts-lsp"
         | "typescript-language-server-js-lsp"
@@ -357,6 +358,43 @@ mod tests {
         let dispatched = drain_dispatched(&mut rx);
         let ids = dispatched.iter().map(|job| job.job.id).collect::<Vec<_>>();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn scheduler_rust_fleet_occupies_one_worker_and_leaves_other_lanes_runnable() {
+        let (mut scheduler, mut rx) = test_scheduler(8);
+        for id in 1..=36 {
+            scheduler.enqueue(test_job(id, id, "rust-analyzer-lsp"));
+        }
+        scheduler.enqueue(test_job(100, 100, "pyright-lsp"));
+        scheduler.drain_runnable();
+
+        let dispatched = drain_dispatched(&mut rx);
+        let rust = dispatched
+            .iter()
+            .filter(|job| job.job.analyzer_id == "rust-analyzer-lsp")
+            .collect::<Vec<_>>();
+        assert_eq!(rust.len(), 1, "only one Rust repo may occupy a worker");
+        assert_eq!(
+            dispatched
+                .iter()
+                .filter(|job| job.job.analyzer_id == "pyright-lsp")
+                .count(),
+            1,
+            "an unrelated analyzer must progress behind the Rust backlog"
+        );
+        assert_eq!(scheduler.active_workers, 2);
+        assert!(scheduler.active_groups.contains("rust-analyzer-cargo"));
+
+        let first = rust[0];
+        scheduler.worker_finished(first.job.id, first.pool_group, first.key.clone());
+        scheduler.drain_runnable();
+
+        let next = rx
+            .try_recv()
+            .expect("next Rust repo dispatched after release");
+        assert_eq!(next.job.analyzer_id, "rust-analyzer-lsp");
+        assert_ne!(next.job.id, first.job.id);
     }
 
     #[test]

@@ -456,10 +456,11 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         &[]
     }
 
-    /// Analyzers that share one pooled LSP process return the same group id so
-    /// the job scheduler never runs two of them concurrently. The shared pool
-    /// serializes them anyway, and the waiter's analyzer timeout must not tick
-    /// while it waits.
+    /// Analyzers that share one pooled LSP process or one heavyweight resource
+    /// lane return the same group id so the job scheduler never runs two of
+    /// them concurrently. Admission is held in the scheduler rather than in a
+    /// worker, so a queued group member consumes neither worker capacity nor
+    /// its analyzer timeout while it waits.
     fn pool_group(&self) -> Option<&'static str> {
         None
     }

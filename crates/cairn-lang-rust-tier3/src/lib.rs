@@ -46,8 +46,9 @@ use serde_json::{Value, json};
 use tree_sitter::Node;
 
 const ANALYZER_ID: &str = "rust-analyzer-lsp";
-const ANALYZER_REVISION: u32 = 4;
+const ANALYZER_REVISION: u32 = 5;
 const POOL_CONFIG_ID: &str = "rust-analyzer-lsp-v3";
+const POOL_GROUP: &str = "rust-analyzer-cargo";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKSPACE_LOAD_HARD_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKSPACE_LOAD_STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -77,6 +78,10 @@ impl WorkspaceAnalyzer for RustAnalyzerWorkspaceAnalyzer {
 
     fn config_paths(&self) -> &'static [&'static str] {
         &["Cargo.toml", "rust-toolchain.toml", "rust-toolchain"]
+    }
+
+    fn pool_group(&self) -> Option<&'static str> {
+        Some(POOL_GROUP)
     }
 
     fn analyze_workspace(
@@ -291,7 +296,11 @@ mod tests {
     fn rust_analyzer_uses_bounded_semantic_readiness_without_flycheck() {
         let pass = rust_analyzer_definition_pass(Path::new("/tmp/repo"), None).unwrap();
 
-        assert_eq!(ANALYZER_REVISION, 4);
+        assert_eq!(ANALYZER_REVISION, 5);
+        assert_eq!(
+            RustAnalyzerWorkspaceAnalyzer.pool_group(),
+            Some("rust-analyzer-cargo")
+        );
         assert_eq!(POOL_CONFIG_ID, "rust-analyzer-lsp-v3");
         assert_eq!(
             pass.spawn_spec.initialization_options["checkOnSave"]["enable"],
