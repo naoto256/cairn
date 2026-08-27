@@ -5,6 +5,30 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.7] — 2026-08-28
+
+> Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
+> or on-disk schema changes.
+
+### Fixed
+
+- **Rust Tier-3 fleet migrations no longer overload Cargo during cold
+  reindexing.** Cargo-heavy rust-analyzer jobs now share one global admission
+  lane across repositories. Waiting jobs do not occupy analyzer workers or
+  consume readiness budgets, while analyzers for other languages continue to
+  make progress.
+- **CLI version checks no longer perform a full repository status scan.** The
+  version guard requests the existing status response without repository
+  details, avoiding a registry and per-repository store traversal solely for
+  the version check before every control command. Explicit
+  `cairn ctl daemon status` calls retain their complete repository report, and
+  old/new CLI-daemon combinations remain compatible.
+
+### PRs
+
+- Rust Tier-3 fleet admission serialization: #345
+- Status RPC version-check fast path: #346
+
 ## [0.8.6] — 2026-08-26
 
 > Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
