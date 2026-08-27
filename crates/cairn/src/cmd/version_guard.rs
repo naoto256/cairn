@@ -28,7 +28,7 @@ use anyhow::{Context, Result, anyhow};
 use cairn_proto::control::StatusReport;
 use cairn_proto::jsonrpc::Response;
 use cairn_proto::version::{VersionCompatibility, pre_one_zero_compat};
-use serde_json::Value;
+use serde_json::json;
 
 use super::rpc_client;
 
@@ -112,9 +112,13 @@ async fn daemon_version(socket_path: &Path) -> Result<String> {
 /// Issue a single newline-delimited `status` JSON-RPC round trip
 /// over the control socket via [`rpc_client::round_trip`].
 async fn control_status(socket_path: &Path) -> Result<Response> {
-    rpc_client::round_trip(socket_path, "status", Value::Null)
-        .await
-        .context("requesting daemon status")
+    rpc_client::round_trip(
+        socket_path,
+        "status",
+        json!({ "include_repositories": false }),
+    )
+    .await
+    .context("requesting daemon status")
 }
 
 #[cfg(test)]
@@ -122,7 +126,6 @@ mod tests {
     use super::*;
     use cairn_proto::control::StatusReport;
     use cairn_proto::jsonrpc::{RequestId, ok_response};
-    use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -212,7 +215,9 @@ mod tests {
             let mut reader = BufReader::new(read);
             let mut request = String::new();
             reader.read_line(&mut request).await.unwrap();
-            assert!(request.contains("\"method\":\"status\""));
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "status");
+            assert_eq!(request["params"], json!({ "include_repositories": false }));
             let report = StatusReport {
                 daemon_version: version.into(),
                 uptime_secs: 1,

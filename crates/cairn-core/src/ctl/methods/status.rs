@@ -36,9 +36,10 @@ use cairn_proto::control::{
 };
 use linkme::distributed_slice;
 use rusqlite::params;
+use serde::Deserialize;
 use serde_json::Value;
 
-use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx};
+use super::super::{CONTROL_METHODS, ControlMethod, CtlCtx, parse_params};
 use crate::anchor;
 use crate::cas::{registry as cas_registry, store as cas_store};
 use crate::enrichment::collect_enrichment;
@@ -46,15 +47,41 @@ use crate::{Error, Result};
 
 struct Status;
 
+#[derive(Debug, Default, Deserialize)]
+struct StatusArgs {
+    #[serde(default)]
+    include_repositories: Option<bool>,
+}
+
+fn status_args(params: Value) -> Result<StatusArgs> {
+    if params.is_null() {
+        Ok(StatusArgs::default())
+    } else {
+        parse_params(params)
+    }
+}
+
 #[async_trait::async_trait]
 impl ControlMethod for Status {
     fn name(&self) -> &'static str {
         "status"
     }
 
-    async fn dispatch(&self, ctx: &CtlCtx, _params: Value) -> Result<Value> {
+    async fn dispatch(&self, ctx: &CtlCtx, params: Value) -> Result<Value> {
+        let args = status_args(params)?;
         let uptime = ctx.started_at.elapsed().as_secs();
         let version = ctx.version.to_string();
+
+        if !args.include_repositories.unwrap_or(true) {
+            return Ok(serde_json::to_value(StatusReport {
+                daemon_version: version,
+                uptime_secs: uptime,
+                initialization: DaemonInitializationStatus::ready(),
+                repos: Vec::new(),
+            })
+            .unwrap());
+        }
+
         let cas_data_dir = ctx.cas_data_dir.clone();
         let lifecycle = ctx.lifecycle.clone();
 
@@ -265,7 +292,52 @@ fn collect_job_summary(conn: &rusqlite::Connection) -> Result<JobSummary> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
     use super::*;
+    use serde_json::json;
+    use tokio::sync::Notify;
+
+    use crate::paths::CasDataDir;
+
+    #[test]
+    fn status_defaults_to_repository_scan_for_null_and_empty_params() {
+        assert_eq!(status_args(Value::Null).unwrap().include_repositories, None);
+        assert_eq!(status_args(json!({})).unwrap().include_repositories, None);
+        assert_eq!(
+            status_args(json!({ "include_repositories": null }))
+                .unwrap()
+                .include_repositories,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn status_without_repositories_does_not_open_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(tmp.path().join("missing")));
+        let ctx = CtlCtx {
+            cas_data_dir: cas_data_dir.clone(),
+            shutdown: Arc::new(Notify::new()),
+            watch_manager: None,
+            job_manager: None,
+            reconcile: None,
+            lifecycle: None,
+            version: "test-version",
+            started_at: Instant::now(),
+        };
+
+        let value = Status
+            .dispatch(&ctx, json!({ "include_repositories": false }))
+            .await
+            .unwrap();
+        let report: StatusReport = serde_json::from_value(value).unwrap();
+
+        assert_eq!(report.daemon_version, "test-version");
+        assert!(report.repos.is_empty());
+        assert!(!cas_data_dir.index_db_path().exists());
+    }
 
     #[test]
     fn missing_status_repository_reports_the_user_facing_alias() {
