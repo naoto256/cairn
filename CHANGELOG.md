@@ -5,6 +5,26 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.8] — 2026-08-30
+
+> Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
+> or on-disk schema changes.
+
+### Fixed
+
+- **Fuzzy symbol searches now handle qualified names as literal text.** Cairn
+  compiles the documented fuzzy-query subset into safe FTS5 expressions, so
+  names containing `::`, `.`, or `\` no longer depend on SQLite query-parser
+  syntax. Whitespace remains AND, quoted text remains an exact-order phrase,
+  and prefix matching still requires an explicit trailing `*`.
+- **Malformed fuzzy queries now fail at the request boundary.** Invalid quote
+  or wildcard placement and embedded NUL bytes return `InvalidArgument`
+  instead of leaking SQLite FTS5 errors.
+
+### PRs
+
+- Qualified fuzzy symbol query compilation: #349
+
 ## [0.8.7] — 2026-08-28
 
 > Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
