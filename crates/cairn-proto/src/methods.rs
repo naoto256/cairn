@@ -775,9 +775,10 @@ pub struct FindSymbolArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Use SQLite FTS5 over `name`, `qualified`, and `doc` instead of
-    /// exact `name` / `qualified` matching. Bare tokens separated by
-    /// spaces are AND-ed by FTS5, quoted strings require exact token
-    /// order, and prefix matching requires an explicit trailing `*`.
+    /// exact `name` / `qualified` matching. Bare terms separated by
+    /// spaces are AND-ed, quoted strings require exact token order,
+    /// and prefix matching requires an explicit trailing `*`.
+    /// Language punctuation such as `::` or `.` is treated as text.
     #[serde(default)]
     pub fuzzy: bool,
     /// Optional result cap.
