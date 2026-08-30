@@ -91,11 +91,93 @@ pub(crate) struct FindSymbolsOutcome {
 }
 
 // FTS membership and exact-name priority intentionally share this one
-// bytewise authority. Query syntax is passed to SQLite unchanged; only a raw
-// `name` equality receives the leading class. The ordinary query reserves
-// `?1` for its manifest; the inherited bulk lookup remaps this same expression
-// to its first bind rather than maintaining a second rank definition.
+// bytewise authority. The raw query is retained only for exact-name ranking;
+// FTS membership uses `compile_fuzzy_query` so language punctuation cannot be
+// interpreted as FTS5 syntax. The ordinary query reserves `?1` for its
+// manifest; the inherited bulk lookup remaps this same expression to its first
+// bind rather than maintaining a second rank definition.
 const FUZZY_RANK_SQL: &str = "CASE WHEN s.name = ?2 COLLATE BINARY THEN 0 ELSE 1 END";
+
+/// Compile the documented fuzzy-query subset into a safe FTS5 expression.
+///
+/// Bare terms remain AND-ed, quoted terms remain phrases, and a single
+/// trailing `*` remains an explicit prefix operator. Everything else inside a
+/// term is quoted, so language-qualified names such as `Event::new` and
+/// `Widget.render` reach the tokenizer as text rather than FTS5 column syntax.
+fn compile_fuzzy_query(query: &str) -> Result<String> {
+    let mut chars = query.chars().peekable();
+    let mut terms = Vec::new();
+
+    loop {
+        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        let Some(first) = chars.peek().copied() else {
+            break;
+        };
+
+        let mut value = String::new();
+        let prefix;
+        if first == '"' {
+            chars.next();
+            let mut closed = false;
+            while let Some(ch) = chars.next() {
+                if ch != '"' {
+                    value.push(ch);
+                    continue;
+                }
+                if chars.next_if_eq(&'"').is_some() {
+                    value.push('"');
+                } else {
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                return Err(crate::Error::InvalidArgument(
+                    "find_symbols: fuzzy query has an unterminated quoted phrase".into(),
+                ));
+            }
+            prefix = chars.next_if_eq(&'*').is_some();
+            if chars.peek().is_some_and(|ch| !ch.is_whitespace()) {
+                return Err(crate::Error::InvalidArgument(
+                    "find_symbols: quoted fuzzy terms must be followed by whitespace or `*`".into(),
+                ));
+            }
+        } else {
+            while let Some(ch) = chars.next_if(|ch| !ch.is_whitespace()) {
+                value.push(ch);
+            }
+            if value.contains('"') {
+                return Err(crate::Error::InvalidArgument(
+                    "find_symbols: `\"` must begin a quoted fuzzy term".into(),
+                ));
+            }
+            prefix = value.ends_with('*');
+            if prefix {
+                value.pop();
+            }
+            if value.contains('*') {
+                return Err(crate::Error::InvalidArgument(
+                    "find_symbols: `*` is only supported once at the end of a fuzzy term".into(),
+                ));
+            }
+        }
+
+        if value.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "find_symbols: fuzzy query terms must not be empty".into(),
+            ));
+        }
+        let escaped = value.replace('"', "\"\"");
+        terms.push(format!("\"{escaped}\"{}", if prefix { "*" } else { "" }));
+    }
+
+    if terms.is_empty() {
+        return Err(crate::Error::InvalidArgument(
+            "find_symbols: fuzzy query must contain at least one term".into(),
+        ));
+    }
+    Ok(terms.join(" "))
+}
 
 fn fuzzy_rank_from_sql(value: i64) -> FuzzyRank {
     if value == 0 {
@@ -114,8 +196,9 @@ fn fuzzy_rank_from_sql(value: i64) -> FuzzyRank {
 /// language → path → line order unchanged.
 ///
 /// # Errors
-/// Returns [`crate::Error::InvalidArgument`] when no filter is set or
-/// the anchor does not resolve. SQLite errors otherwise.
+/// Returns [`crate::Error::InvalidArgument`] when no filter is set, the fuzzy
+/// query does not follow the documented term syntax, or the anchor does not
+/// resolve. SQLite errors otherwise.
 pub fn find_symbols(
     conn: &Connection,
     anchor: &AnchorName,
@@ -236,18 +319,16 @@ fn run_find_symbols(
         if args.fuzzy {
             // FTS5 path: `symbols_fts` is the content-synced virtual
             // table declared in `cas/schema.rs` (unicode61,
-            // `remove_diacritics=0`). Bare whitespace tokens are
-            // AND-ed, `"..."` quotes a phrase, and prefix matching
-            // requires an explicit trailing `*` in `q` — none of
-            // which we translate for the caller here; the raw string
-            // reaches SQLite unchanged.
+            // `remove_diacritics=0`). `compile_fuzzy_query` preserves
+            // the documented AND / phrase / prefix subset while
+            // quoting language punctuation before it reaches SQLite.
             sql.push_str(
                 " AND s.id IN (
                       SELECT rowid FROM symbols_fts
                        WHERE symbols_fts MATCH ?3
                   )",
             );
-            bound.push(Box::new(q.to_string()));
+            bound.push(Box::new(compile_fuzzy_query(q)?));
         } else {
             // Exact path: match on either the bare name or the fully
             // qualified name so callers can pass whichever form they
@@ -676,8 +757,9 @@ fn load_manifest_inheritance_edges(
 fn load_fuzzy_symbol_ranks(conn: &Connection, query: &str) -> Result<HashMap<i64, FuzzyRank>> {
     let sql = fuzzy_rank_lookup_sql();
     let mut stmt = conn.prepare(&sql)?;
+    let match_query = compile_fuzzy_query(query)?;
     Ok(stmt
-        .query_map([query, query], |row| {
+        .query_map([query, match_query.as_str()], |row| {
             Ok((row.get(0)?, fuzzy_rank_from_sql(row.get(1)?)))
         })?
         .collect::<rusqlite::Result<HashMap<_, _>>>()?)
