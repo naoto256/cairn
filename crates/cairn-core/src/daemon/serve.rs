@@ -467,7 +467,7 @@ pub(super) fn spawn_accept_loop(
                         let h = handler.clone();
                         connections.spawn(async move {
                             if let Err(e) = serve_one(stream, h).await {
-                                warn!(target: "cairn_core::daemon", error = %e, "{name} connection ended with error", name = name);
+                                warn!(target: "cairn_core::daemon", error = %e, socket = name, "{name} connection ended with error", name = name);
                             }
                         });
                     }
@@ -966,6 +966,34 @@ mod tests {
         dropped: Arc<Notify>,
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedConnectionLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedConnectionLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedConnectionLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedConnectionLog {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     struct SqliteTerminalGuard(Option<tokio::sync::oneshot::Sender<()>>);
 
     impl Drop for SqliteTerminalGuard {
@@ -1231,6 +1259,58 @@ mod tests {
         assert!(cancellation.is_cancelled());
         assert_eq!(cancellation.active_resources(), (0, 0));
         drop(peer);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_loop_connection_error_records_structured_socket_field() {
+        let output = CapturedConnectionLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let (token_sender, token_receiver) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(Notify::new());
+        let dropped_wait = dropped.notified();
+        let handler: Arc<dyn LineHandler> = Arc::new(FaultAfterAdmissionHandler {
+            fault: PeerCloseTestFault::Observer,
+            token_sender: Mutex::new(Some(token_sender)),
+            dropped: dropped.clone(),
+        });
+        let accept_loop = spawn_accept_loop("control", listener, handler, shutdown.clone());
+
+        let mut peer = UnixStream::connect(&socket).await.unwrap();
+        peer.write_all(b"fault\n").await.unwrap();
+        peer.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), token_receiver)
+            .await
+            .expect("fault carrier handler was not polled")
+            .expect("fault carrier handler dropped its token sender");
+        tokio::time::timeout(Duration::from_secs(1), dropped_wait)
+            .await
+            .expect("fault carrier handler did not reach terminal drop");
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), accept_loop)
+            .await
+            .expect("accept loop did not stop after connection failure")
+            .expect("accept loop task panicked");
+
+        let captured = output.contents();
+        assert_eq!(
+            captured
+                .matches("control connection ended with error")
+                .count(),
+            1
+        );
+        assert!(captured.contains(" WARN cairn_core::daemon:"));
+        assert!(captured.contains("error="));
+        assert!(captured.contains("socket=\"control\""));
     }
 
     #[async_trait::async_trait]
