@@ -89,6 +89,46 @@ fn fuzzy_prefix_matching_requires_star() {
 }
 
 #[test]
+fn fuzzy_language_qualified_query_treats_punctuation_as_text() {
+    let (_repo, _db, c) = registered();
+    for query in ["Widget::render", "Widget.render", "Widget\\render"] {
+        let hits = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some(query.into()),
+                fuzzy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "query={query:?} hits={hits:?}");
+        assert_eq!(hits[0].qualified, "Widget::render", "query={query:?}");
+    }
+}
+
+#[test]
+fn malformed_fuzzy_syntax_is_an_input_error() {
+    let (_repo, _db, c) = registered();
+    for query in ["\"unterminated", "foo*bar", "\"foo\"bar", "*"] {
+        let err = find_symbols(
+            &c,
+            &AnchorName::head(),
+            &FindSymbolsArgs {
+                query: Some(query.into()),
+                fuzzy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidArgument(_)),
+            "query {query:?} returned {err:?}"
+        );
+    }
+}
+
+#[test]
 fn find_by_kind_filters() {
     let (_repo, _db, c) = registered();
     let hits = find_symbols(
