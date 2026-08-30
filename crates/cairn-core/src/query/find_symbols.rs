@@ -162,6 +162,11 @@ fn compile_fuzzy_query(query: &str) -> Result<String> {
             }
         }
 
+        if value.contains('\0') {
+            return Err(crate::Error::InvalidArgument(
+                "find_symbols: fuzzy query terms must not contain NUL bytes".into(),
+            ));
+        }
         if value.is_empty() {
             return Err(crate::Error::InvalidArgument(
                 "find_symbols: fuzzy query terms must not be empty".into(),

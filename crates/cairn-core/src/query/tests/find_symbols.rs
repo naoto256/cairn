@@ -110,7 +110,7 @@ fn fuzzy_language_qualified_query_treats_punctuation_as_text() {
 #[test]
 fn malformed_fuzzy_syntax_is_an_input_error() {
     let (_repo, _db, c) = registered();
-    for query in ["\"unterminated", "foo*bar", "\"foo\"bar", "*"] {
+    for query in ["\"unterminated", "foo*bar", "\"foo\"bar", "*", "foo\0bar"] {
         let err = find_symbols(
             &c,
             &AnchorName::head(),
