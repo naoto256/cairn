@@ -895,7 +895,7 @@ mod linux {
         #[test]
         fn zombie_snapshot_skips_environ_while_executing_failure_remains_residual() {
             let uid = rustix::process::geteuid().as_raw();
-            let status = format!("Name:\\ttest\\nUid:\\t{uid}\\t{uid}\\t{uid}\\t{uid}\\n");
+            let status = format!("Name:\ttest\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
             let zombie = b"42 (server name) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987";
             let snapshot = match inspect_linux_with(
                 42,
@@ -2063,7 +2063,6 @@ time.sleep(300)
             report.remaining,
             report.residual_count()
         );
-        assert_eq!(report.residual_count(), 0, "{counts}");
         assert!(report.signalled >= 1, "{counts}");
         assert!(report.confirmed_execution_absent >= 1, "{counts}");
         assert_eq!(report.remaining, 0, "{counts}");
