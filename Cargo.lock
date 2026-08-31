@@ -197,6 +197,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "libc",
  "linkme",
  "rusqlite",
  "rustix",

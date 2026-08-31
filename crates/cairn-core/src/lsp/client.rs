@@ -36,6 +36,11 @@ use tracing::{info, warn};
 use rustix::process::{Pid, Signal, getpgid, kill_process_group};
 
 use super::error::{Error, Result};
+#[cfg(test)]
+use super::process_sweep::ProcessOwnerContext;
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+use super::process_sweep::daemon_process_owner;
+use super::process_sweep::{ProcessMarker, sweep_family};
 use super::reader::{
     PendingRequest, ProgressState, SharedWriter, WorkspaceLoadDeadline, WorkspaceLoadWaitOutcome,
     WriterSlot, reader_loop,
@@ -68,10 +73,75 @@ const STDERR_OMISSION_MARKER: &str = " ... ";
 /// platforms retain the existing leader-only contract.
 struct OwnedLspChild {
     child: Child,
+    marker: Option<ProcessMarker>,
     #[cfg(unix)]
     pgid: Pid,
     #[cfg(test)]
     leader_waits: Arc<AtomicUsize>,
+}
+
+enum ProcessMarkerMode {
+    /// Pool-managed long-lived children on supported hosts require the daemon
+    /// context to have been published after the startup sweep.
+    #[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+    RequiredDaemon,
+    /// Explicit test ownership keeps deterministic marker authority local to
+    /// the carrier rather than mutating the process-global daemon context.
+    #[cfg(test)]
+    Marked(Arc<ProcessOwnerContext>),
+    /// Public standalone clients and availability probes are intentionally
+    /// outside daemon orphan-marker ownership.
+    Unmarked,
+    /// Unsupported hosts retain their prior leader-only behavior.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Disabled,
+    #[cfg(test)]
+    RequiredMissing,
+}
+
+impl ProcessMarkerMode {
+    fn for_pool() -> Self {
+        #[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+        {
+            Self::RequiredDaemon
+        }
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        {
+            static TEST_OWNER: std::sync::OnceLock<Arc<ProcessOwnerContext>> =
+                std::sync::OnceLock::new();
+            Self::Marked(Arc::clone(TEST_OWNER.get_or_init(|| {
+                ProcessOwnerContext::for_test("cairn-test-pool-owner", [0x5a; 16])
+            })))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Self::Disabled
+        }
+    }
+
+    fn marker_for_spawn(&self) -> Result<Option<ProcessMarker>> {
+        match self {
+            #[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+            Self::RequiredDaemon => daemon_process_owner()
+                .ok_or_else(|| {
+                    Error::Protocol(
+                        "daemon LSP process ownership is not initialized before pooled spawn"
+                            .into(),
+                    )
+                })?
+                .marker_for_spawn()
+                .map(Some),
+            #[cfg(test)]
+            Self::Marked(owner) => owner.marker_for_spawn().map(Some),
+            Self::Unmarked => Ok(None),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Disabled => Ok(None),
+            #[cfg(test)]
+            Self::RequiredMissing => Err(Error::Protocol(
+                "daemon LSP process ownership is not initialized before pooled spawn".into(),
+            )),
+        }
+    }
 }
 
 impl OwnedLspChild {
@@ -97,6 +167,9 @@ pub struct LspClient {
     binary_path: Option<PathBuf>,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    /// Present only for daemon-managed pooled clients. Standalone clients and
+    /// availability probes deliberately remain outside orphan-marker cleanup.
+    process_marker_mode: ProcessMarkerMode,
     workspace_root: PathBuf,
     initialization_options: Value,
     timeout: Duration,
@@ -335,6 +408,72 @@ impl LspClient {
         )
     }
 
+    pub(super) fn configured_for_pool(
+        binary_path: &Path,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        workspace_root: &Path,
+        initialization_options: Value,
+        request_timeout: Duration,
+    ) -> Self {
+        let mut client = Self::new(
+            Some(binary_path.to_path_buf()),
+            args,
+            env,
+            workspace_root.to_path_buf(),
+            initialization_options,
+            request_timeout,
+            MAX_RESTARTS,
+        );
+        client.process_marker_mode = ProcessMarkerMode::for_pool();
+        client
+    }
+
+    #[cfg(test)]
+    pub(super) fn configured_for_pool_with_owner(
+        binary_path: &Path,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        workspace_root: &Path,
+        initialization_options: Value,
+        request_timeout: Duration,
+        process_owner: Arc<ProcessOwnerContext>,
+    ) -> Self {
+        let mut client = Self::new(
+            Some(binary_path.to_path_buf()),
+            args,
+            env,
+            workspace_root.to_path_buf(),
+            initialization_options,
+            request_timeout,
+            MAX_RESTARTS,
+        );
+        client.process_marker_mode = ProcessMarkerMode::Marked(process_owner);
+        client
+    }
+
+    #[cfg(test)]
+    pub(super) fn configured_for_pool_without_owner_for_test(
+        binary_path: &Path,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        workspace_root: &Path,
+        initialization_options: Value,
+        request_timeout: Duration,
+    ) -> Self {
+        let mut client = Self::new(
+            Some(binary_path.to_path_buf()),
+            args,
+            env,
+            workspace_root.to_path_buf(),
+            initialization_options,
+            request_timeout,
+            MAX_RESTARTS,
+        );
+        client.process_marker_mode = ProcessMarkerMode::RequiredMissing;
+        client
+    }
+
     pub(super) async fn start_process(&self) -> Result<()> {
         self.spawn_process().await
     }
@@ -368,6 +507,7 @@ impl LspClient {
             binary_path,
             args,
             env,
+            process_marker_mode: ProcessMarkerMode::Unmarked,
             workspace_root,
             initialization_options,
             timeout: request_timeout,
@@ -457,6 +597,8 @@ impl LspClient {
         // instances per key" invariant callers rely on.
         self.force_terminate().await?;
 
+        let marker = self.process_marker_mode.marker_for_spawn()?;
+
         // `kill_on_drop(true)` is only a leader-level last resort. The pool's
         // armed cleanup task is authoritative because it signals the verified
         // group and reaps the leader even after its first observer times out.
@@ -469,11 +611,15 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(marker) = marker.as_ref() {
+            command.envs(marker.env());
+        }
         #[cfg(unix)]
         command.process_group(0);
         let child = command.spawn().map_err(Error::Spawn)?;
         let mut child = own_spawned_child(
             child,
+            marker,
             #[cfg(test)]
             Arc::clone(&self.leader_waits),
         )
@@ -1115,6 +1261,7 @@ fn rust_analyzer_initialization_options(config_hash: &str) -> Value {
 #[cfg(unix)]
 async fn own_spawned_child(
     mut child: Child,
+    marker: Option<ProcessMarker>,
     #[cfg(test)] leader_waits: Arc<AtomicUsize>,
 ) -> Result<OwnedLspChild> {
     let Some(raw_pid) = child.id() else {
@@ -1132,6 +1279,7 @@ async fn own_spawned_child(
     match validate_process_group_identity(pid, getpgid(Some(pid))) {
         Ok(pgid) => Ok(OwnedLspChild {
             child,
+            marker,
             pgid,
             #[cfg(test)]
             leader_waits,
@@ -1162,10 +1310,12 @@ pub(super) fn validate_process_group_identity(
 #[cfg(not(unix))]
 async fn own_spawned_child(
     child: Child,
+    marker: Option<ProcessMarker>,
     #[cfg(test)] leader_waits: Arc<AtomicUsize>,
 ) -> Result<OwnedLspChild> {
     Ok(OwnedLspChild {
         child,
+        marker,
         #[cfg(test)]
         leader_waits,
     })
@@ -1213,18 +1363,27 @@ async fn terminate_owned_child(child: &mut OwnedLspChild) -> Result<()> {
     };
 
     let wait_error = child.wait_leader().await.err();
-    match (group_error, wait_error) {
-        (None, None) => Ok(()),
-        (group, wait) => {
-            let mut facts = Vec::new();
-            if let Some(error) = group {
-                facts.push(error);
-            }
-            if let Some(error) = wait {
-                facts.push(format!("leader wait after kill: {error}"));
-            }
-            Err(Error::ChildTerminationFailed(facts.join("; ")))
-        }
+    if let Some(marker) = child.marker.as_ref() {
+        // The verified process group and leader reap remain the containment
+        // authority. Exact-PID marker cleanup is an availability-first
+        // diagnostic sweep for descendants that escaped that group. Its
+        // residual facts never redefine PG/leader termination authority.
+        sweep_family(marker);
+    }
+    finish_owned_child_termination(group_error, wait_error)
+}
+
+pub(super) fn finish_owned_child_termination(
+    group_error: Option<String>,
+    wait_error: Option<std::io::Error>,
+) -> Result<()> {
+    let mut facts = Vec::new();
+    facts.extend(group_error);
+    facts.extend(wait_error.map(|error| format!("leader wait after kill: {error}")));
+    if facts.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::ChildTerminationFailed(facts.join("; ")))
     }
 }
 
