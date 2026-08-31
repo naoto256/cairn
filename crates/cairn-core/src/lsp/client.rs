@@ -26,9 +26,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
-#[cfg(test)]
-use tokio::sync::watch;
 use tokio::sync::{Mutex, Notify, oneshot};
+#[cfg(test)]
+use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{info, warn};
 
@@ -66,6 +66,10 @@ const STDERR_SECTION_BYTES: usize = 1024;
 const STDERR_HEAD_LINES: usize = 5;
 const STDERR_TAIL_LINES: usize = 5;
 const STDERR_OMISSION_MARKER: &str = " ... ";
+#[cfg(test)]
+pub(super) const TEST_FAKE_LSP_ENV: &str = "CAIRN_TEST_FAKE_LSP";
+#[cfg(test)]
+static TEST_FAKE_INITIALIZE_ADMISSION: Semaphore = Semaphore::const_new(4);
 
 /// The leader child plus the immutable containment identity validated before
 /// the process is published to the client. On Unix every production LSP spawn
@@ -210,6 +214,8 @@ pub struct LspClient {
     cleanup_runs: Arc<AtomicUsize>,
     #[cfg(test)]
     leader_waits: Arc<AtomicUsize>,
+    #[cfg(test)]
+    forced_os_residual: Arc<StdMutex<Option<String>>>,
 }
 
 /// Cloneable control-plane handle for one LSP child process.
@@ -231,6 +237,38 @@ pub(crate) struct LspProcessControl {
     cleanup_runs: Arc<AtomicUsize>,
     #[cfg(test)]
     leader_waits: Arc<AtomicUsize>,
+    #[cfg(test)]
+    forced_os_residual: Arc<StdMutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessCleanupDisposition {
+    Proven,
+    OsResidual,
+    InvariantFailure,
+}
+
+#[derive(Debug)]
+pub(super) struct ProcessCleanupCompletion {
+    pub(super) disposition: ProcessCleanupDisposition,
+    pub(super) error: Option<Error>,
+    pub(super) os_residual: Option<String>,
+    pub(super) invariant: Option<String>,
+}
+
+impl ProcessCleanupCompletion {
+    pub(super) fn proven() -> Self {
+        Self {
+            disposition: ProcessCleanupDisposition::Proven,
+            error: None,
+            os_residual: None,
+            invariant: None,
+        }
+    }
+
+    pub(super) fn into_result(self) -> Result<()> {
+        self.error.map_or(Ok(()), Err)
+    }
 }
 
 #[cfg(test)]
@@ -246,10 +284,20 @@ impl LspProcessControl {
         self.leader_waits.load(Ordering::SeqCst)
     }
 
-    /// Permanently prevent this client from spawning a replacement child, then
-    /// terminate and reap the current child without taking the pool entry's
-    /// data-plane mutex.
+    #[cfg(test)]
+    pub(super) fn force_os_residual_for_test(&self, message: impl Into<String>) {
+        *self
+            .forced_os_residual
+            .lock()
+            .expect("test forced-residual mutex poisoned") = Some(message.into());
+    }
+
+    #[cfg(test)]
     pub(crate) async fn stop_and_terminate(&self) -> Result<()> {
+        self.stop_and_terminate_completion().await.into_result()
+    }
+
+    pub(super) async fn stop_and_terminate_completion(&self) -> ProcessCleanupCompletion {
         self.stopping.store(true, Ordering::SeqCst);
         self.stopping_notify.notify_waiters();
         #[cfg(test)]
@@ -269,29 +317,62 @@ impl LspProcessControl {
                 }
             }
         }
-        self.force_terminate().await
+        let completion = self.force_terminate_completion().await;
+        #[cfg(test)]
+        let mut completion = completion;
+        #[cfg(test)]
+        if let Some(message) = self
+            .forced_os_residual
+            .lock()
+            .expect("test forced-residual mutex poisoned")
+            .take()
+        {
+            let combined = completion
+                .os_residual
+                .take()
+                .map_or_else(|| message.clone(), |prior| format!("{prior}; {message}"));
+            completion.os_residual = Some(combined);
+            if completion.disposition == ProcessCleanupDisposition::Proven {
+                completion.disposition = ProcessCleanupDisposition::OsResidual;
+            }
+            let residual = Error::ChildTerminationFailed(message);
+            completion.error = Some(match completion.error.take() {
+                Some(prior) => Error::OperationWithCleanupFailure {
+                    original: Box::new(prior),
+                    cleanup: Box::new(residual),
+                },
+                None => residual,
+            });
+        }
+        completion
     }
 
     async fn force_terminate(&self) -> Result<()> {
+        self.force_terminate_completion().await.into_result()
+    }
+
+    async fn force_terminate_completion(&self) -> ProcessCleanupCompletion {
         // Kill first. A wedged server can backpressure a pipe write while the
         // writer mutex is held; waiting for that mutex before kill would make
         // the process-control plane depend on the data plane it must unblock.
         let mut child_slot = self.child.lock().await;
-        self.force_terminate_locked(&mut child_slot, None).await?;
-        Ok(())
+        let (_, completion) = self.force_terminate_locked(&mut child_slot, None).await;
+        completion
     }
 
     async fn force_terminate_generation(&self, generation: u64) -> Result<bool> {
         let mut child_slot = self.child.lock().await;
-        self.force_terminate_locked(&mut child_slot, Some(generation))
-            .await
+        let (terminated, completion) = self
+            .force_terminate_locked(&mut child_slot, Some(generation))
+            .await;
+        completion.into_result().map(|()| terminated)
     }
 
     async fn force_terminate_locked(
         &self,
         child_slot: &mut Option<OwnedLspChild>,
         expected_generation: Option<u64>,
-    ) -> Result<bool> {
+    ) -> (bool, ProcessCleanupCompletion) {
         match expected_generation {
             Some(expected) => {
                 if self
@@ -299,15 +380,15 @@ impl LspProcessControl {
                     .compare_exchange(expected, 0, Ordering::SeqCst, Ordering::SeqCst)
                     .is_err()
                 {
-                    return Ok(false);
+                    return (false, ProcessCleanupCompletion::proven());
                 }
             }
             None => self.current_generation.store(0, Ordering::SeqCst),
         }
-        let termination_err = if let Some(child) = child_slot.as_mut() {
-            terminate_owned_child(child).await.err()
+        let completion = if let Some(child) = child_slot.as_mut() {
+            terminate_owned_child_completion(child).await
         } else {
-            None
+            ProcessCleanupCompletion::proven()
         };
         *child_slot = None;
         {
@@ -321,10 +402,7 @@ impl LspProcessControl {
             let mut pending = self.pending.lock().await;
             pending.clear();
         }
-        match termination_err {
-            Some(err) => Err(err),
-            None => Ok(true),
-        }
+        (true, completion)
     }
 }
 
@@ -529,6 +607,8 @@ impl LspClient {
             cleanup_runs: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             leader_waits: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            forced_os_residual: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -616,6 +696,26 @@ impl LspClient {
         }
         #[cfg(unix)]
         command.process_group(0);
+        // macOS may serialize first execution checks for many distinct
+        // test scripts. Bound only the synthetic fixture's spawn/initialize
+        // wave; permit wait precedes the initialize request deadline, and the
+        // guard drops as soon as the lifecycle handshake reaches a terminal
+        // outcome.
+        #[cfg(test)]
+        let _fake_initialize_permit = if self
+            .env
+            .iter()
+            .any(|(key, value)| key == TEST_FAKE_LSP_ENV && value == "1")
+        {
+            Some(
+                TEST_FAKE_INITIALIZE_ADMISSION
+                    .acquire()
+                    .await
+                    .expect("test fake-LSP initialize semaphore is never closed"),
+            )
+        } else {
+            None
+        };
         let child = command.spawn().map_err(Error::Spawn)?;
         let mut child = own_spawned_child(
             child,
@@ -657,7 +757,10 @@ impl LspClient {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(Error::PoolStopped);
         }
-        if let Err(err) = self.initialize().await {
+        let initialize_result = self.initialize().await;
+        #[cfg(test)]
+        drop(_fake_initialize_permit);
+        if let Err(err) = initialize_result {
             return Err(self.with_stderr_context(err).await);
         }
         Ok(())
@@ -693,6 +796,10 @@ impl LspClient {
         self.process_control().force_terminate().await
     }
 
+    async fn force_terminate_completion(&self) -> ProcessCleanupCompletion {
+        self.process_control().force_terminate_completion().await
+    }
+
     /// Snapshot the control-plane `Arc`s into a cloneable handle
     /// usable without holding the pool entry's data-plane mutex.
     pub(crate) fn process_control(&self) -> LspProcessControl {
@@ -709,6 +816,8 @@ impl LspClient {
             cleanup_runs: Arc::clone(&self.cleanup_runs),
             #[cfg(test)]
             leader_waits: Arc::clone(&self.leader_waits),
+            #[cfg(test)]
+            forced_os_residual: Arc::clone(&self.forced_os_residual),
         }
     }
 
@@ -1000,6 +1109,10 @@ impl LspClient {
     /// # Errors
     /// See the mapping above.
     pub async fn shutdown(self) -> Result<()> {
+        self.shutdown_completion().await.into_result()
+    }
+
+    pub(super) async fn shutdown_completion(self) -> ProcessCleanupCompletion {
         self.stopping.store(true, Ordering::SeqCst);
         self.stopping_notify.notify_waiters();
         let mut protocol_err: Option<Error> = None;
@@ -1013,16 +1126,16 @@ impl LspClient {
                 Err(e) => protocol_err = Some(e),
             }
         }
-        let cleanup = self.force_terminate().await;
-        match (protocol_err, cleanup) {
-            (None, Ok(())) => Ok(()),
-            (Some(e), Ok(())) => Err(e),
-            (None, Err(e)) => Err(e),
-            (Some(orig), Err(cleanup)) => Err(Error::OperationWithCleanupFailure {
-                original: Box::new(orig),
+        let mut cleanup = self.force_terminate_completion().await;
+        cleanup.error = match (protocol_err, cleanup.error) {
+            (None, cleanup) => cleanup,
+            (Some(original), None) => Some(original),
+            (Some(original), Some(cleanup)) => Some(Error::OperationWithCleanupFailure {
+                original: Box::new(original),
                 cleanup: Box::new(cleanup),
             }),
-        }
+        };
+        cleanup
     }
 
     /// Liveness gate called before every operation. When the reader
@@ -1346,7 +1459,7 @@ pub(super) async fn reject_unverified_child(child: &mut Child, reason: &str) -> 
 /// leader exactly once. Group-signal failures are kept even when leader wait
 /// succeeds because descendant containment is then unproven. ESRCH means the
 /// group is already absent, but never substitutes for leader `wait()`.
-async fn terminate_owned_child(child: &mut OwnedLspChild) -> Result<()> {
+async fn terminate_owned_child_completion(child: &mut OwnedLspChild) -> ProcessCleanupCompletion {
     #[cfg(unix)]
     let group_error = classify_group_signal(
         child.pgid,
@@ -1373,7 +1486,11 @@ async fn terminate_owned_child(child: &mut OwnedLspChild) -> Result<()> {
     } else {
         None
     };
-    finish_owned_child_cleanup(group_error, wait_error, sweep_error)
+    process_cleanup_completion(group_error, wait_error, sweep_error)
+}
+
+async fn terminate_owned_child(child: &mut OwnedLspChild) -> Result<()> {
+    terminate_owned_child_completion(child).await.into_result()
 }
 
 async fn sweep_family_blocking(marker: ProcessMarker) -> Result<()> {
@@ -1394,20 +1511,43 @@ pub(super) fn map_family_sweep_join(
     }
 }
 
+#[cfg(test)]
 pub(super) fn finish_owned_child_cleanup(
     group_error: Option<String>,
     wait_error: Option<std::io::Error>,
     sweep_error: Option<Error>,
 ) -> Result<()> {
+    process_cleanup_completion(group_error, wait_error, sweep_error).into_result()
+}
+
+fn process_cleanup_completion(
+    group_error: Option<String>,
+    wait_error: Option<std::io::Error>,
+    sweep_error: Option<Error>,
+) -> ProcessCleanupCompletion {
     let termination = finish_owned_child_termination(group_error, wait_error);
-    match (termination, sweep_error) {
-        (Ok(()), None) => Ok(()),
-        (Err(error), None) => Err(error),
-        (Ok(()), Some(error)) => Err(error),
-        (Err(termination), Some(sweep)) => Err(Error::OperationWithCleanupFailure {
+    let os_residual = termination.as_ref().err().map(ToString::to_string);
+    let invariant = sweep_error.as_ref().map(ToString::to_string);
+    let disposition = if sweep_error.is_some() {
+        ProcessCleanupDisposition::InvariantFailure
+    } else if termination.is_err() {
+        ProcessCleanupDisposition::OsResidual
+    } else {
+        ProcessCleanupDisposition::Proven
+    };
+    let error = match (termination.err(), sweep_error) {
+        (None, None) => None,
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (Some(termination), Some(sweep)) => Some(Error::OperationWithCleanupFailure {
             original: Box::new(sweep),
             cleanup: Box::new(termination),
         }),
+    };
+    ProcessCleanupCompletion {
+        disposition,
+        error,
+        os_residual,
+        invariant,
     }
 }
 
@@ -1458,8 +1598,8 @@ async fn reap_local_child(child: &mut OwnedLspChild, original: &str) -> Error {
 /// the probe explicitly runs `kill` + `wait` so the caller sees
 /// a proof of termination — a `wait()` failure surfaces as a
 /// `ChildTerminationFailed` (composite with `RequestTimeout` on
-/// timeout), which the central `LspClientPool::with_lsp` exit
-/// point can act on to poison the pool.
+/// timeout). This caller-visible process evidence is not itself a pool
+/// invariant or admission-mode classifier.
 ///
 /// Callers:
 /// - [`LspClient::start_with_timeout`] passes `["--version"]`.

@@ -110,18 +110,12 @@ pub enum Error {
     /// old child is still being terminated.
     #[error("LSP pool is draining; retry after the current cleanup completes")]
     PoolDraining,
-    /// The pool is poisoned because a prior child cleanup could
-    /// not prove that the child terminated. This can originate
-    /// from `force_shutdown_all` (outer timeout or an entry that
-    /// returned termination-unproven), an LRU eviction whose
-    /// victim shutdown returned termination-unproven, or any
-    /// termination-unproven error surfaced through the central
-    /// `LspClientPool::with_lsp` exit point. New acquisitions are
-    /// permanently rejected until the daemon restarts, so the
-    /// daemon cannot silently create a replacement child alongside
-    /// a possibly-still-live orphan.
+    /// An internal pool ownership or accounting invariant failed. New
+    /// acquisitions are rejected until daemon restart so custody cannot be
+    /// silently discarded. OS cleanup residuals use
+    /// [`Error::ChildTerminationFailed`] and do not produce this state.
     #[error(
-        "LSP pool is poisoned by a prior child cleanup that could not prove termination; restart the daemon to recover"
+        "LSP pool halted after an internal ownership invariant failed; restart the daemon to recover"
     )]
     PoolPoisoned,
     /// The pool has been finally shut down (daemon-level
@@ -129,10 +123,8 @@ pub enum Error {
     #[error("LSP pool has been shut down")]
     PoolStopped,
     /// The child process could not be reaped via `wait()` after
-    /// `kill()`. We cannot prove the child terminated, so callers
-    /// must treat this as fail-closed (poison the pool rather than
-    /// spawn a replacement child alongside a possibly-still-live
-    /// orphan).
+    /// `kill()`. The initiating caller receives this truthful residual while
+    /// the pool releases terminal custody and continues admission.
     #[error("LSP child termination could not be proven: {0}")]
     ChildTerminationFailed(String),
     /// A cleanup step ran after the original operation failed. Both
@@ -145,6 +137,47 @@ pub enum Error {
         original: Box<Error>,
         cleanup: Box<Error>,
     },
+}
+
+impl Error {
+    /// Duplicate a typed error only for private cleanup-receipt observers.
+    /// This deliberately does not make the public error taxonomy `Clone`.
+    pub(crate) fn clone_for_cleanup(&self) -> Self {
+        match self {
+            Self::BinaryMissing(path) => Self::BinaryMissing(path.clone()),
+            Self::WorkspaceUnsuitable(message) => Self::WorkspaceUnsuitable(message.clone()),
+            Self::Spawn(error) => Self::Spawn(match error.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(error.kind(), error.to_string()),
+            }),
+            Self::Handshake(message) => Self::Handshake(message.clone()),
+            Self::ReadinessTimeout => Self::ReadinessTimeout,
+            Self::RequestTimeout => Self::RequestTimeout,
+            Self::ServerExited(status) => Self::ServerExited(ExitStatusDetail(status.0)),
+            Self::ServerExitedWithStderr { status, stderr } => Self::ServerExitedWithStderr {
+                status: ExitStatusDetail(status.0),
+                stderr: stderr.clone(),
+            },
+            Self::Protocol(message) => Self::Protocol(message.clone()),
+            Self::ResponseError { code, message } => Self::ResponseError {
+                code: *code,
+                message: message.clone(),
+            },
+            Self::PoolAtCapacity { capacity } => Self::PoolAtCapacity {
+                capacity: *capacity,
+            },
+            Self::PoolDraining => Self::PoolDraining,
+            Self::PoolPoisoned => Self::PoolPoisoned,
+            Self::PoolStopped => Self::PoolStopped,
+            Self::ChildTerminationFailed(message) => Self::ChildTerminationFailed(message.clone()),
+            Self::OperationWithCleanupFailure { original, cleanup } => {
+                Self::OperationWithCleanupFailure {
+                    original: Box::new(original.clone_for_cleanup()),
+                    cleanup: Box::new(cleanup.clone_for_cleanup()),
+                }
+            }
+        }
+    }
 }
 
 impl Error {
@@ -171,13 +204,10 @@ impl Error {
     }
 
     /// True when this error is or wraps a `ChildTerminationFailed`
-    /// signal. Callers that manage child lifecycle must treat this
-    /// as fail-closed: the child could not be proven dead, so no
-    /// replacement may be spawned in its slot until the daemon
-    /// restarts. Currently used by `LspClientPool` to poison itself
-    /// on an LRU eviction whose victim shutdown left an unproven
-    /// child, and by `force_shutdown_all` to poison on the same
-    /// signal in addition to the outer timeout.
+    /// signal. This classifies caller-visible OS/process evidence only; it is
+    /// deliberately not a pool-mode decision. `LspClientPool` decides
+    /// admission from its private typed cleanup disposition: OS residuals
+    /// release exact custody, while ownership/accounting invariants halt it.
     #[must_use]
     pub fn is_termination_unproven(&self) -> bool {
         match self {

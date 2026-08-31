@@ -17,10 +17,9 @@
 //!   termination-proven completion (clean `Ok(())` OR
 //!   termination-proven `Err`) remove the placeholder and retry;
 //!   full + no Ready idle victim → [`Error::PoolAtCapacity`]. A
-//!   termination-unproven shutdown keeps the placeholder AND
-//!   poisons the pool globally — no other key can spawn a
-//!   replacement while a possibly-live orphan may still hold
-//!   resources.
+//!   OS cleanup residuals remain truthful caller errors but release the exact
+//!   placeholder and keep admission available. Only a private ownership or
+//!   accounting invariant retains custody and halts the pool.
 //! - Idle sweep: a wall-clock timestamp is refreshed on acquire and
 //!   lease release. Expired Ready entries with no active leases use
 //!   the same `Evicting` reservation and fail-closed termination
@@ -30,8 +29,9 @@
 //!   discoverable across graceful, force, and final cleanup paths.
 //! - Force-shutdown: transitions `Running → Draining`, rejects new
 //!   acquisitions, and gives each published entry one bounded
-//!   process-control cleanup. It returns to `Running` only when termination is
-//!   proven; otherwise the pool becomes `Poisoned` until daemon restart.
+//!   process-control cleanup. The published drain owner returns the pool to
+//!   `Running` after every terminal process outcome (including an OS residual);
+//!   private invariant failures retain custody in `Halted`.
 //! - Final bounded shutdown transitions to `Stopped`, takes both live
 //!   and published draining entries, and drives process control
 //!   without waiting on graceful cleanup. Concurrent kill/reap is
@@ -54,7 +54,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout, timeout_at};
 use tracing::{debug, warn};
 
-use super::client::LspProcessControl;
+use super::client::{LspProcessControl, ProcessCleanupCompletion, ProcessCleanupDisposition};
 use super::{Error, LspClient, Position, Result, Url};
 
 /// Cap on live child processes when the env override is unset.
@@ -249,14 +249,35 @@ struct PublishedDrain {
     entries: Vec<Arc<PoolEntry>>,
 }
 
+fn lock_registry_state(
+    registry: &StdMutex<PoolRegistry>,
+) -> Result<std::sync::MutexGuard<'_, PoolRegistry>> {
+    match registry.lock() {
+        Ok(guard) => Ok(guard),
+        Err(poisoned) => {
+            let mut state = poisoned.into_inner();
+            if state.mode != PoolMode::Stopped {
+                state.mode = PoolMode::Halted;
+            }
+            Err(Error::PoolPoisoned)
+        }
+    }
+}
+
 impl PoolRegistry {
     /// Publish the entries to the bounded-shutdown control plane
     /// before removing them from the live map. Both steps occur
     /// under the registry mutex, so no observer can see an entry in
     /// neither collection.
-    fn publish_live_drain(&mut self) -> PublishedDrain {
+    fn publish_live_drain(&mut self) -> Result<PublishedDrain> {
         let id = self.next_drain_id;
-        self.next_drain_id = self.next_drain_id.wrapping_add(1);
+        let Some(next_drain_id) = self.next_drain_id.checked_add(1) else {
+            if self.mode != PoolMode::Stopped {
+                self.mode = PoolMode::Halted;
+            }
+            return Err(Error::PoolPoisoned);
+        };
+        self.next_drain_id = next_drain_id;
         let entries = self
             .entries
             .values()
@@ -264,7 +285,7 @@ impl PoolRegistry {
             .collect::<Vec<_>>();
         self.draining_entries.insert(id, entries.clone());
         self.entries.clear();
-        PublishedDrain { id, entries }
+        Ok(PublishedDrain { id, entries })
     }
 
     /// Remove a published drain only when it is still owned by that path. A
@@ -298,9 +319,9 @@ enum PoolMode {
     /// with `PoolDraining`; entries have moved from the live map to
     /// a published draining batch.
     Draining,
-    /// A prior `force_shutdown_all` could not prove that at least
-    /// one child terminated. All future acquires reject.
-    Poisoned,
+    /// Internal cleanup ownership or accounting became inconsistent. All
+    /// future acquires reject until the daemon restarts.
+    Halted,
     /// Daemon-level final shutdown. All future acquires reject.
     Stopped,
 }
@@ -330,14 +351,9 @@ enum RecordState {
     /// leasable (same-key acquires reject with `PoolDraining` and
     /// LRU never picks another Evicting record). The eviction
     /// caller holds the `Arc<PoolEntry>` and runs `entry.shutdown()`
-    /// outside the registry lock. On any **termination-proven
-    /// completion** — clean `Ok(())` or an error whose
-    /// `is_termination_unproven` is false — the record is removed
-    /// from the registry so its capacity slot is freed. Only a
-    /// termination-unproven error keeps the record in place AND
-    /// poisons the pool globally, so the possibly-live orphan
-    /// cannot be forgotten and no replacement child can be spawned
-    /// anywhere until the daemon restarts.
+    /// outside the registry lock. Proven and OS-residual terminal outcomes
+    /// release this exact record; only an internal invariant failure retains
+    /// custody and halts admission.
     Evicting,
 }
 
@@ -369,7 +385,13 @@ impl Drop for PoolLease {
         // the inner data so the lease count is still released.
         let mut reg = match self.registry.lock() {
             Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                if state.mode != PoolMode::Stopped {
+                    state.mode = PoolMode::Halted;
+                }
+                state
+            }
         };
         if let Some(record) = reg.entries.get_mut(&self.key)
             && Arc::ptr_eq(&record.entry, &self.entry)
@@ -392,7 +414,7 @@ impl Drop for PoolLease {
                         analyzer = %self.key.analyzer_id,
                         "lsp pool: lease counter underflow on drop; poisoning pool"
                     );
-                    reg.mode = PoolMode::Poisoned;
+                    reg.mode = PoolMode::Halted;
                 }
             }
         }
@@ -536,44 +558,45 @@ fn parse_idle_ttl_env() -> Option<Duration> {
     idle_ttl_from_env_value(std::env::var(IDLE_TTL_ENV).ok().as_deref())
 }
 
-/// Aggregated per-entry outcomes for `force_shutdown_all`. Split
-/// into regular-error and termination-unproven-error slots so an
-/// unproven signal that arrived after a regular protocol error is
-/// still surfaced — the safety-critical cause must not be lost to
-/// order-of-arrival.
+/// Aggregated typed per-entry outcomes for `force_shutdown_all`.
 #[derive(Debug, Default)]
 struct ForceShutdownOutcome {
-    /// First non-termination-proof error observed (protocol
-    /// failure, etc.). Termination-proven Errs whose child WAS
-    /// reaped.
-    first_regular_err: Option<Error>,
-    /// First termination-unproven error observed. Preserved
-    /// separately so its identity survives even when a regular
-    /// error came first.
-    first_unproven_err: Option<Error>,
+    first_os_residual: Option<String>,
+    first_invariant_failure: Option<String>,
+    public_error: Option<Error>,
+    pending: bool,
 }
 
-impl ForceShutdownOutcome {
-    fn termination_unproven(&self) -> bool {
-        self.first_unproven_err.is_some()
-    }
-}
-
-/// Fold bounded per-entry force-shutdown results into the outcome slots. The
-/// bounded entry seam is the sole timeout authority, so every result already
-/// carries the correct termination-proof classification.
-fn classify_force_shutdown_results(results: Vec<Result<()>>) -> ForceShutdownOutcome {
+fn classify_force_shutdown_results(results: &[CleanupOutcome]) -> ForceShutdownOutcome {
     let mut out = ForceShutdownOutcome::default();
     for outcome in results {
+        if let Err(error) = outcome.clone().into_result() {
+            out.public_error = Some(match out.public_error.take() {
+                Some(prior) => Error::OperationWithCleanupFailure {
+                    original: Box::new(prior),
+                    cleanup: Box::new(error),
+                },
+                None => error,
+            });
+        }
         match outcome {
-            Ok(()) => {}
-            Err(e) => {
-                if e.is_termination_unproven() {
-                    if out.first_unproven_err.is_none() {
-                        out.first_unproven_err = Some(e);
-                    }
-                } else if out.first_regular_err.is_none() {
-                    out.first_regular_err = Some(e);
+            CleanupOutcome::Pending => out.pending = true,
+            CleanupOutcome::Terminal(CleanupTerminal::Proven, _) => {}
+            CleanupOutcome::Terminal(CleanupTerminal::OsResidual(message), _) => {
+                out.first_os_residual.get_or_insert_with(|| message.clone());
+            }
+            CleanupOutcome::Terminal(
+                CleanupTerminal::InvariantFailure {
+                    message,
+                    os_residual,
+                },
+                _,
+            ) => {
+                out.first_invariant_failure
+                    .get_or_insert_with(|| message.clone());
+                if let Some(os_residual) = os_residual {
+                    out.first_os_residual
+                        .get_or_insert_with(|| os_residual.clone());
                 }
             }
         }
@@ -689,38 +712,7 @@ impl LspClientPool {
             .runtime()
             .block_on(async move { entry.with_lsp_client(spawn_spec, readiness, work).await });
         drop(lease);
-        // Central poison propagation: any termination-unproven
-        // error observed on the normal path (spawn/initialize/
-        // readiness/ServerExited cleanup) must poison the pool so
-        // no replacement can spawn alongside a possibly-still-live
-        // orphan. Same helper the LRU eviction path uses; both
-        // preserve `Stopped`.
-        if let Err(ref error) = result {
-            self.poison_if_termination_unproven(error);
-        }
         result
-    }
-
-    fn poison_if_termination_unproven(&self, error: &Error) {
-        if error.is_termination_unproven() {
-            self.poison_from_unproven_cleanup(&error.to_string());
-        }
-    }
-
-    fn poison_from_unproven_cleanup(&self, context: &str) {
-        let Ok(mut reg) = self.registry.lock() else {
-            return;
-        };
-        match reg.mode {
-            PoolMode::Stopped => {}
-            _ => {
-                warn!(
-                    context = context,
-                    "lsp pool: termination unproven; poisoning pool"
-                );
-                reg.mode = PoolMode::Poisoned;
-            }
-        }
     }
 
     /// Acquire a lease on `key`, evicting an idle LRU victim outside
@@ -743,7 +735,7 @@ impl LspClientPool {
                 match reg.mode {
                     PoolMode::Running => {}
                     PoolMode::Draining => return Err(Error::PoolDraining),
-                    PoolMode::Poisoned => return Err(Error::PoolPoisoned),
+                    PoolMode::Halted => return Err(Error::PoolPoisoned),
                     PoolMode::Stopped => return Err(Error::PoolStopped),
                 }
                 // Existing key — Ready → bump lease; Evicting →
@@ -756,19 +748,19 @@ impl LspClientPool {
                         RecordState::Evicting => return Err(Error::PoolDraining),
                         RecordState::Ready => {}
                     }
-                    let bumped_seq = reg
-                        .access_seq
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Protocol("pool access_seq overflow".into()))?;
+                    let Some(bumped_seq) = reg.access_seq.checked_add(1) else {
+                        reg.mode = PoolMode::Halted;
+                        return Err(Error::PoolPoisoned);
+                    };
                     reg.access_seq = bumped_seq;
                     let record = reg
                         .entries
                         .get_mut(&key)
                         .expect("contains_key just checked");
-                    let bumped_leases = record
-                        .active_leases
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Protocol("pool lease counter overflow".into()))?;
+                    let Some(bumped_leases) = record.active_leases.checked_add(1) else {
+                        reg.mode = PoolMode::Halted;
+                        return Err(Error::PoolPoisoned);
+                    };
                     record.active_leases = bumped_leases;
                     record.last_used = bumped_seq;
                     record.last_used_at = Instant::now();
@@ -782,10 +774,10 @@ impl LspClientPool {
                 // count toward `entries.len()`, so a live victim
                 // holds its slot until its shutdown completes.)
                 if reg.entries.len() < self.capacity.get() {
-                    let bumped_seq = reg
-                        .access_seq
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Protocol("pool access_seq overflow".into()))?;
+                    let Some(bumped_seq) = reg.access_seq.checked_add(1) else {
+                        reg.mode = PoolMode::Halted;
+                        return Err(Error::PoolPoisoned);
+                    };
                     reg.access_seq = bumped_seq;
                     let entry = PoolEntry::new(key.clone(), &self.registry);
                     reg.entries.insert(
@@ -835,35 +827,30 @@ impl LspClientPool {
             // record stays in the registry as an `Evicting`
             // placeholder throughout — capacity is preserved so no
             // concurrent acquire can spawn a replacement.
-            match victim_entry.shutdown().await {
-                Ok(()) => {
-                    // Termination proven. Safe to remove the
-                    // placeholder and loop to re-acquire; the
-                    // freed slot is now available for our key
-                    // (unless another thread beat us to it, in
-                    // which case we retry eviction).
-                    let mut reg = self.lock_registry()?;
-                    reg.entries.remove(&victim_key);
+            let completion = victim_entry.shutdown().await;
+            match completion.terminal {
+                CleanupTerminal::InvariantFailure { message, .. } => {
+                    let mut registry = self.lock_registry()?;
+                    if registry.mode != PoolMode::Stopped {
+                        warn!(%message, "lsp pool: LRU cleanup invariant failure");
+                        registry.mode = PoolMode::Halted;
+                    }
+                    return Err(Error::PoolPoisoned);
                 }
-                Err(e) if e.is_termination_unproven() => {
-                    // Cannot prove the victim's child died.
-                    // Preserve the `Evicting` placeholder so a
-                    // replacement can never be spawned in its
-                    // slot, and poison the pool globally — the
-                    // possibly-live orphan may hold stdio / port /
-                    // cache locks that collide with any new
-                    // spawn.
-                    self.poison_from_unproven_cleanup(&format!("LRU eviction: {e}"));
-                    return Err(e);
-                }
-                Err(e) => {
-                    // Termination-proven error (e.g. graceful
-                    // protocol failure but the child was reaped).
-                    // Safe to remove the placeholder before
-                    // returning.
-                    let mut reg = self.lock_registry()?;
-                    reg.entries.remove(&victim_key);
-                    return Err(e);
+                CleanupTerminal::Proven | CleanupTerminal::OsResidual(_) => {
+                    // Terminal cleanup releases the exact placeholder. OS
+                    // residuals remain a truthful caller error but do not
+                    // halt unrelated pool admission.
+                    let mut registry = self.lock_registry()?;
+                    let still_reserved = registry.entries.get(&victim_key).is_some_and(|record| {
+                        record.state == RecordState::Evicting
+                            && Arc::ptr_eq(&record.entry, &victim_entry)
+                    });
+                    if still_reserved {
+                        registry.entries.remove(&victim_key);
+                    }
+                    drop(registry);
+                    completion.result?;
                 }
             }
         }
@@ -880,9 +867,7 @@ impl LspClientPool {
         entry_timeout: Duration,
     ) -> Result<usize> {
         let victims = {
-            let mut reg = registry
-                .lock()
-                .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
+            let mut reg = lock_registry_state(registry)?;
             if reg.mode != PoolMode::Running {
                 return Ok(0);
             }
@@ -920,16 +905,14 @@ impl LspClientPool {
         // task must not be stalled indefinitely by one wedged entry.
         let outcomes =
             futures::future::join_all(victims.into_iter().map(|(key, entry)| async move {
-                let result = entry.shutdown_bounded(entry_timeout).await;
-                (key, entry, result)
+                let outcome = entry.shutdown_bounded_outcome(entry_timeout).await;
+                (key, entry, outcome)
             }))
             .await;
 
         let mut first_err = None;
-        let mut reg = registry
-            .lock()
-            .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
-        for (key, entry, result) in outcomes {
+        let mut reg = lock_registry_state(registry)?;
+        for (key, entry, outcome) in outcomes {
             // The registry may have changed while victims were being
             // stopped outside the lock: a drain (`shutdown_all` /
             // `force_shutdown_all` / `shutdown_all_bounded`) can have
@@ -940,40 +923,49 @@ impl LspClientPool {
             let still_reserved = reg.entries.get(&key).is_some_and(|record| {
                 record.state == RecordState::Evicting && Arc::ptr_eq(&record.entry, &entry)
             });
-            match result {
-                Ok(()) => {
+            match outcome {
+                CleanupOutcome::Terminal(CleanupTerminal::Proven, error) => {
                     if still_reserved {
                         reg.entries.remove(&key);
                     }
+                    if first_err.is_none() {
+                        first_err = error;
+                    }
                 }
-                Err(error) if error.is_termination_unproven() => {
+                CleanupOutcome::Terminal(CleanupTerminal::OsResidual(message), error) => {
+                    if still_reserved {
+                        reg.entries.remove(&key);
+                    }
                     warn!(
                         language = %key.language,
                         analyzer = %key.analyzer_id,
-                        %error,
-                        "lsp pool: idle sweep could not prove child termination"
+                        %message,
+                        "lsp pool: idle sweep completed with OS cleanup residual"
                     );
-                    // Final daemon shutdown owns the terminal state.
-                    // Otherwise keep the placeholder and fail closed.
+                    if first_err.is_none() {
+                        first_err = error.or(Some(Error::ChildTerminationFailed(message)));
+                    }
+                }
+                CleanupOutcome::Terminal(
+                    CleanupTerminal::InvariantFailure { message, .. },
+                    error,
+                ) => {
+                    warn!(
+                        language = %key.language,
+                        analyzer = %key.analyzer_id,
+                        %message,
+                        "lsp pool: idle sweep hit cleanup invariant failure"
+                    );
                     if reg.mode != PoolMode::Stopped {
-                        reg.mode = PoolMode::Poisoned;
+                        reg.mode = PoolMode::Halted;
                     }
                     if first_err.is_none() {
-                        first_err = Some(error);
+                        first_err = error.or(Some(Error::PoolPoisoned));
                     }
                 }
-                Err(error) => {
-                    if still_reserved {
-                        reg.entries.remove(&key);
-                    }
-                    warn!(
-                        language = %key.language,
-                        analyzer = %key.analyzer_id,
-                        %error,
-                        "lsp pool: idle sweep completed with shutdown error"
-                    );
+                CleanupOutcome::Pending => {
                     if first_err.is_none() {
-                        first_err = Some(error);
+                        first_err = Some(bounded_shutdown_timeout_error(entry_timeout));
                     }
                 }
             }
@@ -985,9 +977,7 @@ impl LspClientPool {
     }
 
     fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, PoolRegistry>> {
-        self.registry
-            .lock()
-            .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))
+        lock_registry_state(&self.registry)
     }
 
     fn runtime(&self) -> &Runtime {
@@ -1003,26 +993,37 @@ impl LspClientPool {
     /// Returns the first LSP shutdown error observed after
     /// attempting every entry.
     pub fn shutdown_all(&self) -> Result<()> {
-        let drain = {
-            let mut reg = self.lock_registry()?;
+        let (drain_id, entries, publication_error) = {
+            let mut reg = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => {
+                    let mut registry = poisoned.into_inner();
+                    registry.mode = PoolMode::Stopped;
+                    let entries = registry.take_all_for_bounded_shutdown();
+                    drop(registry);
+                    return self
+                        .shutdown_entries_after_publication_failure(entries, Error::PoolPoisoned);
+                }
+            };
             reg.mode = PoolMode::Stopped;
-            reg.publish_live_drain()
+            match reg.publish_live_drain() {
+                Ok(drain) => (Some(drain.id), drain.entries, None),
+                Err(error) => (None, reg.take_all_for_bounded_shutdown(), Some(error)),
+            }
         };
-        let drain_id = drain.id;
         let result = self.runtime().block_on(async move {
             // Shutdown entries concurrently — same rationale as
             // `force_shutdown_all` (independent children, no
             // cross-entry contention).
-            let results: Vec<_> = futures::future::join_all(
-                drain
-                    .entries
+            let completions = futures::future::join_all(
+                entries
                     .into_iter()
                     .map(|entry| async move { entry.shutdown().await }),
             )
             .await;
-            let mut first_err: Option<Error> = None;
-            for r in results {
-                if let Err(e) = r
+            let mut first_err = publication_error;
+            for completion in completions {
+                if let Err(e) = completion.result
                     && first_err.is_none()
                 {
                     first_err = Some(e);
@@ -1033,19 +1034,45 @@ impl LspClientPool {
                 None => Ok(()),
             }
         });
-        match self.lock_registry() {
-            Ok(mut reg) => {
-                reg.finish_published_drain(drain_id);
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    drain_id,
-                    "lsp pool: could not finalize published shutdown drain"
-                );
+        if let Some(drain_id) = drain_id {
+            match self.lock_registry() {
+                Ok(mut reg) => {
+                    reg.finish_published_drain(drain_id);
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        drain_id,
+                        "lsp pool: could not finalize published shutdown drain"
+                    );
+                }
             }
         }
         result
+    }
+
+    fn shutdown_entries_after_publication_failure(
+        &self,
+        entries: Vec<Arc<PoolEntry>>,
+        publication_error: Error,
+    ) -> Result<()> {
+        let cleanup_error = self.runtime().block_on(async move {
+            futures::future::join_all(
+                entries
+                    .into_iter()
+                    .map(|entry| async move { entry.shutdown().await }),
+            )
+            .await
+            .into_iter()
+            .find_map(|completion| completion.result.err())
+        });
+        match cleanup_error {
+            Some(cleanup) => Err(Error::OperationWithCleanupFailure {
+                original: Box::new(publication_error),
+                cleanup: Box::new(cleanup),
+            }),
+            None => Err(publication_error),
+        }
     }
 
     /// Permanently stop the pool and force-terminate every child through its
@@ -1061,10 +1088,18 @@ impl LspClientPool {
     /// is surfaced as [`Error::ChildTerminationFailed`] because child
     /// termination could not be proven.
     pub fn shutdown_all_bounded(&self, entry_timeout: Duration) -> Result<()> {
-        let entries = {
-            let mut reg = self.lock_registry()?;
-            reg.mode = PoolMode::Stopped;
-            reg.take_all_for_bounded_shutdown()
+        let (entries, registry_invariant) = {
+            match self.registry.lock() {
+                Ok(mut reg) => {
+                    reg.mode = PoolMode::Stopped;
+                    (reg.take_all_for_bounded_shutdown(), false)
+                }
+                Err(poisoned) => {
+                    let mut reg = poisoned.into_inner();
+                    reg.mode = PoolMode::Stopped;
+                    (reg.take_all_for_bounded_shutdown(), true)
+                }
+            }
         };
         let registry = Arc::clone(&self.registry);
         self.runtime().block_on(async move {
@@ -1072,7 +1107,7 @@ impl LspClientPool {
             match timeout_at(deadline, async move {
                 let mut receipts = Vec::new();
                 let mut outstanding_receipts = HashMap::new();
-                let mut first_error = None;
+                let mut first_error = registry_invariant.then_some(Error::PoolPoisoned);
                 for entry in entries {
                     match entry.request_cleanup(true, None) {
                         Ok(Some(receipt)) => receipts.push(receipt),
@@ -1084,9 +1119,15 @@ impl LspClientPool {
 
                 loop {
                     let (active_admissions, outstanding, barrier_closed) = {
-                        let mut state = registry
-                            .lock()
-                            .map_err(|_| Error::Protocol("lsp pool registry poisoned".into()))?;
+                        let mut state = match registry.lock() {
+                            Ok(state) => state,
+                            Err(poisoned) => {
+                                if first_error.is_none() {
+                                    first_error = Some(Error::PoolPoisoned);
+                                }
+                                poisoned.into_inner()
+                            }
+                        };
                         let active_admissions = state.active_cleanup_admissions;
                         let outstanding = state
                             .outstanding_cleanups
@@ -1122,6 +1163,10 @@ impl LspClientPool {
             .await
             {
                 Ok(result) => result,
+                Err(_) if registry_invariant => Err(Error::OperationWithCleanupFailure {
+                    original: Box::new(Error::PoolPoisoned),
+                    cleanup: Box::new(bounded_shutdown_timeout_error(entry_timeout)),
+                }),
                 Err(_) => Err(bounded_shutdown_timeout_error(entry_timeout)),
             }
         })
@@ -1134,24 +1179,19 @@ impl LspClientPool {
     /// New acquisitions are rejected with [`Error::PoolDraining`]
     /// while this call is in flight. Mode transitions on finalize:
     ///
-    /// - Every entry clean (no timeout, no termination-unproven)
-    ///   → pool returns to `Running`.
-    /// - Any termination-unproven signal from bounded entry cleanup → pool
-    ///   becomes `Poisoned` and rejects all future acquisitions until the
-    ///   daemon restarts.
+    /// - Every terminal process outcome (proven or OS residual) releases exact
+    ///   custody; after all entries finish the drain owner returns to `Running`.
+    /// - A private ownership/accounting invariant retains custody and moves the
+    ///   pool to `Halted`.
     /// - A concurrent `shutdown_all` transitioned the pool to
     ///   `Stopped` while we were mid-drain → we preserve
     ///   `Stopped`; the pool is stopped, not poisoned.
     ///
     /// # Errors
-    /// - [`Error::PoolPoisoned`] when the finalize mode is
-    ///   `Poisoned` (whether via our own local outcome or a
-    ///   concurrent path).
-    /// - `ChildTerminationFailed` when the mode is `Stopped` /
-    ///   `Running` but a termination-unproven signal was
-    ///   observed. If a non-unproven `first_err` was also
-    ///   present, the two are combined into an
-    ///   `OperationWithCleanupFailure`.
+    /// - [`Error::PoolPoisoned`] for a private invariant failure (combined with
+    ///   any independently observed OS residual).
+    /// - `ChildTerminationFailed` for an OS cleanup residual while the mode
+    ///   remains `Stopped` / `Running`.
     /// - The `first_err` alone (no cleanup err) when the only
     ///   signal was a clean protocol failure whose child was
     ///   still reaped.
@@ -1161,10 +1201,10 @@ impl LspClientPool {
             match reg.mode {
                 PoolMode::Running => reg.mode = PoolMode::Draining,
                 PoolMode::Draining => return Err(Error::PoolDraining),
-                PoolMode::Poisoned => return Err(Error::PoolPoisoned),
+                PoolMode::Halted => return Err(Error::PoolPoisoned),
                 PoolMode::Stopped => return Err(Error::PoolStopped),
             }
-            reg.publish_live_drain()
+            reg.publish_live_drain()?
         };
         let drain_id = drain.id;
         debug!(
@@ -1179,101 +1219,167 @@ impl LspClientPool {
         // `shutdown_bounded` owns the one per-entry timeout. Wrapping it in a
         // second timeout would create two competing authorities for whether
         // child termination was actually proven.
-        let outcome = self.runtime().block_on(async move {
-            let results = futures::future::join_all(
-                drain
-                    .entries
-                    .into_iter()
-                    .map(|entry| async move { entry.shutdown_bounded(entry_timeout).await }),
-            )
-            .await;
-            classify_force_shutdown_results(results)
+        let results = self.runtime().block_on(async move {
+            futures::future::join_all(drain.entries.into_iter().map(|entry| async move {
+                let receipt = match entry.request_cleanup(true, None) {
+                    Ok(Some(receipt)) => Some(receipt),
+                    Ok(None) => None,
+                    Err(error) => {
+                        return (
+                            entry,
+                            CleanupOutcome::invariant(error.to_string(), None),
+                            None,
+                        );
+                    }
+                };
+                let outcome = match receipt.as_ref() {
+                    Some(receipt) => {
+                        observe_cleanup_bounded_outcome(receipt.clone(), entry_timeout).await
+                    }
+                    None => CleanupOutcome::proven(),
+                };
+                (entry, outcome, receipt)
+            }))
+            .await
         });
-        let termination_unproven = outcome.termination_unproven();
-        let ForceShutdownOutcome {
-            first_regular_err,
-            first_unproven_err,
-        } = outcome;
-        // Finalize mode under lock. Preserve BOTH `Stopped` and
-        // `Poisoned`: a concurrent `shutdown_all` may have raced
-        // ahead of us (Stopped wins), OR a concurrent normal-path
-        // cleanup (`with_lsp` central exit, LRU eviction) may have
-        // observed a termination-unproven signal on a DIFFERENT
-        // path while our own drain was clean (Poisoned must not
-        // regress to Running). Only when the mode is still
-        // `Draining` — which means nobody else transitioned it
-        // during our drain — do we apply our local outcome.
+        let outcome = classify_force_shutdown_results(
+            &results
+                .iter()
+                .map(|(_, outcome, _)| outcome.clone())
+                .collect::<Vec<_>>(),
+        );
         let final_mode = {
             let mut reg = self.lock_registry()?;
-            // Final bounded shutdown may already have taken this
-            // published batch. Removing only our own id cannot
-            // clobber its Stopped/Poisoned mode or another drain.
-            reg.finish_published_drain(drain_id);
+            let remove_drain = if let Some(entries) = reg.draining_entries.get_mut(&drain_id) {
+                entries.retain(|entry| {
+                    !results.iter().any(|(completed, outcome, _)| {
+                        Arc::ptr_eq(entry, completed)
+                            && matches!(
+                                outcome,
+                                CleanupOutcome::Terminal(
+                                    CleanupTerminal::Proven | CleanupTerminal::OsResidual(_),
+                                    _,
+                                )
+                            )
+                    })
+                });
+                entries.is_empty()
+            } else {
+                false
+            };
+            if remove_drain {
+                reg.draining_entries.remove(&drain_id);
+            }
             match reg.mode {
                 PoolMode::Stopped => PoolMode::Stopped,
-                PoolMode::Poisoned => PoolMode::Poisoned,
+                PoolMode::Halted => PoolMode::Halted,
                 PoolMode::Draining => {
-                    // Only a termination-unproven bounded cleanup drives the
-                    // mode transition. A clean `first_err` (e.g. protocol
-                    // failure on an entry whose child was cleanly reaped) is
-                    // NOT a safety hazard for future spawns.
-                    reg.mode = if termination_unproven {
-                        PoolMode::Poisoned
-                    } else {
-                        PoolMode::Running
+                    if outcome.first_invariant_failure.is_some() {
+                        reg.mode = PoolMode::Halted;
+                    } else if !outcome.pending && reg.draining_entries.is_empty() {
+                        reg.mode = PoolMode::Running;
+                    }
+                    reg.mode
+                }
+                PoolMode::Running => PoolMode::Running,
+            }
+        };
+        if final_mode == PoolMode::Draining && outcome.pending {
+            let pending = results
+                .iter()
+                .filter_map(|(entry, outcome, receipt)| {
+                    matches!(outcome, CleanupOutcome::Pending)
+                        .then(|| (Arc::clone(entry), receipt.clone()))
+                        .and_then(|(entry, receipt)| receipt.map(|receipt| (entry, receipt)))
+                })
+                .collect::<Vec<_>>();
+            if !pending.is_empty() {
+                let registry = Arc::clone(&self.registry);
+                self.runtime().spawn(async move {
+                    let terminals = futures::future::join_all(pending.into_iter().map(
+                        |(entry, mut receipt)| async move {
+                            let terminal = observe_cleanup_terminal(&mut receipt).await;
+                            (entry, terminal)
+                        },
+                    ))
+                    .await;
+                    let mut reg = match registry.lock() {
+                        Ok(reg) => reg,
+                        Err(poisoned) => {
+                            let mut reg = poisoned.into_inner();
+                            if reg.mode != PoolMode::Stopped {
+                                reg.mode = PoolMode::Halted;
+                            }
+                            return;
+                        }
                     };
-                    reg.mode
-                }
-                PoolMode::Running => {
-                    // Should not happen — we set Draining above and
-                    // no other path writes Running. Preserve
-                    // whatever the current state is defensively.
-                    reg.mode
-                }
+                    let invariant = terminals.iter().any(|(_, terminal)| {
+                        matches!(
+                            terminal,
+                            CleanupOutcome::Terminal(CleanupTerminal::InvariantFailure { .. }, _,)
+                        )
+                    });
+                    let remove_drain =
+                        if let Some(entries) = reg.draining_entries.get_mut(&drain_id) {
+                            entries.retain(|entry| {
+                                !terminals.iter().any(|(completed, terminal)| {
+                                    Arc::ptr_eq(entry, completed)
+                                        && matches!(
+                                            terminal,
+                                            CleanupOutcome::Terminal(
+                                                CleanupTerminal::Proven
+                                                    | CleanupTerminal::OsResidual(_),
+                                                _,
+                                            )
+                                        )
+                                })
+                            });
+                            entries.is_empty()
+                        } else {
+                            true
+                        };
+                    if remove_drain {
+                        reg.draining_entries.remove(&drain_id);
+                    }
+                    if reg.mode == PoolMode::Draining {
+                        if invariant {
+                            reg.mode = PoolMode::Halted;
+                        } else if reg.draining_entries.is_empty() {
+                            reg.mode = PoolMode::Running;
+                        }
+                    }
+                });
             }
-        };
-        // Keep the safety-critical error in the cleanup slot when a regular
-        // error was also observed so recursive termination-proof checks retain
-        // its identity independent of completion order.
-        let combined = match (first_regular_err, first_unproven_err) {
-            (None, None) => None,
-            (Some(e), None) | (None, Some(e)) => Some(e),
-            (Some(orig), Some(safety)) => Some(Error::OperationWithCleanupFailure {
-                original: Box::new(orig),
-                cleanup: Box::new(safety),
-            }),
-        };
-        if final_mode == PoolMode::Poisoned {
-            // Log the actual cause on the way out so operators
-            // debugging a poisoned pool have the evidence
-            // (previously we swallowed it).
-            if let Some(e) = combined.as_ref() {
-                warn!(
-                    error = %e,
-                    "lsp pool: force-shutdown finalize observed Poisoned mode; pool poisoned until daemon restart"
-                );
-            } else {
-                warn!(
-                    "lsp pool: force-shutdown finalize observed Poisoned mode; pool poisoned until daemon restart"
-                );
-            }
+        }
+        if let Some(reason) = outcome.first_invariant_failure.as_deref() {
+            warn!(
+                reason,
+                "lsp pool: force-shutdown observed an internal invariant failure"
+            );
+            return Err(outcome
+                .public_error
+                .unwrap_or_else(|| match outcome.first_os_residual {
+                    Some(message) => Error::OperationWithCleanupFailure {
+                        original: Box::new(Error::PoolPoisoned),
+                        cleanup: Box::new(Error::ChildTerminationFailed(message)),
+                    },
+                    None => Error::PoolPoisoned,
+                }));
+        }
+        if final_mode == PoolMode::Halted {
             return Err(Error::PoolPoisoned);
         }
-        if final_mode == PoolMode::Stopped {
-            // A concurrent `shutdown_all` won on the mode
-            // transition. We still surface any accumulated
-            // termination-unproven / first_err so the caller can
-            // see the evidence.
-            return match combined {
-                Some(e) => Err(e),
-                None => Ok(()),
-            };
+        if outcome.pending {
+            return Err(bounded_shutdown_timeout_error(entry_timeout));
         }
-        debug!("lsp pool: force-shutdown complete; pool running");
-        match combined {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(error) = outcome.public_error {
+            return Err(error);
         }
+        if let Some(message) = outcome.first_os_residual {
+            return Err(Error::ChildTerminationFailed(message));
+        }
+        debug!(mode = ?final_mode, "lsp pool: force-shutdown complete");
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1308,10 +1414,8 @@ impl LspClientPool {
 
     /// Remove one idle entry so a test leaves the shared pool as it found it.
     ///
-    /// Termination-unproven cleanup keeps the record and poisons the pool,
-    /// matching how production treats a child it could not prove dead:
-    /// dropping the record would discard the pool's registry-owned cleanup
-    /// path for a child that may still be running.
+    /// OS residual cleanup releases the exact record and returns the caller
+    /// error; a private invariant retains it and halts admission.
     #[cfg(test)]
     pub(crate) fn remove_idle_test_entry(&self, key: &PoolKey) -> Result<()> {
         let entry = {
@@ -1328,19 +1432,25 @@ impl LspClientPool {
             Arc::clone(&record.entry)
         };
 
-        let result = self.runtime().block_on(entry.shutdown());
-        match result {
-            Ok(()) => {
-                self.lock_registry()?.entries.remove(key);
-                Ok(())
+        let completion = self.runtime().block_on(entry.shutdown());
+        match completion.terminal {
+            CleanupTerminal::InvariantFailure { message, .. } => {
+                let mut registry = self.lock_registry()?;
+                if registry.mode != PoolMode::Stopped {
+                    registry.mode = PoolMode::Halted;
+                }
+                warn!(%message, "lsp pool: test cleanup invariant failure");
+                Err(Error::PoolPoisoned)
             }
-            Err(error) if error.is_termination_unproven() => {
-                self.poison_from_unproven_cleanup(&format!("test entry cleanup: {error}"));
-                Err(error)
-            }
-            Err(error) => {
-                self.lock_registry()?.entries.remove(key);
-                Err(error)
+            CleanupTerminal::Proven | CleanupTerminal::OsResidual(_) => {
+                let mut registry = self.lock_registry()?;
+                let exact = registry.entries.get(key).is_some_and(|record| {
+                    record.state == RecordState::Evicting && Arc::ptr_eq(&record.entry, &entry)
+                });
+                if exact {
+                    registry.entries.remove(key);
+                }
+                completion.result
             }
         }
     }
@@ -1354,43 +1464,47 @@ impl Drop for LspClientPool {
         // Production uses the static GLOBAL_POOL, which is not dropped during
         // daemon final shutdown. This path is lifecycle hygiene for tests and
         // future non-static owners: runtime teardown must never cancel cleanup.
-        let entries = self
-            .registry
-            .lock()
-            .map(|registry| {
-                registry
-                    .entries
-                    .values()
-                    .map(|record| Arc::clone(&record.entry))
-                    .chain(
-                        registry
-                            .draining_entries
-                            .values()
-                            .flat_map(|entries| entries.iter().cloned()),
-                    )
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let (entries, mut receipts) = {
+            let registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => {
+                    let mut registry = poisoned.into_inner();
+                    if registry.mode != PoolMode::Stopped {
+                        registry.mode = PoolMode::Halted;
+                    }
+                    registry
+                }
+            };
+            let entries = registry
+                .entries
+                .values()
+                .map(|record| Arc::clone(&record.entry))
+                .chain(
+                    registry
+                        .draining_entries
+                        .values()
+                        .flat_map(|entries| entries.iter().cloned()),
+                )
+                .collect::<Vec<_>>();
+            let receipts: Vec<_> = registry.outstanding_cleanups.values().cloned().collect();
+            (entries, receipts)
+        };
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let _runtime_context = runtime.enter();
             for entry in entries {
-                if let Err(error) = entry.request_cleanup(true, None) {
-                    warn!(%error, "lsp pool: could not schedule cleanup during drop");
+                match entry.request_cleanup(true, None) {
+                    Ok(Some(receipt)) => {
+                        if !receipts.iter().any(|prior| prior.same_channel(&receipt)) {
+                            receipts.push(receipt);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(%error, "lsp pool: could not schedule cleanup during drop");
+                    }
                 }
             }
         }));
-
-        let receipts = self
-            .registry
-            .lock()
-            .map(|registry| {
-                registry
-                    .outstanding_cleanups
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         if receipts.is_empty() {
             return;
         }
@@ -1442,7 +1556,7 @@ impl Drop for LspClientPool {
                     }));
                     if reaped.is_err() {
                         if let Ok(mut registry) = reaper_registry.lock() {
-                            registry.mode = PoolMode::Poisoned;
+                            registry.mode = PoolMode::Halted;
                         }
                         std::mem::forget(runtime);
                     }
@@ -1453,7 +1567,7 @@ impl Drop for LspClientPool {
                     warn!("lsp pool: cleanup reaper rejected runtime ownership");
                     std::mem::forget(error.0.0);
                     if let Ok(mut registry) = self.registry.lock() {
-                        registry.mode = PoolMode::Poisoned;
+                        registry.mode = PoolMode::Halted;
                     }
                 }
             }
@@ -1461,7 +1575,7 @@ impl Drop for LspClientPool {
                 warn!(%error, "lsp pool: could not start cleanup reaper");
                 std::mem::forget(runtime);
                 if let Ok(mut registry) = self.registry.lock() {
-                    registry.mode = PoolMode::Poisoned;
+                    registry.mode = PoolMode::Halted;
                 }
             }
         }
@@ -1505,28 +1619,248 @@ struct ProcessControlSlot {
     cleanup: Option<CleanupTask>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum CleanupOutcome {
     Pending,
+    /// Private cleanup disposition plus the original typed public failure.
+    /// The first axis controls custody/mode; the second is cloned into each
+    /// observer's `Result` without reconstructing it from strings.
+    Terminal(CleanupTerminal, Option<Error>),
+}
+
+impl Clone for CleanupOutcome {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Pending => Self::Pending,
+            Self::Terminal(terminal, error) => Self::Terminal(
+                terminal.clone(),
+                error.as_ref().map(Error::clone_for_cleanup),
+            ),
+        }
+    }
+}
+
+impl PartialEq for CleanupOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pending, Self::Pending) => true,
+            (Self::Terminal(left, _), Self::Terminal(right, _)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CleanupOutcome {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupTerminal {
     Proven,
-    Unproven(String),
+    OsResidual(String),
+    InvariantFailure {
+        message: String,
+        os_residual: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+struct EntryCleanupCompletion {
+    terminal: CleanupTerminal,
+    result: Result<()>,
+}
+
+impl EntryCleanupCompletion {
+    fn proven() -> Self {
+        Self {
+            terminal: CleanupTerminal::Proven,
+            result: Ok(()),
+        }
+    }
+
+    fn from_process(completion: ProcessCleanupCompletion) -> Self {
+        let message = completion
+            .error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let terminal = match completion.disposition {
+            ProcessCleanupDisposition::Proven => CleanupTerminal::Proven,
+            ProcessCleanupDisposition::OsResidual => {
+                CleanupTerminal::OsResidual(completion.os_residual.clone().unwrap_or(message))
+            }
+            ProcessCleanupDisposition::InvariantFailure => CleanupTerminal::InvariantFailure {
+                message: completion.invariant.clone().unwrap_or(message),
+                os_residual: completion.os_residual.clone(),
+            },
+        };
+        Self {
+            terminal,
+            result: completion.into_result(),
+        }
+    }
+
+    fn from_outcome(outcome: CleanupOutcome) -> Self {
+        match outcome {
+            CleanupOutcome::Pending => Self {
+                terminal: CleanupTerminal::InvariantFailure {
+                    message: "cleanup receipt remained pending after observation".into(),
+                    os_residual: None,
+                },
+                result: Err(Error::PoolPoisoned),
+            },
+            CleanupOutcome::Terminal(terminal, error) => {
+                let result = CleanupOutcome::Terminal(terminal.clone(), error).into_result();
+                Self { terminal, result }
+            }
+        }
+    }
 }
 
 impl CleanupOutcome {
+    fn from_process(completion: ProcessCleanupCompletion) -> Self {
+        let entry = EntryCleanupCompletion::from_process(completion);
+        Self::Terminal(entry.terminal, entry.result.err())
+    }
+
+    fn proven() -> Self {
+        Self::Terminal(CleanupTerminal::Proven, None)
+    }
+
+    fn invariant(message: impl Into<String>, os_residual: Option<String>) -> Self {
+        let error = match os_residual.as_ref() {
+            Some(residual) => Error::OperationWithCleanupFailure {
+                original: Box::new(Error::PoolPoisoned),
+                cleanup: Box::new(Error::ChildTerminationFailed(residual.clone())),
+            },
+            None => Error::PoolPoisoned,
+        };
+        Self::Terminal(
+            CleanupTerminal::InvariantFailure {
+                message: message.into(),
+                os_residual,
+            },
+            Some(error),
+        )
+    }
+
     fn into_result(self) -> Result<()> {
         match self {
             Self::Pending => Err(Error::Protocol(
                 "LSP cleanup receipt observed before completion".into(),
             )),
-            Self::Proven => Ok(()),
-            Self::Unproven(message) => Err(Error::ChildTerminationFailed(message)),
+            Self::Terminal(_, Some(error)) => Err(error),
+            Self::Terminal(CleanupTerminal::Proven, None) => Ok(()),
+            Self::Terminal(CleanupTerminal::OsResidual(message), None) => {
+                Err(Error::ChildTerminationFailed(message))
+            }
+            Self::Terminal(CleanupTerminal::InvariantFailure { os_residual, .. }, None) => {
+                Self::invariant("cleanup invariant", os_residual).into_result()
+            }
         }
+    }
+}
+
+fn cleanup_os_residual(outcome: &CleanupOutcome) -> Option<String> {
+    match outcome {
+        CleanupOutcome::Terminal(CleanupTerminal::OsResidual(message), _) => Some(message.clone()),
+        CleanupOutcome::Terminal(CleanupTerminal::InvariantFailure { os_residual, .. }, _) => {
+            os_residual.clone()
+        }
+        CleanupOutcome::Pending | CleanupOutcome::Terminal(CleanupTerminal::Proven, _) => None,
+    }
+}
+
+fn add_cleanup_invariant(outcome: CleanupOutcome, message: impl Into<String>) -> CleanupOutcome {
+    let message = message.into();
+    let os_residual = cleanup_os_residual(&outcome);
+    let (message, prior_error) = match outcome {
+        CleanupOutcome::Terminal(
+            CleanupTerminal::InvariantFailure { message: prior, .. },
+            error,
+        ) => (format!("{prior}; {message}"), error),
+        CleanupOutcome::Terminal(_, error) => (message, error),
+        CleanupOutcome::Pending => (message, None),
+    };
+    let error = compose_cleanup_invariant_error(prior_error, os_residual.as_deref());
+    CleanupOutcome::Terminal(
+        CleanupTerminal::InvariantFailure {
+            message,
+            os_residual,
+        },
+        Some(error),
+    )
+}
+
+fn compose_cleanup_invariant_error(prior_error: Option<Error>, os_residual: Option<&str>) -> Error {
+    let Some(os_residual) = os_residual else {
+        return match prior_error {
+            Some(prior) => Error::OperationWithCleanupFailure {
+                original: Box::new(prior),
+                cleanup: Box::new(Error::PoolPoisoned),
+            },
+            None => Error::PoolPoisoned,
+        };
+    };
+
+    match prior_error {
+        Some(Error::ChildTerminationFailed(message)) => Error::OperationWithCleanupFailure {
+            original: Box::new(Error::PoolPoisoned),
+            cleanup: Box::new(Error::ChildTerminationFailed(message)),
+        },
+        Some(Error::OperationWithCleanupFailure { original, cleanup })
+            if cleanup.is_termination_unproven() =>
+        {
+            Error::OperationWithCleanupFailure {
+                original: Box::new(Error::OperationWithCleanupFailure {
+                    original,
+                    cleanup: Box::new(Error::PoolPoisoned),
+                }),
+                cleanup,
+            }
+        }
+        Some(prior) => Error::OperationWithCleanupFailure {
+            original: Box::new(Error::OperationWithCleanupFailure {
+                original: Box::new(prior),
+                cleanup: Box::new(Error::PoolPoisoned),
+            }),
+            cleanup: Box::new(Error::ChildTerminationFailed(os_residual.to_owned())),
+        },
+        None => Error::OperationWithCleanupFailure {
+            original: Box::new(Error::PoolPoisoned),
+            cleanup: Box::new(Error::ChildTerminationFailed(os_residual.to_owned())),
+        },
     }
 }
 
 struct CleanupTask {
     epoch: u64,
+    sender: watch::Sender<CleanupOutcome>,
     receipt: watch::Receiver<CleanupOutcome>,
+    tracking_invariants: Arc<StdMutex<Vec<String>>>,
+}
+
+fn record_cleanup_tracking_invariant(
+    tracking_invariants: &Arc<StdMutex<Vec<String>>>,
+    message: impl Into<String>,
+) -> Result<()> {
+    tracking_invariants
+        .lock()
+        .map_err(|_| Error::PoolPoisoned)?
+        .push(message.into());
+    Ok(())
+}
+
+fn apply_cleanup_tracking_invariants(
+    mut outcome: CleanupOutcome,
+    tracking_invariants: &Arc<StdMutex<Vec<String>>>,
+) -> CleanupOutcome {
+    let messages = match tracking_invariants.lock() {
+        Ok(mut messages) => std::mem::take(&mut *messages),
+        Err(_) => vec!["LSP cleanup tracking-facts mutex poisoned".into()],
+    };
+    for message in messages {
+        outcome = add_cleanup_invariant(outcome, message);
+    }
+    outcome
 }
 
 struct CleanupAdmission {
@@ -1539,16 +1873,15 @@ impl CleanupAdmission {
             return Ok(Some(Self { registry: None }));
         };
         {
-            let mut state = registry
-                .lock()
-                .map_err(|_| Error::ChildTerminationFailed("LSP pool registry poisoned".into()))?;
+            let mut state = registry.lock().map_err(|_| Error::PoolPoisoned)?;
             if state.cleanup_admissions_closed {
                 return Ok(None);
             }
-            state.active_cleanup_admissions = state
-                .active_cleanup_admissions
-                .checked_add(1)
-                .ok_or_else(|| Error::Protocol("LSP cleanup admission overflow".into()))?;
+            let Some(next) = state.active_cleanup_admissions.checked_add(1) else {
+                state.mode = PoolMode::Halted;
+                return Err(Error::PoolPoisoned);
+            };
+            state.active_cleanup_admissions = next;
         }
         Ok(Some(Self {
             registry: Some(registry),
@@ -1558,10 +1891,22 @@ impl CleanupAdmission {
 
 impl Drop for CleanupAdmission {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.as_ref()
-            && let Ok(mut state) = registry.lock()
-        {
-            state.active_cleanup_admissions = state.active_cleanup_admissions.saturating_sub(1);
+        if let Some(registry) = self.registry.as_ref() {
+            let mut state = match registry.lock() {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    if state.mode != PoolMode::Stopped {
+                        state.mode = PoolMode::Halted;
+                    }
+                    state
+                }
+            };
+            match state.active_cleanup_admissions.checked_sub(1) {
+                Some(next) => state.active_cleanup_admissions = next,
+                None if state.mode != PoolMode::Stopped => state.mode = PoolMode::Halted,
+                None => {}
+            }
         }
     }
 }
@@ -1643,32 +1988,48 @@ impl Drop for UncommittedExitGuard {
             return;
         }
         if let Err(error) = self.entry.request_cleanup(false, Some(self.epoch)) {
-            self.entry.poison_registry(&error.to_string());
+            self.entry.halt_registry(&error.to_string());
         }
     }
 }
 
 async fn observe_cleanup(mut receipt: watch::Receiver<CleanupOutcome>) -> Result<()> {
+    observe_cleanup_terminal(&mut receipt).await.into_result()
+}
+
+async fn observe_cleanup_terminal(receipt: &mut watch::Receiver<CleanupOutcome>) -> CleanupOutcome {
     loop {
         let outcome = receipt.borrow().clone();
         if outcome != CleanupOutcome::Pending {
-            return outcome.into_result();
+            return outcome;
         }
         if receipt.changed().await.is_err() {
-            return Err(Error::ChildTerminationFailed(
-                "LSP cleanup receipt disconnected before completion".into(),
-            ));
+            return CleanupOutcome::invariant(
+                "LSP cleanup receipt disconnected before completion",
+                None,
+            );
         }
     }
 }
 
+async fn observe_cleanup_bounded_outcome(
+    mut receipt: watch::Receiver<CleanupOutcome>,
+    entry_timeout: Duration,
+) -> CleanupOutcome {
+    match timeout(entry_timeout, observe_cleanup_terminal(&mut receipt)).await {
+        Ok(outcome) => outcome,
+        Err(_) => CleanupOutcome::Pending,
+    }
+}
+
+#[cfg(test)]
 async fn observe_cleanup_bounded(
     receipt: watch::Receiver<CleanupOutcome>,
     entry_timeout: Duration,
 ) -> Result<()> {
-    match timeout(entry_timeout, observe_cleanup(receipt)).await {
-        Ok(result) => result,
-        Err(_) => Err(bounded_shutdown_timeout_error(entry_timeout)),
+    match observe_cleanup_bounded_outcome(receipt, entry_timeout).await {
+        CleanupOutcome::Pending => Err(bounded_shutdown_timeout_error(entry_timeout)),
+        outcome => outcome.into_result(),
     }
 }
 
@@ -1752,10 +2113,13 @@ impl PoolEntry {
         self: &Arc<Self>,
         control: LspProcessControl,
     ) -> Result<UncommittedExitGuard> {
-        let mut slot = self
-            .process_control
-            .lock()
-            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+        let mut slot = match self.process_control.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                self.halt_registry("lsp process-control slot poisoned during install");
+                return Err(Error::PoolPoisoned);
+            }
+        };
         if slot.stopping {
             return Err(Error::PoolStopped);
         }
@@ -1766,23 +2130,31 @@ impl PoolEntry {
         if let Some(prior_cleanup) = prior_cleanup {
             match prior_cleanup {
                 CleanupOutcome::Pending => return Err(Error::PoolDraining),
-                CleanupOutcome::Unproven(message) => {
-                    return Err(Error::ChildTerminationFailed(message));
+                CleanupOutcome::Terminal(CleanupTerminal::InvariantFailure { .. }, _) => {
+                    drop(slot);
+                    self.halt_registry("prior cleanup ended with an internal invariant failure");
+                    return Err(Error::PoolPoisoned);
                 }
-                CleanupOutcome::Proven => {
+                CleanupOutcome::Terminal(
+                    CleanupTerminal::Proven | CleanupTerminal::OsResidual(_),
+                    _,
+                ) => {
                     slot.control = None;
                     slot.cleanup = None;
                 }
             }
         }
         if slot.control.is_some() {
-            return Err(Error::PoolDraining);
+            drop(slot);
+            self.halt_registry("duplicate LSP process-control ownership");
+            return Err(Error::PoolPoisoned);
         }
-        slot.epoch = slot
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| Error::Protocol("lsp process-control epoch overflow".into()))?;
-        let epoch = slot.epoch;
+        let Some(epoch) = slot.epoch.checked_add(1) else {
+            drop(slot);
+            self.halt_registry("lsp process-control epoch overflow");
+            return Err(Error::PoolPoisoned);
+        };
+        slot.epoch = epoch;
         slot.control = Some(control);
         Ok(UncommittedExitGuard {
             entry: Arc::clone(self),
@@ -1799,10 +2171,20 @@ impl PoolEntry {
         final_stop: bool,
         expected_epoch: Option<u64>,
     ) -> Result<Option<watch::Receiver<CleanupOutcome>>> {
-        let admission = CleanupAdmission::begin(&self.registry)?;
-        let mut slot = self.process_control.lock().map_err(|_| {
-            Error::ChildTerminationFailed("LSP process-control slot poisoned".into())
-        })?;
+        let (admission, mut tracking_invariant) = match CleanupAdmission::begin(&self.registry) {
+            Ok(admission) => (admission, None),
+            Err(error) => (
+                None,
+                Some(format!("LSP cleanup admission bookkeeping failed: {error}")),
+            ),
+        };
+        let mut slot = match self.process_control.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                self.halt_registry("lsp process-control slot poisoned during cleanup request");
+                return Err(Error::PoolPoisoned);
+            }
+        };
         if final_stop {
             slot.stopping = true;
         }
@@ -1813,19 +2195,37 @@ impl PoolEntry {
         if let Some(cleanup) = slot.cleanup.as_ref()
             && cleanup.epoch == epoch
         {
+            if let Some(message) = tracking_invariant {
+                record_cleanup_tracking_invariant(&cleanup.tracking_invariants, message)?;
+                let current = cleanup.receipt.borrow().clone();
+                if !matches!(current, CleanupOutcome::Pending) {
+                    let current =
+                        apply_cleanup_tracking_invariants(current, &cleanup.tracking_invariants);
+                    cleanup.sender.send_replace(current);
+                }
+            }
             return Ok(Some(cleanup.receipt.clone()));
         }
-        let Some(_admission) = admission else {
+        if admission.is_none() && tracking_invariant.is_none() {
             return Err(Error::PoolStopped);
-        };
+        }
+        let _admission = admission;
 
         let (sender, receiver) = watch::channel(CleanupOutcome::Pending);
+        let tracking_invariants = Arc::new(StdMutex::new(Vec::new()));
+        if let Some(message) = tracking_invariant.take() {
+            record_cleanup_tracking_invariant(&tracking_invariants, message)?;
+        }
         slot.cleanup = Some(CleanupTask {
             epoch,
+            sender: sender.clone(),
             receipt: receiver.clone(),
+            tracking_invariants: Arc::clone(&tracking_invariants),
         });
         let Some(control) = slot.control.clone() else {
-            sender.send_replace(CleanupOutcome::Proven);
+            let outcome =
+                apply_cleanup_tracking_invariants(CleanupOutcome::proven(), &tracking_invariants);
+            sender.send_replace(outcome);
             return Ok(Some(receiver));
         };
         drop(slot);
@@ -1839,9 +2239,28 @@ impl PoolEntry {
                         registry.outstanding_cleanups.insert(id, receiver.clone());
                         Some(id)
                     }
-                    None => None,
+                    None => {
+                        if registry.mode != PoolMode::Stopped {
+                            registry.mode = PoolMode::Halted;
+                        }
+                        record_cleanup_tracking_invariant(
+                            &tracking_invariants,
+                            "LSP cleanup id overflow",
+                        )?;
+                        None
+                    }
                 },
-                Err(_) => None,
+                Err(poisoned) => {
+                    let mut registry = poisoned.into_inner();
+                    if registry.mode != PoolMode::Stopped {
+                        registry.mode = PoolMode::Halted;
+                    }
+                    record_cleanup_tracking_invariant(
+                        &tracking_invariants,
+                        "LSP pool registry mutex poisoned",
+                    )?;
+                    None
+                }
             }
         } else {
             None
@@ -1852,35 +2271,68 @@ impl PoolEntry {
         let self_ref = self.self_ref.clone();
         let key = self.key.clone();
         let task = async move {
-            let outcome = match AssertUnwindSafe(control.stop_and_terminate())
+            let mut outcome = match AssertUnwindSafe(control.stop_and_terminate_completion())
                 .catch_unwind()
                 .await
             {
-                Ok(Ok(())) => CleanupOutcome::Proven,
-                Ok(Err(error)) => CleanupOutcome::Unproven(error.to_string()),
-                Err(_) => CleanupOutcome::Unproven("LSP cleanup task panicked".into()),
+                Ok(completion) => CleanupOutcome::from_process(completion),
+                Err(_) => CleanupOutcome::invariant("LSP cleanup task panicked", None),
             };
-
-            if let Ok(mut slot) = process_control.lock()
-                && slot.epoch == epoch
-            {
-                if outcome == CleanupOutcome::Proven {
-                    slot.control = None;
+            match process_control.lock() {
+                Ok(mut slot) if slot.epoch == epoch => {
+                    if matches!(
+                        &outcome,
+                        CleanupOutcome::Terminal(
+                            CleanupTerminal::Proven | CleanupTerminal::OsResidual(_),
+                            _,
+                        )
+                    ) {
+                        slot.control = None;
+                    }
+                }
+                Ok(_) => {
+                    outcome =
+                        add_cleanup_invariant(outcome, "LSP cleanup epoch changed before finalize");
+                }
+                Err(_) => {
+                    outcome = add_cleanup_invariant(
+                        outcome,
+                        "LSP process-control slot poisoned during cleanup finalize",
+                    );
                 }
             }
-            sender.send_replace(outcome.clone());
 
             let Some(registry) = registry.upgrade() else {
+                sender.send_replace(apply_cleanup_tracking_invariants(
+                    outcome,
+                    &tracking_invariants,
+                ));
                 return;
             };
             let Ok(mut registry) = registry.lock() else {
+                outcome = add_cleanup_invariant(
+                    outcome,
+                    "LSP pool registry mutex poisoned during cleanup finalize",
+                );
+                sender.send_replace(apply_cleanup_tracking_invariants(
+                    outcome,
+                    &tracking_invariants,
+                ));
                 return;
             };
             if let Some(cleanup_id) = cleanup_id {
-                registry.outstanding_cleanups.remove(&cleanup_id);
+                if registry.outstanding_cleanups.remove(&cleanup_id).is_none() {
+                    outcome = add_cleanup_invariant(
+                        outcome,
+                        format!("LSP cleanup receipt custody lost for id {cleanup_id}"),
+                    );
+                }
             }
-            match outcome {
-                CleanupOutcome::Proven => {
+            match &outcome {
+                CleanupOutcome::Terminal(
+                    CleanupTerminal::Proven | CleanupTerminal::OsResidual(_),
+                    _,
+                ) => {
                     if let (Some(key), Some(entry)) = (key, self_ref.upgrade()) {
                         let release = registry.entries.get(&key).is_some_and(|record| {
                             record.state == RecordState::Evicting
@@ -1889,16 +2341,35 @@ impl PoolEntry {
                         if release {
                             registry.entries.remove(&key);
                         }
+                        for entries in registry.draining_entries.values_mut() {
+                            entries.retain(|candidate| !Arc::ptr_eq(candidate, &entry));
+                        }
+                        registry
+                            .draining_entries
+                            .retain(|_, entries| !entries.is_empty());
+                        // The published-drain owner is the sole authority for
+                        // `Draining -> Running`. Entry-local completion may
+                        // release exact custody, but must not reopen admission
+                        // while `force_shutdown_all` is still aggregating.
+                    }
+                    if let CleanupOutcome::Terminal(CleanupTerminal::OsResidual(message), _) =
+                        &outcome
+                    {
+                        warn!(%message, "lsp pool: cleanup completed with OS residual; admission continues");
                     }
                 }
-                CleanupOutcome::Unproven(message) => {
+                CleanupOutcome::Terminal(CleanupTerminal::InvariantFailure { message, .. }, _) => {
                     if registry.mode != PoolMode::Stopped {
-                        warn!(%message, "lsp pool: background cleanup unproven; poisoning pool");
-                        registry.mode = PoolMode::Poisoned;
+                        warn!(%message, "lsp pool: cleanup invariant failure; halting pool");
+                        registry.mode = PoolMode::Halted;
                     }
                 }
                 CleanupOutcome::Pending => {}
             }
+            sender.send_replace(apply_cleanup_tracking_invariants(
+                outcome,
+                &tracking_invariants,
+            ));
         };
 
         let spawn_result = Handle::try_current().map_err(|_| ()).and_then(|handle| {
@@ -1910,13 +2381,15 @@ impl PoolEntry {
             // spawning fails. Rebuild a terminal receipt in the slot so future
             // installs remain fail-closed.
             let (_terminal_sender, terminal_receiver) =
-                watch::channel(CleanupOutcome::Unproven(message.clone()));
+                watch::channel(CleanupOutcome::invariant(message.clone(), None));
             if let Ok(mut slot) = self.process_control.lock()
                 && slot.epoch == epoch
             {
                 slot.cleanup = Some(CleanupTask {
                     epoch,
+                    sender: _terminal_sender,
                     receipt: terminal_receiver.clone(),
+                    tracking_invariants: Arc::new(StdMutex::new(Vec::new())),
                 });
             }
             if let Some(registry) = self.registry.upgrade()
@@ -1925,13 +2398,13 @@ impl PoolEntry {
             {
                 registry.outstanding_cleanups.remove(&cleanup_id);
             }
-            self.poison_registry(&message);
+            self.halt_registry(&message);
             return Ok(Some(terminal_receiver));
         }
         Ok(Some(receiver))
     }
 
-    fn poison_registry(&self, message: &str) {
+    fn halt_registry(&self, message: &str) {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
@@ -1939,8 +2412,8 @@ impl PoolEntry {
             return;
         };
         if registry.mode != PoolMode::Stopped {
-            warn!(%message, "lsp pool: cleanup scheduling failed; poisoning pool");
-            registry.mode = PoolMode::Poisoned;
+            warn!(%message, "lsp pool: internal cleanup invariant failed; halting pool");
+            registry.mode = PoolMode::Halted;
         }
     }
 
@@ -2027,9 +2500,9 @@ impl PoolEntry {
         // force-terminate the child; `opened_documents` is cleared
         // so the respawn starts from `didOpen` instead of
         // `didChange` against a document the new server never saw.
-        // If the cleanup itself cannot prove the child terminated,
-        // surface both errors via `OperationWithCleanupFailure` so
-        // the central `with_lsp` poison path fires.
+        // If cleanup reports an OS residual, surface both errors via
+        // `OperationWithCleanupFailure`; the private cleanup disposition, not
+        // this public error shape, independently decides pool admission.
         if matches!(
             result,
             Err(super::Error::ServerExited(_)) | Err(super::Error::ServerExitedWithStderr { .. })
@@ -2058,21 +2531,56 @@ impl PoolEntry {
     /// data-plane mutex, so an in-flight pass completes first. `Ok(())` means
     /// either no client was installed or `LspClient::shutdown` reaped the child
     /// — callers treat it as termination-proven.
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self) -> EntryCleanupCompletion {
         let _shutdown_guard = self.shutdown_gate.lock().await;
         let mut state = self.state.lock().await;
         state.opened_documents.clear();
-        let result = match state.client.take() {
-            Some(client) => client.shutdown().await,
-            None => Ok(()),
+        let completion = match state.client.take() {
+            Some(client) => {
+                EntryCleanupCompletion::from_process(client.shutdown_completion().await)
+            }
+            None => match self.request_cleanup(false, None) {
+                Ok(Some(mut receipt)) => EntryCleanupCompletion::from_outcome(
+                    observe_cleanup_terminal(&mut receipt).await,
+                ),
+                Ok(None) => EntryCleanupCompletion::proven(),
+                Err(error) => EntryCleanupCompletion {
+                    terminal: CleanupTerminal::InvariantFailure {
+                        message: error.to_string(),
+                        os_residual: None,
+                    },
+                    result: Err(error),
+                },
+            },
         };
-        if !result
-            .as_ref()
-            .is_err_and(|error| error.is_termination_unproven())
+        if matches!(
+            completion.terminal,
+            CleanupTerminal::Proven | CleanupTerminal::OsResidual(_)
+        ) && let Err(error) = self.clear_process_control()
         {
-            self.clear_process_control()?;
+            self.halt_registry(&error.to_string());
+            let result = match completion.result {
+                Ok(()) => Err(Error::PoolPoisoned),
+                Err(prior) => Err(Error::OperationWithCleanupFailure {
+                    original: Box::new(prior),
+                    cleanup: Box::new(Error::PoolPoisoned),
+                }),
+            };
+            return EntryCleanupCompletion {
+                terminal: CleanupTerminal::InvariantFailure {
+                    message: error.to_string(),
+                    os_residual: match completion.terminal {
+                        CleanupTerminal::OsResidual(ref message) => Some(message.clone()),
+                        CleanupTerminal::InvariantFailure {
+                            ref os_residual, ..
+                        } => os_residual.clone(),
+                        CleanupTerminal::Proven => None,
+                    },
+                },
+                result,
+            };
         }
-        result
+        completion
     }
 
     /// Bounded entry shutdown that never waits for the data-plane state mutex.
@@ -2087,13 +2595,31 @@ impl PoolEntry {
     ///
     /// This method owns the sole per-entry timeout classification for process
     /// termination; callers must not wrap it in a second timeout.
+    #[cfg(test)]
     async fn shutdown_bounded(&self, entry_timeout: Duration) -> Result<()> {
-        let Some(receipt) = self.request_cleanup(true, None)? else {
-            return Ok(());
+        match self.shutdown_bounded_outcome(entry_timeout).await {
+            CleanupOutcome::Pending => Err(bounded_shutdown_timeout_error(entry_timeout)),
+            outcome => outcome.into_result(),
+        }
+    }
+
+    async fn shutdown_bounded_outcome(&self, entry_timeout: Duration) -> CleanupOutcome {
+        let receipt = match self.request_cleanup(true, None) {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => return CleanupOutcome::proven(),
+            Err(error) => {
+                return CleanupOutcome::Terminal(
+                    CleanupTerminal::InvariantFailure {
+                        message: error.to_string(),
+                        os_residual: None,
+                    },
+                    Some(error),
+                );
+            }
         };
         // The timeout bounds observation only. `request_cleanup` transferred
         // kill/wait into a pool-runtime task which continues to completion.
-        observe_cleanup_bounded(receipt, entry_timeout).await
+        observe_cleanup_bounded_outcome(receipt, entry_timeout).await
     }
 
     /// Drop the control handle after the child is known terminated
@@ -2101,12 +2627,12 @@ impl PoolEntry {
     /// untouched — the spawn veto is permanent for this entry.
     ///
     /// # Errors
-    /// A protocol error when the slot mutex is poisoned.
+    /// [`Error::PoolPoisoned`] when the slot mutex is poisoned.
     fn clear_process_control(&self) -> Result<()> {
         let mut slot = self
             .process_control
             .lock()
-            .map_err(|_| Error::Protocol("lsp process-control slot poisoned".into()))?;
+            .map_err(|_| Error::PoolPoisoned)?;
         let cleanup_pending = slot
             .cleanup
             .as_ref()
