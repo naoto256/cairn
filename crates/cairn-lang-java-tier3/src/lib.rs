@@ -640,6 +640,16 @@ class Main extends Base implements Runnable {
             .map(|_| PathBuf::from("python3"))
     }
 
+    fn initialize_test_process_owner() {
+        static OWNER_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        OWNER_ROOT.get_or_init(|| {
+            let root = tempfile::tempdir().expect("create test LSP owner root");
+            cairn_core::lsp::initialize_daemon_process_owner(root.path())
+                .expect("initialize test LSP process ownership");
+            root
+        });
+    }
+
     fn run_mock_lsp_pass(
         python: &Path,
         repo_root: &Path,
@@ -648,6 +658,7 @@ class Main extends Base implements Runnable {
         ref_kind: RefKind,
         collect: fn(&[u8]) -> Result<Vec<DefinitionSite>>,
     ) -> WorkspaceFacts {
+        initialize_test_process_owner();
         let script = repo_root.join("mock_lsp.py");
         fs::write(&script, mock_lsp_script()).unwrap();
         let target_uri = Url::from_file_path(target).unwrap().as_str().to_string();

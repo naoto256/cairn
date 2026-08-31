@@ -849,11 +849,15 @@ mod linux {
             let listing = collect_numeric_pids([
                 Ok(OsString::from("123")),
                 Ok(OsString::from("not-a-pid")),
-                Err(io::Error::from_raw_os_error(libc::EACCES)),
+                Err(io::Error::from(io::ErrorKind::PermissionDenied)),
             ]);
             assert_eq!(listing.pids, vec![123]);
             assert_eq!(listing.residuals.len(), 1);
-            assert!(listing.residuals[0].contains("Permission denied"));
+            assert!(
+                listing.residuals[0]
+                    .to_ascii_lowercase()
+                    .contains("permission denied")
+            );
         }
 
         #[test]
@@ -863,14 +867,14 @@ mod linux {
                 _ => InspectFailure::Residual(format!("read status: {error}")),
             };
             assert!(matches!(
-                classify(io::Error::from_raw_os_error(libc::ENOENT)),
+                classify(io::Error::from(io::ErrorKind::NotFound)),
                 InspectFailure::Gone
             ));
-            for errno in [libc::EACCES, libc::EIO] {
-                assert!(matches!(
-                    classify(io::Error::from_raw_os_error(errno)),
-                    InspectFailure::Residual(_)
-                ));
+            for error in [
+                io::Error::from(io::ErrorKind::PermissionDenied),
+                io::Error::other("forced I/O error"),
+            ] {
+                assert!(matches!(classify(error), InspectFailure::Residual(_)));
             }
         }
 
