@@ -140,6 +140,10 @@ impl ControlMethod for Doctor {
             None,
         ));
 
+        checks.push(orphan_cleanup_check(
+            crate::lsp::orphan_cleanup_diagnostics(),
+        ));
+
         checks.extend(tier3_binary_checks());
 
         let cas_data_dir = ctx.cas_data_dir.clone();
@@ -225,6 +229,41 @@ fn doctor_check(
         detail,
         remediation,
     }
+}
+
+fn orphan_cleanup_check(orphan_cleanup: crate::lsp::SweepDiagnostics) -> DoctorCheck {
+    let status = if orphan_cleanup.residual_count == 0 {
+        DoctorStatus::Pass
+    } else {
+        DoctorStatus::Warn
+    };
+    let detail = if orphan_cleanup.initialized {
+        format!(
+            "last {} sweep: examined={}, matched={}, signalled={}, confirmed_execution_absent={}, remaining={}, residuals={}{}",
+            orphan_cleanup.last_scope.unwrap_or("unknown"),
+            orphan_cleanup.examined,
+            orphan_cleanup.matched,
+            orphan_cleanup.signalled,
+            orphan_cleanup.confirmed_execution_absent,
+            orphan_cleanup.remaining,
+            orphan_cleanup.residual_count,
+            if orphan_cleanup.matched == 0 {
+                ""
+            } else {
+                "; child markers can be inherited by helpers such as sccache"
+            }
+        )
+    } else {
+        "daemon-scoped LSP ownership has not been initialized in this process".into()
+    };
+    doctor_check(
+        "LSP orphan cleanup",
+        status,
+        Some(detail),
+        (orphan_cleanup.residual_count != 0).then(|| {
+            "Inspect daemon logs; residual marked processes may require manual cleanup.".into()
+        }),
+    )
 }
 
 fn workspace_analyzer_ids() -> Vec<&'static str> {
@@ -644,6 +683,25 @@ mod tests {
     use tokio::sync::Notify;
 
     const RUST_ANALYZER_ID: &str = "rust-analyzer-lsp";
+
+    #[test]
+    fn orphan_cleanup_check_warns_on_residual_without_blocking_admission() {
+        let check = orphan_cleanup_check(crate::lsp::SweepDiagnostics {
+            initialized: true,
+            last_scope: Some("runtime-family"),
+            examined: 8,
+            matched: 2,
+            signalled: 1,
+            confirmed_execution_absent: 0,
+            remaining: 1,
+            residual_count: 1,
+            residuals: vec!["permission denied".into()],
+        });
+
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.as_deref().unwrap().contains("residuals=1"));
+        assert!(check.remediation.is_some());
+    }
 
     #[test]
     fn missing_repo_path_check_includes_remediation() {

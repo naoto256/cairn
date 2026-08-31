@@ -221,6 +221,7 @@ async fn initialize_runtime(
     gate: Arc<StartupGate>,
 ) -> Result<()> {
     cas_data_dir.ensure()?;
+    cairn_core::lsp::initialize_daemon_process_owner(cas_data_dir.root())?;
     info!(root = %cas_data_dir.root().display(), "storage open");
     gate.advance(
         DaemonInitializationPhase::RepositoryLifecycle,

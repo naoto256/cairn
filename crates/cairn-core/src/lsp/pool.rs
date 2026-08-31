@@ -695,12 +695,16 @@ impl LspClientPool {
         // no replacement can spawn alongside a possibly-still-live
         // orphan. Same helper the LRU eviction path uses; both
         // preserve `Stopped`.
-        if let Err(ref e) = result
-            && e.is_termination_unproven()
-        {
-            self.poison_from_unproven_cleanup(&e.to_string());
+        if let Err(ref error) = result {
+            self.poison_if_termination_unproven(error);
         }
         result
+    }
+
+    fn poison_if_termination_unproven(&self, error: &Error) {
+        if error.is_termination_unproven() {
+            self.poison_from_unproven_cleanup(&error.to_string());
+        }
     }
 
     fn poison_from_unproven_cleanup(&self, context: &str) {
@@ -1952,7 +1956,7 @@ impl PoolEntry {
         let mut state = self.state.lock().await;
         if state.client.is_none() {
             check_lsp_available(&spec.binary, &spec.availability, spec.request_timeout).await?;
-            let client = LspClient::configured(
+            let client = LspClient::configured_for_pool(
                 &spec.binary,
                 spec.launch_args.clone(),
                 spec.env.clone(),
