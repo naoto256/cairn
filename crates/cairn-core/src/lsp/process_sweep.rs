@@ -39,7 +39,15 @@ pub(super) struct ProcessMarker {
     owner: Arc<str>,
     family: Arc<str>,
     #[cfg(test)]
-    backend: Option<Arc<dyn SweepBackend>>,
+    sweep: TestSweepAuthority,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum TestSweepAuthority {
+    Actual,
+    Empty,
+    Backend(Arc<dyn SweepBackend>),
 }
 
 impl ProcessMarker {
@@ -63,7 +71,7 @@ pub(super) struct ProcessOwnerContext {
     nonce_hex: String,
     next_spawn_seq: AtomicU64,
     #[cfg(test)]
-    backend: Option<Arc<dyn SweepBackend>>,
+    sweep: TestSweepAuthority,
 }
 
 impl ProcessOwnerContext {
@@ -73,7 +81,7 @@ impl ProcessOwnerContext {
             nonce_hex: hex::encode(nonce),
             next_spawn_seq: AtomicU64::new(0),
             #[cfg(test)]
-            backend: None,
+            sweep: TestSweepAuthority::Actual,
         }
     }
 
@@ -89,7 +97,7 @@ impl ProcessOwnerContext {
             owner: Arc::clone(&self.owner),
             family: Arc::from(format!("{FAMILY_PREFIX}{}:{sequence:016x}", self.nonce_hex)),
             #[cfg(test)]
-            backend: self.backend.clone(),
+            sweep: self.sweep.clone(),
         })
     }
 
@@ -106,12 +114,22 @@ impl ProcessOwnerContext {
     }
 
     #[cfg(test)]
+    pub(super) fn for_test_with_empty_sweep(
+        owner: &str,
+        nonce: [u8; STARTUP_NONCE_BYTES],
+    ) -> Arc<Self> {
+        let mut context = Self::new(owner.into(), nonce);
+        context.sweep = TestSweepAuthority::Empty;
+        Arc::new(context)
+    }
+
+    #[cfg(test)]
     pub(super) fn for_test_with_residual_sweep(
         owner: &str,
         nonce: [u8; STARTUP_NONCE_BYTES],
     ) -> Arc<Self> {
         let mut context = Self::new(owner.into(), nonce);
-        context.backend = Some(Arc::new(AlwaysResidualBackend));
+        context.sweep = TestSweepAuthority::Backend(Arc::new(AlwaysResidualBackend));
         Arc::new(context)
     }
 
@@ -132,6 +150,38 @@ impl ProcessOwnerContext {
     }
 
     #[cfg(test)]
+    pub(super) fn for_test_with_blocking_sweep(
+        owner: &str,
+        nonce: [u8; STARTUP_NONCE_BYTES],
+    ) -> (Arc<Self>, BlockingSweepControl) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut context = Self::new(owner.into(), nonce);
+        context.sweep = TestSweepAuthority::Backend(Arc::new(BlockingSweepBackend {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            blocked: std::sync::atomic::AtomicBool::new(false),
+        }));
+        (
+            Arc::new(context),
+            BlockingSweepControl {
+                started: started_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_panicking_sweep(
+        owner: &str,
+        nonce: [u8; STARTUP_NONCE_BYTES],
+    ) -> Arc<Self> {
+        let mut context = Self::new(owner.into(), nonce);
+        context.sweep = TestSweepAuthority::Backend(Arc::new(PanickingSweepBackend));
+        Arc::new(context)
+    }
+
+    #[cfg(test)]
     fn for_test_with_matching_backend(
         owner: &str,
         nonce: [u8; STARTUP_NONCE_BYTES],
@@ -139,12 +189,28 @@ impl ProcessOwnerContext {
     ) -> Arc<Self> {
         let mut context = Self::new(owner.into(), nonce);
         let family = format!("{FAMILY_PREFIX}{}:{:016x}", hex::encode(nonce), 1_u64);
-        context.backend = Some(Arc::new(MatchingInjectedBackend {
+        context.sweep = TestSweepAuthority::Backend(Arc::new(MatchingInjectedBackend {
             owner: owner.into(),
             family,
             kill,
         }));
         Arc::new(context)
+    }
+}
+
+#[cfg(test)]
+pub(super) struct BlockingSweepControl {
+    started: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl BlockingSweepControl {
+    pub(super) async fn started(self) -> std::sync::mpsc::Sender<()> {
+        self.started
+            .await
+            .expect("blocking sweep did not publish its start");
+        self.release
     }
 }
 
@@ -244,10 +310,14 @@ pub(super) fn sweep_family(marker: &ProcessMarker) {
         family: marker.family(),
     };
     #[cfg(test)]
-    let report = marker.backend.as_ref().map_or_else(
-        || run_sweep(matcher),
-        |backend| sweep_with_backend(backend.as_ref(), matcher),
-    );
+    let report = match &marker.sweep {
+        TestSweepAuthority::Actual => run_sweep(matcher),
+        TestSweepAuthority::Empty => SweepReport {
+            scope: matcher.scope(),
+            ..SweepReport::default()
+        },
+        TestSweepAuthority::Backend(backend) => sweep_with_backend(backend.as_ref(), matcher),
+    };
     #[cfg(not(test))]
     let report = run_sweep(matcher);
     record_report(&report, true);
@@ -483,6 +553,61 @@ impl SweepBackend for AlwaysResidualBackend {
 
     fn kill_exact(&self, _expected: &ProcessIdentity) -> std::result::Result<KillResult, String> {
         unreachable!("uninspectable process must not be signalled")
+    }
+}
+
+#[cfg(test)]
+struct BlockingSweepBackend {
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    blocked: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl SweepBackend for BlockingSweepBackend {
+    fn list_pids(&self) -> std::result::Result<PidListing, String> {
+        if !self.blocked.swap(true, Ordering::SeqCst) {
+            if let Some(started) = self
+                .started
+                .lock()
+                .map_err(|_| "blocking sweep start mutex poisoned")?
+                .take()
+            {
+                let _ = started.send(());
+            }
+            self.release
+                .lock()
+                .map_err(|_| "blocking sweep release mutex poisoned")?
+                .recv()
+                .map_err(|_| "blocking sweep release sender dropped")?;
+        }
+        Ok(PidListing::default())
+    }
+
+    fn inspect(&self, _pid: i32) -> std::result::Result<ProcessSnapshot, InspectFailure> {
+        unreachable!("empty blocking sweep listing must not inspect")
+    }
+
+    fn kill_exact(&self, _expected: &ProcessIdentity) -> std::result::Result<KillResult, String> {
+        unreachable!("empty blocking sweep listing must not signal")
+    }
+}
+
+#[cfg(test)]
+struct PanickingSweepBackend;
+
+#[cfg(test)]
+impl SweepBackend for PanickingSweepBackend {
+    fn list_pids(&self) -> std::result::Result<PidListing, String> {
+        panic!("test-injected blocking sweep panic")
+    }
+
+    fn inspect(&self, _pid: i32) -> std::result::Result<ProcessSnapshot, InspectFailure> {
+        unreachable!("panicking sweep must not inspect")
+    }
+
+    fn kill_exact(&self, _expected: &ProcessIdentity) -> std::result::Result<KillResult, String> {
+        unreachable!("panicking sweep must not signal")
     }
 }
 
