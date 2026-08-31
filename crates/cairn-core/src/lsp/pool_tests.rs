@@ -6,8 +6,9 @@ use tracing_subscriber::fmt::MakeWriter;
 
 #[cfg(unix)]
 use crate::lsp::client::{
-    classify_group_signal, finish_owned_child_cleanup, finish_owned_child_termination,
-    map_family_sweep_join, reject_unverified_child, validate_process_group_identity,
+    TEST_FAKE_LSP_ENV, classify_group_signal, finish_owned_child_cleanup,
+    finish_owned_child_termination, map_family_sweep_join, reject_unverified_child,
+    validate_process_group_identity,
 };
 #[cfg(unix)]
 use rustix::process::Pid;
@@ -561,72 +562,73 @@ fn idle_ttl_env_warnings_do_not_log_raw_values() {
 
 #[test]
 fn classify_force_shutdown_all_ok_yields_neither_flag() {
-    let results = vec![Ok(()), Ok(())];
-    let out = classify_force_shutdown_results(results);
-    assert!(!out.termination_unproven());
-    assert!(out.first_regular_err.is_none());
-    assert!(out.first_unproven_err.is_none());
-}
-
-#[test]
-fn classify_force_shutdown_actual_unproven_lands_in_unproven_slot() {
-    // A real `ChildTerminationFailed` from bounded entry cleanup lands in the
-    // unproven slot without a second timeout authority fabricating a cause.
-    let results = vec![Err(Error::ChildTerminationFailed("real".into()))];
-    let out = classify_force_shutdown_results(results);
-    assert!(out.termination_unproven());
-    assert!(out.first_regular_err.is_none());
-    match out.first_unproven_err {
-        Some(Error::ChildTerminationFailed(msg)) => assert_eq!(msg, "real"),
-        other => panic!("expected preserved ChildTerminationFailed, got {other:?}"),
-    }
-}
-
-#[test]
-fn classify_force_shutdown_non_unproven_err_only_flags_regular_slot() {
-    // A protocol failure whose child was still reaped is NOT a
-    // termination-unproven signal — mode stays Running / does
-    // not poison; downstream sees the protocol err only.
-    let results = vec![Err(Error::Protocol("proto".into()))];
-    let out = classify_force_shutdown_results(results);
-    assert!(!out.termination_unproven());
-    assert!(matches!(out.first_regular_err, Some(Error::Protocol(_))));
-    assert!(out.first_unproven_err.is_none());
-}
-
-#[test]
-fn classify_force_shutdown_mixed_regular_then_unproven_preserves_both() {
-    // Order 1: regular error first, then unproven. Both must be
-    // preserved in their respective slots — a naive single-slot
-    // `first_err` would silently drop the unproven cause.
     let results = vec![
-        Err(Error::Protocol("a".into())),
-        Err(Error::ChildTerminationFailed("b".into())),
+        CleanupOutcome::Terminal(CleanupTerminal::Proven, None),
+        CleanupOutcome::Terminal(CleanupTerminal::Proven, None),
     ];
-    let out = classify_force_shutdown_results(results);
-    assert!(out.termination_unproven());
-    assert!(matches!(out.first_regular_err, Some(Error::Protocol(_))));
-    assert!(matches!(
-        out.first_unproven_err,
-        Some(Error::ChildTerminationFailed(_))
-    ));
+    let out = classify_force_shutdown_results(&results);
+    assert!(out.first_os_residual.is_none());
+    assert!(out.first_invariant_failure.is_none());
+    assert!(!out.pending);
 }
 
 #[test]
-fn classify_force_shutdown_mixed_unproven_then_regular_preserves_both() {
-    // Order 2: unproven first, then regular. Symmetric — the
-    // classifier must not depend on order-of-arrival.
+fn classify_force_shutdown_preserves_os_residual_without_invariant() {
+    let results = vec![CleanupOutcome::Terminal(
+        CleanupTerminal::OsResidual("real".into()),
+        None,
+    )];
+    let out = classify_force_shutdown_results(&results);
+    assert_eq!(out.first_os_residual.as_deref(), Some("real"));
+    assert!(out.first_invariant_failure.is_none());
+    assert!(!out.pending);
+}
+
+#[test]
+fn classify_force_shutdown_preserves_invariant_failure() {
+    let results = vec![CleanupOutcome::Terminal(
+        CleanupTerminal::InvariantFailure {
+            message: "broken custody".into(),
+            os_residual: None,
+        },
+        None,
+    )];
+    let out = classify_force_shutdown_results(&results);
+    assert!(out.first_os_residual.is_none());
+    assert_eq!(
+        out.first_invariant_failure.as_deref(),
+        Some("broken custody")
+    );
+    assert!(!out.pending);
+}
+
+#[test]
+fn classify_force_shutdown_pending_is_distinct_from_terminal_facts() {
     let results = vec![
-        Err(Error::ChildTerminationFailed("b".into())),
-        Err(Error::Protocol("a".into())),
+        CleanupOutcome::Pending,
+        CleanupOutcome::Terminal(CleanupTerminal::Proven, None),
     ];
-    let out = classify_force_shutdown_results(results);
-    assert!(out.termination_unproven());
-    assert!(matches!(out.first_regular_err, Some(Error::Protocol(_))));
-    assert!(matches!(
-        out.first_unproven_err,
-        Some(Error::ChildTerminationFailed(_))
-    ));
+    let out = classify_force_shutdown_results(&results);
+    assert!(out.pending);
+    assert!(out.first_os_residual.is_none());
+    assert!(out.first_invariant_failure.is_none());
+}
+
+#[test]
+fn classify_force_shutdown_preserves_os_and_invariant_axes() {
+    let results = vec![
+        CleanupOutcome::Terminal(CleanupTerminal::OsResidual("os".into()), None),
+        CleanupOutcome::Terminal(
+            CleanupTerminal::InvariantFailure {
+                message: "inv".into(),
+                os_residual: None,
+            },
+            None,
+        ),
+    ];
+    let out = classify_force_shutdown_results(&results);
+    assert_eq!(out.first_os_residual.as_deref(), Some("os"));
+    assert_eq!(out.first_invariant_failure.as_deref(), Some("inv"));
 }
 
 #[test]
@@ -715,6 +717,39 @@ fn bounded_final_shutdown_bypasses_graceful_shutdown_gate() {
     assert_eq!(pool.mode(), PoolMode::Stopped);
 
     drop(gate);
+}
+
+#[test]
+fn bounded_final_shutdown_cleans_owned_control_after_registry_poison() {
+    let pool = pool(1);
+    let key = test_key(123);
+    drop(acquire(&pool, key.clone()).unwrap());
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let client = unstarted_client_for_cleanup();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    let registry = Arc::clone(&pool.registry);
+    assert!(
+        std::thread::spawn(move || {
+            let _registry = registry.lock().unwrap();
+            panic!("poison registry before final shutdown publication");
+        })
+        .join()
+        .is_err()
+    );
+
+    let error = pool
+        .shutdown_all_bounded(Duration::from_secs(1))
+        .expect_err("registry invariant remains caller-visible");
+
+    assert!(matches!(error, Error::PoolPoisoned));
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+    let mode = match pool.registry.lock() {
+        Ok(registry) => registry.mode,
+        Err(poisoned) => poisoned.into_inner().mode,
+    };
+    assert_eq!(mode, PoolMode::Stopped);
 }
 
 #[test]
@@ -873,7 +908,7 @@ fn published_drain_remains_visible_to_bounded_shutdown() {
     drop(acquire(&pool, test_key(32)).unwrap());
 
     let mut registry = pool.registry.lock().unwrap();
-    let drain = registry.publish_live_drain();
+    let drain = registry.publish_live_drain().unwrap();
     assert_eq!(drain.entries.len(), 2);
     assert!(
         registry.entries.is_empty(),
@@ -899,7 +934,7 @@ fn pool_poisoned_mode_permanently_rejects_acquire() {
     let pool = pool(2);
     {
         let mut reg = pool.registry.lock().unwrap();
-        reg.mode = PoolMode::Poisoned;
+        reg.mode = PoolMode::Halted;
     }
     let err = acquire(&pool, test_key(1)).unwrap_err();
     assert!(matches!(err, Error::PoolPoisoned));
@@ -1058,8 +1093,7 @@ fn client_initialize_failure_kills_child_before_returning() {
 /// - never sends `$/progress` (so `ProgressQuiescence` readiness
 ///   always times out — used to pin readiness cleanup)
 #[cfg(unix)]
-const FAKE_LSP_SCRIPT: &str = r#"#!/usr/bin/env python3
-import sys, os, json, subprocess
+const FAKE_LSP_SCRIPT: &str = r#"import sys, os, json, subprocess, fcntl, time
 
 spawn_count_file = os.environ.get("CAIRN_TEST_SPAWN_COUNT_FILE")
 spawn_ordinal = 0
@@ -1075,6 +1109,25 @@ if spawn_count_file:
         f.flush()
         os.fsync(f.fileno())
 fail_initialize_ordinal = int(os.environ.get("CAIRN_TEST_FAIL_INITIALIZE_ORDINAL", "-1"))
+
+initialize_state_file = os.environ.get("CAIRN_TEST_INITIALIZE_STATE_FILE")
+initialize_delay_ms = int(os.environ.get("CAIRN_TEST_INITIALIZE_DELAY_MS", "0"))
+def update_initialize_state(delta):
+    if not initialize_state_file:
+        return
+    with open(initialize_state_file, "a+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.seek(0)
+        raw = f.read().strip()
+        current, maximum = map(int, raw.split(",")) if raw else (0, 0)
+        current += delta
+        maximum = max(maximum, current)
+        f.seek(0)
+        f.truncate()
+        f.write("{},{}".format(current, maximum))
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 pid_file = os.environ.get("CAIRN_TEST_PID_FILE")
 if pid_file:
@@ -1137,6 +1190,12 @@ while True:
     if method:
         log_method(method)
     if method == "initialize" and spawn_ordinal != fail_initialize_ordinal:
+        update_initialize_state(1)
+        try:
+            if initialize_delay_ms:
+                time.sleep(initialize_delay_ms / 1000.0)
+        finally:
+            update_initialize_state(-1)
         write_message({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
     elif method == "shutdown" and os.environ.get("CAIRN_TEST_RESPOND_SHUTDOWN", "1") == "1":
         write_message({"jsonrpc": "2.0", "id": msg["id"], "result": None})
@@ -1157,7 +1216,8 @@ while True:
 #[cfg(unix)]
 struct FakeLspBinary {
     _dir: tempfile::TempDir,
-    path: PathBuf,
+    interpreter: PathBuf,
+    script_path: PathBuf,
     pid_file: PathBuf,
 }
 
@@ -1165,26 +1225,34 @@ struct FakeLspBinary {
 impl FakeLspBinary {
     fn new() -> Self {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake-lsp.py");
+        let script_path = dir.path().join("fake-lsp.py");
         let pid_file = dir.path().join("fake-lsp.pid");
-        fs::write(&path, FAKE_LSP_SCRIPT).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        fs::write(&script_path, FAKE_LSP_SCRIPT).unwrap();
         Self {
             _dir: dir,
-            path,
+            interpreter: stable_python_interpreter(),
+            script_path,
             pid_file,
         }
     }
 
+    fn binary(&self) -> &Path {
+        &self.interpreter
+    }
+
+    fn launch_args(&self) -> Vec<String> {
+        vec![self.script_path.to_string_lossy().into_owned()]
+    }
+
     fn env(&self) -> Vec<(String, String)> {
-        vec![(
-            "CAIRN_TEST_PID_FILE".into(),
-            self.pid_file.display().to_string(),
-        )]
+        vec![
+            (TEST_FAKE_LSP_ENV.into(), "1".into()),
+            (
+                "CAIRN_TEST_PID_FILE".into(),
+                self.pid_file.display().to_string(),
+            ),
+        ]
     }
 
     fn env_with_grandchild(&self, grandchild_pid_file: &Path) -> Vec<(String, String)> {
@@ -1202,6 +1270,16 @@ impl FakeLspBinary {
             "CAIRN_TEST_MARKER_FILE".into(),
             marker_file.display().to_string(),
         ));
+        env
+    }
+
+    fn env_with_initialize_probe(&self, state_file: &Path) -> Vec<(String, String)> {
+        let mut env = self.env();
+        env.push((
+            "CAIRN_TEST_INITIALIZE_STATE_FILE".into(),
+            state_file.display().to_string(),
+        ));
+        env.push(("CAIRN_TEST_INITIALIZE_DELAY_MS".into(), "250".into()));
         env
     }
 
@@ -1236,16 +1314,40 @@ impl FakeLspBinary {
 }
 
 #[cfg(unix)]
+fn stable_python_interpreter() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    static INTERPRETER: OnceLock<PathBuf> = OnceLock::new();
+    INTERPRETER
+        .get_or_init(|| {
+            let search_path =
+                std::env::var_os("PATH").expect("the fake LSP tests require python3 on PATH");
+            std::env::split_paths(&search_path)
+                .map(|directory| directory.join("python3"))
+                .find(|candidate| {
+                    std::fs::metadata(candidate)
+                        .map(|metadata| {
+                            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                        })
+                        .unwrap_or(false)
+                })
+                .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+                .expect("the fake LSP tests require an executable python3 on PATH")
+        })
+        .clone()
+}
+
+#[cfg(unix)]
 fn spawn_spec(fake: &FakeLspBinary, request_timeout: Duration) -> LspSpawnSpec {
     LspSpawnSpec {
-        binary: fake.path.clone(),
+        binary: fake.interpreter.clone(),
         workspace_root: PathBuf::from("/tmp"),
         config_hash: "test".into(),
         request_timeout,
         availability: AvailabilityStrategy::PathExistsExecutable,
         readiness: ReadinessStrategy::InitializeResponseOnly,
         language_id: "python",
-        launch_args: Vec::new(),
+        launch_args: fake.launch_args(),
         env: fake.env(),
         initialization_options: serde_json::json!({}),
     }
@@ -1281,12 +1383,12 @@ fn pooled_spawns_receive_unique_markers_while_standalone_spawn_remains_unmarked(
     let runtime = Runtime::new().unwrap();
     runtime.block_on(async {
         let pooled = LspClient::configured_for_pool_with_owner(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env_with_marker_log(&marker_file),
             Path::new("/tmp"),
             serde_json::json!({}),
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             owner,
         );
         pooled.start_process().await.unwrap();
@@ -1295,12 +1397,12 @@ fn pooled_spawns_receive_unique_markers_while_standalone_spawn_remains_unmarked(
         pooled.force_terminate().await.unwrap();
 
         let standalone = LspClient::configured(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env_with_marker_log(&marker_file),
             Path::new("/tmp"),
             serde_json::json!({}),
-            Duration::from_secs(3),
+            Duration::from_secs(10),
         );
         standalone.start_process().await.unwrap();
         standalone.force_terminate().await.unwrap();
@@ -1323,8 +1425,8 @@ fn pooled_spawns_receive_unique_markers_while_standalone_spawn_remains_unmarked(
 fn pooled_spawn_without_required_owner_context_starts_no_process() {
     let fake = FakeLspBinary::new();
     let client = LspClient::configured_for_pool_without_owner_for_test(
-        &fake.path,
-        Vec::new(),
+        fake.binary(),
+        fake.launch_args(),
         fake.env(),
         Path::new("/tmp"),
         serde_json::json!({}),
@@ -1349,8 +1451,8 @@ fn runtime_family_inspection_residual_is_diagnostic_and_allows_successor_admissi
     let fake = FakeLspBinary::new();
     let owner = ProcessOwnerContext::for_test_with_residual_sweep("owner", [8; 16]);
     let client = LspClient::configured_for_pool_with_owner(
-        &fake.path,
-        Vec::new(),
+        fake.binary(),
+        fake.launch_args(),
         fake.env(),
         Path::new("/tmp"),
         serde_json::json!({}),
@@ -1361,8 +1463,8 @@ fn runtime_family_inspection_residual_is_diagnostic_and_allows_successor_admissi
         client.start_process().await.unwrap();
         client.force_terminate().await.unwrap();
         let successor = LspClient::configured_for_pool_with_owner(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env(),
             Path::new("/tmp"),
             serde_json::json!({}),
@@ -1390,8 +1492,8 @@ fn runtime_family_kill_failure_and_persistent_identity_allow_successor_admission
     for (ordinal, owner) in owners.into_iter().enumerate() {
         let fake = FakeLspBinary::new();
         let client = LspClient::configured_for_pool_with_owner(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env(),
             Path::new("/tmp"),
             serde_json::json!({}),
@@ -1452,8 +1554,8 @@ fn runtime_family_sweep_runs_off_async_worker_after_leader_wait_and_before_clean
     let (owner, control) =
         ProcessOwnerContext::for_test_with_blocking_sweep("blocking-owner", [11; 16]);
     let client = LspClient::configured_for_pool_with_owner(
-        &fake.path,
-        Vec::new(),
+        fake.binary(),
+        fake.launch_args(),
         fake.env(),
         Path::new("/tmp"),
         serde_json::json!({}),
@@ -1508,8 +1610,8 @@ fn blocking_sweep_join_failures_are_not_silent_and_preserve_termination_facts() 
 
     let fake = FakeLspBinary::new();
     let client = LspClient::configured_for_pool_with_owner(
-        &fake.path,
-        Vec::new(),
+        fake.binary(),
+        fake.launch_args(),
         fake.env(),
         Path::new("/tmp"),
         serde_json::json!({}),
@@ -1548,9 +1650,56 @@ fn fake_pool_key(fake: &FakeLspBinary, n: u32) -> PoolKey {
         canonical_repo_root: PathBuf::from(format!("/tmp/pool-key-{n}")),
         language: "python".into(),
         analyzer_id: format!("fake-{n}"),
-        binary: fake.path.clone(),
+        binary: fake.interpreter.clone(),
         config_hash: "test".into(),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_initialize_admission_is_bounded_without_serializing_post_init_work() {
+    let fake = FakeLspBinary::new();
+    let initialize_state = fake.pid_file.with_file_name("initialize-state");
+    let pool = Arc::new(pool(8));
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let work = Arc::new(tokio::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+
+    for ordinal in 0..8_u32 {
+        let pool = Arc::clone(&pool);
+        let start = Arc::clone(&start);
+        let work = Arc::clone(&work);
+        let key = fake_pool_key(&fake, 300 + ordinal);
+        let spec = LspSpawnSpec {
+            env: fake.env_with_initialize_probe(&initialize_state),
+            ..spawn_spec(&fake, Duration::from_secs(3))
+        };
+        handles.push(std::thread::spawn(move || {
+            start.wait();
+            pool.with_lsp(key, spec, move |_lsp| {
+                let work = Arc::clone(&work);
+                Box::pin(async move {
+                    timeout(Duration::from_secs(3), work.wait())
+                        .await
+                        .expect("post-initialize work was serialized behind admission");
+                    Ok::<(), Error>(())
+                })
+            })
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    let state = std::fs::read_to_string(&initialize_state).unwrap();
+    let (current, maximum) = state.trim().split_once(',').unwrap();
+    assert_eq!(current.parse::<usize>().unwrap(), 0);
+    let maximum = maximum.parse::<usize>().unwrap();
+    assert!(
+        (1..=4).contains(&maximum),
+        "fake initialize concurrency escaped its four-permit admission: {maximum}"
+    );
+    pool.force_shutdown_all(Duration::from_secs(3)).unwrap();
 }
 
 #[cfg(unix)]
@@ -1569,6 +1718,45 @@ fn force_shutdown_all_with_active_entry_returns_running() {
     pool.force_shutdown_all(Duration::from_secs(3)).unwrap();
     assert_eq!(pool.mode(), PoolMode::Running);
     assert_eq!(pool.len(), 0);
+}
+
+#[test]
+fn force_timeout_stays_draining_until_published_owner_observes_terminal_cleanup() {
+    let pool = Arc::new(pool(1));
+    let key = test_key(122);
+    drop(acquire(&pool, key.clone()).unwrap());
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let client = unstarted_client_for_cleanup();
+    let (mut entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+
+    let force_pool = Arc::clone(&pool);
+    let force =
+        std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_millis(10)));
+    pool.runtime().block_on(async {
+        timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("cleanup task did not start")
+            .expect("cleanup entry signal disconnected");
+    });
+    let error = force
+        .join()
+        .unwrap()
+        .expect_err("observation must time out");
+    assert!(error.is_termination_unproven());
+    assert_eq!(
+        pool.mode(),
+        PoolMode::Draining,
+        "entry-local timeout/completion cannot reopen global admission"
+    );
+
+    release.send_replace(true);
+    assert!(
+        wait_for_mode(&pool, PoolMode::Running, Duration::from_secs(1)),
+        "published drain owner must reopen admission after terminal cleanup"
+    );
 }
 
 #[cfg(unix)]
@@ -1994,7 +2182,7 @@ fn force_shutdown_process_control_failure_poisons_and_rejects_replacement() {
         matches!(err, Error::PoolPoisoned),
         "unproven process-control failure must poison, got {err:?}"
     );
-    assert_eq!(pool.mode(), PoolMode::Poisoned);
+    assert_eq!(pool.mode(), PoolMode::Halted);
     assert!(matches!(acquire(&pool, key), Err(Error::PoolPoisoned)));
 }
 
@@ -2005,29 +2193,32 @@ fn stopped_force_shutdown_surfaces_unproven_cleanup_error() {
     let poisoned_key = test_key(44);
     drop(acquire(&pool, gated_key.clone()).unwrap());
     drop(acquire(&pool, poisoned_key.clone()).unwrap());
-    let (gated_entry, poisoned_entry) = {
+    let (gated_entry, residual_entry) = {
         let registry = pool.registry.lock().unwrap();
         (
             registry.entries[&gated_key].entry.clone(),
             registry.entries[&poisoned_key].entry.clone(),
         )
     };
-    // Test-only deterministic barrier: holding this slot keeps one entry's
-    // bounded cleanup pending while Stopped precedence is established.
-    // Production holders finish their short synchronous slot operation and
-    // release it before any await, so this synchronous hold has no production
-    // counterpart. The gate drops as soon as Stopped is observed; this test
-    // asserts evidence retention, not entry-timeout behaviour.
-    let process_gate = gated_entry.process_control.lock().unwrap();
-    let poison_entry = Arc::clone(&poisoned_entry);
-    assert!(
-        std::thread::spawn(move || {
-            let _slot = poison_entry.process_control.lock().unwrap();
-            panic!("poison one process-control slot for Stopped precedence");
-        })
-        .join()
-        .is_err()
-    );
+    // Purpose-specific carriers keep the axes independent: one cleanup pauses
+    // after Draining is published, while the other reports a typed OS
+    // residual. No mutex poison is involved in this Stopped-precedence test.
+    let gated_client = unstarted_client_for_cleanup();
+    let (_entered, release) = gated_client.pause_cleanup_for_test();
+    let mut gated_guard = gated_entry
+        .install_and_arm(gated_client.process_control())
+        .unwrap();
+    gated_guard.armed = false;
+    drop(gated_guard);
+    let residual_client = unstarted_client_for_cleanup();
+    residual_client
+        .process_control()
+        .force_os_residual_for_test("synthetic force-shutdown OS residual");
+    let mut residual_guard = residual_entry
+        .install_and_arm(residual_client.process_control())
+        .unwrap();
+    residual_guard.armed = false;
+    drop(residual_guard);
 
     let force_pool = Arc::clone(&pool);
     let force = std::thread::spawn(move || force_pool.force_shutdown_all(Duration::from_secs(2)));
@@ -2035,13 +2226,10 @@ fn stopped_force_shutdown_surfaces_unproven_cleanup_error() {
         wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
         "force shutdown must publish Draining before final shutdown"
     );
-    // Either poll order leaves the held slot blocking finalize, while the
-    // poisoned slot's termination-unproven result is aggregated by or after
-    // gate release.
     pool.shutdown_all()
         .expect("the already-published force batch leaves no graceful work");
     assert_eq!(pool.mode(), PoolMode::Stopped);
-    drop(process_gate);
+    release.send_replace(true);
 
     let err = force
         .join()
@@ -2112,8 +2300,8 @@ fn client_readiness_timeout_terminates_child_and_surfaces_both_errors() {
     let workspace = tempfile::tempdir().unwrap();
     rt.block_on(async {
         let client = LspClient::start_configured(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env(),
             workspace.path(),
             serde_json::json!({}),
@@ -2155,8 +2343,8 @@ fn client_force_terminate_on_live_client_kills_pid() {
     let workspace = tempfile::tempdir().unwrap();
     rt.block_on(async {
         let client = LspClient::start_configured(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env(),
             workspace.path(),
             serde_json::json!({}),
@@ -2232,8 +2420,8 @@ fn verified_process_group_kill_reaps_leader_and_terminates_grandchild() {
         env.push(("CAIRN_LSP_FAMILY".into(), "group-family".into()));
         env.push(("CAIRN_TEST_SCRUB_GRANDCHILD_MARKERS".into(), "1".into()));
         let client = LspClient::start_configured(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             env,
             workspace.path(),
             serde_json::json!({}),
@@ -2325,6 +2513,122 @@ fn cleanup_timeout_keeps_one_task_running_and_vetoes_replacement_until_proven() 
             .expect("late proof must release the epoch for replacement");
         replacement.armed = false;
     });
+}
+
+#[test]
+fn capacity_lru_joins_pending_uncommitted_cleanup_before_opening_slot() {
+    let pool = Arc::new(pool(1));
+    let victim_key = test_key(123);
+    let replacement_key = test_key(124);
+    let client = unstarted_client_for_cleanup();
+    let (mut entered, release) = client.pause_cleanup_for_test();
+
+    pool.runtime().block_on(async {
+        let lease = pool.acquire_lease(victim_key.clone()).await.unwrap();
+        let guard = lease
+            .entry
+            .install_and_arm(client.process_control())
+            .unwrap();
+        // The uncommitted guard owns the only cleanup request; `state.client`
+        // remains None throughout this carrier.
+        drop(guard);
+        drop(lease);
+        timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("uncommitted cleanup did not start")
+            .expect("cleanup entry signal disconnected");
+
+        let acquiring_pool = Arc::clone(&pool);
+        let acquire =
+            tokio::spawn(async move { acquiring_pool.acquire_lease(replacement_key).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!acquire.is_finished(), "LRU treated Pending as Proven");
+        {
+            let registry = pool.registry.lock().unwrap();
+            let victim = registry.entries.get(&victim_key).unwrap();
+            assert_eq!(victim.state, RecordState::Evicting);
+            assert_eq!(registry.entries.len(), 1, "replacement opened early");
+        }
+
+        release.send_replace(true);
+        let replacement = acquire
+            .await
+            .expect("replacement acquire task panicked")
+            .expect("replacement must acquire after exact terminal cleanup");
+        assert_eq!(client.cleanup_run_count_for_test(), 1);
+        drop(replacement);
+    });
+}
+
+#[test]
+fn cleanup_id_overflow_still_runs_owned_cleanup_and_halts_on_tracking_invariant() {
+    let pool = pool(1);
+    let key = test_key(120);
+    drop(acquire(&pool, key.clone()).unwrap());
+    let entry = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let client = unstarted_client_for_cleanup();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    pool.registry.lock().unwrap().next_cleanup_id = u64::MAX;
+
+    let error = pool.runtime().block_on(async {
+        let receipt = entry.request_cleanup(false, None).unwrap().unwrap();
+        observe_cleanup(receipt)
+            .await
+            .expect_err("tracking overflow is an invariant failure")
+    });
+
+    assert!(matches!(error, Error::PoolPoisoned));
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+    assert_eq!(pool.mode(), PoolMode::Halted);
+}
+
+#[test]
+fn late_cleanup_completion_does_not_remove_same_key_successor() {
+    let pool = pool(1);
+    let key = test_key(121);
+    drop(acquire(&pool, key.clone()).unwrap());
+    let victim = pool.registry.lock().unwrap().entries[&key].entry.clone();
+    let client = unstarted_client_for_cleanup();
+    let (mut entered, release) = client.pause_cleanup_for_test();
+    let mut guard = victim.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    pool.registry
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(&key)
+        .unwrap()
+        .state = RecordState::Evicting;
+    let receipt = pool.runtime().block_on(async {
+        let receipt = victim.request_cleanup(false, None).unwrap().unwrap();
+        timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("cleanup task did not start")
+            .expect("cleanup entry signal disconnected");
+        receipt
+    });
+
+    let successor = PoolEntry::new(key.clone(), &pool.registry);
+    pool.registry.lock().unwrap().entries.insert(
+        key.clone(),
+        PoolRecord {
+            entry: Arc::clone(&successor),
+            active_leases: 0,
+            last_used: 1,
+            last_used_at: Instant::now(),
+            state: RecordState::Ready,
+        },
+    );
+    release.send_replace(true);
+    pool.runtime().block_on(observe_cleanup(receipt)).unwrap();
+
+    let registry = pool.registry.lock().unwrap();
+    let current = registry.entries.get(&key).expect("successor must remain");
+    assert!(Arc::ptr_eq(&current.entry, &successor));
+    assert_eq!(current.state, RecordState::Ready);
 }
 
 #[test]
@@ -2422,6 +2726,157 @@ fn pool_drop_waits_for_outstanding_cleanup_before_runtime_teardown() {
     drop(pool);
     releaser.join().unwrap();
     assert_eq!(client.cleanup_run_count_for_test(), 1);
+}
+
+#[test]
+fn pool_drop_collects_untracked_overflow_receipt_before_runtime_teardown() {
+    let pool = pool(1);
+    let key = test_key(125);
+    let lease = pool.runtime().block_on(pool.acquire_lease(key)).unwrap();
+    let entry = Arc::clone(&lease.entry);
+    let client = unstarted_client_for_cleanup();
+    let (entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    drop(lease);
+    pool.registry.lock().unwrap().next_cleanup_id = u64::MAX;
+
+    let releaser = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !*entered.borrow() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(*entered.borrow(), "drop did not start overflow cleanup");
+        release.send_replace(true);
+    });
+    drop(pool);
+    releaser.join().unwrap();
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+}
+
+#[test]
+fn pool_drop_recovers_poisoned_registry_and_observes_local_receipt() {
+    let pool = pool(1);
+    let key = test_key(126);
+    let lease = pool.runtime().block_on(pool.acquire_lease(key)).unwrap();
+    let entry = Arc::clone(&lease.entry);
+    let client = unstarted_client_for_cleanup();
+    let (entered, release) = client.pause_cleanup_for_test();
+    let mut guard = entry.install_and_arm(client.process_control()).unwrap();
+    guard.armed = false;
+    drop(guard);
+    drop(lease);
+
+    let registry = Arc::clone(&pool.registry);
+    let _ = std::thread::spawn(move || {
+        let _guard = registry.lock().unwrap();
+        panic!("poison registry for drop carrier");
+    })
+    .join();
+    assert!(pool.registry.is_poisoned());
+
+    let releaser = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !*entered.borrow() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(*entered.borrow(), "drop did not recover poisoned custody");
+        release.send_replace(true);
+    });
+    drop(pool);
+    releaser.join().unwrap();
+    assert_eq!(client.cleanup_run_count_for_test(), 1);
+}
+
+#[test]
+fn cleanup_receipt_preserves_mixed_protocol_os_and_late_invariant_shape() {
+    let process = ProcessCleanupCompletion {
+        disposition: ProcessCleanupDisposition::InvariantFailure,
+        error: Some(Error::OperationWithCleanupFailure {
+            original: Box::new(Error::Protocol("family sweep join failed".into())),
+            cleanup: Box::new(Error::ChildTerminationFailed(
+                "group signal failed; leader wait failed".into(),
+            )),
+        }),
+        os_residual: Some("group signal failed; leader wait failed".into()),
+        invariant: Some("family sweep join failed".into()),
+    };
+    let outcome = add_cleanup_invariant(
+        CleanupOutcome::from_process(process),
+        "receipt registry ownership failed",
+    );
+    let (_sender, receipt) = watch::channel(outcome);
+    let error = Runtime::new()
+        .unwrap()
+        .block_on(observe_cleanup(receipt))
+        .unwrap_err();
+    assert!(error.is_termination_unproven());
+    let Error::OperationWithCleanupFailure { original, cleanup } = error else {
+        panic!("late invariant must compose without flattening prior error");
+    };
+    assert!(matches!(*cleanup, Error::ChildTerminationFailed(_)));
+    let Error::OperationWithCleanupFailure {
+        original: protocol,
+        cleanup: invariant,
+    } = *original
+    else {
+        panic!("mixed process axes were not preserved");
+    };
+    assert!(matches!(*protocol, Error::Protocol(_)));
+    assert!(matches!(*invariant, Error::PoolPoisoned));
+}
+
+#[test]
+fn cleanup_receipt_invariant_without_termination_is_not_unproven() {
+    let outcome = add_cleanup_invariant(CleanupOutcome::proven(), "late ownership failure");
+    assert!(matches!(
+        outcome,
+        CleanupOutcome::Terminal(CleanupTerminal::InvariantFailure { .. }, _)
+    ));
+    let error = outcome.into_result().unwrap_err();
+    assert!(matches!(error, Error::PoolPoisoned));
+    assert!(!error.is_termination_unproven());
+}
+
+#[test]
+fn cleanup_receipt_graceful_protocol_and_invariant_preserve_both_facts() {
+    let outcome = add_cleanup_invariant(
+        CleanupOutcome::from_process(ProcessCleanupCompletion {
+            disposition: ProcessCleanupDisposition::Proven,
+            error: Some(Error::Protocol("shutdown response was malformed".into())),
+            os_residual: None,
+            invariant: None,
+        }),
+        "receipt registry ownership failed",
+    );
+    let error = outcome.into_result().unwrap_err();
+    assert!(!error.is_termination_unproven());
+    let Error::OperationWithCleanupFailure { original, cleanup } = error else {
+        panic!("graceful protocol and invariant facts must remain distinct");
+    };
+    assert!(matches!(*original, Error::Protocol(_)));
+    assert!(matches!(*cleanup, Error::PoolPoisoned));
+}
+
+#[test]
+fn cleanup_receipt_proven_disposition_preserves_graceful_protocol_error() {
+    let outcome = CleanupOutcome::from_process(ProcessCleanupCompletion {
+        disposition: ProcessCleanupDisposition::Proven,
+        error: Some(Error::Protocol("shutdown response was malformed".into())),
+        os_residual: None,
+        invariant: None,
+    });
+    assert!(matches!(
+        outcome,
+        CleanupOutcome::Terminal(CleanupTerminal::Proven, Some(Error::Protocol(_)))
+    ));
+    let (_sender, receipt) = watch::channel(outcome);
+    let error = Runtime::new()
+        .unwrap()
+        .block_on(observe_cleanup(receipt))
+        .unwrap_err();
+    assert!(matches!(error, Error::Protocol(_)));
 }
 
 #[test]
@@ -2624,8 +3079,8 @@ fn client_drop_after_initialize_kills_pid_via_kill_on_drop() {
     let workspace = tempfile::tempdir().unwrap();
     let pid = rt.block_on(async {
         let client = LspClient::start_configured(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             fake.env(),
             workspace.path(),
             serde_json::json!({}),
@@ -2647,7 +3102,7 @@ fn client_drop_after_initialize_kills_pid_via_kill_on_drop() {
     );
 }
 
-// ─── is_termination_unproven + central poison propagation ──
+// ─── public termination diagnostic compatibility ───────────
 
 #[test]
 fn is_termination_unproven_covers_direct_and_nested_variants() {
@@ -2673,16 +3128,9 @@ fn is_termination_unproven_covers_direct_and_nested_variants() {
 }
 
 #[test]
-fn with_lsp_result_termination_unproven_poisons_pool() {
-    // Central-poison invariant: any Err bubbling out of
-    // `with_lsp` that satisfies `is_termination_unproven`
-    // must transition the pool to `Poisoned`, so no
-    // subsequent acquire (any key) spawns a replacement.
-    //
-    // We simulate the unproven signal via the `work` closure
-    // rather than manipulating internal state — that's the
-    // exact path a real ServerExited-with-cleanup-failure
-    // would take.
+fn with_lsp_result_termination_unproven_does_not_classify_pool_mode() {
+    // The public diagnostic helper remains source-compatible, but pool mode
+    // is driven only by the private typed cleanup disposition.
     let fake = FakeLspBinary::new();
     let pool = pool(4);
     let key = fake_pool_key(&fake, 1);
@@ -2699,22 +3147,16 @@ fn with_lsp_result_termination_unproven_poisons_pool() {
         },
     );
     assert!(outcome.is_err());
-    assert_eq!(pool.mode(), PoolMode::Poisoned);
-    // Any subsequent acquire must reject.
-    let err = acquire(&pool, fake_pool_key(&fake, 2)).unwrap_err();
-    assert!(matches!(err, Error::PoolPoisoned));
+    assert_eq!(pool.mode(), PoolMode::Running);
+    drop(acquire(&pool, fake_pool_key(&fake, 2)).unwrap());
 }
 
 #[test]
-fn stopped_mode_wins_over_normal_path_poison() {
-    // The central poison helper must never overwrite
-    // `Stopped` — a completed daemon-final shutdown wins over
-    // an in-flight unproven cleanup.
+fn stopped_mode_wins_over_late_invariant_failure() {
     let pool = pool(2);
     pool.shutdown_all().unwrap();
     assert_eq!(pool.mode(), PoolMode::Stopped);
-    // Try to poison — helper is a no-op under Stopped.
-    pool.poison_from_unproven_cleanup("test");
+    PoolEntry::new(test_key(1), &pool.registry).halt_registry("late invariant");
     assert_eq!(pool.mode(), PoolMode::Stopped);
 }
 
@@ -2869,7 +3311,7 @@ fn lease_underflow_poisons_pool_fail_closed() {
     drop(lease);
     assert_eq!(
         pool.mode(),
-        PoolMode::Poisoned,
+        PoolMode::Halted,
         "lease-counter underflow must poison the pool"
     );
 }
@@ -3016,18 +3458,19 @@ fn lru_eviction_real_path_placeholder_visible_and_replaced_on_termination_proof(
     let shutdown_gate = pool.runtime().block_on(victim_entry.shutdown_gate.lock());
     let b_pool = StdArc::clone(&pool);
     let b_key_for_thread = b_key.clone();
-    let fake_b_path = fake_b.path.clone();
+    let fake_b_interpreter = fake_b.interpreter.clone();
+    let fake_b_launch_args = fake_b.launch_args();
     let fake_b_env = fake_b.env();
     let b_handle = std::thread::spawn(move || {
         let spec = LspSpawnSpec {
-            binary: fake_b_path,
+            binary: fake_b_interpreter,
             workspace_root: PathBuf::from("/tmp"),
             config_hash: "test".into(),
             request_timeout: Duration::from_secs(10),
             availability: AvailabilityStrategy::PathExistsExecutable,
             readiness: ReadinessStrategy::InitializeResponseOnly,
             language_id: "python",
-            launch_args: Vec::new(),
+            launch_args: fake_b_launch_args,
             env: fake_b_env,
             initialization_options: serde_json::json!({}),
         };
@@ -3116,19 +3559,20 @@ fn same_key_concurrent_with_lsp_serializes_at_pool_entry_state() {
         let counter = StdArc::clone(&counter);
         let max_concurrent = StdArc::clone(&max_concurrent);
         let barrier = StdArc::clone(&barrier);
-        let fake_path = fake.path.clone();
+        let fake_interpreter = fake.interpreter.clone();
+        let fake_launch_args = fake.launch_args();
         let fake_env = fake.env();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             let spec = LspSpawnSpec {
-                binary: fake_path,
+                binary: fake_interpreter,
                 workspace_root: PathBuf::from("/tmp"),
                 config_hash: "test".into(),
                 request_timeout: Duration::from_secs(3),
                 availability: AvailabilityStrategy::PathExistsExecutable,
                 readiness: ReadinessStrategy::InitializeResponseOnly,
                 language_id: "python",
-                launch_args: Vec::new(),
+                launch_args: fake_launch_args,
                 env: fake_env,
                 initialization_options: serde_json::json!({}),
             };
@@ -3194,60 +3638,49 @@ fn server_exit_clears_state_and_respawn_sends_did_open() {
     let key = fake_pool_key(&fake, 1);
     let uri = Url::from("file:///tmp/pool-test/hello.py");
     let first_spec = LspSpawnSpec {
-        env: {
-            let mut env = fake.env_with_methods_log(&methods_log);
-            env.push(("CAIRN_TEST_EXIT_ON_DEFINITION".into(), "1".into()));
-            env
-        },
-        ..spawn_spec(&fake, Duration::from_secs(3))
+        env: fake.env_with_methods_log(&methods_log),
+        ..spawn_spec(&fake, Duration::from_secs(10))
     };
     let uri_clone = uri.clone();
+    let first_methods_log = methods_log.clone();
     let first_result = pool.with_lsp(key.clone(), first_spec, move |pooled| {
         Box::pin(async move {
             pooled.sync_document(&uri_clone, "print('hello')").await?;
-            // Any `definition` request triggers the fake's
-            // configured exit-with-stderr, which surfaces as
-            // `ServerExitedWithStderr` on the next `request` roundtrip.
-            let _ = pooled
-                .definition(
-                    &uri_clone,
-                    Position {
-                        line: 0,
-                        character: 0,
-                    },
-                )
-                .await?;
-            Ok::<(), Error>(())
+            assert!(
+                wait_for_logged_method(
+                    &first_methods_log,
+                    "textDocument/didOpen",
+                    Duration::from_secs(3),
+                ),
+                "first child must consume didOpen before cleanup begins"
+            );
+            pooled
+                .client
+                .process_control()
+                .force_os_residual_for_test("synthetic process-group residual");
+            // Inject the terminal transport fact after didOpen. The branch
+            // under test owns process cleanup; depending on reader timing for
+            // a subprocess exit would conflate that contract with request
+            // timeout scheduling.
+            Err::<(), Error>(Error::ServerExited(None.into()))
         })
     });
-    if let Err(Error::OperationWithCleanupFailure { cleanup, .. }) = &first_result
-        && cleanup.is_termination_unproven()
-    {
-        // Some Unix kernels report EPERM when the verified group contains
-        // only the already-exited leader. The containment contract is
-        // intentionally fail-closed: retain the group-signal fact, poison the
-        // pool, and forbid a same-key replacement.
-        assert_eq!(pool.mode(), PoolMode::Poisoned);
-        assert!(matches!(
-            pool.with_lsp(key, spawn_spec(&fake, Duration::from_secs(3)), |_| {
-                Box::pin(async { Ok::<(), Error>(()) })
-            }),
-            Err(Error::PoolPoisoned)
-        ));
-        return;
-    }
     assert!(
-        matches!(
-            first_result,
-            Err(Error::ServerExited(_)) | Err(Error::ServerExitedWithStderr { .. })
-        ),
-        "first work must surface a server-exit error, got {first_result:?}"
+        first_result
+            .as_ref()
+            .is_err_and(Error::is_termination_unproven),
+        "first work must retain its synthetic OS residual, got {first_result:?}"
+    );
+    assert_eq!(
+        pool.mode(),
+        PoolMode::Running,
+        "an OS residual is a caller error, not an admission invariant"
     );
     // Second call — new spec, no exit-on-definition, work only
     // does the didOpen so it succeeds. Same key, same URI.
     let second_spec = LspSpawnSpec {
         env: fake.env_with_methods_log(&methods_log),
-        ..spawn_spec(&fake, Duration::from_secs(3))
+        ..spawn_spec(&fake, Duration::from_secs(10))
     };
     let uri_clone = uri.clone();
     pool.with_lsp(key.clone(), second_spec, move |pooled| {
@@ -3281,8 +3714,8 @@ fn server_exit_clears_state_and_respawn_sends_did_open() {
 
 #[cfg(unix)]
 #[test]
-fn force_finalize_preserves_concurrent_poisoned_mode() {
-    // If a concurrent normal-path cleanup poisons the pool
+fn force_finalize_preserves_concurrent_halted_mode() {
+    // If a concurrent invariant failure halts the pool
     // while `force_shutdown_all` is mid-drain, the force
     // finalizer must NOT regress the mode back to `Running`
     // just because its own local cleanup was clean.
@@ -3291,10 +3724,7 @@ fn force_finalize_preserves_concurrent_poisoned_mode() {
     // 1. Populate one entry and hold its process-control slot so bounded
     //    cleanup pauses after publishing the drain.
     // 2. Kick `force_shutdown_all` on a thread and observe `Draining`.
-    // 3. Directly call `poison_from_unproven_cleanup` on the
-    //    pool (simulating a concurrent central-poison event
-    //    from a different normal-path caller). This transitions
-    //    mode to `Poisoned` mid-drain.
+    // 3. Inject a typed internal invariant on the exact entry.
     // 4. Wait for the force thread to complete. Since its own
     //    drain is clean (no timeout / no unproven), it would
     //    naively finalize to `Running` — the finalize must
@@ -3321,14 +3751,14 @@ fn force_finalize_preserves_concurrent_poisoned_mode() {
         wait_for_mode(&pool, PoolMode::Draining, Duration::from_secs(2)),
         "force_shutdown_all failed to publish Draining"
     );
-    // Race in a normal-path poison.
-    pool.poison_from_unproven_cleanup("synthetic normal-path unproven");
+    // Race in a private invariant failure.
+    entry.halt_registry("synthetic invariant failure");
     drop(process_gate);
     // Force completes; finalize must NOT overwrite Poisoned.
     let force_result = force_handle.join().unwrap();
     assert_eq!(
         pool.mode(),
-        PoolMode::Poisoned,
+        PoolMode::Halted,
         "force finalize must preserve concurrent Poisoned, got {:?}",
         pool.mode()
     );
@@ -3405,8 +3835,8 @@ fn respawn_initialize_failure_reaps_child_and_allows_next_attempt() {
 
     Runtime::new().unwrap().block_on(async {
         let client = LspClient::start_configured(
-            &fake.path,
-            Vec::new(),
+            fake.binary(),
+            fake.launch_args(),
             env,
             workspace.path(),
             serde_json::json!({}),

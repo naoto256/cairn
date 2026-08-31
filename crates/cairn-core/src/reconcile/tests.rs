@@ -832,8 +832,10 @@ async fn mf1_request_bumps_desired_before_worker_runs() {
         "applied must not advance until the worker completes"
     );
 
-    // Let the worker finish so shutdown does not race.
-    gate.wait_for_entry(500).await;
+    // Let the worker finish so shutdown does not race. This test coordination
+    // bound observes worker-hook scheduling under full workspace/default-thread
+    // contention; it is not a production deadline.
+    gate.wait_for_entry(2_000).await;
     gate.release();
     mgr.shutdown(Duration::from_secs(2)).await;
 }
@@ -915,7 +917,9 @@ async fn mf3_event_during_in_flight_attempt_re_runs_after_success() {
         .await
         .unwrap();
     assert_eq!(o1.generation, 1);
-    gate.wait_for_entry(500).await;
+    // This test coordination bound observes worker-hook scheduling under full
+    // workspace/default-thread contention; it is not a production deadline.
+    gate.wait_for_entry(2_000).await;
 
     // Second request while attempt is parked in the hook.
     let o2 = mgr
