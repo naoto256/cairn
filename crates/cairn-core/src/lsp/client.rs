@@ -110,7 +110,7 @@ impl ProcessMarkerMode {
             static TEST_OWNER: std::sync::OnceLock<Arc<ProcessOwnerContext>> =
                 std::sync::OnceLock::new();
             Self::Marked(Arc::clone(TEST_OWNER.get_or_init(|| {
-                ProcessOwnerContext::for_test("cairn-test-pool-owner", [0x5a; 16])
+                ProcessOwnerContext::for_test_with_empty_sweep("cairn-test-pool-owner", [0x5a; 16])
             })))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1363,14 +1363,52 @@ async fn terminate_owned_child(child: &mut OwnedLspChild) -> Result<()> {
     };
 
     let wait_error = child.wait_leader().await.err();
-    if let Some(marker) = child.marker.as_ref() {
+    let sweep_error = if let Some(marker) = child.marker.clone() {
         // The verified process group and leader reap remain the containment
         // authority. Exact-PID marker cleanup is an availability-first
         // diagnostic sweep for descendants that escaped that group. Its
-        // residual facts never redefine PG/leader termination authority.
-        sweep_family(marker);
+        // residual facts never redefine PG/leader termination authority. The
+        // OS process enumeration remains off the async runtime worker.
+        sweep_family_blocking(marker).await.err()
+    } else {
+        None
+    };
+    finish_owned_child_cleanup(group_error, wait_error, sweep_error)
+}
+
+async fn sweep_family_blocking(marker: ProcessMarker) -> Result<()> {
+    map_family_sweep_join(tokio::task::spawn_blocking(move || sweep_family(&marker)).await)
+}
+
+pub(super) fn map_family_sweep_join(
+    joined: std::result::Result<(), tokio::task::JoinError>,
+) -> Result<()> {
+    match joined {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::error!(error = %error, "LSP orphan sweep blocking task failed to join");
+            Err(Error::Protocol(
+                "LSP orphan sweep blocking task failed".into(),
+            ))
+        }
     }
-    finish_owned_child_termination(group_error, wait_error)
+}
+
+pub(super) fn finish_owned_child_cleanup(
+    group_error: Option<String>,
+    wait_error: Option<std::io::Error>,
+    sweep_error: Option<Error>,
+) -> Result<()> {
+    let termination = finish_owned_child_termination(group_error, wait_error);
+    match (termination, sweep_error) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) => Err(error),
+        (Ok(()), Some(error)) => Err(error),
+        (Err(termination), Some(sweep)) => Err(Error::OperationWithCleanupFailure {
+            original: Box::new(sweep),
+            cleanup: Box::new(termination),
+        }),
+    }
 }
 
 pub(super) fn finish_owned_child_termination(
