@@ -6,8 +6,8 @@ use tracing_subscriber::fmt::MakeWriter;
 
 #[cfg(unix)]
 use crate::lsp::client::{
-    classify_group_signal, finish_owned_child_termination, reject_unverified_child,
-    validate_process_group_identity,
+    classify_group_signal, finish_owned_child_cleanup, finish_owned_child_termination,
+    map_family_sweep_join, reject_unverified_child, validate_process_group_identity,
 };
 #[cfg(unix)]
 use rustix::process::Pid;
@@ -1441,6 +1441,105 @@ fn group_and_wait_failures_remain_termination_unproven_and_compose_losslessly() 
     assert!(text.contains("group failure"));
     assert!(text.contains("leader wait after kill: wait failure"));
     assert!(error.is_termination_unproven());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_family_sweep_runs_off_async_worker_after_leader_wait_and_before_cleanup_terminal() {
+    use crate::lsp::process_sweep::ProcessOwnerContext;
+
+    let fake = FakeLspBinary::new();
+    let (owner, control) =
+        ProcessOwnerContext::for_test_with_blocking_sweep("blocking-owner", [11; 16]);
+    let client = LspClient::configured_for_pool_with_owner(
+        &fake.path,
+        Vec::new(),
+        fake.env(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(3),
+        owner,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        client.start_process().await.unwrap();
+        let process_control = client.process_control();
+        let cleanup = client.force_terminate();
+        tokio::pin!(cleanup);
+        let release = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                release = control.started() => release,
+                result = &mut cleanup => panic!("cleanup completed before sweep start: {result:?}"),
+            }
+        })
+        .await
+        .expect("blocking family sweep did not start");
+
+        assert_eq!(process_control.leader_wait_count_for_test(), 1);
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+        let heartbeat_task = Arc::clone(&heartbeat);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            heartbeat_task.store(1, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(heartbeat.load(Ordering::SeqCst), 1);
+        tokio::select! {
+            result = &mut cleanup => panic!("cleanup completed before sweep terminal: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        release.send(()).expect("release blocking family sweep");
+        tokio::time::timeout(Duration::from_secs(3), &mut cleanup)
+            .await
+            .expect("cleanup did not terminate after sweep release")
+            .unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn blocking_sweep_join_failures_are_not_silent_and_preserve_termination_facts() {
+    use crate::lsp::process_sweep::ProcessOwnerContext;
+
+    let fake = FakeLspBinary::new();
+    let client = LspClient::configured_for_pool_with_owner(
+        &fake.path,
+        Vec::new(),
+        fake.env(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(3),
+        ProcessOwnerContext::for_test_with_panicking_sweep("panic-owner", [12; 16]),
+    );
+    Runtime::new().unwrap().block_on(async {
+        client.start_process().await.unwrap();
+        let error = client.force_terminate().await.unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)));
+        assert!(!error.is_termination_unproven());
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let join_error = cancelled.await.unwrap_err();
+        let error = map_family_sweep_join(Err(join_error)).unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)));
+    });
+
+    let mixed = finish_owned_child_cleanup(
+        Some("group failure".into()),
+        Some(io::Error::other("wait failure")),
+        Some(Error::Protocol("sweep task failure".into())),
+    )
+    .unwrap_err();
+    let text = mixed.to_string();
+    assert!(text.contains("sweep task failure"));
+    assert!(text.contains("group failure"));
+    assert!(text.contains("leader wait after kill: wait failure"));
+    assert!(mixed.is_termination_unproven());
 }
 
 #[cfg(unix)]
