@@ -6,7 +6,8 @@ use tracing_subscriber::fmt::MakeWriter;
 
 #[cfg(unix)]
 use crate::lsp::client::{
-    classify_group_signal, reject_unverified_child, validate_process_group_identity,
+    classify_group_signal, finish_owned_child_termination, reject_unverified_child,
+    validate_process_group_identity,
 };
 #[cfg(unix)]
 use rustix::process::Pid;
@@ -1080,9 +1081,23 @@ if pid_file:
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
 
+marker_file = os.environ.get("CAIRN_TEST_MARKER_FILE")
+if marker_file:
+    with open(marker_file, "a") as f:
+        f.write("{}|{}\n".format(
+            os.environ.get("CAIRN_LSP_OWNER", "<unset>"),
+            os.environ.get("CAIRN_LSP_FAMILY", "<unset>")))
+        f.flush()
+
 grandchild_pid_file = os.environ.get("CAIRN_TEST_GRANDCHILD_PID_FILE")
 if grandchild_pid_file:
-    grandchild = subprocess.Popen(["sleep", "300"])
+    grandchild_env = None
+    if os.environ.get("CAIRN_TEST_SCRUB_GRANDCHILD_MARKERS") == "1":
+        grandchild_env = {
+            key: value for key, value in os.environ.items()
+            if key not in ("CAIRN_LSP_OWNER", "CAIRN_LSP_FAMILY")
+        }
+    grandchild = subprocess.Popen(["sleep", "300"], env=grandchild_env)
     with open(grandchild_pid_file, "w") as f:
         f.write(str(grandchild.pid))
 
@@ -1181,6 +1196,15 @@ impl FakeLspBinary {
         env
     }
 
+    fn env_with_marker_log(&self, marker_file: &Path) -> Vec<(String, String)> {
+        let mut env = self.env();
+        env.push((
+            "CAIRN_TEST_MARKER_FILE".into(),
+            marker_file.display().to_string(),
+        ));
+        env
+    }
+
     /// Env that also silences shutdown responses so graceful shutdown would
     /// stall. Force shutdown must bypass that protocol path and terminate the
     /// installed child through process control.
@@ -1244,6 +1268,179 @@ fn unstarted_client_for_cleanup() -> LspClient {
         serde_json::json!({}),
         Duration::from_secs(1),
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn pooled_spawns_receive_unique_markers_while_standalone_spawn_remains_unmarked() {
+    use crate::lsp::process_sweep::ProcessOwnerContext;
+
+    let fake = FakeLspBinary::new();
+    let marker_file = fake.pid_file.with_file_name("markers.log");
+    let owner = ProcessOwnerContext::for_test("owner-exact", [4; 16]);
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let pooled = LspClient::configured_for_pool_with_owner(
+            &fake.path,
+            Vec::new(),
+            fake.env_with_marker_log(&marker_file),
+            Path::new("/tmp"),
+            serde_json::json!({}),
+            Duration::from_secs(3),
+            owner,
+        );
+        pooled.start_process().await.unwrap();
+        pooled.force_terminate().await.unwrap();
+        pooled.start_process().await.unwrap();
+        pooled.force_terminate().await.unwrap();
+
+        let standalone = LspClient::configured(
+            &fake.path,
+            Vec::new(),
+            fake.env_with_marker_log(&marker_file),
+            Path::new("/tmp"),
+            serde_json::json!({}),
+            Duration::from_secs(3),
+        );
+        standalone.start_process().await.unwrap();
+        standalone.force_terminate().await.unwrap();
+    });
+
+    let lines: Vec<_> = std::fs::read_to_string(&marker_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].starts_with("owner-exact|cairn-family-v1:"));
+    assert!(lines[1].starts_with("owner-exact|cairn-family-v1:"));
+    assert_ne!(lines[0], lines[1], "each spawn must own a fresh family");
+    assert_eq!(lines[2], "<unset>|<unset>");
+}
+
+#[cfg(unix)]
+#[test]
+fn pooled_spawn_without_required_owner_context_starts_no_process() {
+    let fake = FakeLspBinary::new();
+    let client = LspClient::configured_for_pool_without_owner_for_test(
+        &fake.path,
+        Vec::new(),
+        fake.env(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(3),
+    );
+    let error = Runtime::new()
+        .unwrap()
+        .block_on(client.start_process())
+        .unwrap_err();
+    assert!(matches!(error, Error::Protocol(_)));
+    assert!(
+        !fake.pid_file.exists(),
+        "required owner context failure spawned a child"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_family_inspection_residual_is_diagnostic_and_allows_successor_admission() {
+    use crate::lsp::process_sweep::ProcessOwnerContext;
+
+    let fake = FakeLspBinary::new();
+    let owner = ProcessOwnerContext::for_test_with_residual_sweep("owner", [8; 16]);
+    let client = LspClient::configured_for_pool_with_owner(
+        &fake.path,
+        Vec::new(),
+        fake.env(),
+        Path::new("/tmp"),
+        serde_json::json!({}),
+        Duration::from_secs(3),
+        owner,
+    );
+    Runtime::new().unwrap().block_on(async {
+        client.start_process().await.unwrap();
+        client.force_terminate().await.unwrap();
+        let successor = LspClient::configured_for_pool_with_owner(
+            &fake.path,
+            Vec::new(),
+            fake.env(),
+            Path::new("/tmp"),
+            serde_json::json!({}),
+            Duration::from_secs(3),
+            ProcessOwnerContext::for_test_with_residual_sweep("owner", [8; 16]),
+        );
+        successor.start_process().await.unwrap();
+        successor.force_terminate().await.unwrap();
+    });
+
+    let pool = pool(1);
+    assert_eq!(pool.mode(), PoolMode::Running);
+    drop(acquire(&pool, fake_pool_key(&fake, 90)).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_family_kill_failure_and_persistent_identity_allow_successor_admission() {
+    use crate::lsp::process_sweep::ProcessOwnerContext;
+
+    let owners = [
+        ProcessOwnerContext::for_test_with_kill_failure_sweep("kill-owner", [9; 16]),
+        ProcessOwnerContext::for_test_with_persistent_sweep("persistent-owner", [10; 16]),
+    ];
+    for (ordinal, owner) in owners.into_iter().enumerate() {
+        let fake = FakeLspBinary::new();
+        let client = LspClient::configured_for_pool_with_owner(
+            &fake.path,
+            Vec::new(),
+            fake.env(),
+            Path::new("/tmp"),
+            serde_json::json!({}),
+            Duration::from_secs(3),
+            owner,
+        );
+        Runtime::new().unwrap().block_on(async {
+            client.start_process().await.unwrap();
+            client.force_terminate().await.unwrap();
+        });
+
+        let pool = pool(1);
+        assert_eq!(pool.mode(), PoolMode::Running);
+        drop(
+            acquire(
+                &pool,
+                fake_pool_key(&fake, u32::try_from(91 + ordinal).unwrap()),
+            )
+            .unwrap(),
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn group_and_wait_failures_remain_termination_unproven_and_compose_losslessly() {
+    let group_only =
+        finish_owned_child_termination(Some("group failure".into()), None).unwrap_err();
+    assert!(group_only.is_termination_unproven());
+    assert!(group_only.to_string().contains("group failure"));
+
+    let wait_only =
+        finish_owned_child_termination(None, Some(io::Error::other("wait failure"))).unwrap_err();
+    assert!(wait_only.is_termination_unproven());
+    assert!(
+        wait_only
+            .to_string()
+            .contains("leader wait after kill: wait failure")
+    );
+
+    let error = finish_owned_child_termination(
+        Some("group failure".into()),
+        Some(io::Error::other("wait failure")),
+    )
+    .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("group failure"));
+    assert!(text.contains("leader wait after kill: wait failure"));
+    assert!(error.is_termination_unproven());
 }
 
 #[cfg(unix)]
@@ -1932,6 +2129,9 @@ fn verified_process_group_kill_reaps_leader_and_terminates_grandchild() {
     rt.block_on(async {
         let mut env = fake.env_with_grandchild(&grandchild_pid_file);
         env.push(("CAIRN_TEST_IGNORE_EXIT".into(), "1".into()));
+        env.push(("CAIRN_LSP_OWNER".into(), "group-owner".into()));
+        env.push(("CAIRN_LSP_FAMILY".into(), "group-family".into()));
+        env.push(("CAIRN_TEST_SCRUB_GRANDCHILD_MARKERS".into(), "1".into()));
         let client = LspClient::start_configured(
             &fake.path,
             Vec::new(),
