@@ -317,6 +317,7 @@ impl JobManager {
                 alias: row.alias.clone(),
                 repo_hash: row.repo_hash.clone(),
                 store_path: row.store_path.clone(),
+                index_db_path: self.cas_data_dir.index_db_path(),
                 repo_root: row.repo_root.clone(),
                 manifest_id: row.manifest_id,
                 analyzer_id: row.analyzer_id.clone(),
