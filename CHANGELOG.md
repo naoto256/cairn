@@ -5,6 +5,43 @@ All notable changes to cairn are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/).
 
+## [0.8.9] — 2026-09-01
+
+> Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
+> or on-disk schema changes.
+
+### Changed
+
+- **Daemon connection serving is separated internally from lifetime management.**
+  Connection serving now lives in a separate internal module from daemon startup,
+  lifetime, and teardown; public daemon paths and runtime ordering remain unchanged.
+
+### Fixed
+
+- **Daemon connection warnings identify the affected socket.** Structured warning
+  fields make data/control connection failures queryable without losing the
+  original error.
+- **Marked orphaned language-server descendants receive bounded cleanup sweeps.**
+  Startup and shutdown sweeps detect and individually signal matching processes,
+  while doctor diagnostics report any residual cleanup and unrelated processes
+  remain protected; standalone clients and availability probes remain outside this
+  containment scope.
+- **Language-server cleanup residuals no longer halt unrelated admission.** OS
+  cleanup failures remain typed caller errors and diagnostics, while only
+  internal lifecycle invariant failures halt the pool.
+- **Analyzer dispatch and restart recovery preserve durable ownership.** Exact
+  transactional claims protect replacement, cancellation, shutdown, removal,
+  manifest, revision, and configuration currency; eligible legacy pooled-analyzer
+  `PoolPoisoned` failures are requeued once for a recovery attempt with a fresh job
+  ID.
+
+### PRs
+
+- Daemon lifecycle/serving separation: #352
+- Socket-scoped daemon warnings: #353
+- Orphaned LSP descendant sweep and diagnostics: #354
+- LSP admission, analyzer claim, and legacy recovery hardening: #355
+
 ## [0.8.8] — 2026-08-30
 
 > Compatibility: no breaking public Rust API, CLI, JSON-RPC, MCP wire-shape,
