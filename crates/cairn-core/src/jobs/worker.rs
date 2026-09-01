@@ -1,5 +1,23 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_QUARANTINE_OBSERVATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn observe_after_quarantine_read_for_test() {
+    AFTER_QUARANTINE_OBSERVATION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn observe_after_quarantine_read_for_test() {}
+
 impl JobManager {
     /// One worker task. All workers compete for dispatches on the
     /// shared receiver (serialized by the async mutex); the loop
@@ -64,10 +82,6 @@ impl JobManager {
         // first cancellation check.
         self.register_active_progress(job_id, progress.clone());
         let joined = tokio::task::spawn_blocking(move || {
-            // Enter running state only after the blocking pool grants
-            // an execution slot. The terminal-state guard inside
-            // `mark_running` keeps this transition monotonic.
-            runtime_metrics.mark_running(job_id);
             run_job_blocking(dispatch.job, runtime_metrics, progress, lease)
         })
         .await;
@@ -223,49 +237,215 @@ fn run_job_blocking(
     _lease: Option<crate::lifecycle::RepoLease>,
 ) -> Result<()> {
     let mut conn = cas_store::open_existing(&job.store_path)?;
-    let row: Option<(String, i64)> = conn
+    // The IMMEDIATE transaction is the dispatch authority. Manifest currency,
+    // expected membership, revision/config identity, cancellation, and the
+    // exact queued row are checked under the same store write lock. Only the
+    // unique Queued -> Running update grants permission to continue.
+    let claim = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let durable: Option<(String, i64, i64, String)> = claim
         .query_row(
-            "SELECT status, cancel_requested
+            "SELECT status, cancel_requested, analyzer_revision, config_hash
              FROM workspace_analysis_runs
              WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3",
             params![job.id, job.manifest_id.0, job.analyzer_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    // The lookup is keyed by (job_id, manifest, analyzer). If no row
-    // matches (e.g. the run row was rewritten or removed since this
-    // job was dispatched), the job is a no-op.
-    let Some((state, cancel_requested)) = row else {
+    let Some((state, cancel_requested, stored_revision, stored_config_hash)) = durable else {
+        claim.commit()?;
+        runtime_metrics.mark_finished(job.id, "superseded");
         return Ok(());
     };
-    // Three cancellation sources collapse here: the in-process
-    // progress handle (shutdown, or cancel of a job this process is
-    // handling), a row already flipped to `cancelled`, and a queued
-    // row whose `cancel_requested` flag was set while it waited.
-    if progress.is_cancelled()
-        || state == RunStatus::Cancelled.as_str()
-        || (state == RunStatus::Queued.as_str() && cancel_requested != 0)
-    {
-        conn.execute(
-            "UPDATE workspace_analysis_runs
-             SET status = 'cancelled', finished_at_ns = ?1
-             WHERE job_id = ?2",
-            params![now_ns(), job.id],
-        )?;
-        runtime_metrics.mark_finished(job.id, RunStatus::Cancelled.as_str());
-        return Ok(());
-    }
-    // Any other terminal state means the run already concluded
-    // elsewhere; nothing to do.
-    if state != RunStatus::Queued.as_str() && state != RunStatus::Running.as_str() {
+    if state != RunStatus::Queued.as_str() {
+        claim.commit()?;
+        runtime_metrics.mark_finished(job.id, "superseded");
         return Ok(());
     }
 
-    let analyzer = all_workspace_analyzers()
+    // Resolve the linked analyzer only after proving that this dispatch still
+    // owns the exact durable Queued row. A recovered job for an analyzer that
+    // no longer exists must retire that row instead of returning an error and
+    // leaving it queued for the next restart to advertise again.
+    let Some(analyzer) = all_workspace_analyzers()
         .into_iter()
         .find(|a| a.id() == job.analyzer_id)
-        .ok_or_else(|| Error::InvalidArgument(format!("unknown analyzer: {}", job.analyzer_id)))?;
-    let entries = manifest::get_entries(&conn, job.manifest_id)?;
+    else {
+        let reason = "linked analyzer is no longer available";
+        let changed = claim.execute(
+            "UPDATE workspace_analysis_runs
+             SET status = 'skipped', finished_at_ns = ?1, error = ?2
+             WHERE job_id = ?3 AND manifest_id = ?4 AND analyzer_id = ?5
+               AND status = 'queued' AND cancel_requested = ?6
+               AND analyzer_revision = ?7 AND config_hash = ?8",
+            params![
+                now_ns(),
+                reason,
+                job.id,
+                job.manifest_id.0,
+                job.analyzer_id,
+                cancel_requested,
+                stored_revision,
+                stored_config_hash,
+            ],
+        )?;
+        claim.commit()?;
+        runtime_metrics.mark_finished(
+            job.id,
+            if changed == 1 {
+                RunStatus::Skipped.as_str()
+            } else {
+                "superseded"
+            },
+        );
+        return Ok(());
+    };
+    let current_config_hash = config_hash(&job.repo_root, analyzer.config_paths());
+
+    // Quarantine is durable reconcile scheduling state, not a repository-wide
+    // activity lock. Observe it immediately before the store claim: a state
+    // already visible here suppresses this recovered attempt, while a
+    // quarantine committed after admission may coexist with the current run.
+    // Read failure is therefore not promoted into a new exclusion authority.
+    let quarantined_before_claim = match cas_registry::open(&job.index_db_path)
+        .and_then(|index| cas_registry::get_reconcile_state(&index, &job.repo_hash))
+    {
+        Ok(state) => state.is_some_and(|state| state.quarantined_at_ns.is_some()),
+        Err(error) => {
+            warn!(
+                repo_hash = %job.repo_hash,
+                error = %error,
+                "could not observe quarantine before analyzer claim"
+            );
+            false
+        }
+    };
+    observe_after_quarantine_read_for_test();
+    if progress.is_cancelled() || cancel_requested != 0 {
+        let changed = claim.execute(
+            "UPDATE workspace_analysis_runs
+             SET status = 'cancelled', finished_at_ns = ?1
+             WHERE job_id = ?2 AND manifest_id = ?3 AND analyzer_id = ?4
+               AND status = 'queued' AND cancel_requested = ?5
+               AND analyzer_revision = ?6 AND config_hash = ?7",
+            params![
+                now_ns(),
+                job.id,
+                job.manifest_id.0,
+                job.analyzer_id,
+                cancel_requested,
+                stored_revision,
+                stored_config_hash,
+            ],
+        )?;
+        claim.commit()?;
+        runtime_metrics.mark_finished(
+            job.id,
+            if changed == 1 {
+                RunStatus::Cancelled.as_str()
+            } else {
+                "superseded"
+            },
+        );
+        return Ok(());
+    }
+    let current_manifest = crate::anchor::resolve_tentative_manifest_id(&claim, &job.repo_root)?;
+    let current_and_expected = if current_manifest == Some(job.manifest_id) {
+        expected_analyzers_for_manifest(&claim, job.manifest_id)?
+            .iter()
+            .any(|candidate| candidate.id() == job.analyzer_id)
+    } else {
+        false
+    };
+    let currency_reason = if quarantined_before_claim {
+        Some("repository was quarantined before dispatch admission")
+    } else if current_manifest != Some(job.manifest_id) {
+        Some("current manifest changed before dispatch admission")
+    } else if !current_and_expected {
+        Some("analyzer is not expected for the current manifest")
+    } else if u32::try_from(stored_revision).ok() != Some(analyzer.revision()) {
+        Some("analyzer revision changed before dispatch admission")
+    } else if stored_config_hash != current_config_hash {
+        Some("analyzer configuration changed before dispatch admission")
+    } else {
+        None
+    };
+    if let Some(reason) = currency_reason {
+        let changed = claim.execute(
+            "UPDATE workspace_analysis_runs
+             SET status = 'skipped', finished_at_ns = ?1, error = ?2
+             WHERE job_id = ?3 AND manifest_id = ?4 AND analyzer_id = ?5
+               AND status = 'queued' AND cancel_requested = 0
+               AND analyzer_revision = ?6 AND config_hash = ?7",
+            params![
+                now_ns(),
+                reason,
+                job.id,
+                job.manifest_id.0,
+                job.analyzer_id,
+                stored_revision,
+                stored_config_hash,
+            ],
+        )?;
+        claim.commit()?;
+        runtime_metrics.mark_finished(
+            job.id,
+            if changed == 1 {
+                RunStatus::Skipped.as_str()
+            } else {
+                "superseded"
+            },
+        );
+        return Ok(());
+    }
+    let changed = claim.execute(
+        "UPDATE workspace_analysis_runs
+         SET status = 'running', started_at_ns = ?1,
+             finished_at_ns = NULL, error = NULL
+         WHERE job_id = ?2 AND manifest_id = ?3 AND analyzer_id = ?4
+           AND status = 'queued' AND cancel_requested = 0
+           AND analyzer_revision = ?5 AND config_hash = ?6",
+        params![
+            now_ns(),
+            job.id,
+            job.manifest_id.0,
+            job.analyzer_id,
+            analyzer.revision(),
+            current_config_hash,
+        ],
+    )?;
+    claim.commit()?;
+    if changed != 1 {
+        runtime_metrics.mark_finished(job.id, "superseded");
+        return Ok(());
+    }
+    runtime_metrics.mark_running(job.id);
+
+    // Entry materialization begins only after the exact claim. If it fails,
+    // retire only the still-owned Running row; never overwrite a replacement.
+    let entries = match manifest::get_entries(&conn, job.manifest_id) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let message = error.to_string();
+            conn.execute(
+                "UPDATE workspace_analysis_runs
+                 SET status = 'failed', finished_at_ns = ?1, error = ?2
+                 WHERE job_id = ?3 AND manifest_id = ?4 AND analyzer_id = ?5
+                   AND status = 'running' AND cancel_requested = 0
+                   AND analyzer_revision = ?6 AND config_hash = ?7",
+                params![
+                    now_ns(),
+                    message,
+                    job.id,
+                    job.manifest_id.0,
+                    job.analyzer_id,
+                    analyzer.revision(),
+                    current_config_hash,
+                ],
+            )?;
+            runtime_metrics.mark_finished(job.id, RunStatus::Failed.as_str());
+            return Err(error);
+        }
+    };
     let now = now_ns();
     debug!(
         alias = %job.alias,
@@ -304,7 +484,352 @@ fn run_job_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::tests::job;
+    use crate::jobs::tests::{insert_anchor, insert_manifest, insert_manifest_parser, job};
+
+    struct WorkerFixture {
+        _data: tempfile::TempDir,
+        _repo: tempfile::TempDir,
+        conn: rusqlite::Connection,
+        job: Job,
+    }
+
+    fn worker_fixture(job_id: JobId, stored_config: Option<&str>) -> WorkerFixture {
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cas_data_dir = CasDataDir::with_root(data.path().to_path_buf());
+        let index_db_path = cas_data_dir.index_db_path();
+        {
+            let mut index = cas_registry::open(&index_db_path).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(
+                &tx,
+                "worker",
+                repo.path().to_str().unwrap(),
+                "worker-repo",
+                1,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let store_path = cas_data_dir.store_db_path("worker-repo");
+        let conn = cas_store::open(&store_path).unwrap();
+        let manifest_id = ManifestId(7);
+        insert_manifest(&conn, manifest_id.0);
+        conn.execute(
+            "INSERT INTO worktrees (worktree_id, path, registered_at_ns)
+             VALUES (1, ?1, 0)",
+            [repo.path().to_str().unwrap()],
+        )
+        .unwrap();
+        insert_anchor(&conn, "tentative/1", manifest_id.0);
+        insert_manifest_parser(
+            &conn,
+            manifest_id,
+            "src/main.fake",
+            "worker-blob",
+            "fake-parser",
+        );
+        let analyzer = all_workspace_analyzers()
+            .into_iter()
+            .find(|analyzer| analyzer.id() == "fake-workspace")
+            .unwrap();
+        let current_config = config_hash(repo.path(), analyzer.config_paths());
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+             VALUES (?1, 'fake-workspace', ?2, ?3,
+                     'queued', 1, NULL, NULL, ?4, 0)",
+            params![
+                manifest_id.0,
+                analyzer.revision(),
+                stored_config.unwrap_or(&current_config),
+                job_id,
+            ],
+        )
+        .unwrap();
+        let repo_root = repo.path().to_path_buf();
+        WorkerFixture {
+            _data: data,
+            _repo: repo,
+            conn,
+            job: Job {
+                id: job_id,
+                alias: "worker".into(),
+                repo_hash: "worker-repo".into(),
+                store_path,
+                index_db_path,
+                repo_root,
+                manifest_id,
+                analyzer_id: "fake-workspace".into(),
+            },
+        }
+    }
+
+    fn run_fixture(fixture: &WorkerFixture) {
+        run_job_blocking(
+            fixture.job.clone(),
+            JobRuntimeMetricsStore::default(),
+            AnalyzerProgress::default(),
+            None,
+        )
+        .unwrap();
+    }
+
+    fn enqueued_metrics(job_id: JobId) -> JobRuntimeMetricsStore {
+        let metrics = JobRuntimeMetricsStore::default();
+        metrics.mark_enqueued(job_id, None, 1);
+        metrics
+    }
+
+    fn metric_snapshot(metrics: &JobRuntimeMetricsStore, job_id: JobId) -> JobSnapshot {
+        let mut snapshot = job(job_id, "fake-workspace", "queued");
+        metrics.decorate(&mut snapshot, now_ns());
+        snapshot
+    }
+
+    #[test]
+    fn quarantined_before_preclaim_skips_exact_job_without_invocation() {
+        let fixture = worker_fixture(41, None);
+        let index = cas_registry::open(&fixture.job.index_db_path).unwrap();
+        let changed = index
+            .execute(
+                "UPDATE repo_reconcile_state SET quarantined_at_ns = 10
+                 WHERE repo_hash = 'worker-repo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        run_fixture(&fixture);
+
+        let (status, error): (String, Option<String>) = fixture
+            .conn
+            .query_row(
+                "SELECT status, error FROM workspace_analysis_runs WHERE job_id = 41",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Skipped.as_str());
+        assert!(
+            error
+                .unwrap()
+                .contains("quarantined before dispatch admission")
+        );
+    }
+
+    #[test]
+    fn quarantine_committed_after_observation_does_not_revoke_admitted_attempt() {
+        let fixture = worker_fixture(45, None);
+        let index_path = fixture.job.index_db_path.clone();
+        AFTER_QUARANTINE_OBSERVATION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let index = cas_registry::open(&index_path).unwrap();
+                let changed = index
+                    .execute(
+                        "UPDATE repo_reconcile_state SET quarantined_at_ns = 10
+                         WHERE repo_hash = 'worker-repo'",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(changed, 1);
+            }));
+        });
+
+        run_fixture(&fixture);
+
+        let status: String = fixture
+            .conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs WHERE job_id = 45",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Succeeded.as_str());
+    }
+
+    #[test]
+    fn config_mismatch_before_preclaim_skips_without_running_analyzer() {
+        let fixture = worker_fixture(42, Some("stale-config"));
+
+        run_fixture(&fixture);
+
+        let status: String = fixture
+            .conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs WHERE job_id = 42",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Skipped.as_str());
+    }
+
+    #[test]
+    fn replacement_job_id_is_not_claimed_or_clobbered() {
+        let fixture = worker_fixture(43, None);
+        fixture
+            .conn
+            .execute(
+                "UPDATE workspace_analysis_runs SET job_id = 44 WHERE job_id = 43",
+                [],
+            )
+            .unwrap();
+
+        let metrics = enqueued_metrics(43);
+        run_job_blocking(
+            fixture.job.clone(),
+            metrics.clone(),
+            AnalyzerProgress::default(),
+            None,
+        )
+        .unwrap();
+
+        let (job_id, status): (i64, String) = fixture
+            .conn
+            .query_row(
+                "SELECT job_id, status FROM workspace_analysis_runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((job_id, status), (44, RunStatus::Queued.as_str().into()));
+        let runtime = metric_snapshot(&metrics, 43);
+        assert_eq!(runtime.scheduler_state.as_deref(), Some("superseded"));
+        assert!(runtime.run_started_at.is_none());
+    }
+
+    #[test]
+    fn exact_claim_is_the_only_runtime_running_authority() {
+        let fixture = worker_fixture(48, None);
+        let metrics = enqueued_metrics(48);
+
+        run_job_blocking(
+            fixture.job.clone(),
+            metrics.clone(),
+            AnalyzerProgress::default(),
+            None,
+        )
+        .unwrap();
+
+        let status: String = fixture
+            .conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs WHERE job_id = 48",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Succeeded.as_str());
+        let runtime = metric_snapshot(&metrics, 48);
+        assert_eq!(
+            runtime.scheduler_state.as_deref(),
+            Some(RunStatus::Succeeded.as_str())
+        );
+        assert!(runtime.run_started_at.is_some());
+    }
+
+    #[test]
+    fn unknown_analyzer_retires_exact_queued_row_without_running_metrics() {
+        let mut fixture = worker_fixture(49, None);
+        fixture
+            .conn
+            .execute(
+                "UPDATE workspace_analysis_runs
+                 SET analyzer_id = 'retired-analyzer'
+                 WHERE job_id = 49 AND status = 'queued'",
+                [],
+            )
+            .unwrap();
+        fixture.job.analyzer_id = "retired-analyzer".into();
+        let metrics = enqueued_metrics(49);
+
+        run_job_blocking(
+            fixture.job.clone(),
+            metrics.clone(),
+            AnalyzerProgress::default(),
+            None,
+        )
+        .unwrap();
+
+        let (status, error): (String, Option<String>) = fixture
+            .conn
+            .query_row(
+                "SELECT status, error FROM workspace_analysis_runs WHERE job_id = 49",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Skipped.as_str());
+        assert!(error.is_some_and(|message| message.contains("no longer available")));
+        let queued: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs
+                 WHERE job_id = 49 AND status = 'queued'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 0, "restart restore must not re-advertise the row");
+        let runtime = metric_snapshot(&metrics, 49);
+        assert_eq!(
+            runtime.scheduler_state.as_deref(),
+            Some(RunStatus::Skipped.as_str())
+        );
+        assert!(runtime.run_started_at.is_none());
+    }
+
+    #[test]
+    fn durable_cancel_before_claim_retires_without_invocation() {
+        let fixture = worker_fixture(46, None);
+        fixture
+            .conn
+            .execute(
+                "UPDATE workspace_analysis_runs SET cancel_requested = 1 WHERE job_id = 46",
+                [],
+            )
+            .unwrap();
+
+        run_fixture(&fixture);
+
+        let status: String = fixture
+            .conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs WHERE job_id = 46",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Cancelled.as_str());
+    }
+
+    #[test]
+    fn shutdown_token_before_claim_retires_without_invocation() {
+        let fixture = worker_fixture(47, None);
+        let progress = AnalyzerProgress::default();
+        progress.cancel();
+
+        run_job_blocking(
+            fixture.job.clone(),
+            JobRuntimeMetricsStore::default(),
+            progress,
+            None,
+        )
+        .unwrap();
+
+        let status: String = fixture
+            .conn
+            .query_row(
+                "SELECT status FROM workspace_analysis_runs WHERE job_id = 47",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Cancelled.as_str());
+    }
 
     fn scheduler_state(metrics: &JobRuntimeMetricsStore, job_id: JobId) -> String {
         let mut snapshot = job(job_id, "pyright-lsp", "failed");

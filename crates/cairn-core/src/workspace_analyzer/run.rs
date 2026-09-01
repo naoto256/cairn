@@ -1,11 +1,10 @@
 //! Workspace analyzer run driver: run lifecycle, stall watchdog, and
 //! `workspace_analysis_runs` persistence.
 //!
-//! One run row exists per `(manifest_id, analyzer_id)` and is
-//! upserted in place through `queued -> {skipped / failed at
-//! preflight, or running -> terminal}`: an empty selection goes
-//! `queued -> skipped` and a materialization failure goes
-//! `queued -> failed`, neither passing through `running`. The stall
+//! One run row exists per `(manifest_id, analyzer_id)`. Direct callers upsert
+//! it in place; scheduler workers first claim an exact `job_id` as `Running`
+//! and every runner write then continues only that identity. An empty selection
+//! or materialization failure terminates before analyzer invocation. The stall
 //! watchdog treats the analyzer's progress ticks as a liveness
 //! beacon: a run is stopped only when the beacon stops advancing,
 //! never for total elapsed time (see [`ANALYZER_STALL_TIMEOUT`]).
@@ -151,11 +150,11 @@ pub(super) fn run_workspace_analyzers_with_timeout(
 
 /// Inputs for one analyzer invocation over one manifest.
 ///
-/// `job_id` is `None` when the run is not driven by the job
-/// scheduler; [`mark_run`]'s upsert then preserves any `job_id`
-/// already stored on the row (COALESCE). `progress` is `None` for
-/// callers without external cancellation; the runner substitutes a
-/// default handle that is never cancelled.
+/// `job_id` is `None` when the run is not driven by the job scheduler. A
+/// concrete id means the worker already claimed the exact row as `Running`;
+/// every later status write is therefore an exact continuation and never an
+/// upsert. `progress` is `None` for callers without external cancellation; the
+/// runner substitutes a default handle that is never cancelled.
 pub(crate) struct AnalyzerRunRequest<'a> {
     pub(crate) analyzer: Box<dyn WorkspaceAnalyzer>,
     pub(crate) repo_root: &'a Path,
@@ -205,11 +204,59 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         job_id,
         progress,
     } = request;
+    let preclaimed = job_id.is_some();
     let analyzer_id = analyzer.id();
     let analyzer_revision = analyzer.revision();
     let parser_id = analyzer.parser_id();
     let tier_prefix = analyzer.tier_prefix();
-    let config_hash = config_hash(repo_root, analyzer.config_paths());
+    let observed_config_hash = config_hash(repo_root, analyzer.config_paths());
+    let config_hash = if let Some(job_id) = job_id {
+        let claimed: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT config_hash, cancel_requested FROM workspace_analysis_runs
+                 WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3
+                   AND status = 'running' AND analyzer_revision = ?4",
+                params![job_id, manifest_id.0, analyzer_id, analyzer_revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((claimed, cancel_requested)) = claimed else {
+            return Ok(AnalyzerExecution {
+                status: RunStatus::Skipped,
+                inserted_refs: 0,
+                error: Some("dispatch ownership changed before run preflight".into()),
+            });
+        };
+        if cancel_requested != 0
+            || progress
+                .as_ref()
+                .is_some_and(AnalyzerProgress::is_cancelled)
+        {
+            let message = "analyzer cancelled";
+            mark_run(
+                conn,
+                RunRecord {
+                    manifest_id,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash: &claimed,
+                    status: RunStatus::Cancelled,
+                    started_at_ns: now_ns,
+                    finished_at_ns: now_ns,
+                    error: Some(message),
+                    job_id: Some(job_id),
+                },
+            )?;
+            return Ok(AnalyzerExecution {
+                status: RunStatus::Cancelled,
+                inserted_refs: 0,
+                error: Some(message.into()),
+            });
+        }
+        claimed
+    } else {
+        observed_config_hash
+    };
     let files = workspace_files_for(conn, parser_id, repo_root, entries)?;
     // An empty selection is legitimate non-applicability (e.g. a
     // Kotlin analyzer over a Ruby-only repo): record `Skipped`, not
@@ -286,23 +333,24 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
         files
     };
 
-    // Mark `Running`. `mark_run` stores NULL finished_at_ns for the
-    // non-terminal statuses, so the row reads as in-flight from here
-    // until one of the terminal upserts below overwrites it.
-    mark_run(
-        conn,
-        RunRecord {
-            manifest_id,
-            analyzer_id,
-            analyzer_revision,
-            config_hash: &config_hash,
-            status: RunStatus::Running,
-            started_at_ns: now_ns,
-            finished_at_ns: now_ns,
-            error: None,
-            job_id,
-        },
-    )?;
+    // Scheduler-driven runs already own an exact Running row. Direct callers
+    // retain the legacy upsert path and establish Running here.
+    if !preclaimed {
+        mark_run(
+            conn,
+            RunRecord {
+                manifest_id,
+                analyzer_id,
+                analyzer_revision,
+                config_hash: &config_hash,
+                status: RunStatus::Running,
+                started_at_ns: now_ns,
+                finished_at_ns: now_ns,
+                error: None,
+                job_id,
+            },
+        )?;
+    }
 
     let progress = progress.unwrap_or_default();
     // Cancellation checkpoint before the worker thread is spawned: a
@@ -329,6 +377,98 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             inserted_refs: 0,
             error: Some(message.into()),
         });
+    }
+    if let Some(job_id) = job_id {
+        // This is the last gate before the analyzer worker can be spawned.
+        // The store claim is the durable admission authority; this second
+        // observation catches manifest/config/cancel changes that landed while
+        // entries were selected or materialized. Quarantine is intentionally
+        // absent here: it is a best-effort preclaim eligibility observation,
+        // not a repository-wide activity lock.
+        let durable_cancel: Option<i64> = conn
+            .query_row(
+                "SELECT cancel_requested FROM workspace_analysis_runs
+                 WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3
+                   AND status = 'running' AND analyzer_revision = ?4 AND config_hash = ?5",
+                params![
+                    job_id,
+                    manifest_id.0,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(durable_cancel) = durable_cancel else {
+            return Ok(AnalyzerExecution {
+                status: RunStatus::Skipped,
+                inserted_refs: 0,
+                error: Some("dispatch ownership changed before invocation".into()),
+            });
+        };
+        if durable_cancel != 0 || progress.is_cancelled() {
+            let message = "analyzer cancelled";
+            mark_run(
+                conn,
+                RunRecord {
+                    manifest_id,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash: &config_hash,
+                    status: RunStatus::Cancelled,
+                    started_at_ns: now_ns,
+                    finished_at_ns: now_ns,
+                    error: Some(message),
+                    job_id: Some(job_id),
+                },
+            )?;
+            return Ok(AnalyzerExecution {
+                status: RunStatus::Cancelled,
+                inserted_refs: 0,
+                error: Some(message.into()),
+            });
+        }
+        let current_manifest = crate::anchor::resolve_tentative_manifest_id(conn, repo_root)?;
+        let still_expected = if current_manifest == Some(manifest_id) {
+            super::expected_analyzers_for_manifest(conn, manifest_id)?
+                .iter()
+                .any(|candidate| candidate.id() == analyzer_id)
+        } else {
+            false
+        };
+        let current_config_hash =
+            crate::workspace_analyzer::config_hash(repo_root, analyzer.config_paths());
+        let stale_reason = if current_manifest != Some(manifest_id) {
+            Some("current manifest changed before analyzer invocation")
+        } else if !still_expected {
+            Some("analyzer is no longer expected before invocation")
+        } else if current_config_hash != config_hash {
+            Some("analyzer configuration changed before invocation")
+        } else {
+            None
+        };
+        if let Some(message) = stale_reason {
+            mark_run(
+                conn,
+                RunRecord {
+                    manifest_id,
+                    analyzer_id,
+                    analyzer_revision,
+                    config_hash: &config_hash,
+                    status: RunStatus::Skipped,
+                    started_at_ns: now_ns,
+                    finished_at_ns: now_ns,
+                    error: Some(message),
+                    job_id: Some(job_id),
+                },
+            )?;
+            return Ok(AnalyzerExecution {
+                status: RunStatus::Skipped,
+                inserted_refs: 0,
+                error: Some(message.into()),
+            });
+        }
     }
     let workspace_state_dir = conn
         .path()
@@ -497,6 +637,29 @@ fn persist_completed_run_atomically(
     facts: &WorkspaceFacts,
 ) -> Result<usize> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(job_id) = successful_run.job_id {
+        let still_owned = tx
+            .query_row(
+                "SELECT 1 FROM workspace_analysis_runs
+                 WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3
+                   AND status = 'running' AND cancel_requested = 0
+                   AND analyzer_revision = ?4 AND config_hash = ?5",
+                params![
+                    job_id,
+                    successful_run.manifest_id.0,
+                    successful_run.analyzer_id,
+                    successful_run.analyzer_revision,
+                    successful_run.config_hash,
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !still_owned {
+            tx.commit()?;
+            return Ok(0);
+        }
+    }
     tx.execute_batch("SAVEPOINT workspace_analyzer_facts")?;
     let persisted = (|| -> Result<usize> {
         let inserted_refs = persist_resolved_refs_in_transaction(
@@ -1112,13 +1275,15 @@ impl RunStatus {
     }
 }
 
-/// One upsert payload for [`mark_run`], keyed by
-/// `(manifest_id, analyzer_id)`.
+/// One status payload for [`mark_run`], keyed by `(manifest_id, analyzer_id)`
+/// for direct runs and additionally by `job_id` for scheduler continuations.
 ///
 /// `finished_at_ns` is only persisted for terminal statuses; for
 /// `Queued` / `Running` it is written as NULL regardless of the value
-/// carried here. A `None` `job_id` preserves whatever job id the row
-/// already holds (COALESCE in the upsert).
+/// carried here. A `None` `job_id` uses the direct upsert and preserves any
+/// stored job id. `Queued` with a concrete `job_id` creates/replaces the
+/// scheduler-owned row; later statuses with `Some` update only that exact
+/// still-Running attempt.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RunRecord<'a> {
     pub(crate) manifest_id: ManifestId,
@@ -1134,9 +1299,11 @@ pub(crate) struct RunRecord<'a> {
 
 /// Upsert the run row for `(manifest_id, analyzer_id)`.
 ///
-/// Successive transitions of the same run overwrite the row in place
-/// — there is one row per run key, not one per attempt, so only the
-/// latest status is observable.
+/// Direct runs (`job_id = None`) and scheduler enqueue (`Queued` with a concrete
+/// id) upsert the row in place. Once the worker has transactionally claimed the
+/// row as `Running`, later scheduler transitions update only that exact identity
+/// while its revision/config still match, so a replacement row cannot be
+/// overwritten by a late worker.
 ///
 /// # Errors
 /// Returns the underlying SQLite error.
@@ -1151,6 +1318,26 @@ pub(crate) fn mark_run(conn: &Connection, run: RunRecord<'_>) -> Result<()> {
         | RunStatus::TimedOut
         | RunStatus::Cancelled => Some(run.finished_at_ns),
     };
+    if let Some(job_id) = run.job_id.filter(|_| run.status != RunStatus::Queued) {
+        conn.execute(
+            "UPDATE workspace_analysis_runs
+             SET status = ?1, started_at_ns = ?2, finished_at_ns = ?3, error = ?4
+             WHERE job_id = ?5 AND manifest_id = ?6 AND analyzer_id = ?7
+               AND status = 'running' AND analyzer_revision = ?8 AND config_hash = ?9",
+            params![
+                run.status.as_str(),
+                run.started_at_ns,
+                finished,
+                run.error,
+                job_id,
+                run.manifest_id.0,
+                run.analyzer_id,
+                run.analyzer_revision,
+                run.config_hash,
+            ],
+        )?;
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO workspace_analysis_runs
            (manifest_id, analyzer_id, analyzer_revision, config_hash,
@@ -2819,6 +3006,59 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn preclaimed_late_terminal_and_facts_do_not_clobber_replacement_row() {
+        let db = tempfile::tempdir().unwrap();
+        let (mut conn, _) = seed_fixture(&db.path().join("store.db"), "src/lib.rs");
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+             VALUES (1, 'test-analyzer', 2, 'replacement',
+                     'queued', 2, NULL, NULL, 8, 0)",
+            [],
+        )
+        .unwrap();
+        let late = RunRecord {
+            manifest_id: ManifestId(1),
+            analyzer_id: "test-analyzer",
+            analyzer_revision: 1,
+            config_hash: "old-config",
+            status: RunStatus::Succeeded,
+            started_at_ns: 1,
+            finished_at_ns: 3,
+            error: None,
+            job_id: Some(7),
+        };
+
+        mark_run(&conn, late).unwrap();
+        let inserted = persist_completed_run_atomically(
+            &mut conn,
+            late,
+            "tier25-",
+            "tree-sitter-test",
+            &WorkspaceFacts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 0);
+        let row: (i64, String, i64, String) = conn
+            .query_row(
+                "SELECT job_id, status, analyzer_revision, config_hash
+                 FROM workspace_analysis_runs
+                 WHERE manifest_id = 1 AND analyzer_id = 'test-analyzer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (8, "queued".into(), 2, "replacement".into()));
+        assert_eq!(
+            tier25_resolution_count(&conn),
+            1,
+            "late facts must not replace the successor's visible facts"
+        );
+    }
+
     fn workspace_analysis_run_row(conn: &Connection) -> (String, Option<String>) {
         conn.query_row(
             "SELECT status, error FROM workspace_analysis_runs WHERE analyzer_id = 'test-analyzer'",
@@ -2913,7 +3153,7 @@ mod tests {
                 entries: &[entry],
                 now_ns: 42,
                 analyzer_stall_timeout: Duration::from_secs(30),
-                job_id: Some(7),
+                job_id: None,
                 progress: None,
             },
         )
@@ -2978,7 +3218,7 @@ mod tests {
                 entries: &[entry],
                 now_ns: 42,
                 analyzer_stall_timeout: Duration::from_secs(30),
-                job_id: Some(7),
+                job_id: None,
                 progress: None,
             },
         )
@@ -3014,7 +3254,7 @@ mod tests {
                 entries: &[entry],
                 now_ns: 0,
                 analyzer_stall_timeout: Duration::from_secs(30),
-                job_id: Some(7),
+                job_id: None,
                 progress: Some(progress),
             },
         )
