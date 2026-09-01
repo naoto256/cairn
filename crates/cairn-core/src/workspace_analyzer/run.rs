@@ -169,10 +169,34 @@ pub(crate) struct AnalyzerRunRequest<'a> {
 /// Outcome of one analyzer invocation, mirroring the terminal status
 /// and error text that were stamped onto the run row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnalyzerExecutionStatus {
+    Terminal(RunStatus),
+    Superseded,
+}
+
+impl AnalyzerExecutionStatus {
+    pub(crate) fn as_scheduler_state(&self) -> &str {
+        match self {
+            Self::Terminal(status) => status.as_str(),
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// Outcome of one analyzer invocation, including the private scheduler
+/// disposition when a completed attempt no longer owns its durable row.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AnalyzerExecution {
-    pub status: RunStatus,
+    pub status: AnalyzerExecutionStatus,
     pub inserted_refs: usize,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletedRunPersistence {
+    Persisted(usize),
+    Cancelled,
+    Superseded,
 }
 
 /// Drive one analyzer through its full run lifecycle over one
@@ -222,7 +246,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             .optional()?;
         let Some((claimed, cancel_requested)) = claimed else {
             return Ok(AnalyzerExecution {
-                status: RunStatus::Skipped,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Skipped),
                 inserted_refs: 0,
                 error: Some("dispatch ownership changed before run preflight".into()),
             });
@@ -248,7 +272,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             return Ok(AnalyzerExecution {
-                status: RunStatus::Cancelled,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Cancelled),
                 inserted_refs: 0,
                 error: Some(message.into()),
             });
@@ -278,7 +302,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             },
         )?;
         return Ok(AnalyzerExecution {
-            status: RunStatus::Skipped,
+            status: AnalyzerExecutionStatus::Terminal(RunStatus::Skipped),
             inserted_refs: 0,
             error: Some("no matching files".into()),
         });
@@ -323,7 +347,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             return Ok(AnalyzerExecution {
-                status: RunStatus::Failed,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Failed),
                 inserted_refs: 0,
                 error: Some(error),
             });
@@ -373,7 +397,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             },
         )?;
         return Ok(AnalyzerExecution {
-            status: RunStatus::Cancelled,
+            status: AnalyzerExecutionStatus::Terminal(RunStatus::Cancelled),
             inserted_refs: 0,
             error: Some(message.into()),
         });
@@ -402,7 +426,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             .optional()?;
         let Some(durable_cancel) = durable_cancel else {
             return Ok(AnalyzerExecution {
-                status: RunStatus::Skipped,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Skipped),
                 inserted_refs: 0,
                 error: Some("dispatch ownership changed before invocation".into()),
             });
@@ -424,7 +448,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             return Ok(AnalyzerExecution {
-                status: RunStatus::Cancelled,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Cancelled),
                 inserted_refs: 0,
                 error: Some(message.into()),
             });
@@ -464,7 +488,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             return Ok(AnalyzerExecution {
-                status: RunStatus::Skipped,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Skipped),
                 inserted_refs: 0,
                 error: Some(message.into()),
             });
@@ -507,7 +531,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             Ok(AnalyzerExecution {
-                status: RunStatus::Cancelled,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::Cancelled),
                 inserted_refs: 0,
                 error: Some(message.into()),
             })
@@ -518,7 +542,8 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
             // publishes `Failed` in the same outer transaction, and
             // still propagates the infrastructure error to the job
             // runner.
-            let inserted_refs = persist_completed_run_atomically(
+            test_observe_completed_before_persist();
+            let persistence = persist_completed_run_atomically(
                 conn,
                 RunRecord {
                     manifest_id,
@@ -535,11 +560,23 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 parser_id,
                 &facts,
             )?;
-            Ok(AnalyzerExecution {
-                status: RunStatus::Succeeded,
-                inserted_refs,
-                error: None,
-            })
+            match persistence {
+                CompletedRunPersistence::Persisted(inserted_refs) => Ok(AnalyzerExecution {
+                    status: AnalyzerExecutionStatus::Terminal(RunStatus::Succeeded),
+                    inserted_refs,
+                    error: None,
+                }),
+                CompletedRunPersistence::Cancelled => Ok(AnalyzerExecution {
+                    status: AnalyzerExecutionStatus::Terminal(RunStatus::Cancelled),
+                    inserted_refs: 0,
+                    error: Some("analyzer cancelled".into()),
+                }),
+                CompletedRunPersistence::Superseded => Ok(AnalyzerExecution {
+                    status: AnalyzerExecutionStatus::Superseded,
+                    inserted_refs: 0,
+                    error: None,
+                }),
+            }
         }
         AnalyzerRun::Completed(Err(err)) => {
             let message = err.to_string();
@@ -581,7 +618,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             Ok(AnalyzerExecution {
-                status,
+                status: AnalyzerExecutionStatus::Terminal(status),
                 inserted_refs: 0,
                 error: Some(message),
             })
@@ -612,7 +649,7 @@ pub(crate) fn run_one_workspace_analyzer_with_timeout(
                 },
             )?;
             Ok(AnalyzerExecution {
-                status: RunStatus::TimedOut,
+                status: AnalyzerExecutionStatus::Terminal(RunStatus::TimedOut),
                 inserted_refs: 0,
                 error: Some(message),
             })
@@ -635,14 +672,14 @@ fn persist_completed_run_atomically(
     tier_prefix: &str,
     parser_id: &str,
     facts: &WorkspaceFacts,
-) -> Result<usize> {
+) -> Result<CompletedRunPersistence> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(job_id) = successful_run.job_id {
-        let still_owned = tx
+        let cancel_requested = tx
             .query_row(
-                "SELECT 1 FROM workspace_analysis_runs
+                "SELECT cancel_requested FROM workspace_analysis_runs
                  WHERE job_id = ?1 AND manifest_id = ?2 AND analyzer_id = ?3
-                   AND status = 'running' AND cancel_requested = 0
+                   AND status = 'running'
                    AND analyzer_revision = ?4 AND config_hash = ?5",
                 params![
                     job_id,
@@ -651,13 +688,43 @@ fn persist_completed_run_atomically(
                     successful_run.analyzer_revision,
                     successful_run.config_hash,
                 ],
-                |_| Ok(()),
+                |row| row.get::<_, i64>(0),
             )
-            .optional()?
-            .is_some();
-        if !still_owned {
+            .optional()?;
+        let Some(cancel_requested) = cancel_requested else {
             tx.commit()?;
-            return Ok(0);
+            return Ok(CompletedRunPersistence::Superseded);
+        };
+        if cancel_requested == 1 {
+            let message = "analyzer cancelled";
+            let changed = tx.execute(
+                "UPDATE workspace_analysis_runs
+                 SET status = 'cancelled', finished_at_ns = ?1, error = ?2
+                 WHERE job_id = ?3 AND manifest_id = ?4 AND analyzer_id = ?5
+                   AND status = 'running' AND cancel_requested = 1
+                   AND analyzer_revision = ?6 AND config_hash = ?7",
+                params![
+                    successful_run.finished_at_ns,
+                    message,
+                    job_id,
+                    successful_run.manifest_id.0,
+                    successful_run.analyzer_id,
+                    successful_run.analyzer_revision,
+                    successful_run.config_hash,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::Internal(format!(
+                    "post-analysis cancellation lost exact run ownership: changed {changed} rows"
+                )));
+            }
+            tx.commit()?;
+            return Ok(CompletedRunPersistence::Cancelled);
+        }
+        if cancel_requested != 0 {
+            return Err(Error::Internal(format!(
+                "invalid cancel_requested value for analyzer run: {cancel_requested}"
+            )));
         }
     }
     tx.execute_batch("SAVEPOINT workspace_analyzer_facts")?;
@@ -704,7 +771,7 @@ fn persist_completed_run_atomically(
     match persisted {
         Ok(inserted_refs) => {
             tx.commit()?;
-            Ok(inserted_refs)
+            Ok(CompletedRunPersistence::Persisted(inserted_refs))
         }
         Err(error) => {
             let message = format!("workspace analyzer persistence failed: {error}");
@@ -739,11 +806,55 @@ fn persist_completed_run_atomically(
 
 #[cfg(test)]
 thread_local! {
+    static COMPLETED_BEFORE_PERSIST_OBSERVER:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+            std::cell::RefCell::new(None)
+        };
     static ATOMIC_PERSIST_MIDPOINT_OBSERVER:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
             std::cell::RefCell::new(None)
         };
 }
+
+#[cfg(test)]
+fn test_observe_completed_before_persist() {
+    COMPLETED_BEFORE_PERSIST_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().take() {
+            observer();
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_completed_before_persist_observer<T>(
+    observer: impl FnOnce() + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPLETED_BEFORE_PERSIST_OBSERVER.with(|observer| {
+                observer.borrow_mut().take();
+            });
+        }
+    }
+
+    COMPLETED_BEFORE_PERSIST_OBSERVER.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "completed-persist observer already set"
+        );
+        *slot.borrow_mut() = Some(Box::new(observer));
+    });
+    let reset = Reset;
+    let result = run();
+    drop(reset);
+    result
+}
+
+#[cfg(not(test))]
+fn test_observe_completed_before_persist() {}
 
 #[cfg(test)]
 fn test_observe_atomic_persist_midpoint() {
@@ -2541,7 +2652,10 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(execution.status, RunStatus::Succeeded);
+            assert_eq!(
+                execution.status,
+                AnalyzerExecutionStatus::Terminal(RunStatus::Succeeded)
+            );
         }
 
         let first_state = first_state.canonicalize().unwrap();
@@ -2618,7 +2732,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(execution.status, RunStatus::Succeeded);
+        assert_eq!(
+            execution.status,
+            AnalyzerExecutionStatus::Terminal(RunStatus::Succeeded)
+        );
         assert_eq!(status, "succeeded");
         assert_eq!(stored_hash, pre_run_hash);
         assert_ne!(stored_hash, post_run_hash);
@@ -3041,7 +3158,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(inserted, 0);
+        assert_eq!(inserted, CompletedRunPersistence::Superseded);
         let row: (i64, String, i64, String) = conn
             .query_row(
                 "SELECT job_id, status, analyzer_revision, config_hash
@@ -3057,6 +3174,44 @@ mod tests {
             1,
             "late facts must not replace the successor's visible facts"
         );
+    }
+
+    #[test]
+    fn preclaimed_owned_completion_with_zero_refs_is_still_succeeded() {
+        let db = tempfile::tempdir().unwrap();
+        let (mut conn, _) = seed_fixture(&db.path().join("store.db"), "src/lib.rs");
+        conn.execute(
+            "INSERT INTO workspace_analysis_runs
+               (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                status, started_at_ns, finished_at_ns, error, job_id, cancel_requested)
+             VALUES (1, 'test-analyzer', 1, 'current-config',
+                     'running', 1, NULL, NULL, 7, 0)",
+            [],
+        )
+        .unwrap();
+        let run = RunRecord {
+            manifest_id: ManifestId(1),
+            analyzer_id: "test-analyzer",
+            analyzer_revision: 1,
+            config_hash: "current-config",
+            status: RunStatus::Succeeded,
+            started_at_ns: 1,
+            finished_at_ns: 3,
+            error: None,
+            job_id: Some(7),
+        };
+
+        let persisted = persist_completed_run_atomically(
+            &mut conn,
+            run,
+            "tier25-",
+            "tree-sitter-test",
+            &WorkspaceFacts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(persisted, CompletedRunPersistence::Persisted(0));
+        assert_eq!(workspace_analysis_run_row(&conn).0, "succeeded");
     }
 
     fn workspace_analysis_run_row(conn: &Connection) -> (String, Option<String>) {
@@ -3224,7 +3379,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(
+            outcome.status,
+            AnalyzerExecutionStatus::Terminal(RunStatus::Succeeded)
+        );
         assert_eq!(outcome.inserted_refs, 1);
         assert_eq!(analyzer_ref_count(&conn), 1);
         assert_eq!(tier25_resolution_count(&conn), 1);
@@ -3260,7 +3418,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.status, RunStatus::Cancelled);
+        assert_eq!(
+            outcome.status,
+            AnalyzerExecutionStatus::Terminal(RunStatus::Cancelled)
+        );
         assert_eq!(outcome.inserted_refs, 0);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(tier25_resolution_count(&conn), 1);
@@ -3318,7 +3479,7 @@ mod tests {
 
         assert_eq!(
             outcome.status,
-            RunStatus::Failed,
+            AnalyzerExecutionStatus::Terminal(RunStatus::Failed),
             "unreadable input must produce Failed (not Skipped, not Succeeded)"
         );
         assert_eq!(
@@ -3385,7 +3546,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(
+            outcome.status,
+            AnalyzerExecutionStatus::Terminal(RunStatus::Succeeded)
+        );
         assert_eq!(
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3474,7 +3638,10 @@ mod tests {
 
         // The analyzer was called (default capability skips the
         // materialization gate) and its outcome drives the run.
-        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(
+            outcome.status,
+            AnalyzerExecutionStatus::Terminal(RunStatus::Succeeded)
+        );
         assert!(
             !observed_source_bytes_is_some.load(std::sync::atomic::Ordering::SeqCst),
             "LSP / default analyzers must see source_bytes = None — \

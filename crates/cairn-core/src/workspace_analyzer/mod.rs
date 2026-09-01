@@ -119,6 +119,8 @@ mod lsp_pass;
 mod path;
 mod persist;
 mod run;
+#[cfg(test)]
+pub(crate) use run::with_completed_before_persist_observer;
 mod staleness;
 
 pub use expected::expected_analyzers_for_manifest;

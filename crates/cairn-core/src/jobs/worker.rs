@@ -469,12 +469,12 @@ fn run_job_blocking(
             progress: Some(progress),
         },
     )?;
-    runtime_metrics.mark_finished(job.id, outcome.status.as_str());
+    runtime_metrics.mark_finished(job.id, outcome.status.as_scheduler_state());
     debug!(
         alias = %job.alias,
         analyzer_id = %job.analyzer_id,
         job_id = job.id,
-        status = %outcome.status.as_str(),
+        status = %outcome.status.as_scheduler_state(),
         inserted_refs = outcome.inserted_refs,
         "analyzer job finished"
     );
@@ -729,6 +729,138 @@ mod tests {
             Some(RunStatus::Succeeded.as_str())
         );
         assert!(runtime.run_started_at.is_some());
+    }
+
+    #[test]
+    fn replacement_after_analyzer_completion_supersedes_runtime_without_persisting() {
+        let fixture = worker_fixture(50, None);
+        let metrics = enqueued_metrics(50);
+        let store_path = fixture.job.store_path.clone();
+
+        crate::workspace_analyzer::with_completed_before_persist_observer(
+            move || {
+                let conn = cas_store::open_existing(&store_path).unwrap();
+                let changed = conn
+                    .execute(
+                        "UPDATE workspace_analysis_runs
+                         SET job_id = 51, status = 'queued', analyzer_revision = 99,
+                             config_hash = 'replacement-config'
+                         WHERE job_id = 50 AND status = 'running'",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(changed, 1);
+            },
+            || {
+                run_job_blocking(
+                    fixture.job.clone(),
+                    metrics.clone(),
+                    AnalyzerProgress::default(),
+                    None,
+                )
+                .unwrap();
+            },
+        );
+
+        let row: (i64, String, i64, String) = fixture
+            .conn
+            .query_row(
+                "SELECT job_id, status, analyzer_revision, config_hash
+                 FROM workspace_analysis_runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (51, "queued".into(), 99, "replacement-config".into()));
+        let succeeded: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs WHERE status = 'succeeded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let facts: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM refs) + (SELECT COUNT(*) FROM resolutions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(succeeded, 0);
+        assert_eq!(facts, 0);
+        assert_eq!(
+            metric_snapshot(&metrics, 50).scheduler_state.as_deref(),
+            Some("superseded")
+        );
+    }
+
+    #[test]
+    fn cancellation_after_analyzer_completion_finishes_cancelled_without_facts() {
+        let fixture = worker_fixture(52, None);
+        let metrics = enqueued_metrics(52);
+        let store_path = fixture.job.store_path.clone();
+
+        crate::workspace_analyzer::with_completed_before_persist_observer(
+            move || {
+                let conn = cas_store::open_existing(&store_path).unwrap();
+                let changed = conn
+                    .execute(
+                        "UPDATE workspace_analysis_runs
+                         SET cancel_requested = 1
+                         WHERE job_id = 52 AND status = 'running'",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(changed, 1);
+            },
+            || {
+                run_job_blocking(
+                    fixture.job.clone(),
+                    metrics.clone(),
+                    AnalyzerProgress::default(),
+                    None,
+                )
+                .unwrap();
+            },
+        );
+
+        let row: (String, i64, Option<i64>, Option<String>) = fixture
+            .conn
+            .query_row(
+                "SELECT status, cancel_requested, finished_at_ns, error
+                 FROM workspace_analysis_runs WHERE job_id = 52",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "cancelled");
+        assert_eq!(row.1, 1);
+        assert!(row.2.is_some());
+        assert_eq!(row.3.as_deref(), Some("analyzer cancelled"));
+        let succeeded: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_analysis_runs WHERE status = 'succeeded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(succeeded, 0);
+        let facts: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM refs) + (SELECT COUNT(*) FROM resolutions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(facts, 0);
+        assert_eq!(
+            metric_snapshot(&metrics, 52).scheduler_state.as_deref(),
+            Some("cancelled")
+        );
     }
 
     #[test]

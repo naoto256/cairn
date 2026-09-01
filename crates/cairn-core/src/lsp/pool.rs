@@ -572,11 +572,11 @@ fn classify_force_shutdown_results(results: &[CleanupOutcome]) -> ForceShutdownO
     for outcome in results {
         if let Err(error) = outcome.clone().into_result() {
             out.public_error = Some(match out.public_error.take() {
+                None => error,
                 Some(prior) => Error::OperationWithCleanupFailure {
                     original: Box::new(prior),
                     cleanup: Box::new(error),
                 },
-                None => error,
             });
         }
         match outcome {
@@ -601,7 +601,45 @@ fn classify_force_shutdown_results(results: &[CleanupOutcome]) -> ForceShutdownO
             }
         }
     }
+    if let Some(message) = out.first_os_residual.as_ref() {
+        // The private typed disposition, rather than whichever public error
+        // happened to be folded last, owns the caller's termination axis.
+        // Remove copies of that exact fact from the aggregate before placing
+        // it once at the outer cleanup position; distinct later residuals and
+        // protocol/invariant facts remain on the original side.
+        let original = out
+            .public_error
+            .take()
+            .and_then(|error| remove_child_termination_fact(error, message));
+        let residual = Error::ChildTerminationFailed(message.clone());
+        out.public_error = Some(match original {
+            Some(original) => Error::OperationWithCleanupFailure {
+                original: Box::new(original),
+                cleanup: Box::new(residual),
+            },
+            None => residual,
+        });
+    }
     out
+}
+
+fn remove_child_termination_fact(error: Error, message: &str) -> Option<Error> {
+    match error {
+        Error::ChildTerminationFailed(candidate) if candidate == message => None,
+        Error::OperationWithCleanupFailure { original, cleanup } => {
+            let original = remove_child_termination_fact(*original, message);
+            let cleanup = remove_child_termination_fact(*cleanup, message);
+            match (original, cleanup) {
+                (Some(original), Some(cleanup)) => Some(Error::OperationWithCleanupFailure {
+                    original: Box::new(original),
+                    cleanup: Box::new(cleanup),
+                }),
+                (Some(error), None) | (None, Some(error)) => Some(error),
+                (None, None) => None,
+            }
+        }
+        other => Some(other),
+    }
 }
 
 impl LspClientPool {
