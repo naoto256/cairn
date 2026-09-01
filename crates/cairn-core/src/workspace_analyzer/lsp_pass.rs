@@ -2548,7 +2548,7 @@ while True:
                 entries: &entries,
                 now_ns: 42,
                 analyzer_stall_timeout: Duration::from_secs(5),
-                job_id: Some(324),
+                job_id: None,
                 progress: Some(progress.clone()),
             },
         )

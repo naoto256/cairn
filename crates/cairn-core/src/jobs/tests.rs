@@ -567,6 +567,7 @@ pub(super) fn test_job(id: JobId, manifest_id: i64, analyzer_id: &str) -> Job {
         alias: "repo".into(),
         repo_hash: "repo-hash".into(),
         store_path: PathBuf::from("/tmp/store.db"),
+        index_db_path: PathBuf::from("/tmp/index.db"),
         repo_root: PathBuf::from("/tmp/repo"),
         manifest_id: ManifestId(manifest_id),
         analyzer_id: analyzer_id.into(),
