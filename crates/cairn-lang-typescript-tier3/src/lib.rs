@@ -115,6 +115,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerTsAnalyzer {
         TS_LANGUAGE.parser_id
     }
 
+    fn uses_lsp_pool(&self) -> bool {
+        true
+    }
+
     fn defer_stall_watchdog_until_active_work(&self) -> bool {
         true
     }
@@ -155,6 +159,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerJsAnalyzer {
         JS_LANGUAGE.parser_id
     }
 
+    fn uses_lsp_pool(&self) -> bool {
+        true
+    }
+
     fn defer_stall_watchdog_until_active_work(&self) -> bool {
         true
     }
@@ -193,6 +201,10 @@ impl WorkspaceAnalyzer for TypescriptLanguageServerTsxAnalyzer {
 
     fn parser_id(&self) -> &'static str {
         TSX_LANGUAGE.parser_id
+    }
+
+    fn uses_lsp_pool(&self) -> bool {
+        true
     }
 
     fn defer_stall_watchdog_until_active_work(&self) -> bool {

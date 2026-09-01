@@ -22,6 +22,37 @@
 //! is `JobManager::prune_jobs`'s domain (`jobs/list.rs`).
 use super::*;
 
+const LEGACY_POOL_POISONED_ERROR: &str = "LSP pool is poisoned by a prior child cleanup that could not prove termination; restart the daemon to recover";
+
+#[derive(Debug)]
+struct LegacyPoisonRecovery {
+    store_path: PathBuf,
+    repo_root: PathBuf,
+    manifest_id: ManifestId,
+    analyzer_id: String,
+    analyzer_revision: u32,
+    config_hash: String,
+    old_job_id: JobId,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_TOMBSTONE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn observe_legacy_tombstone_for_test() {
+    LEGACY_TOMBSTONE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn observe_legacy_tombstone_for_test() {}
+
 /// A single row observed during `restore_from_db`, tagged with the
 /// store it lives in and whether it is dispatch-active (queued or a
 /// running row that was flipped back to queued). Used to build the
@@ -91,7 +122,7 @@ impl JobManager {
         // and we would otherwise resolve `cancel(old_id)` to that last
         // row, silently targeting a still-live sibling of the
         // (already-rewritten) intended job.
-        let existing_tombstones = cas_registry::all_ambiguous_job_ids(&index)?;
+        let mut existing_tombstones = cas_registry::all_ambiguous_job_ids(&index)?;
 
         // Phase 1: status recovery only. Flip `running` back to
         // `queued` (a `running` row can only have been produced by a
@@ -99,6 +130,7 @@ impl JobManager {
         // NULL-fill — happens in phase 2 through the daemon-global
         // allocator, strictly after `observed_max` seeding, so no
         // per-store id is ever written to disk.
+        let mut legacy_recoveries = Vec::new();
         for entry in &unique_entries {
             let store_path = self.cas_data_dir.store_db_path(&entry.repo_hash);
             let conn = cas_store::open_existing(&store_path)?;
@@ -108,6 +140,120 @@ impl JobManager {
                  WHERE status = 'running'",
                 [],
             )?;
+
+            let repo_root = PathBuf::from(&entry.root_path);
+            let Some(manifest_id) =
+                crate::anchor::resolve_tentative_manifest_id(&conn, &repo_root)?
+            else {
+                continue;
+            };
+            for analyzer in expected_analyzers_for_manifest(&conn, manifest_id)?
+                .into_iter()
+                .filter(|analyzer| analyzer.uses_lsp_pool())
+            {
+                let current_config_hash = config_hash(&repo_root, analyzer.config_paths());
+                let row = conn
+                    .query_row(
+                        "SELECT job_id
+                         FROM workspace_analysis_runs
+                         WHERE manifest_id = ?1 AND analyzer_id = ?2
+                           AND analyzer_revision = ?3 AND config_hash = ?4
+                           AND status = 'failed' AND error = ?5
+                           AND cancel_requested = 0 AND job_id IS NOT NULL",
+                        params![
+                            manifest_id.0,
+                            analyzer.id(),
+                            analyzer.revision(),
+                            current_config_hash,
+                            LEGACY_POOL_POISONED_ERROR,
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if let Some(old_job_id) = row {
+                    legacy_recoveries.push(LegacyPoisonRecovery {
+                        store_path: store_path.clone(),
+                        repo_root: repo_root.clone(),
+                        manifest_id,
+                        analyzer_id: analyzer.id().to_string(),
+                        analyzer_revision: analyzer.revision(),
+                        config_hash: current_config_hash,
+                        old_job_id,
+                    });
+                }
+            }
+        }
+
+        // Revalidate every eligibility fact immediately before retiring the
+        // old external id. A candidate that stopped being current must remain
+        // Failed under its original id; silently tombstoning it would retire a
+        // still-truthful terminal record. Once a concrete id is tombstoned,
+        // failure of the following exact store rewrite aborts startup: the
+        // cross-database cut is intentionally fail-closed and the next restart
+        // completes it through the existing tombstone recovery path.
+        for candidate in legacy_recoveries {
+            let Some(analyzer) = all_workspace_analyzers().into_iter().find(|analyzer| {
+                analyzer.id() == candidate.analyzer_id && analyzer.uses_lsp_pool()
+            }) else {
+                continue;
+            };
+            let current_manifest = crate::anchor::resolve_tentative_manifest_id(
+                &cas_store::open_existing(&candidate.store_path)?,
+                &candidate.repo_root,
+            )?;
+            if current_manifest != Some(candidate.manifest_id) {
+                continue;
+            }
+            let eligibility_conn = cas_store::open_existing(&candidate.store_path)?;
+            let still_expected =
+                expected_analyzers_for_manifest(&eligibility_conn, candidate.manifest_id)?
+                    .into_iter()
+                    .any(|expected| {
+                        expected.id() == candidate.analyzer_id && expected.uses_lsp_pool()
+                    });
+            if !still_expected {
+                continue;
+            }
+            let current_config_hash = config_hash(&candidate.repo_root, analyzer.config_paths());
+            if current_config_hash != candidate.config_hash
+                || analyzer.revision() != candidate.analyzer_revision
+            {
+                continue;
+            }
+            let tx = index.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            cas_registry::insert_ambiguous_ids(&tx, &[candidate.old_job_id], now_ns())?;
+            tx.commit()?;
+            existing_tombstones.insert(candidate.old_job_id);
+            observe_legacy_tombstone_for_test();
+            let mut conn = cas_store::open_existing(&candidate.store_path)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE workspace_analysis_runs
+                 SET status = 'queued', started_at_ns = ?1,
+                     finished_at_ns = NULL, error = NULL, job_id = NULL,
+                     cancel_requested = 0
+                 WHERE manifest_id = ?2 AND analyzer_id = ?3
+                   AND analyzer_revision = ?4 AND config_hash = ?5
+                   AND status = 'failed' AND error = ?6
+                   AND cancel_requested = 0
+                   AND job_id = ?7",
+                params![
+                    now_ns(),
+                    candidate.manifest_id.0,
+                    candidate.analyzer_id,
+                    candidate.analyzer_revision,
+                    candidate.config_hash,
+                    LEGACY_POOL_POISONED_ERROR,
+                    candidate.old_job_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::Internal(format!(
+                    "legacy pool-poison recovery lost exact row after id retirement: manifest={} analyzer={} changed={changed}",
+                    candidate.manifest_id.0, candidate.analyzer_id
+                )));
+            }
+            tx.commit()?;
         }
 
         // Phase 2: collect every row across every store — all
@@ -334,6 +480,281 @@ impl JobManager {
 mod tests {
     use super::*;
     use crate::jobs::tests::*;
+
+    struct LegacyRecoveryFixture {
+        _data: tempfile::TempDir,
+        _repo: tempfile::TempDir,
+        manager: Arc<JobManager>,
+        conn: rusqlite::Connection,
+        manifest_id: ManifestId,
+        revision: u32,
+        config_hash: String,
+    }
+
+    fn legacy_recovery_fixture() -> LegacyRecoveryFixture {
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cas_data_dir = Arc::new(CasDataDir::with_root(data.path().to_path_buf()));
+        {
+            let mut index = cas_registry::open(&cas_data_dir.index_db_path()).unwrap();
+            let tx = index.transaction().unwrap();
+            cas_registry::upsert(&tx, "repo", repo.path().to_str().unwrap(), "legacy-repo", 1)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = cas_store::open(&cas_data_dir.store_db_path("legacy-repo")).unwrap();
+        let manifest_id = ManifestId(7);
+        insert_manifest(&conn, manifest_id.0);
+        conn.execute(
+            "INSERT INTO worktrees (worktree_id, path, registered_at_ns)
+             VALUES (1, ?1, 0)",
+            [repo.path().to_str().unwrap()],
+        )
+        .unwrap();
+        insert_anchor(&conn, "tentative/1", manifest_id.0);
+        insert_manifest_parser(
+            &conn,
+            manifest_id,
+            "src/main.fake",
+            "fake-blob",
+            "fake-parser",
+        );
+        let analyzer = all_workspace_analyzers()
+            .into_iter()
+            .find(|analyzer| analyzer.id() == "fake-workspace")
+            .unwrap();
+        let revision = analyzer.revision();
+        let config_hash = config_hash(repo.path(), analyzer.config_paths());
+        let manager = JobManager::new(cas_data_dir);
+        LegacyRecoveryFixture {
+            _data: data,
+            _repo: repo,
+            manager,
+            conn,
+            manifest_id,
+            revision,
+            config_hash,
+        }
+    }
+
+    fn insert_legacy_failure(
+        fixture: &LegacyRecoveryFixture,
+        analyzer_id: &str,
+        revision: u32,
+        config_hash: &str,
+        error: &str,
+        job_id: Option<JobId>,
+        cancel_requested: i64,
+    ) {
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO workspace_analysis_runs
+                   (manifest_id, analyzer_id, analyzer_revision, config_hash,
+                    status, started_at_ns, finished_at_ns, error, job_id,
+                    cancel_requested)
+                 VALUES (?1, ?2, ?3, ?4, 'failed', 10, 20, ?5, ?6, ?7)",
+                params![
+                    fixture.manifest_id.0,
+                    analyzer_id,
+                    revision,
+                    config_hash,
+                    error,
+                    job_id,
+                    cancel_requested,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn restore_requeues_only_exact_current_legacy_pool_failure_with_fresh_id() {
+        let fixture = legacy_recovery_fixture();
+        insert_legacy_failure(
+            &fixture,
+            "fake-workspace",
+            fixture.revision,
+            &fixture.config_hash,
+            LEGACY_POOL_POISONED_ERROR,
+            Some(41),
+            0,
+        );
+
+        fixture.manager.restore_from_db().unwrap();
+
+        let (status, error, job_id): (String, Option<String>, Option<i64>) = fixture
+            .conn
+            .query_row(
+                "SELECT status, error, job_id FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'fake-workspace'",
+                [fixture.manifest_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Queued.as_str());
+        assert!(error.is_none());
+        assert!(job_id.is_some_and(|id| id != 41));
+        let index = cas_registry::open(&fixture.manager.cas_data_dir.index_db_path()).unwrap();
+        assert!(
+            cas_registry::all_ambiguous_job_ids(&index)
+                .unwrap()
+                .contains(&41)
+        );
+    }
+
+    #[test]
+    fn restore_legacy_recovery_requires_a_concrete_old_job_id() {
+        let fixture = legacy_recovery_fixture();
+        insert_legacy_failure(
+            &fixture,
+            "fake-workspace",
+            fixture.revision,
+            &fixture.config_hash,
+            LEGACY_POOL_POISONED_ERROR,
+            None,
+            0,
+        );
+
+        fixture.manager.restore_from_db().unwrap();
+
+        let (status, job_id): (String, Option<i64>) = fixture
+            .conn
+            .query_row(
+                "SELECT status, job_id FROM workspace_analysis_runs
+                 WHERE manifest_id = ?1 AND analyzer_id = 'fake-workspace'",
+                [fixture.manifest_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Failed.as_str());
+        assert!(job_id.is_none());
+    }
+
+    #[test]
+    fn restore_fails_closed_when_exact_legacy_row_changes_after_tombstone() {
+        let fixture = legacy_recovery_fixture();
+        insert_legacy_failure(
+            &fixture,
+            "fake-workspace",
+            fixture.revision,
+            &fixture.config_hash,
+            LEGACY_POOL_POISONED_ERROR,
+            Some(42),
+            0,
+        );
+        let store_path = fixture.manager.cas_data_dir.store_db_path("legacy-repo");
+        LEGACY_TOMBSTONE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                cas_store::open_existing(&store_path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE workspace_analysis_runs SET job_id = 43 WHERE job_id = 42",
+                        [],
+                    )
+                    .unwrap();
+            }));
+        });
+
+        let error = fixture
+            .manager
+            .restore_from_db()
+            .expect_err("changed exact row after tombstone must abort startup");
+        assert!(
+            error
+                .to_string()
+                .contains("lost exact row after id retirement")
+        );
+        let index = cas_registry::open(&fixture.manager.cas_data_dir.index_db_path()).unwrap();
+        assert!(
+            cas_registry::all_ambiguous_job_ids(&index)
+                .unwrap()
+                .contains(&42)
+        );
+        let current_id: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT job_id FROM workspace_analysis_runs WHERE analyzer_id = 'fake-workspace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_id, 43, "replacement row must not be clobbered");
+    }
+
+    #[test]
+    fn restore_leaves_near_stale_cancelled_and_non_lsp_legacy_rows_failed() {
+        let cases = [
+            (
+                "fake-workspace",
+                1,
+                "current",
+                LEGACY_POOL_POISONED_ERROR,
+                0,
+            ),
+            (
+                "fake-workspace",
+                0,
+                "stale-config",
+                LEGACY_POOL_POISONED_ERROR,
+                0,
+            ),
+            (
+                "fake-workspace",
+                0,
+                "current",
+                "LSP pool is poisoned by a near-match",
+                0,
+            ),
+            (
+                "fake-workspace",
+                0,
+                "current",
+                LEGACY_POOL_POISONED_ERROR,
+                1,
+            ),
+            (
+                "second-fake-workspace",
+                11,
+                "fake-config",
+                LEGACY_POOL_POISONED_ERROR,
+                0,
+            ),
+        ];
+        for (ordinal, (analyzer_id, revision_marker, config_marker, error, cancel)) in
+            cases.into_iter().enumerate()
+        {
+            let fixture = legacy_recovery_fixture();
+            let revision = if revision_marker == 0 {
+                fixture.revision
+            } else {
+                fixture.revision.saturating_add(revision_marker)
+            };
+            let config = if config_marker == "current" {
+                fixture.config_hash.as_str()
+            } else {
+                config_marker
+            };
+            insert_legacy_failure(
+                &fixture,
+                analyzer_id,
+                revision,
+                config,
+                error,
+                Some(100 + i64::try_from(ordinal).unwrap()),
+                cancel,
+            );
+            fixture.manager.restore_from_db().unwrap();
+            let status: String = fixture
+                .conn
+                .query_row(
+                    "SELECT status FROM workspace_analysis_runs WHERE manifest_id = ?1",
+                    [fixture.manifest_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, RunStatus::Failed.as_str(), "case {ordinal}");
+        }
+    }
 
     #[test]
     fn restore_recycles_all_rows_in_collision_group_preserves_unique() {

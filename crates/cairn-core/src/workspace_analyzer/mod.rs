@@ -465,6 +465,14 @@ pub trait WorkspaceAnalyzer: Send + Sync {
         None
     }
 
+    /// Whether this analyzer obtains its runtime through the daemon-global
+    /// LSP client pool. This is an explicit recovery capability; callers must
+    /// not infer it from an analyzer id, watchdog policy, or pool group.
+    #[doc(hidden)]
+    fn uses_lsp_pool(&self) -> bool {
+        false
+    }
+
     /// Whether this analyzer starts its stall watchdog only after entering
     /// active work.
     ///
@@ -739,6 +747,10 @@ mod tests {
             &["Cargo.toml", ".ruby-lsp/Gemfile", ".ruby-lsp/Gemfile.lock"]
         }
 
+        fn uses_lsp_pool(&self) -> bool {
+            true
+        }
+
         fn analyze_workspace(
             &self,
             _repo_root: &Path,
@@ -1005,6 +1017,17 @@ mod tests {
 
         assert_eq!(fake.revision(), 7);
         assert_eq!(fake.language(), "fake");
+    }
+
+    #[test]
+    fn lsp_pool_capability_dispatches_without_id_inference() {
+        let mut actual = all_workspace_analyzers()
+            .into_iter()
+            .filter(|analyzer| analyzer.uses_lsp_pool())
+            .map(|analyzer| analyzer.id())
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, ["fake-workspace"]);
     }
 
     #[test]
