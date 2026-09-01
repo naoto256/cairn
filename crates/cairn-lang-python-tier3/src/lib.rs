@@ -61,6 +61,10 @@ impl WorkspaceAnalyzer for PyrightWorkspaceAnalyzer {
         "tree-sitter-python"
     }
 
+    fn uses_lsp_pool(&self) -> bool {
+        true
+    }
+
     fn defer_stall_watchdog_until_active_work(&self) -> bool {
         true
     }

@@ -48,6 +48,10 @@ impl WorkspaceAnalyzer for PhpantomLspWorkspaceAnalyzer {
         PhpBackend.parser_id()
     }
 
+    fn uses_lsp_pool(&self) -> bool {
+        true
+    }
+
     fn defer_stall_watchdog_until_active_work(&self) -> bool {
         true
     }

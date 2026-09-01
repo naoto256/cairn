@@ -615,6 +615,14 @@ mod tests {
             ]
         );
         assert_eq!(analyzers.len() - deferred.len(), 7);
+
+        let mut pooled = analyzers
+            .iter()
+            .filter(|analyzer| analyzer.uses_lsp_pool())
+            .map(|analyzer| analyzer.id())
+            .collect::<Vec<_>>();
+        pooled.sort_unstable();
+        assert_eq!(pooled, deferred);
     }
 
     #[test]
