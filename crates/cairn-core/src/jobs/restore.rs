@@ -197,14 +197,14 @@ impl JobManager {
             }) else {
                 continue;
             };
+            let eligibility_conn = cas_store::open_existing(&candidate.store_path)?;
             let current_manifest = crate::anchor::resolve_tentative_manifest_id(
-                &cas_store::open_existing(&candidate.store_path)?,
+                &eligibility_conn,
                 &candidate.repo_root,
             )?;
             if current_manifest != Some(candidate.manifest_id) {
                 continue;
             }
-            let eligibility_conn = cas_store::open_existing(&candidate.store_path)?;
             let still_expected =
                 expected_analyzers_for_manifest(&eligibility_conn, candidate.manifest_id)?
                     .into_iter()
