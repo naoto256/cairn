@@ -629,6 +629,136 @@ fn classify_force_shutdown_preserves_os_and_invariant_axes() {
     let out = classify_force_shutdown_results(&results);
     assert_eq!(out.first_os_residual.as_deref(), Some("os"));
     assert_eq!(out.first_invariant_failure.as_deref(), Some("inv"));
+    assert!(
+        out.public_error
+            .as_ref()
+            .is_some_and(Error::is_termination_unproven)
+    );
+}
+
+fn error_contains_protocol(error: &Error) -> bool {
+    match error {
+        Error::Protocol(_) => true,
+        Error::OperationWithCleanupFailure { original, cleanup } => {
+            error_contains_protocol(original) || error_contains_protocol(cleanup)
+        }
+        _ => false,
+    }
+}
+
+fn error_contains_pool_poisoned(error: &Error) -> bool {
+    match error {
+        Error::PoolPoisoned => true,
+        Error::OperationWithCleanupFailure { original, cleanup } => {
+            error_contains_pool_poisoned(original) || error_contains_pool_poisoned(cleanup)
+        }
+        _ => false,
+    }
+}
+
+fn child_termination_fact_count(error: &Error, message: &str) -> usize {
+    match error {
+        Error::ChildTerminationFailed(candidate) => usize::from(candidate == message),
+        Error::OperationWithCleanupFailure { original, cleanup } => {
+            child_termination_fact_count(original, message)
+                + child_termination_fact_count(cleanup, message)
+        }
+        _ => 0,
+    }
+}
+
+fn outer_cleanup_residual(error: &Error) -> Option<&str> {
+    match error {
+        Error::ChildTerminationFailed(message) => Some(message),
+        Error::OperationWithCleanupFailure { cleanup, .. } => match cleanup.as_ref() {
+            Error::ChildTerminationFailed(message) => Some(message),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[test]
+fn force_classifier_uses_typed_first_residual_as_unique_outer_cleanup() {
+    let residual_a = CleanupOutcome::Terminal(
+        CleanupTerminal::OsResidual("group signal residual A".into()),
+        None,
+    );
+    let residual_b = CleanupOutcome::Terminal(
+        CleanupTerminal::OsResidual("leader wait residual B".into()),
+        None,
+    );
+    let protocol = CleanupOutcome::Terminal(
+        CleanupTerminal::Proven,
+        Some(Error::Protocol("graceful shutdown failed".into())),
+    );
+    let invariant = CleanupOutcome::invariant("custody invariant", None);
+
+    for (results, first, other) in [
+        (
+            vec![
+                residual_a.clone(),
+                protocol.clone(),
+                invariant.clone(),
+                residual_b.clone(),
+            ],
+            "group signal residual A",
+            "leader wait residual B",
+        ),
+        (
+            vec![residual_b, protocol.clone(), invariant, residual_a],
+            "leader wait residual B",
+            "group signal residual A",
+        ),
+    ] {
+        let out = classify_force_shutdown_results(&results);
+        assert_eq!(out.first_os_residual.as_deref(), Some(first));
+        assert_eq!(
+            out.first_invariant_failure.as_deref(),
+            Some("custody invariant")
+        );
+        let public_error = out.public_error.as_ref().unwrap();
+        assert!(public_error.is_termination_unproven());
+        assert_eq!(outer_cleanup_residual(public_error), Some(first));
+        assert_eq!(child_termination_fact_count(public_error, first), 1);
+        assert_eq!(child_termination_fact_count(public_error, other), 1);
+        assert!(error_contains_protocol(public_error));
+        assert!(error_contains_pool_poisoned(public_error));
+    }
+}
+
+#[test]
+fn force_classifier_without_os_residual_is_not_termination_unproven() {
+    let out = classify_force_shutdown_results(&[
+        CleanupOutcome::Terminal(
+            CleanupTerminal::Proven,
+            Some(Error::Protocol("graceful shutdown failed".into())),
+        ),
+        CleanupOutcome::invariant("custody invariant", None),
+    ]);
+
+    assert!(out.first_os_residual.is_none());
+    assert_eq!(
+        out.first_invariant_failure.as_deref(),
+        Some("custody invariant")
+    );
+    let public_error = out.public_error.as_ref().unwrap();
+    assert!(!public_error.is_termination_unproven());
+    assert!(error_contains_protocol(public_error));
+    assert!(error_contains_pool_poisoned(public_error));
+}
+
+#[test]
+fn force_classifier_typed_os_axis_repairs_a_nontermination_public_shape() {
+    let out = classify_force_shutdown_results(&[CleanupOutcome::Terminal(
+        CleanupTerminal::OsResidual("typed OS residual".into()),
+        Some(Error::Protocol("graceful shutdown failed".into())),
+    )]);
+
+    assert_eq!(out.first_os_residual.as_deref(), Some("typed OS residual"));
+    let public_error = out.public_error.as_ref().unwrap();
+    assert!(public_error.is_termination_unproven());
+    assert!(error_contains_protocol(public_error));
 }
 
 #[test]
