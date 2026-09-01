@@ -2554,7 +2554,10 @@ while True:
         )
         .unwrap();
 
-        assert_eq!(execution.status, RunStatus::Failed);
+        assert_eq!(
+            execution.status,
+            crate::workspace_analyzer::run::AnalyzerExecutionStatus::Terminal(RunStatus::Failed)
+        );
         assert!(
             execution
                 .error
